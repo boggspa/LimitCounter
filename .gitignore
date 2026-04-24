@@ -1,0 +1,21 @@
+.DS_Store
+
+# Xcode build products and local state
+DerivedData/
+build/
+*.xcresult
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM/
+
+# SwiftPM local scratch data
+.build/
+.swiftpm/
+
+# Local editor and agent caches
+.codex/
+.agents/
+.claude/
+.cursor/
+.cache/

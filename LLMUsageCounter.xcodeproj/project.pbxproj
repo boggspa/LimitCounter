@@ -6,13 +6,94 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
+		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
+		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
+		35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
+		53D0D4FE81308907359D330E /* AIUsageWidgetExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		5A7E2A5B4CC14C9AA58D915F /* CloudKitSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C938E723B134DAAACF68821 /* CloudKitSync.swift */; };
+		760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */; };
+		823855AA90207DEE5462F15A /* QuotaTimelineProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */; };
+		8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */; };
+		A090A16CD728E819CEAB1C12 /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
+		A51F1D7A8D634C6DA9E9D6C5 /* CursorSessionImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */; };
+		A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C38142DE1DDB3110221F8CF /* DashboardView.swift */; };
+		AA65955C07EB3790F62BC8CC /* QuotaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */; };
+		AE3CE50218E452F2353349B8 /* LLMActivityHeatmapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */; };
+		B1A64D48BC5A4D97A3A61B0F /* GlassChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */; };
+		B6D67D7E3C8B4F2AB0C6C99C /* GlassChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */; };
+		C277E330E1E1A288294467FB /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */; };
+		C5890563D5868124AC951D99 /* AIUsageTrackerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */; };
+		D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */; };
+		DD5B5E4FABB1AA1A8D5E4B64 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78232D955058B7DEEE4A12CF /* Foundation.framework */; };
+		DDD693B6BE87A2E553B057AA /* SyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82D69C00C45CEED72F493637 /* SyncCoordinator.swift */; };
+		E5F58CBAF2274B5E6338D4D1 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
+		EAFB87C29D9F037A4DC1A183 /* AppStateStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */; };
+		EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
+		F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */; };
+		F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */; };
+		F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		4D5979E94E4C97D8E58E8205 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A42BC5302F9140180096DECB /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0FCC435F5CB21003226F661C;
+			remoteInfo = AIUsageWidgetExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		E49392A0B501D8DC6584E684 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				53D0D4FE81308907359D330E /* AIUsageWidgetExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GeminiProviderClient.swift; path = App/Providers/GeminiProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaSnapshotStore.swift; path = Shared/Storage/QuotaSnapshotStore.swift; sourceTree = SOURCE_ROOT; };
+		14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.macOS.entitlements; path = Widget/AIUsageWidgetExtension.macOS.entitlements; sourceTree = SOURCE_ROOT; };
+		1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AIUsageWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LLMActivityHeatmapView.swift; path = Shared/Views/LLMActivityHeatmapView.swift; sourceTree = SOURCE_ROOT; };
+		388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaTimelineProvider.swift; path = Widget/QuotaTimelineProvider.swift; sourceTree = SOURCE_ROOT; };
+		3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaCardView.swift; path = Shared/Views/QuotaCardView.swift; sourceTree = SOURCE_ROOT; };
+		453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AIUsageTrackerApp.swift; path = App/AIUsageTrackerApp.swift; sourceTree = SOURCE_ROOT; };
+		47B21C6EE756C027946DD210 /* AIUsageWidgetExtension-Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; name = "AIUsageWidgetExtension-Info.plist"; path = "Widget/AIUsageWidgetExtension-Info.plist"; sourceTree = SOURCE_ROOT; };
+		52ECCBB7247196B57F543B01 /* MenuBarController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MenuBarController.swift; path = App/MenuBarController.swift; sourceTree = SOURCE_ROOT; };
+		6497EE5E8894C69C0C3FED10 /* AIUsageWidgetExtension.iOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.iOS.entitlements; path = Widget/AIUsageWidgetExtension.iOS.entitlements; sourceTree = SOURCE_ROOT; };
+		6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CursorSessionImportView.swift; path = App/Views/CursorSessionImportView.swift; sourceTree = SOURCE_ROOT; };
+		6C938E723B134DAAACF68821 /* CloudKitSync.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudKitSync.swift; path = App/CloudKitSync.swift; sourceTree = SOURCE_ROOT; };
+		781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SettingsView.swift; path = App/Views/SettingsView.swift; sourceTree = SOURCE_ROOT; };
+		78232D955058B7DEEE4A12CF /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		82D69C00C45CEED72F493637 /* SyncCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SyncCoordinator.swift; path = App/SyncCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CodexTelemetryProviderClient.swift; path = App/Providers/CodexTelemetryProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		9C38142DE1DDB3110221F8CF /* DashboardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = DashboardView.swift; path = App/Views/DashboardView.swift; sourceTree = SOURCE_ROOT; };
 		A42BC5382F9140180096DECB /* LLMUsageCounter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LLMUsageCounter.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderDetailView.swift; path = App/Views/ProviderDetailView.swift; sourceTree = SOURCE_ROOT; };
+		AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderClient.swift; path = App/Providers/ProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GlassChrome.swift; path = Shared/Views/GlassChrome.swift; sourceTree = SOURCE_ROOT; };
+		B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AppStateStore.swift; path = App/AppStateStore.swift; sourceTree = SOURCE_ROOT; };
+		C7D74721EA3E8C99B51CF09D /* MockData.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MockData.swift; path = Shared/Models/MockData.swift; sourceTree = SOURCE_ROOT; };
+		CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = KeychainService.swift; path = App/Keychain/KeychainService.swift; sourceTree = SOURCE_ROOT; };
+		EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaModels.swift; path = Shared/Models/QuotaModels.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		A42BC53A2F9140180096DECB /* LLMUsageCounter */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = LLMUsageCounter;
 			sourceTree = "<group>";
 		};
@@ -26,14 +107,76 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F9E41EA8F5951BE341260BFE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DD5B5E4FABB1AA1A8D5E4B64 /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		558DC4DE64CCE2D80E927F99 /* Storage */ = {
+			isa = PBXGroup;
+			children = (
+				0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */,
+			);
+			path = Storage;
+			sourceTree = "<group>";
+		};
+		85A7C518E3672111E595E3FB /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */,
+				21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		8B42C81774DA3E0851F628FC /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				78232D955058B7DEEE4A12CF /* Foundation.framework */,
+			);
+			name = iOS;
+			sourceTree = "<group>";
+		};
+		9D3558D520C1572BEF5EB737 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */,
+				6C938E723B134DAAACF68821 /* CloudKitSync.swift */,
+				B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */,
+				82D69C00C45CEED72F493637 /* SyncCoordinator.swift */,
+				A2FB8197FE14AD73E2CC491A /* Providers */,
+				F7817BF72DDD8971A8F746D3 /* Keychain */,
+				B15DFF02575EC87C5D82B4E9 /* Views */,
+				52ECCBB7247196B57F543B01 /* MenuBarController.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A2FB8197FE14AD73E2CC491A /* Providers */ = {
+			isa = PBXGroup;
+			children = (
+				8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */,
+				AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */,
+				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
+			);
+			path = Providers;
+			sourceTree = "<group>";
+		};
 		A42BC52F2F9140180096DECB = {
 			isa = PBXGroup;
 			children = (
 				A42BC53A2F9140180096DECB /* LLMUsageCounter */,
 				A42BC5392F9140180096DECB /* Products */,
+				EFDF0D9C31CD0D2702D8910D /* Shared */,
+				9D3558D520C1572BEF5EB737 /* App */,
+				D8970929E420175492EEF3D7 /* Frameworks */,
+				BD787368B797C0F81269E11A /* Widget */,
 			);
 			sourceTree = "<group>";
 		};
@@ -41,13 +184,90 @@
 			isa = PBXGroup;
 			children = (
 				A42BC5382F9140180096DECB /* LLMUsageCounter.app */,
+				1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		B15DFF02575EC87C5D82B4E9 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */,
+				6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */,
+				9C38142DE1DDB3110221F8CF /* DashboardView.swift */,
+				A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */,
+				781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		BD787368B797C0F81269E11A /* Widget */ = {
+			isa = PBXGroup;
+			children = (
+				388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */,
+				47B21C6EE756C027946DD210 /* AIUsageWidgetExtension-Info.plist */,
+				6497EE5E8894C69C0C3FED10 /* AIUsageWidgetExtension.iOS.entitlements */,
+				14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */,
+			);
+			name = Widget;
+			path = Widget;
+			sourceTree = "<group>";
+		};
+		D8970929E420175492EEF3D7 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				8B42C81774DA3E0851F628FC /* iOS */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		DC0F04A07877F47900175A40 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				C7D74721EA3E8C99B51CF09D /* MockData.swift */,
+				EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		EFDF0D9C31CD0D2702D8910D /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				DC0F04A07877F47900175A40 /* Models */,
+				558DC4DE64CCE2D80E927F99 /* Storage */,
+				85A7C518E3672111E595E3FB /* Views */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		F7817BF72DDD8971A8F746D3 /* Keychain */ = {
+			isa = PBXGroup;
+			children = (
+				CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */,
+			);
+			path = Keychain;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		0FCC435F5CB21003226F661C /* AIUsageWidgetExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D5AA20048D22740497597493 /* Build configuration list for PBXNativeTarget "AIUsageWidgetExtension" */;
+			buildPhases = (
+				8FC5515B526076CB1CF43748 /* Sources */,
+				F9E41EA8F5951BE341260BFE /* Frameworks */,
+				86AFB6DEBF7801AB676DDC79 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AIUsageWidgetExtension;
+			productName = AIUsageWidgetExtension;
+			productReference = 1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		A42BC5372F9140180096DECB /* LLMUsageCounter */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A42BC5432F9140190096DECB /* Build configuration list for PBXNativeTarget "LLMUsageCounter" */;
@@ -55,17 +275,17 @@
 				A42BC5342F9140180096DECB /* Sources */,
 				A42BC5352F9140180096DECB /* Frameworks */,
 				A42BC5362F9140180096DECB /* Resources */,
+				E49392A0B501D8DC6584E684 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B7C196B6B296B74014041874 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				A42BC53A2F9140180096DECB /* LLMUsageCounter */,
 			);
 			name = LLMUsageCounter;
-			packageProductDependencies = (
-			);
 			productName = LLMUsageCounter;
 			productReference = A42BC5382F9140180096DECB /* LLMUsageCounter.app */;
 			productType = "com.apple.product-type.application";
@@ -100,11 +320,19 @@
 			projectRoot = "";
 			targets = (
 				A42BC5372F9140180096DECB /* LLMUsageCounter */,
+				0FCC435F5CB21003226F661C /* AIUsageWidgetExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		86AFB6DEBF7801AB676DDC79 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A42BC5362F9140180096DECB /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -115,16 +343,122 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		8FC5515B526076CB1CF43748 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				823855AA90207DEE5462F15A /* QuotaTimelineProvider.swift in Sources */,
+				A090A16CD728E819CEAB1C12 /* MockData.swift in Sources */,
+				AA65955C07EB3790F62BC8CC /* QuotaModels.swift in Sources */,
+				1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */,
+				E5F58CBAF2274B5E6338D4D1 /* QuotaCardView.swift in Sources */,
+				B6D67D7E3C8B4F2AB0C6C99C /* GlassChrome.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A42BC5342F9140180096DECB /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */,
+				8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */,
+				35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */,
+				EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */,
+				C5890563D5868124AC951D99 /* AIUsageTrackerApp.swift in Sources */,
+				5A7E2A5B4CC14C9AA58D915F /* CloudKitSync.swift in Sources */,
+				EAFB87C29D9F037A4DC1A183 /* AppStateStore.swift in Sources */,
+				DDD693B6BE87A2E553B057AA /* SyncCoordinator.swift in Sources */,
+				F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */,
+				F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */,
+				D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */,
+				A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */,
+				25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */,
+				C277E330E1E1A288294467FB /* SettingsView.swift in Sources */,
+				A51F1D7A8D634C6DA9E9D6C5 /* CursorSessionImportView.swift in Sources */,
+				B1A64D48BC5A4D97A3A61B0F /* GlassChrome.swift in Sources */,
+				760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */,
+				0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */,
+				AE3CE50218E452F2353349B8 /* LLMActivityHeatmapView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		B7C196B6B296B74014041874 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = AIUsageWidgetExtension;
+			target = 0FCC435F5CB21003226F661C /* AIUsageWidgetExtension */;
+			targetProxy = 4D5979E94E4C97D8E58E8205 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		593B517D43F95EF59F3C033C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8CZML8FK2D;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Widget/AIUsageWidgetExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter.widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		90695265DE8B716863270A69 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8CZML8FK2D;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Widget/AIUsageWidgetExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter.widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		A42BC5412F9140190096DECB /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -246,6 +580,8 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
@@ -254,10 +590,14 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*]" = "fetch remote-notification";
+				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*]" = "fetch remote-notification";
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
@@ -290,6 +630,8 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
@@ -298,10 +640,14 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*]" = "fetch remote-notification";
+				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*]" = "fetch remote-notification";
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
@@ -346,6 +692,15 @@
 			buildConfigurations = (
 				A42BC5442F9140190096DECB /* Debug */,
 				A42BC5452F9140190096DECB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D5AA20048D22740497597493 /* Build configuration list for PBXNativeTarget "AIUsageWidgetExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				593B517D43F95EF59F3C033C /* Release */,
+				90695265DE8B716863270A69 /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

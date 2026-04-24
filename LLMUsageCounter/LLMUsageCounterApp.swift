@@ -7,11 +7,4 @@
 
 import SwiftUI
 
-@main
-struct LLMUsageCounterApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}
+// Entry point moved to App/AIUsageTrackerApp.swift
