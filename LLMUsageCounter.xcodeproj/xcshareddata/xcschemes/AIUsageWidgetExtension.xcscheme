@@ -17,7 +17,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "0FCC435F5CB21003226F661C"
-               BuildableName = "AIUsageWidgetExtension.appex"
+               BuildableName = "Limit Counter Widget.appex"
                BlueprintName = "AIUsageWidgetExtension"
                ReferencedContainer = "container:LLMUsageCounter.xcodeproj">
             </BuildableReference>
@@ -31,7 +31,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A42BC5372F9140180096DECB"
-               BuildableName = "LLMUsageCounter.app"
+               BuildableName = "Limit Counter.app"
                BlueprintName = "LLMUsageCounter"
                ReferencedContainer = "container:LLMUsageCounter.xcodeproj">
             </BuildableReference>
@@ -63,7 +63,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "0FCC435F5CB21003226F661C"
-            BuildableName = "AIUsageWidgetExtension.appex"
+            BuildableName = "Limit Counter Widget.appex"
             BlueprintName = "AIUsageWidgetExtension"
             ReferencedContainer = "container:LLMUsageCounter.xcodeproj">
          </BuildableReference>
@@ -72,7 +72,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A42BC5372F9140180096DECB"
-            BuildableName = "LLMUsageCounter.app"
+            BuildableName = "Limit Counter.app"
             BlueprintName = "LLMUsageCounter"
             ReferencedContainer = "container:LLMUsageCounter.xcodeproj">
          </BuildableReference>
@@ -123,7 +123,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A42BC5372F9140180096DECB"
-            BuildableName = "LLMUsageCounter.app"
+            BuildableName = "Limit Counter.app"
             BlueprintName = "LLMUsageCounter"
             ReferencedContainer = "container:LLMUsageCounter.xcodeproj">
          </BuildableReference>
