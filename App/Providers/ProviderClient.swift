@@ -1,5 +1,188 @@
 import Foundation
+import Security
 import SQLite3
+
+// MARK: - AGBench Unified Telemetry Source
+
+/// Reads AGBench's unified usage telemetry (`usage.json`) and emits
+/// per-provider `UsageEvent` records.
+///
+/// AGBench (a.k.a. GUIGemini) maintains a JSON array at
+/// `~/Library/Application Support/agbench/usage.json` that records every
+/// chat/run across providers — Kimi, Gemini, Codex, Claude — in a clean
+/// structured form. This is a richer signal than per-provider local
+/// scanners for users who drive activity through AGBench, since one
+/// file aggregates everything.
+enum AGBenchUsageReader {
+    private static let usageFileRelativePath = "usage.json"
+
+    /// Returns recent `UsageEvent`s drawn from `usage.json` for the
+    /// given provider key. Provider keys match AGBench's internal naming
+    /// (`"kimi"`, `"gemini"`, `"codex"`, `"claude"`), not our
+    /// `ProviderID.rawValue`.
+    ///
+    /// Returns `[]` on any failure (file missing, JSON malformed,
+    /// sandbox denial). Failures log to console so they surface without
+    /// breaking the calling provider's fetch.
+    static func events(
+        forProviderKey providerKey: String,
+        rootURL: URL,
+        retentionDays: Int = 35,
+        now: Date = Date()
+    ) -> [UsageEvent] {
+        let fileURL = resolveUsageFileURL(rootURL: rootURL)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            print("[AGBenchReader] usage.json not found at \(fileURL.path)")
+            return []
+        }
+
+        guard let data = try? Data(contentsOf: fileURL) else {
+            print("[AGBenchReader] Read failed for \(fileURL.path) (sandbox / permissions?)")
+            return []
+        }
+
+        guard let records = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            print("[AGBenchReader] usage.json had unexpected shape (not a top-level array)")
+            return []
+        }
+
+        let horizon = now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
+        let normalizedKey = providerKey.lowercased()
+        var events: [UsageEvent] = []
+        events.reserveCapacity(records.count)
+
+        for record in records {
+            guard let recordProvider = (record["provider"] as? String)?.lowercased(),
+                  recordProvider == normalizedKey else { continue }
+
+            // Timestamps are Unix epoch milliseconds.
+            guard let timestampMs = numericValue(record["timestamp"]) else { continue }
+            let timestamp = Date(timeIntervalSince1970: timestampMs / 1000)
+            guard timestamp >= horizon else { continue }
+
+            let totalTokens = numericValue(record["totalTokens"]) ?? 0
+            // Some records carry tokens == 0 (e.g. a run that failed
+            // before producing output); we still emit the event with
+            // tokens=nil so it shows up on the heatmap as an activity
+            // marker without inflating token totals.
+            let tokens: Double? = totalTokens > 0 ? totalTokens : nil
+            let model = (record["model"] as? String) ?? providerKey
+
+            events.append(
+                UsageEvent(
+                    timestamp: timestamp,
+                    tokens: tokens,
+                    model: model,
+                    type: .message
+                )
+            )
+        }
+
+        print("[AGBenchReader] Loaded \(events.count) events for provider '\(providerKey)' from \(fileURL.lastPathComponent)")
+        return events
+    }
+
+    /// Resolves the user-bookmarked root URL into the actual
+    /// `usage.json` path. Accepts either:
+    ///   - A bookmark on the AGBench app-support directory (we append
+    ///     `usage.json`).
+    ///   - A bookmark directly on `usage.json`.
+    private static func resolveUsageFileURL(rootURL: URL) -> URL {
+        if rootURL.lastPathComponent == usageFileRelativePath {
+            return rootURL
+        }
+        return rootURL.appendingPathComponent(usageFileRelativePath)
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let v = value as? Double { return v }
+        if let v = value as? Int { return Double(v) }
+        if let v = value as? NSNumber { return v.doubleValue }
+        if let v = value as? String { return Double(v) }
+        return nil
+    }
+
+    /// Convenience wrapper: resolves the bookmark, opens scoped access,
+    /// parses events, tears scoped access down. Most callers should
+    /// use this rather than stitching the pieces together.
+    static func loadEvents(forProviderKey providerKey: String) -> [UsageEvent] {
+        guard let scoped = AGBenchBookmarkStore.startAccess() else {
+            return []
+        }
+        defer { scoped.stop() }
+        return events(forProviderKey: providerKey, rootURL: scoped.url)
+    }
+}
+
+/// Persists a single user-granted security-scoped bookmark to the
+/// AGBench data directory. Stored in `UserDefaults` under a fixed key
+/// rather than the per-provider `ProviderCredential` keychain because
+/// the same bookmark is consumed by multiple providers (Kimi, Codex,
+/// Gemini, Claude).
+enum AGBenchBookmarkStore {
+    private static let defaultsKey = "agbenchBookmarkData"
+
+    static var hasBookmark: Bool {
+        UserDefaults.standard.data(forKey: defaultsKey) != nil
+    }
+
+    @discardableResult
+    static func save(url: URL) -> Bool {
+        #if os(macOS)
+        do {
+            let bookmark = try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            UserDefaults.standard.set(bookmark, forKey: defaultsKey)
+            print("[AGBenchBookmark] Saved bookmark for \(url.path)")
+            return true
+        } catch {
+            print("[AGBenchBookmark] Failed to create bookmark for \(url.path): \(error)")
+            return false
+        }
+        #else
+        return false
+        #endif
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+    }
+
+    /// Resolves the saved bookmark and starts security-scoped access.
+    /// Returns the URL plus a closure to release access (caller MUST
+    /// invoke). Returns `nil` if no bookmark or unresolvable.
+    static func startAccess() -> (url: URL, stop: () -> Void)? {
+        guard let bookmark = UserDefaults.standard.data(forKey: defaultsKey) else {
+            return nil
+        }
+
+        #if os(macOS)
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmark,
+            options: .withSecurityScope,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            print("[AGBenchBookmark] Failed to resolve bookmark — user may need to re-grant access")
+            return nil
+        }
+
+        if isStale {
+            print("[AGBenchBookmark] Bookmark is stale (path moved?) — events may still load but a re-grant is recommended")
+        }
+
+        let didStart = url.startAccessingSecurityScopedResource()
+        return (url, {
+            if didStart { url.stopAccessingSecurityScopedResource() }
+        })
+        #else
+        return nil
+        #endif
+    }
+}
 
 /// Every provider implements this protocol.
 /// Receives credentials from KeychainService, returns a normalized QuotaSnapshot.
@@ -7,6 +190,111 @@ import SQLite3
 public protocol ProviderClient {
     var providerID: ProviderID { get }
     func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot
+}
+
+// MARK: - Heatmap event preservation
+
+/// Content-based key used to dedupe `UsageEvent`s across fetches.
+///
+/// Crucial detail #1: `UsageEvent.id` is a fresh `UUID()` on every
+/// construction, with no provider passing an explicit id. So an
+/// id-based dedupe would treat the *same underlying message* as
+/// distinct events between (a) what we stored on the previous fetch
+/// and (b) what the current fetch re-scanned — leading to silent
+/// double-counting on the heatmap that grows on every refresh.
+///
+/// Crucial detail #2: `tokens` is part of the key for `.message` and
+/// `.activity` events, but NOT for `.bucket` events. The two event
+/// types have opposite semantics:
+///
+///   - `.message`: per-API-call delta. Stable across fetches. Helps
+///     distinguish two legitimately distinct calls that happen to
+///     fall on the same second-resolution timestamp (which can occur
+///     during a busy turn). Excluding tokens would silently collapse
+///     those into one event.
+///
+///   - `.bucket`: cumulative daily total (e.g. Gemini's daily-usage
+///     endpoint). Grows on every refresh — 5M, 6M, 7M throughout the
+///     day. If tokens were in the key each refresh would mint a NEW
+///     event and the heatmap's "tokens today" would balloon over the
+///     course of a day. Excluding tokens means each daily bucket has
+///     a stable key — the fresh event simply replaces the historical
+///     one in the merge.
+///
+/// `.activity` events typically have `tokens == nil` so the choice
+/// doesn't matter there; tokens is included only for consistency with
+/// `.message`.
+private struct UsageEventContentKey: Hashable {
+    let timestamp: Date
+    let type: UsageEvent.EventType
+    let model: String?
+    let tokens: Double?
+
+    init(_ event: UsageEvent) {
+        self.timestamp = event.timestamp
+        self.type = event.type
+        self.model = event.model
+        // See doc comment above for why bucket events drop tokens.
+        self.tokens = (event.type == .bucket) ? nil : event.tokens
+    }
+}
+
+/// Preserves heatmap events across fetches when a provider's data
+/// source has a time-window filter that would otherwise drop them.
+///
+/// Providers like Claude and Kimi scan local transcript files filtered
+/// by modification date (typically a 30-day window), so the moment a
+/// project goes untouched its events disappear from subsequent
+/// snapshots even though they'd still fall within the heatmap's
+/// display window. Windsurf reads only a single `lastSessionDate`
+/// pseudo-event that gets overwritten on the next session boundary —
+/// same problem, different cause.
+///
+/// This helper merges the events from the previously-persisted
+/// snapshot for the same provider into the freshly-built snapshot,
+/// deduped by content key. Trimmed to `lookbackDays` so the array
+/// stays bounded — the heatmap displays 30 days but we keep 60 to
+/// absorb DST edges and provide buffer if the heatmap window ever
+/// grows.
+///
+/// Everything else on the snapshot (windows, stats, fetchState,
+/// fetchedAt, planName) passes through unchanged so the card keeps
+/// reflecting the latest live data.
+private func enrichEventsWithHistory(
+    _ snapshot: QuotaSnapshot,
+    lookbackDays: Int = 60
+) -> QuotaSnapshot {
+    let horizon = Date().addingTimeInterval(-Double(lookbackDays) * 24 * 60 * 60)
+    guard let previous = QuotaSnapshotStore.shared.loadSnapshots()
+        .first(where: { $0.providerID == snapshot.providerID }) else {
+        return snapshot
+    }
+
+    var seen = Set(snapshot.events.map(UsageEventContentKey.init))
+    var combined = snapshot.events
+    for event in previous.events where event.timestamp >= horizon {
+        if seen.insert(UsageEventContentKey(event)).inserted {
+            combined.append(event)
+        }
+    }
+
+    guard combined.count != snapshot.events.count else {
+        return snapshot
+    }
+
+    return QuotaSnapshot(
+        id: snapshot.id,
+        providerID: snapshot.providerID,
+        displayName: snapshot.displayName,
+        planName: snapshot.planName,
+        windows: snapshot.windows,
+        stats: snapshot.stats,
+        balances: snapshot.balances,
+        signals: snapshot.signals,
+        events: combined,
+        fetchState: snapshot.fetchState,
+        fetchedAt: snapshot.fetchedAt
+    )
 }
 
 /// Opaque credential bag — actual shape varies per provider.
@@ -112,7 +400,7 @@ public struct MockProviderClient: ProviderClient {
 /// Real adapter for OpenAI's official organization usage and project rate limit APIs.
 /// Requires an OpenAI admin API key plus a project ID entered by the user.
 public struct OpenAIUsageProviderClient: ProviderClient {
-    public let providerID: ProviderID = .openai
+    public let providerID: ProviderID = .openaiAPI
 
     private let session: URLSession
     private let decoder = JSONDecoder()
@@ -138,6 +426,7 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         let startOfMinute = utcCalendar.date(
             from: utcCalendar.dateComponents([.year, .month, .day, .hour, .minute], from: now)
         ) ?? now
+        let thirtyDayStart = utcCalendar.date(byAdding: .day, value: -29, to: startOfDay) ?? startOfDay
 
         async let rateLimits = fetchRateLimits(
             baseURL: baseURL,
@@ -165,18 +454,28 @@ public struct OpenAIUsageProviderClient: ProviderClient {
             projectID: projectID
         )
 
+        async let analyticsBuckets = fetchAnalyticsBuckets(
+            baseURL: baseURL,
+            adminKey: adminKey,
+            projectID: projectID,
+            startTime: thirtyDayStart,
+            endTime: now,
+            now: now
+        )
+
         let (fetchedRateLimits, fetchedDailyUsagePage, fetchedMinuteUsagePage) = try await (
             rateLimits,
             dailyUsagePage,
             minuteUsagePage
         )
+        let fetchedAnalyticsBuckets = await analyticsBuckets
 
         guard !fetchedRateLimits.data.isEmpty else {
             throw ProviderFetchError.parsingError("No project rate limits were returned for this OpenAI project.")
         }
 
-        let dailyUsageByModel = usageByModel(from: fetchedDailyUsagePage)
-        let minuteUsageByModel = usageByModel(from: fetchedMinuteUsagePage)
+        let dailyUsageByModel = usageByModel(from: fetchedDailyUsagePage.data)
+        let minuteUsageByModel = usageByModel(from: fetchedMinuteUsagePage.data)
 
         let selectedRateLimit = chooseDisplayRateLimit(
             from: fetchedRateLimits.data,
@@ -191,21 +490,8 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         let nextUTCMinute = utcCalendar.date(byAdding: .minute, value: 1, to: startOfMinute)
         let projectSubtitle = "Project \(shortProjectID(projectID))"
         var windows: [QuotaWindow] = []
-        var events: [UsageEvent] = []
-
-        // Extract usage events from daily buckets for heatmap
-        for bucket in fetchedDailyUsagePage.data {
-            let timestamp = Date(timeIntervalSince1970: bucket.startTime)
-            let totalTokens = bucket.results.reduce(0) { $0 + $1.totalTokens }
-            let model = bucket.results.first?.model
-
-            events.append(UsageEvent(
-                timestamp: timestamp,
-                tokens: totalTokens,
-                model: model,
-                type: .bucket
-            ))
-        }
+        let stats = analyticsStats(from: fetchedAnalyticsBuckets, now: now)
+        let events = analyticsEvents(from: fetchedAnalyticsBuckets)
 
         if let dailyLimit = selectedRateLimit.maxRequestsPer1Day {
             windows.append(
@@ -249,11 +535,13 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         let cappedEvents = Array(sortedEvents.prefix(1000))
 
         return QuotaSnapshot(
-            providerID: .openai,
-            displayName: "OpenAI Project",
+            providerID: .openaiAPI,
+            displayName: "OpenAI API",
             planName: displayModelName(selectedRateLimit.model),
             windows: windows,
+            stats: stats,
             events: cappedEvents,
+            analyticsBuckets: fetchedAnalyticsBuckets,
             fetchState: .success,
             fetchedAt: now
         )
@@ -285,9 +573,10 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         endTime: Date,
         bucketWidth: String,
         limit: Int,
-        projectID: String
+        projectID: String,
+        page: String? = nil
     ) async throws -> OpenAIUsageBucketPage {
-        let queryItems = [
+        var queryItems = [
             URLQueryItem(name: "start_time", value: String(Int(startTime.timeIntervalSince1970))),
             URLQueryItem(name: "end_time", value: String(Int(endTime.timeIntervalSince1970))),
             URLQueryItem(name: "bucket_width", value: bucketWidth),
@@ -295,6 +584,9 @@ public struct OpenAIUsageProviderClient: ProviderClient {
             URLQueryItem(name: "project_ids", value: projectID),
             URLQueryItem(name: "group_by", value: "model")
         ]
+        if let page {
+            queryItems.append(URLQueryItem(name: "page", value: page))
+        }
         let requestURL = makeURL(
             baseURL: baseURL,
             pathComponents: ["organization", "usage", "completions"],
@@ -307,6 +599,171 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         } catch {
             throw ProviderFetchError.parsingError("Unable to decode OpenAI completions usage response.")
         }
+    }
+
+    private func fetchAllCompletionsUsageBuckets(
+        baseURL: URL,
+        adminKey: String,
+        startTime: Date,
+        endTime: Date,
+        bucketWidth: String,
+        limit: Int,
+        projectID: String
+    ) async throws -> [OpenAIUsageBucket] {
+        var allBuckets: [OpenAIUsageBucket] = []
+        var nextPage: String?
+
+        repeat {
+            let page = try await fetchCompletionsUsage(
+                baseURL: baseURL,
+                adminKey: adminKey,
+                startTime: startTime,
+                endTime: endTime,
+                bucketWidth: bucketWidth,
+                limit: limit,
+                projectID: projectID,
+                page: nextPage
+            )
+            allBuckets.append(contentsOf: page.data)
+            nextPage = page.hasMore ? page.nextPage : nil
+        } while nextPage != nil
+
+        return allBuckets
+    }
+
+    private func fetchCosts(
+        baseURL: URL,
+        adminKey: String,
+        startTime: Date,
+        endTime: Date,
+        bucketWidth: String,
+        limit: Int,
+        projectID: String,
+        page: String? = nil
+    ) async throws -> OpenAICostBucketPage {
+        var queryItems = [
+            URLQueryItem(name: "start_time", value: String(Int(startTime.timeIntervalSince1970))),
+            URLQueryItem(name: "end_time", value: String(Int(endTime.timeIntervalSince1970))),
+            URLQueryItem(name: "bucket_width", value: bucketWidth),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "project_ids", value: projectID)
+        ]
+        if let page {
+            queryItems.append(URLQueryItem(name: "page", value: page))
+        }
+
+        let requestURL = makeURL(
+            baseURL: baseURL,
+            pathComponents: ["organization", "costs"],
+            queryItems: queryItems
+        )
+        let data = try await fetchData(from: requestURL, bearerToken: adminKey)
+
+        do {
+            return try decoder.decode(OpenAICostBucketPage.self, from: data)
+        } catch {
+            throw ProviderFetchError.parsingError("Unable to decode OpenAI costs response.")
+        }
+    }
+
+    private func fetchAllCostBuckets(
+        baseURL: URL,
+        adminKey: String,
+        startTime: Date,
+        endTime: Date,
+        bucketWidth: String,
+        limit: Int,
+        projectID: String
+    ) async throws -> [OpenAICostBucket] {
+        var allBuckets: [OpenAICostBucket] = []
+        var nextPage: String?
+
+        repeat {
+            let page = try await fetchCosts(
+                baseURL: baseURL,
+                adminKey: adminKey,
+                startTime: startTime,
+                endTime: endTime,
+                bucketWidth: bucketWidth,
+                limit: limit,
+                projectID: projectID,
+                page: nextPage
+            )
+            allBuckets.append(contentsOf: page.data)
+            nextPage = page.hasMore ? page.nextPage : nil
+        } while nextPage != nil
+
+        return allBuckets
+    }
+
+    private func fetchAnalyticsBuckets(
+        baseURL: URL,
+        adminKey: String,
+        projectID: String,
+        startTime: Date,
+        endTime: Date,
+        now: Date
+    ) async -> [UsageAnalyticsBucket] {
+        async let usageResult: Result<[OpenAIUsageBucket], Error> = {
+            do {
+                let buckets = try await fetchAllCompletionsUsageBuckets(
+                    baseURL: baseURL,
+                    adminKey: adminKey,
+                    startTime: startTime,
+                    endTime: endTime,
+                    bucketWidth: "1d",
+                    limit: 30,
+                    projectID: projectID
+                )
+                return .success(buckets)
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        async let costResult: Result<[OpenAICostBucket], Error> = {
+            do {
+                let buckets = try await fetchAllCostBuckets(
+                    baseURL: baseURL,
+                    adminKey: adminKey,
+                    startTime: startTime,
+                    endTime: endTime,
+                    bucketWidth: "1d",
+                    limit: 30,
+                    projectID: projectID
+                )
+                return .success(buckets)
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        let (usageOutcome, costOutcome) = await (usageResult, costResult)
+
+        let usageBuckets: [OpenAIUsageBucket]
+        switch usageOutcome {
+        case .success(let buckets):
+            usageBuckets = buckets
+        case .failure(let error):
+            print("[OpenAIUsageProvider] Usage analytics fetch skipped: \(error.localizedDescription)")
+            usageBuckets = []
+        }
+
+        let costBuckets: [OpenAICostBucket]
+        switch costOutcome {
+        case .success(let buckets):
+            costBuckets = buckets
+        case .failure(let error):
+            print("[OpenAIUsageProvider] Cost analytics fetch skipped: \(error.localizedDescription)")
+            costBuckets = []
+        }
+
+        return analyticsBuckets(
+            usageBuckets: usageBuckets,
+            costBuckets: costBuckets,
+            fallbackProjectID: projectID,
+            now: now
+        )
     }
 
     private func fetchData(from url: URL, bearerToken: String) async throws -> Data {
@@ -368,10 +825,10 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         return components?.url ?? url
     }
 
-    private func usageByModel(from page: OpenAIUsageBucketPage) -> [String: OpenAIUsageTotals] {
+    private func usageByModel(from buckets: [OpenAIUsageBucket]) -> [String: OpenAIUsageTotals] {
         var aggregated: [String: OpenAIUsageTotals] = [:]
 
-        for bucket in page.data {
+        for bucket in buckets {
             for result in bucket.results {
                 let model = result.model ?? "All models"
                 var current = aggregated[model] ?? .zero
@@ -382,6 +839,132 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         }
 
         return aggregated
+    }
+
+    private func analyticsBuckets(
+        usageBuckets: [OpenAIUsageBucket],
+        costBuckets: [OpenAICostBucket],
+        fallbackProjectID: String,
+        now: Date
+    ) -> [UsageAnalyticsBucket] {
+        var buckets: [UsageAnalyticsBucket] = []
+
+        for bucket in usageBuckets {
+            let startDate = Date(timeIntervalSince1970: bucket.startTime)
+            let endDate = Date(timeIntervalSince1970: bucket.endTime)
+
+            for result in bucket.results {
+                let model = normalizedModelName(result.model)
+                let projectID = result.projectID ?? fallbackProjectID
+                let cachedTokens = result.inputCachedTokens ?? 0
+                let uncachedInput = max(0, result.inputTokens - cachedTokens)
+                let analyticsBucket = UsageAnalyticsBucket(
+                    startDate: startDate,
+                    endDate: endDate,
+                    model: model,
+                    projectID: projectID,
+                    inputTokens: uncachedInput,
+                    outputTokens: result.outputTokens + (result.outputAudioTokens ?? 0),
+                    cachedInputTokens: cachedTokens + (result.inputAudioTokens ?? 0),
+                    requests: result.numModelRequests,
+                    costUSD: nil,
+                    source: .officialAPI
+                )
+                if analyticsBucket.hasUsage {
+                    buckets.append(analyticsBucket)
+                }
+            }
+        }
+
+        for bucket in costBuckets {
+            let startDate = Date(timeIntervalSince1970: bucket.startTime)
+            let endDate = Date(timeIntervalSince1970: bucket.endTime)
+            let totalCost = bucket.results.reduce(0.0) { $0 + $1.amount.value }
+            guard totalCost > 0 else { continue }
+
+            buckets.append(
+                UsageAnalyticsBucket(
+                    startDate: startDate,
+                    endDate: endDate,
+                    model: nil,
+                    projectID: fallbackProjectID,
+                    costUSD: totalCost,
+                    source: .officialAPI,
+                    note: "Cost"
+                )
+            )
+        }
+
+        return buckets
+            .filter { $0.startDate <= now }
+            .sorted {
+                if $0.startDate == $1.startDate {
+                    return ($0.model ?? $0.note ?? "") < ($1.model ?? $1.note ?? "")
+                }
+                return $0.startDate > $1.startDate
+            }
+    }
+
+    private func analyticsStats(from buckets: [UsageAnalyticsBucket], now: Date) -> [QuotaStat] {
+        guard !buckets.isEmpty else { return [] }
+
+        let dayStart = utcCalendar.startOfDay(for: now)
+        let sevenDayStart = utcCalendar.date(byAdding: .day, value: -6, to: dayStart) ?? dayStart
+        let thirtyDayStart = utcCalendar.date(byAdding: .day, value: -29, to: dayStart) ?? dayStart
+
+        let today = analyticsTotals(from: buckets, since: dayStart)
+        let sevenDay = analyticsTotals(from: buckets, since: sevenDayStart)
+        let thirtyDay = analyticsTotals(from: buckets, since: thirtyDayStart)
+
+        var stats: [QuotaStat] = [
+            QuotaStat(label: "Today Tokens", value: today.tokens, unit: "tok", subtitle: "Official usage API"),
+            QuotaStat(label: "7D Tokens", value: sevenDay.tokens, unit: "tok", subtitle: "Official usage API"),
+            QuotaStat(label: "30D Tokens", value: thirtyDay.tokens, unit: "tok", subtitle: "Official usage API"),
+            QuotaStat(label: "Today Requests", value: today.requests, unit: "req", subtitle: "Official usage API"),
+            QuotaStat(label: "7D Requests", value: sevenDay.requests, unit: "req", subtitle: "Official usage API")
+        ]
+
+        if thirtyDay.cost > 0 {
+            stats.append(QuotaStat(label: "Today Cost", value: today.cost, unit: "$", subtitle: "Official costs API"))
+            stats.append(QuotaStat(label: "7D Cost", value: sevenDay.cost, unit: "$", subtitle: "Official costs API"))
+            stats.append(QuotaStat(label: "30D Cost", value: thirtyDay.cost, unit: "$", subtitle: "Official costs API"))
+        }
+
+        return stats
+    }
+
+    private func analyticsEvents(from buckets: [UsageAnalyticsBucket]) -> [UsageEvent] {
+        let grouped = Dictionary(grouping: buckets.filter { $0.totalTokens > 0 }, by: { $0.startDate })
+
+        return grouped.map { date, dayBuckets in
+            let tokens = dayBuckets.reduce(0) { $0 + $1.totalTokens }
+            let model = topModelName(in: dayBuckets)
+            return UsageEvent(timestamp: date, tokens: tokens, model: model, type: .bucket)
+        }
+        .sorted { $0.timestamp > $1.timestamp }
+        .prefix(1_000)
+        .map { $0 }
+    }
+
+    private func analyticsTotals(from buckets: [UsageAnalyticsBucket], since startDate: Date) -> OpenAIAnalyticsTotals {
+        var totals = OpenAIAnalyticsTotals()
+        for bucket in buckets where bucket.startDate >= startDate {
+            totals.tokens += bucket.totalTokens
+            totals.requests += bucket.requests
+            totals.cost += bucket.costUSD ?? 0
+        }
+        return totals
+    }
+
+    private func topModelName(in buckets: [UsageAnalyticsBucket]) -> String? {
+        let totalsByModel = buckets.reduce(into: [String: Double]()) { partial, bucket in
+            guard let model = bucket.model else { return }
+            partial[model, default: 0] += bucket.totalTokens
+        }
+        return totalsByModel.max { lhs, rhs in
+            if lhs.value == rhs.value { return lhs.key > rhs.key }
+            return lhs.value < rhs.value
+        }?.key
     }
 
     private func chooseDisplayRateLimit(
@@ -455,6 +1038,14 @@ public struct OpenAIUsageProviderClient: ProviderClient {
         model
     }
 
+    private func normalizedModelName(_ model: String?) -> String? {
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else {
+            return nil
+        }
+        return model
+    }
+
     private func shortProjectID(_ projectID: String) -> String {
         guard projectID.count > 18 else { return projectID }
         return "\(projectID.prefix(10))…\(projectID.suffix(4))"
@@ -500,6 +1091,7 @@ private struct OpenAIUsageBucket: Decodable {
 private struct OpenAICompletionsUsageResult: Decodable {
     let inputTokens: Double
     let outputTokens: Double
+    let inputCachedTokens: Double?
     let inputAudioTokens: Double?
     let outputAudioTokens: Double?
     let numModelRequests: Double
@@ -513,6 +1105,7 @@ private struct OpenAICompletionsUsageResult: Decodable {
     private enum CodingKeys: String, CodingKey {
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+        case inputCachedTokens = "input_cached_tokens"
         case inputAudioTokens = "input_audio_tokens"
         case outputAudioTokens = "output_audio_tokens"
         case numModelRequests = "num_model_requests"
@@ -564,6 +1157,57 @@ private struct OpenAIUsageTotals {
     var tokens: Double
 
     static let zero = OpenAIUsageTotals(requests: 0, tokens: 0)
+}
+
+private struct OpenAIAnalyticsTotals {
+    var tokens: Double = 0
+    var requests: Double = 0
+    var cost: Double = 0
+}
+
+private struct OpenAICostBucketPage: Decodable {
+    let object: String?
+    let data: [OpenAICostBucket]
+    let hasMore: Bool
+    let nextPage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case object
+        case data
+        case hasMore = "has_more"
+        case nextPage = "next_page"
+    }
+}
+
+private struct OpenAICostBucket: Decodable {
+    let object: String?
+    let startTime: TimeInterval
+    let endTime: TimeInterval
+    let results: [OpenAICostResult]
+
+    private enum CodingKeys: String, CodingKey {
+        case object
+        case startTime = "start_time"
+        case endTime = "end_time"
+        case results
+    }
+}
+
+private struct OpenAICostResult: Decodable {
+    let amount: OpenAIMoneyAmount
+    let projectID: String?
+    let lineItem: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case amount
+        case projectID = "project_id"
+        case lineItem = "line_item"
+    }
+}
+
+private struct OpenAIMoneyAmount: Decodable {
+    let value: Double
+    let currency: String?
 }
 
 // MARK: - Unified Credential Import Service
@@ -652,7 +1296,7 @@ public enum CredentialImportService {
             || FileManager.default.fileExists(atPath: codexSessionIndex.path) {
             detected.append(DetectedCredential(
                 providerID: .codexTelemetry,
-                fileURL: FileManager.default.fileExists(atPath: codexSQLite.path) ? codexSQLite : codexRoot,
+                fileURL: codexRoot,
                 description: "Codex telemetry logs"
             ))
         }
@@ -710,6 +1354,16 @@ public enum CredentialImportService {
             ))
         }
 
+        // Kimi Code: ~/.kimi/credentials/kimi-code.json
+        let kimiCredentialsPath = home.appendingPathComponent(".kimi/credentials/kimi-code.json")
+        if FileManager.default.fileExists(atPath: kimiCredentialsPath.path) {
+            detected.append(DetectedCredential(
+                providerID: .kimi,
+                fileURL: kimiCredentialsPath,
+                description: "Kimi Code CLI OAuth file"
+            ))
+        }
+
         return detected
     }
 
@@ -720,15 +1374,15 @@ public enum CredentialImportService {
         guard url.isFileURL else { throw ImportError.fileNotFound }
 
         if providerID == .codexTelemetry {
-            let resolvedRoot = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
+            let selectedURL = url
             return ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
-                customEndpoint: resolvedRoot.path,
+                customEndpoint: selectedURL.path,
                 extraFields: [
                     "codexTelemetrySource": url.hasDirectoryPath ? "directory" : "file"
                 ],
-                bookmarkData: makeSecurityScopedBookmarkData(for: resolvedRoot)
+                bookmarkData: makeSecurityScopedBookmarkData(for: selectedURL)
             )
         }
 
@@ -745,6 +1399,26 @@ public enum CredentialImportService {
             )
         }
 
+        if providerID == .cursor, url.hasDirectoryPath {
+            let stateDBURL = url.appendingPathComponent("state.vscdb")
+            let backupDBURL = url.appendingPathComponent("state.vscdb.backup")
+            guard FileManager.default.fileExists(atPath: stateDBURL.path)
+                    || FileManager.default.fileExists(atPath: backupDBURL.path) else {
+                throw ImportError.missingRequiredField("state.vscdb")
+            }
+
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: stateDBURL.path,
+                extraFields: [
+                    "cursorAuthMode": "localState",
+                    "cursorLocalStateSource": "directory"
+                ],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
+            )
+        }
+
         // Special handling for SQLite databases (Windsurf and Cursor)
         if url.lastPathComponent == "state.vscdb" {
             print("[CredentialImportService] Reading SQLite database immediately: \(url.path)")
@@ -753,20 +1427,25 @@ public enum CredentialImportService {
             // bookmark. The local editor token is useful for cached metadata,
             // but it is not enough for cursor.com live usage on its own.
             if providerID == .cursor {
-                let bookmarkData = makeSecurityScopedBookmarkData(for: url.deletingLastPathComponent())
+                let bookmarkData = makeSecurityScopedBookmarkData(for: url)
                 return ImportedCredential(
                     accessToken: nil,
                     accountIdentifier: nil,
                     customEndpoint: url.path,
                     extraFields: [
-                        "cursorAuthMode": "localState"
+                        "cursorAuthMode": "localState",
+                        "cursorLocalStateSource": "file"
                     ],
                     bookmarkData: bookmarkData
                 )
             }
 
             if providerID == .windsurf {
-                let bookmarkData = makeSecurityScopedBookmarkData(for: url.deletingLastPathComponent())
+                // Bookmark the FILE itself, not the parent directory.
+                // NSOpenPanel grants security-scoped access only to the user-selected URL;
+                // bookmarking the parent directory produces an invalid bookmark that fails
+                // to resolve on the next launch, forcing the user to re-import every time.
+                let bookmarkData = makeSecurityScopedBookmarkData(for: url)
                 let authStatus = readWindsurfAuthStatus(from: url)
 
                 return ImportedCredential(
@@ -798,6 +1477,24 @@ public enum CredentialImportService {
                 customEndpoint: selectedRoot.path,
                 extraFields: nil,
                 bookmarkData: bookmarkData
+            )
+        }
+
+        if providerID == .kimi, url.hasDirectoryPath {
+            let credentialsFile = kimiOAuthFileURL(fromSelectedDirectory: url)
+            guard FileManager.default.fileExists(atPath: credentialsFile.path) else {
+                throw ImportError.missingRequiredField("credentials/kimi-code.json")
+            }
+
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: credentialsFile.path,
+                extraFields: [
+                    "kimiAuthMode": "oauthFile",
+                    "kimiCredentialSource": "directory"
+                ],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
             )
         }
 
@@ -950,6 +1647,8 @@ public enum CredentialImportService {
         switch providerID {
         case .openai:
             return try parseCodexJSON(json)
+        case .openaiAPI:
+            return try parseOpenAIAPIJSON(json)
         case .chatgpt:
             return ImportedCredential(
                 accessToken: nil,
@@ -961,14 +1660,15 @@ public enum CredentialImportService {
                 bookmarkData: makeSecurityScopedBookmarkData(for: sourceURL.hasDirectoryPath ? sourceURL : sourceURL.deletingLastPathComponent())
             )
         case .codexTelemetry:
+            let selectedURL = sourceURL
             return ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
-                customEndpoint: sourceURL.hasDirectoryPath ? sourceURL.path : sourceURL.deletingLastPathComponent().path,
+                customEndpoint: selectedURL.path,
                 extraFields: [
                     "codexTelemetrySource": "json"
                 ],
-                bookmarkData: makeSecurityScopedBookmarkData(for: sourceURL.hasDirectoryPath ? sourceURL : sourceURL.deletingLastPathComponent())
+                bookmarkData: makeSecurityScopedBookmarkData(for: selectedURL)
             )
         case .claude:
             return try parseClaudeJSON(json, sourceURL: sourceURL)
@@ -985,6 +1685,8 @@ public enum CredentialImportService {
                 extraFields: nil,
                 bookmarkData: makeSecurityScopedBookmarkData(for: selectedRoot)
             )
+        case .kimi:
+            return try parseKimiJSON(json, sourceURL: sourceURL)
         case .heatmap:
             throw ImportError.unsupportedProvider
         }
@@ -1013,6 +1715,30 @@ public enum CredentialImportService {
         return ImportedCredential(
             accessToken: accessToken,
             accountIdentifier: tokens["account_id"] as? String,
+            customEndpoint: nil,
+            extraFields: nil,
+            bookmarkData: nil
+        )
+    }
+
+    private static func parseOpenAIAPIJSON(_ json: [String: Any]) throws -> ImportedCredential {
+        let accessToken = json["admin_api_key"] as? String
+            ?? json["api_key"] as? String
+            ?? json["apiKey"] as? String
+            ?? json["access_token"] as? String
+            ?? json["token"] as? String
+
+        guard let token = accessToken else {
+            throw ImportError.missingRequiredField("admin_api_key or api_key")
+        }
+
+        let projectID = json["project_id"] as? String
+            ?? json["projectID"] as? String
+            ?? json["project"] as? String
+
+        return ImportedCredential(
+            accessToken: token,
+            accountIdentifier: projectID,
             customEndpoint: nil,
             extraFields: nil,
             bookmarkData: nil
@@ -1096,6 +1822,50 @@ public enum CredentialImportService {
         )
     }
 
+    private static func parseKimiJSON(_ json: [String: Any], sourceURL: URL) throws -> ImportedCredential {
+        if json["refresh_token"] is String || json["expires_at"] != nil || json["scope"] as? String == "kimi-code" {
+            guard sourceURL.isFileURL else { throw ImportError.fileNotFound }
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: sourceURL.path,
+                extraFields: [
+                    "kimiAuthMode": "oauthFile"
+                ],
+                bookmarkData: makeSecurityScopedBookmarkData(for: sourceURL)
+            )
+        }
+
+        let accessToken = json["api_key"] as? String
+            ?? json["apiKey"] as? String
+            ?? json["token"] as? String
+            ?? json["access_token"] as? String
+
+        guard let token = accessToken else {
+            throw ImportError.missingRequiredField("api_key or access_token")
+        }
+
+        return ImportedCredential(
+            accessToken: token,
+            accountIdentifier: nil,
+            customEndpoint: nil,
+            extraFields: [
+                "kimiAuthMode": "apiKey"
+            ],
+            bookmarkData: nil
+        )
+    }
+
+    private static func kimiOAuthFileURL(fromSelectedDirectory url: URL) -> URL {
+        if url.lastPathComponent == "credentials" {
+            return url.appendingPathComponent("kimi-code.json")
+        }
+
+        return url
+            .appendingPathComponent("credentials", isDirectory: true)
+            .appendingPathComponent("kimi-code.json")
+    }
+
     private static func detectedHomeDirectory() -> URL? {
         #if os(macOS)
         let homePath = NSHomeDirectory()
@@ -1146,19 +1916,30 @@ public extension CredentialImportService {
     ) {
         DispatchQueue.main.async {
             let panel = NSOpenPanel()
-            panel.message = "Select credential file for \(providerID.displayName)"
+            panel.message = {
+                switch providerID {
+                case .codexTelemetry:
+                    return "Select the ~/.codex folder for complete Codex activity, or one log file for limited access."
+                case .cursor:
+                    return "Select Cursor's globalStorage folder or state.vscdb for local metadata. Use the web session import for live usage."
+                default:
+                    return "Select credential file for \(providerID.displayName)"
+                }
+            }()
             panel.prompt = "Import"
-            panel.allowedContentTypes = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .gemini
+            panel.allowedContentTypes = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi
                 ? [UTType.folder, UTType.json, UTType.plainText, UTType.data]
                 : [UTType.json, UTType.plainText, UTType.data]
             panel.allowsMultipleSelection = false
-            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .gemini
+            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi
 
             // Suggest starting directory based on provider
             let home = FileManager.default.homeDirectoryForCurrentUser
             switch providerID {
             case .openai:
                 panel.directoryURL = home.appendingPathComponent(".codex")
+            case .openaiAPI:
+                panel.directoryURL = home
             case .chatgpt:
                 panel.directoryURL = home.appendingPathComponent("Library/Application Support/com.openai.chat")
             case .codexTelemetry:
@@ -1173,6 +1954,8 @@ public extension CredentialImportService {
                 panel.directoryURL = home.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage")
             case .gemini:
                 panel.directoryURL = home.appendingPathComponent(".gemini")
+            case .kimi:
+                panel.directoryURL = home.appendingPathComponent(".kimi")
             case .heatmap:
                 break
             }
@@ -1194,6 +1977,694 @@ public extension CredentialImportService {
     }
 }
 #endif
+
+// MARK: - Kimi Code Provider Client
+
+public struct KimiProviderClient: ProviderClient {
+    public let providerID: ProviderID = .kimi
+
+    private let session: URLSession
+
+    public init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        guard let credentials else { throw ProviderFetchError.notConfigured }
+
+        let accessToken = try resolvedAccessToken(from: credentials)
+        guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
+
+        let usageURL = try resolvedUsageURL(from: credentials)
+        var request = URLRequest(url: usageURL)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ProviderFetchError.unknown
+        }
+
+        switch httpResponse.statusCode {
+        case 200..<300:
+            let apiSnapshot = try KimiUsageNormalizer.snapshot(from: data, fetchedAt: Date())
+            // Best-effort augmentation: read local `~/.kimi/sessions/**/wire.jsonl`
+            // so per-turn activity events surface on the heatmap. Returns [] if
+            // the sandbox denies the read (typical when the user only granted a
+            // bookmark to `kimi-code.json` itself).
+            let cliEvents = loadLocalKimiEvents(credentials: credentials)
+            // Additional source: AGBench's unified usage.json tracks every
+            // run the user invokes through GUIGemini, including Kimi runs.
+            // For users who drive activity through AGBench this is the
+            // richer signal (61 records vs whatever wire.jsonl has on its
+            // own). No-op when the user hasn't granted the bookmark.
+            let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "kimi")
+            let combinedEvents = cliEvents + agbenchEvents
+            let merged = mergeEvents(into: apiSnapshot, events: combinedEvents)
+            // Preserve historical events whose source `wire.jsonl` has aged
+            // past the 30-day modification-date window in
+            // `KimiLocalTranscriptReader`. Same fix as Claude.
+            return enrichEventsWithHistory(merged)
+        case 401, 403:
+            throw ProviderFetchError.invalidCredential
+        case 429:
+            throw ProviderFetchError.rateLimited
+        default:
+            throw ProviderFetchError.parsingError("Kimi usage endpoint returned HTTP \(httpResponse.statusCode).")
+        }
+    }
+
+    private func loadLocalKimiEvents(credentials: ProviderCredential) -> [UsageEvent] {
+        let kimiRootURL = resolvedKimiRoot(from: credentials)
+        let bookmarkData = credentials.kimiBookmarkData
+            ?? credentials.extraFields?["bookmarkData"].flatMap { Data(base64Encoded: $0) }
+
+        var accessURL = kimiRootURL
+        var didStartAccessing = false
+
+        if let bookmarkData {
+            #if os(macOS)
+            var isStale = false
+            if let resolved = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: .withSecurityScope,
+                bookmarkDataIsStale: &isStale
+            ) {
+                // If the bookmark was for `kimi-code.json`, walk up to the
+                // Kimi config root so `sessions/` is reachable when (and only
+                // when) the sandbox grants enclosing-directory access.
+                if resolved.lastPathComponent.hasSuffix(".json") {
+                    accessURL = resolved.deletingLastPathComponent().deletingLastPathComponent()
+                } else if resolved.lastPathComponent == "credentials" {
+                    accessURL = resolved.deletingLastPathComponent()
+                } else {
+                    accessURL = resolved
+                }
+                didStartAccessing = accessURL.startAccessingSecurityScopedResource()
+            }
+            #endif
+        }
+
+        defer {
+            if didStartAccessing {
+                accessURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        return KimiLocalTranscriptReader.loadEvents(kimiRootURL: accessURL)
+    }
+
+    /// Resolves the Kimi config root (`~/.kimi`) in a sandbox-aware way.
+    /// Used as the fallback path before/after attempting bookmark resolution.
+    private func resolvedKimiRoot(from credentials: ProviderCredential) -> URL {
+        if let endpoint = credentials.normalizedCustomEndpoint, !endpoint.isEmpty {
+            let url = URL(fileURLWithPath: endpoint)
+            // If the credential points to `kimi-code.json`, navigate up to `~/.kimi`.
+            return url.lastPathComponent.hasSuffix(".json")
+                ? url.deletingLastPathComponent().deletingLastPathComponent()
+                : url
+        }
+
+        let homePath = NSHomeDirectory()
+        let realHome: String
+        if let r = homePath.range(of: "/Library/Containers/") {
+            realHome = String(homePath[..<r.lowerBound])
+        } else {
+            realHome = homePath
+        }
+        return URL(fileURLWithPath: realHome).appendingPathComponent(".kimi")
+    }
+
+    /// Returns a copy of `snapshot` with `events` attached (no-op when empty).
+    private func mergeEvents(into snapshot: QuotaSnapshot, events: [UsageEvent]) -> QuotaSnapshot {
+        guard !events.isEmpty else { return snapshot }
+        let sorted = events.sorted { $0.timestamp > $1.timestamp }
+        let capped = Array(sorted.prefix(1000))
+        return QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: snapshot.windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            signals: snapshot.signals,
+            events: capped,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
+    }
+
+    private func resolvedAccessToken(from credentials: ProviderCredential) throws -> String {
+        if shouldUseOAuthFile(credentials),
+           let token = try accessTokenFromOAuthFile(credentials) {
+            return token
+        }
+
+        guard let token = credentials.normalizedAccessToken else {
+            throw ProviderFetchError.notConfigured
+        }
+        return token
+    }
+
+    private func shouldUseOAuthFile(_ credentials: ProviderCredential) -> Bool {
+        if credentials.extraFields?["kimiAuthMode"] == "oauthFile" {
+            return true
+        }
+
+        guard credentials.normalizedAccessToken == nil,
+              let endpoint = credentials.normalizedCustomEndpoint else {
+            return false
+        }
+
+        return endpoint.hasSuffix("kimi-code.json")
+    }
+
+    private func accessTokenFromOAuthFile(_ credentials: ProviderCredential) throws -> String? {
+        guard let url = resolvedOAuthFileURL(from: credentials) else {
+            throw ProviderFetchError.notConfigured
+        }
+
+        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        let oauthFile: KimiOAuthFile
+        do {
+            oauthFile = try JSONDecoder().decode(KimiOAuthFile.self, from: data)
+        } catch {
+            throw ProviderFetchError.parsingError("Unable to read Kimi CLI OAuth file.")
+        }
+
+        guard oauthFile.expiresAt > Date().timeIntervalSince1970 else {
+            throw ProviderFetchError.credentialExpired("Kimi CLI OAuth token is expired. Paste a Kimi Code Console API key, or run `/login` in Kimi CLI and re-import `~/.kimi/credentials/kimi-code.json`.")
+        }
+
+        return oauthFile.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func resolvedOAuthFileURL(from credentials: ProviderCredential) -> URL? {
+        if let bookmarkData = credentials.kimiBookmarkData {
+            #if os(macOS)
+            var isStale = false
+            if let resolvedURL = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: .withSecurityScope,
+                bookmarkDataIsStale: &isStale
+            ) {
+                if resolvedURL.hasDirectoryPath {
+                    if resolvedURL.lastPathComponent == "credentials" {
+                        return resolvedURL.appendingPathComponent("kimi-code.json")
+                    }
+
+                    return resolvedURL
+                        .appendingPathComponent("credentials", isDirectory: true)
+                        .appendingPathComponent("kimi-code.json")
+                }
+
+                return resolvedURL
+            }
+            #endif
+        }
+
+        guard let path = credentials.normalizedCustomEndpoint else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func resolvedUsageURL(from credentials: ProviderCredential) throws -> URL {
+        if !shouldUseOAuthFile(credentials),
+           let customEndpoint = credentials.normalizedCustomEndpoint,
+           customEndpoint.hasPrefix("http") {
+            guard let baseURL = URL(string: customEndpoint) else {
+                throw ProviderFetchError.parsingError("Custom Kimi endpoint is not a valid URL.")
+            }
+
+            if baseURL.lastPathComponent == "usages" {
+                return baseURL
+            }
+            return baseURL.appendingPathComponent("usages")
+        }
+
+        return URL(string: "https://api.kimi.com/coding/v1/usages")!
+    }
+}
+
+private extension ProviderCredential {
+    var kimiBookmarkData: Data? {
+        if let bookmarkData {
+            return bookmarkData
+        }
+        guard let bookmarkBase64 = extraFields?["bookmarkData"] else {
+            return nil
+        }
+        return Data(base64Encoded: bookmarkBase64)
+    }
+}
+
+private struct KimiOAuthFile: Decodable {
+    let accessToken: String
+    let expiresAt: TimeInterval
+
+    private enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case expiresAt = "expires_at"
+    }
+}
+
+/// Reads Kimi CLI's local transcript files (`wire.jsonl`) and emits one
+/// `UsageEvent` per assistant turn so the activity heatmap can render Kimi
+/// activity alongside the API-fetched quota meters. Best-effort: returns []
+/// when the sandbox denies access to the transcripts root.
+private enum KimiLocalTranscriptReader {
+    /// Heatmap window — only files modified within this lookback are scanned.
+    private static let lookback: TimeInterval = 30 * 24 * 60 * 60
+    /// Cap to keep parse time bounded on heavy users.
+    private static let maxFiles = 80
+    private static let maxEventsPerFile = 500
+    /// Heatmap rows are 2-hour wide, matching `ClaudeHeatmapEventBucketer`.
+    /// Aggregating per-turn events into per-bucket totals (a) avoids
+    /// crowding 50+ messages into one cell with no visible benefit and
+    /// (b) gives us a stable cross-fetch content fingerprint via the
+    /// bucket's wall-clock start time. Same shape Claude uses.
+    private static let bucketHours = 2
+
+    /// Returns recent `UsageEvent`s found under `kimiRootURL/sessions/**/wire.jsonl`,
+    /// aggregated into 2-hour heatmap buckets for visual consistency with Claude.
+    /// Caller is responsible for any security-scoped access bracketing.
+    static func loadEvents(kimiRootURL: URL) -> [UsageEvent] {
+        let sessionsRoot = kimiRootURL.lastPathComponent == "sessions"
+            ? kimiRootURL
+            : kimiRootURL.appendingPathComponent("sessions")
+
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: sessionsRoot.path) else {
+            print("[KimiProvider] Local scan: sessions root not found at \(sessionsRoot.path)")
+            return []
+        }
+
+        let cutoff = Date().addingTimeInterval(-lookback)
+        guard let enumerator = fileManager.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            print("[KimiProvider] Local scan: enumeration failed for \(sessionsRoot.path) (sandbox/permission?)")
+            return []
+        }
+
+        var wireFiles: [(URL, Date)] = []
+        for case let url as URL in enumerator where url.lastPathComponent == "wire.jsonl" {
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+            let mtime = values.contentModificationDate ?? .distantPast
+            guard mtime >= cutoff else { continue }
+            wireFiles.append((url, mtime))
+        }
+        wireFiles.sort { $0.1 > $1.1 }
+        let scanList = wireFiles.prefix(maxFiles)
+
+        if wireFiles.isEmpty {
+            print("[KimiProvider] Local scan: 0 wire.jsonl files under \(sessionsRoot.path) within 30-day window")
+            return []
+        }
+
+        var perTurnEvents: [UsageEvent] = []
+        for (url, _) in scanList {
+            perTurnEvents.append(contentsOf: parseWireJSONL(at: url))
+        }
+
+        let bucketed = bucketEvents(perTurnEvents)
+
+        if let oldest = bucketed.map(\.timestamp).min(),
+           let newest = bucketed.map(\.timestamp).max() {
+            print("[KimiProvider] Local scan: \(scanList.count) file(s), \(perTurnEvents.count) turns -> \(bucketed.count) heatmap buckets (oldest=\(oldest) newest=\(newest))")
+        } else {
+            print("[KimiProvider] Local scan: \(scanList.count) file(s) scanned but produced 0 heatmap buckets (no parseable StatusUpdate lines)")
+        }
+
+        return bucketed
+    }
+
+    /// Collapses per-turn `.message` events into 2-hour `.bucket` events
+    /// keyed by local-time bucket start. Sums token counts within each
+    /// bucket. Mirrors `ClaudeHeatmapEventBucketer`. The model field
+    /// stays "Kimi" so `guessProviderFromModel` resolves correctly when
+    /// the heatmap renders.
+    private static func bucketEvents(_ events: [UsageEvent]) -> [UsageEvent] {
+        guard !events.isEmpty else { return [] }
+        let calendar = Calendar.current
+        var totals: [Date: Double] = [:]
+
+        for event in events {
+            let bucketStart = bucketStart(for: event.timestamp, calendar: calendar)
+            totals[bucketStart, default: 0] += event.tokens ?? 0
+        }
+
+        return totals
+            .compactMap { bucketStart, tokens -> UsageEvent? in
+                guard tokens > 0 else {
+                    // Zero-token bucket: still surface as an activity
+                    // marker so the heatmap shows Kimi was used in that
+                    // window, even when token counts weren't reported.
+                    return UsageEvent(
+                        timestamp: bucketStart,
+                        tokens: nil,
+                        model: "Kimi",
+                        type: .bucket
+                    )
+                }
+                return UsageEvent(
+                    timestamp: bucketStart,
+                    tokens: tokens,
+                    model: "Kimi",
+                    type: .bucket
+                )
+            }
+            .sorted { $0.timestamp > $1.timestamp }
+    }
+
+    private static func bucketStart(for date: Date, calendar: Calendar) -> Date {
+        let dayStart = calendar.startOfDay(for: date)
+        let hour = calendar.component(.hour, from: date)
+        let bucketIndex = max(0, min(11, hour / bucketHours))
+        return calendar.date(byAdding: .hour, value: bucketIndex * bucketHours, to: dayStart)
+            ?? dayStart.addingTimeInterval(Double(bucketIndex * bucketHours * 3600))
+    }
+
+    /// Parses one `wire.jsonl` file. Emits a single `UsageEvent` per
+    /// `StatusUpdate` line — that's the message Kimi CLI writes once per
+    /// completed turn, and it contains the authoritative token counts.
+    private static func parseWireJSONL(at url: URL) -> [UsageEvent] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+        var events: [UsageEvent] = []
+        events.reserveCapacity(64)
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            if events.count >= maxEventsPerFile { break }
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty,
+                  let lineData = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                continue
+            }
+
+            guard let tsValue = json["timestamp"],
+                  let timestampSec = numericValue(tsValue) else { continue }
+
+            guard let message = json["message"] as? [String: Any],
+                  let type = message["type"] as? String,
+                  type == "StatusUpdate",
+                  let payload = message["payload"] as? [String: Any] else {
+                continue
+            }
+
+            let tokenUsage = payload["token_usage"] as? [String: Any]
+            let inputOther     = numericValue(tokenUsage?["input_other"]) ?? 0
+            let output         = numericValue(tokenUsage?["output"]) ?? 0
+            let cacheRead      = numericValue(tokenUsage?["input_cache_read"]) ?? 0
+            let cacheCreation  = numericValue(tokenUsage?["input_cache_creation"]) ?? 0
+            let totalTokens    = inputOther + output + cacheRead + cacheCreation
+
+            events.append(UsageEvent(
+                timestamp: Date(timeIntervalSince1970: timestampSec),
+                tokens: totalTokens > 0 ? totalTokens : nil,
+                model: "Kimi",
+                type: .message
+            ))
+        }
+        return events
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let v = value as? Double { return v }
+        if let v = value as? Int { return Double(v) }
+        if let v = value as? NSNumber { return v.doubleValue }
+        if let v = value as? String { return Double(v) }
+        return nil
+    }
+}
+
+enum KimiUsageNormalizer {
+    static func snapshot(from data: Data, fetchedAt: Date = Date()) throws -> QuotaSnapshot {
+        guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderFetchError.parsingError("Kimi usage response was not a JSON object.")
+        }
+        return try snapshot(from: payload, fetchedAt: fetchedAt)
+    }
+
+    static func snapshot(from payload: [String: Any], fetchedAt: Date = Date()) throws -> QuotaSnapshot {
+        var windows: [QuotaWindow] = []
+
+        if let limits = payload["limits"] as? [[String: Any]] {
+            for limit in limits {
+                let detail = (limit["detail"] as? [String: Any]) ?? limit
+                let window = limit["window"] as? [String: Any]
+                let label = labelForLimitWindow(window)
+                let subtitle = subtitleForLimitWindow(window)
+                if let quotaWindow = quotaWindow(
+                    label: label,
+                    kind: .sliding,
+                    detail: detail,
+                    subtitle: subtitle
+                ) {
+                    windows.append(quotaWindow)
+                }
+            }
+        }
+
+        if let usage = payload["usage"] as? [String: Any],
+           let weeklyWindow = quotaWindow(
+                label: "Weekly",
+                kind: .weekly,
+                detail: usage,
+                subtitle: "Kimi Code membership quota"
+           ) {
+            windows.append(weeklyWindow)
+        }
+
+        guard !windows.isEmpty else {
+            throw ProviderFetchError.parsingError("Kimi usage response did not contain quota windows.")
+        }
+
+        var stats: [QuotaStat] = []
+        if let parallel = payload["parallel"] as? [String: Any],
+           let parallelLimit = number(parallel["limit"]) {
+            stats.append(
+                QuotaStat(
+                    label: "Parallel Limit",
+                    value: parallelLimit,
+                    unit: "tasks",
+                    subtitle: "Concurrent Kimi Code requests"
+                )
+            )
+        }
+
+        var balances: [QuotaBalance] = []
+        if let totalQuota = payload["totalQuota"] as? [String: Any],
+           let remaining = number(totalQuota["remaining"]) {
+            let limit = number(totalQuota["limit"])
+            balances.append(
+                QuotaBalance(
+                    label: "Total Quota",
+                    amount: remaining,
+                    unit: "quota",
+                    subtitle: limit.map { "\($0.compactString) total membership quota" },
+                    resetDate: nil
+                )
+            )
+        }
+
+        return QuotaSnapshot(
+            providerID: .kimi,
+            displayName: "Kimi Code",
+            planName: planName(from: payload),
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            fetchState: .success,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    private static func quotaWindow(
+        label: String,
+        kind: QuotaWindowKind,
+        detail: [String: Any],
+        subtitle: String?
+    ) -> QuotaWindow? {
+        let limit = number(detail["limit"])
+        let remaining = number(detail["remaining"])
+
+        guard limit != nil || remaining != nil else {
+            return nil
+        }
+
+        let used: Double
+        if let limit, let remaining {
+            used = min(max(limit - remaining, 0), limit)
+        } else {
+            used = 0
+        }
+
+        return QuotaWindow(
+            label: label,
+            windowKind: kind,
+            used: used,
+            total: limit,
+            resetDate: date(detail["resetTime"] ?? detail["reset_time"] ?? detail["resetAt"] ?? detail["reset_at"]),
+            unit: "quota",
+            subtitle: subtitle
+        )
+    }
+
+    private static func labelForLimitWindow(_ window: [String: Any]?) -> String {
+        guard let duration = number(window?["duration"]),
+              let unit = string(window?["timeUnit"] ?? window?["time_unit"]) else {
+            return "Rolling"
+        }
+
+        return durationLabel(duration: duration, timeUnit: unit) ?? "Rolling"
+    }
+
+    private static func subtitleForLimitWindow(_ window: [String: Any]?) -> String {
+        guard let duration = number(window?["duration"]),
+              let unit = string(window?["timeUnit"] ?? window?["time_unit"]),
+              let label = durationLabel(duration: duration, timeUnit: unit)?.lowercased() else {
+            return "Rolling quota window"
+        }
+
+        return "Rolling \(label) quota"
+    }
+
+    private static func durationLabel(duration: Double, timeUnit: String) -> String? {
+        let unit = timeUnit.uppercased()
+        let rounded = Int(duration.rounded())
+
+        if unit.contains("MINUTE") {
+            if rounded % 60 == 0 {
+                return "\(rounded / 60)H"
+            }
+            return "\(rounded)M"
+        }
+
+        if unit.contains("HOUR") {
+            return "\(rounded)H"
+        }
+
+        if unit.contains("DAY") {
+            return "\(rounded)D"
+        }
+
+        return nil
+    }
+
+    private static func planName(from payload: [String: Any]) -> String? {
+        let user = payload["user"] as? [String: Any]
+        let membership = user?["membership"] as? [String: Any]
+        if let level = string(membership?["level"]) {
+            return membershipName(for: level)
+        }
+        if let subType = string(payload["subType"]) {
+            return prettyRawName(subType, droppingPrefix: "TYPE_")
+        }
+        return nil
+    }
+
+    private static func membershipName(for rawLevel: String) -> String {
+        switch rawLevel.uppercased() {
+        case "LEVEL_FREE":
+            return "Adagio"
+        case "LEVEL_BASIC":
+            return "Moderato"
+        case "LEVEL_PRO":
+            return "Allegretto"
+        case "LEVEL_MAX":
+            return "Allegro"
+        case "LEVEL_ULTRA":
+            return "Vivace"
+        default:
+            return prettyRawName(rawLevel, droppingPrefix: "LEVEL_")
+        }
+    }
+
+    private static func prettyRawName(_ raw: String, droppingPrefix prefix: String) -> String {
+        let trimmed = raw.uppercased().hasPrefix(prefix) ? String(raw.dropFirst(prefix.count)) : raw
+        return trimmed
+            .split(separator: "_")
+            .map { part in
+                let lower = part.lowercased()
+                return lower.prefix(1).uppercased() + lower.dropFirst()
+            }
+            .joined(separator: " ")
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let value = value as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return String(describing: value)
+    }
+
+    private static func date(_ value: Any?) -> Date? {
+        guard var value = string(value) else { return nil }
+
+        let fractionalPattern = #"(\.\d{6})\d+(Z|[+-]\d{2}:\d{2})$"#
+        if let regex = try? NSRegularExpression(pattern: fractionalPattern),
+           let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+           match.numberOfRanges == 3,
+           let fractionRange = Range(match.range(at: 1), in: value),
+           let suffixRange = Range(match.range(at: 2), in: value) {
+            value = String(value[..<fractionRange.lowerBound])
+                + String(value[fractionRange])
+                + String(value[suffixRange])
+        }
+
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractionalFormatter.date(from: value) {
+            return date
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+}
 
 // Legacy CodexImportService kept for backward compatibility
 public enum CodexImportService {
@@ -1280,12 +2751,13 @@ public struct CodexSessionProviderClient: ProviderClient {
 
     private func normalize(payload: CodexUsagePayload, accountID: String) -> QuotaSnapshot {
         let now = Date()
-        var windows: [QuotaWindow] = []
+        var aggregateWindows: [QuotaWindow] = []
+        var additionalWindows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
 
         // Primary window: typically the 5-hour rolling window
         if let primary = payload.primaryWindow {
-            windows.append(
+            aggregateWindows.append(
                 quotaWindow(
                     from: primary,
                     label: "Session",
@@ -1297,7 +2769,7 @@ public struct CodexSessionProviderClient: ProviderClient {
 
         // Secondary window: typically the 7-day rolling window
         if let secondary = payload.secondaryWindow {
-            windows.append(
+            aggregateWindows.append(
                 quotaWindow(
                     from: secondary,
                     label: "Weekly",
@@ -1312,7 +2784,7 @@ public struct CodexSessionProviderClient: ProviderClient {
             let name = additionalLimit.displayName
 
             if let primary = rateLimit.primaryWindow {
-                windows.append(
+                additionalWindows.append(
                     quotaWindow(
                         from: primary,
                         label: "\(name) 5h",
@@ -1323,7 +2795,7 @@ public struct CodexSessionProviderClient: ProviderClient {
             }
 
             if let secondary = rateLimit.secondaryWindow {
-                windows.append(
+                additionalWindows.append(
                     quotaWindow(
                         from: secondary,
                         label: "\(name) Weekly",
@@ -1350,7 +2822,10 @@ public struct CodexSessionProviderClient: ProviderClient {
             providerID: .openai,
             displayName: "Codex",
             planName: chatGPTPlanName(from: payload.planType),
-            windows: windows,
+            windows: reconciledCodexWindows(
+                aggregateWindows: aggregateWindows,
+                additionalWindows: additionalWindows
+            ),
             balances: balances,
             fetchState: .success,
             fetchedAt: now
@@ -1376,6 +2851,57 @@ public struct CodexSessionProviderClient: ProviderClient {
             unit: "hrs",
             subtitle: subtitle
         )
+    }
+
+    private func reconciledCodexWindows(
+        aggregateWindows: [QuotaWindow],
+        additionalWindows: [QuotaWindow]
+    ) -> [QuotaWindow] {
+        let activeAggregateWindows = aggregateWindows.filter {
+            !isStaleAggregateWindow($0, comparedTo: additionalWindows)
+        }
+        return activeAggregateWindows + additionalWindows
+    }
+
+    private func isStaleAggregateWindow(
+        _ aggregateWindow: QuotaWindow,
+        comparedTo additionalWindows: [QuotaWindow]
+    ) -> Bool {
+        guard let aggregateTotal = aggregateWindow.total,
+              aggregateTotal > 0,
+              let aggregateResetDate = aggregateWindow.resetDate,
+              usageFraction(for: aggregateWindow) >= 0.98 else {
+            return false
+        }
+
+        let resetShiftThreshold = staleAggregateResetShiftThreshold(for: aggregateWindow)
+
+        return additionalWindows.contains { additionalWindow in
+            guard additionalWindow.windowKind == aggregateWindow.windowKind,
+                  let additionalTotal = additionalWindow.total,
+                  additionalTotal > 0,
+                  let additionalResetDate = additionalWindow.resetDate,
+                  abs(additionalTotal - aggregateTotal) <= max(0.01, aggregateTotal * 0.05),
+                  usageFraction(for: additionalWindow) <= 0.20 else {
+                return false
+            }
+
+            return additionalResetDate.timeIntervalSince(aggregateResetDate) >= resetShiftThreshold
+        }
+    }
+
+    private func usageFraction(for window: QuotaWindow) -> Double {
+        guard let total = window.total, total > 0 else { return 0 }
+        return min(max(window.used / total, 0), 1)
+    }
+
+    private func staleAggregateResetShiftThreshold(for window: QuotaWindow) -> TimeInterval {
+        guard let totalHours = window.total, totalHours > 0 else {
+            return 30 * 60
+        }
+
+        let duration = totalHours * 3_600
+        return min(max(duration * 0.05, 30 * 60), 12 * 60 * 60)
     }
 
     private func chatGPTPlanName(from planType: String?) -> String {
@@ -1513,7 +3039,14 @@ public struct WindsurfProviderClient: ProviderClient {
 
         do {
             let state = try WindsurfLocalStateReader.loadCachedPlanInfo(customPath: customPath, bookmarkData: bookmarkData)
-            return makeSnapshot(from: state)
+            // Each fetch produces at most one `lastSessionDate` activity
+            // marker, and the underlying SQLite value is overwritten when
+            // a new session starts — so without enrichment the heatmap
+            // only ever shows the most recent session. Merging in prior
+            // snapshots' events lets us accumulate session markers over
+            // time (content-deduped, so repeating the same lastSessionDate
+            // across many fetches collapses to a single marker).
+            return enrichEventsWithHistory(makeSnapshot(from: state))
         } catch {
             print("[WindsurfProvider] Failed to read cached plan info: \(error.localizedDescription)")
             throw error as? ProviderFetchError ?? .parsingError(error.localizedDescription)
@@ -2460,9 +3993,9 @@ public struct CursorProviderClient: ProviderClient {
                 let resolvedURL = try resolveSecurityScopedURL(from: bookmarkData)
                 print("[CursorProvider] Resolved bookmark to: \(resolvedURL.path)")
                 if isDirectory(resolvedURL) {
-                    return (resolvedURL, fallbackStateDBURL)
+                    return (resolvedURL, cursorStateDBURL(for: resolvedURL))
                 }
-                return (resolvedURL, resolvedURL)
+                return (resolvedURL, cursorStateDBURL(for: resolvedURL))
             } catch {
                 print("[CursorProvider] Failed to resolve bookmark: \(error), falling back to configured path")
             }
@@ -2470,7 +4003,7 @@ public struct CursorProviderClient: ProviderClient {
 
         if let customPath, !customPath.isEmpty {
             print("[CursorProvider] Using configured file path: \(customPath)")
-            let url = URL(fileURLWithPath: customPath)
+            let url = cursorStateDBURL(for: URL(fileURLWithPath: customPath))
             return (nil, url)
         }
 
@@ -2499,19 +4032,28 @@ public struct CursorProviderClient: ProviderClient {
     }
 
     private func cursorDatabaseCandidates(for url: URL) -> [URL] {
-        guard url.lastPathComponent == "state.vscdb" else {
-            return [url]
+        let stateDBURL = cursorStateDBURL(for: url)
+
+        if stateDBURL.lastPathComponent == "state.vscdb.backup" {
+            return [
+                stateDBURL,
+                stateDBURL.deletingLastPathComponent().appendingPathComponent("state.vscdb")
+            ]
+        }
+
+        guard stateDBURL.lastPathComponent == "state.vscdb" else {
+            return [stateDBURL]
         }
 
         return [
-            url,
-            url.deletingLastPathComponent().appendingPathComponent("state.vscdb.backup")
+            stateDBURL,
+            stateDBURL.deletingLastPathComponent().appendingPathComponent("state.vscdb.backup")
         ]
     }
 
     private func resolvedStateDBURL(customPath: String?) -> URL {
         if let customPath, !customPath.isEmpty {
-            return URL(fileURLWithPath: customPath)
+            return cursorStateDBURL(for: URL(fileURLWithPath: customPath))
         }
 
         let homePath = NSHomeDirectory()
@@ -2524,6 +4066,18 @@ public struct CursorProviderClient: ProviderClient {
         let realHome = URL(fileURLWithPath: realHomePath)
 
         return realHome.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    }
+
+    private func cursorStateDBURL(for url: URL) -> URL {
+        if url.lastPathComponent == "state.vscdb" || url.lastPathComponent == "state.vscdb.backup" {
+            return url
+        }
+
+        if isDirectory(url) || url.hasDirectoryPath || url.pathExtension.isEmpty {
+            return url.appendingPathComponent("state.vscdb")
+        }
+
+        return url
     }
 
     private func resolveSecurityScopedURL(from bookmarkData: Data) throws -> URL {
@@ -2656,19 +4210,29 @@ public struct CursorProviderClient: ProviderClient {
             }
         }
 
-        var events: [UsageEvent] = []
-        if let dailyStats = localState?.dailyStats {
-            for stat in dailyStats {
-                events.append(UsageEvent(
-                    timestamp: stat.date,
-                    // Cursor dailyStats is request-count based. Treat as activity, not tokens, so
-                    // the heatmap "today" token total doesn't get wildly inflated.
-                    tokens: nil,
-                    model: "Cursor",
-                    type: .bucket
-                ))
-            }
+        // Zero-usage placeholder. The API returned success but the user
+        // hasn't burned any requests this month (numRequests=0,
+        // numTokens=0, and limits often null too on Pro). Without this,
+        // the card renders empty under the header — visually
+        // indistinguishable from a broken integration. Emit a single
+        // labelled window so the user can see "Cursor is connected,
+        // just unused yet". We only show this on a recognised plan so
+        // we don't paper over genuine misconfigurations.
+        if windows.isEmpty, !planName.isEmpty {
+            windows.append(
+                QuotaWindow(
+                    label: "Fast Requests",
+                    windowKind: .monthly,
+                    used: 0,
+                    total: nil,
+                    resetDate: monthStart,
+                    unit: "requests",
+                    subtitle: "No usage yet this month"
+                )
+            )
         }
+
+        let events = cursorActivityEvents(from: localState)
 
         return QuotaSnapshot(
             providerID: .cursor,
@@ -2701,9 +4265,26 @@ public struct CursorProviderClient: ProviderClient {
             windows: [],
             stats: supplemental.stats,
             signals: supplemental.signals,
+            events: cursorActivityEvents(from: localState),
             fetchState: .success,
             fetchedAt: now
         )
+    }
+
+    private func cursorActivityEvents(from localState: CursorLocalStateSnapshot?) -> [UsageEvent] {
+        guard let dailyStats = localState?.dailyStats else { return [] }
+        return dailyStats
+            .sorted { $0.date > $1.date }
+            .map { stat in
+                UsageEvent(
+                    timestamp: stat.date,
+                    // Cursor dailyStats is request-count based. Treat as activity, not tokens, so
+                    // the heatmap "today" token total doesn't get wildly inflated.
+                    tokens: nil,
+                    model: "Cursor",
+                    type: .bucket
+                )
+            }
     }
 
     private func cursorSupplementalContent(
@@ -3391,10 +4972,572 @@ private struct ChatGPTLocalMetadata {
     var events: [UsageEvent] = []
 }
 
+// MARK: - Claude OAuth Response
+
+struct ClaudeOAuthWindow: Decodable {
+    let utilization: Double?
+    let resetAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case utilization
+        case resetAt = "resets_at"
+    }
+}
+
+enum ClaudeOAuthModelWindowMapper {
+    static func quotaWindow(
+        label: String,
+        subtitle: String,
+        from window: ClaudeOAuthWindow?
+    ) -> QuotaWindow? {
+        guard let window, let utilization = window.utilization else {
+            return nil
+        }
+
+        return QuotaWindow(
+            label: label,
+            windowKind: .weekly,
+            used: utilization,
+            total: 100,
+            resetDate: window.resetAt,
+            unit: "%",
+            subtitle: subtitle
+        )
+    }
+}
+
+private struct ClaudeOAuthExtraUsage: Decodable {
+    let isEnabled: Bool
+    let monthlyLimit: Double?
+    let usedCredits: Double?
+    let utilization: Double?
+    let currency: String?
+
+    enum CodingKeys: String, CodingKey {
+        case isEnabled = "is_enabled"
+        case monthlyLimit = "monthly_limit"
+        case usedCredits = "used_credits"
+        case utilization
+        case currency
+    }
+}
+
+private struct ClaudeOAuthUsageResponse: Decodable {
+    let fiveHour: ClaudeOAuthWindow?
+    let sevenDay: ClaudeOAuthWindow?
+    let sevenDayOpus: ClaudeOAuthWindow?
+    let sevenDaySonnet: ClaudeOAuthWindow?
+    let sevenDayOAuthApps: ClaudeOAuthWindow?
+    let extraUsage: ClaudeOAuthExtraUsage?
+
+    enum CodingKeys: String, CodingKey {
+        case fiveHour = "five_hour"
+        case sevenDay = "seven_day"
+        case sevenDayOpus = "seven_day_opus"
+        case sevenDaySonnet = "seven_day_sonnet"
+        case sevenDayOAuthApps = "seven_day_oauth_apps"
+        case extraUsage = "extra_usage"
+    }
+}
+
 // MARK: - Claude Provider Client
 
+/// In-memory cache for the Anthropic OAuth usage endpoint.
+/// The endpoint is aggressively rate-limited (HTTP 429 after only a couple of
+/// requests per minute), so we serve a recent successful response if the
+/// dashboard refreshes faster than `freshTTL`, and we fall back to the most
+/// recent successful response for `staleTTL` whenever the live call fails
+/// transiently (rate-limit, network blip) — that way the card keeps showing
+/// real meters instead of flipping to "Update failed".
+final class ClaudeOAuthResponseCache: @unchecked Sendable {
+    static let shared = ClaudeOAuthResponseCache()
+
+    /// Serve cached snapshot without touching the network if newer than this.
+    private let freshTTL: TimeInterval
+    /// Serve in-memory stale snapshot on transient failure within this window.
+    /// Beyond it we hop to the disk-persisted snapshot via QuotaSnapshotStore.
+    private let staleTTL: TimeInterval
+    /// Hard cap on how old a disk-persisted snapshot can be before we give
+    /// up and let the error surface. 24h is generous enough to ride out
+    /// extended Anthropic outages while still surfacing a problem when
+    /// something is genuinely broken for the user (expired creds, deleted
+    /// keychain entry, etc.).
+    private let diskMaxAge: TimeInterval
+
+    private let lock = NSLock()
+    private var stored: (snapshot: QuotaSnapshot, fetchedAt: Date)?
+
+    init(
+        freshTTL: TimeInterval = 120,                  // 2 min
+        staleTTL: TimeInterval = 4 * 60 * 60,          // 4 hours
+        diskMaxAge: TimeInterval = 24 * 60 * 60        // 24 hours
+    ) {
+        self.freshTTL = freshTTL
+        self.staleTTL = staleTTL
+        self.diskMaxAge = diskMaxAge
+    }
+
+    func fresh(now: Date = Date()) -> QuotaSnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        guard let stored, now.timeIntervalSince(stored.fetchedAt) < freshTTL else {
+            return nil
+        }
+        return stored.snapshot
+    }
+
+    /// Last-known-good snapshot to serve when the live fetch fails for a
+    /// transient reason. Layered fallback:
+    ///   1. In-memory: most recent successful response from this process.
+    ///   2. Disk: previously-stored snapshot from `QuotaSnapshotStore`,
+    ///      letting us recover across app launches without showing
+    ///      "Update failed" before we ever get one good fetch.
+    func staleFallback(now: Date = Date()) -> QuotaSnapshot? {
+        lock.lock()
+        if let stored, now.timeIntervalSince(stored.fetchedAt) < staleTTL {
+            let snapshot = stored.snapshot
+            lock.unlock()
+            return snapshot
+        }
+        lock.unlock()
+
+        // Disk fallback: find the Claude snapshot in the shared store.
+        // The snapshot itself carries the original fetchedAt, so the
+        // card's "Updated X ago" line stays truthful — the user can see
+        // how stale the data is and decide for themselves.
+        let disk = QuotaSnapshotStore.shared.loadSnapshots()
+            .first { $0.providerID == .claude && $0.fetchState == .success }
+
+        guard let disk, now.timeIntervalSince(disk.fetchedAt) < diskMaxAge else {
+            return nil
+        }
+        return disk
+    }
+
+    func store(_ snapshot: QuotaSnapshot, now: Date = Date()) {
+        lock.lock(); defer { lock.unlock() }
+        stored = (snapshot, now)
+    }
+}
+
+private final class ClaudeTimeoutRaceState<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Never>?
+
+    init(_ continuation: CheckedContinuation<Value, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(with value: Value) -> Bool {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return false
+        }
+        self.continuation = nil
+        lock.unlock()
+
+        continuation.resume(returning: value)
+        return true
+    }
+}
+
+// MARK: - Claude OAuth Token Management
+
+/// Resolved Claude subscription tier, derived from the keychain payload.
+/// Used both to label the card header and to gate per-model meters that
+/// only Max plans receive (e.g. weekly Sonnet utilization).
+private struct ClaudePlanInfo {
+    /// Human-readable label for the card subtitle (e.g. "Pro", "Max x20").
+    let displayName: String
+    /// True for any flavour of Max plan — gates Max-only supplemental meters.
+    let isMax: Bool
+}
+
+/// One-shot diagnostic — prints the plan info we resolved from the keychain
+/// alongside the live `seven_day_sonnet` / `seven_day_opus` fields from the
+/// /api/oauth/usage response, so we can confirm on any build whether the
+/// model-specific meter gate sees what we expect. Fires at most once per
+/// process launch to avoid log spam.
+private final class ClaudeSonnetGateDiagnostics: @unchecked Sendable {
+    static let shared = ClaudeSonnetGateDiagnostics()
+    private let lock = NSLock()
+    private var logged = false
+
+    func logOnce(plan: ClaudePlanInfo?, sonnet: ClaudeOAuthWindow?, opus: ClaudeOAuthWindow?) {
+        lock.lock(); defer { lock.unlock() }
+        guard !logged else { return }
+        logged = true
+
+        let planSummary: String = plan.map { "displayName=\($0.displayName) isMax=\($0.isMax)" } ?? "<nil>"
+        let sonnetSummary = Self.summarize(sonnet)
+        let opusSummary = Self.summarize(opus)
+        print("[ClaudeOAuth-Diag] plan=\(planSummary) sonnet=\(sonnetSummary) opus=\(opusSummary)")
+    }
+
+    private static func summarize(_ window: ClaudeOAuthWindow?) -> String {
+        guard let window else { return "<nil>" }
+        let util = window.utilization.map { String($0) } ?? "<nil>"
+        let resetsAt = window.resetAt.map { ISO8601DateFormatter().string(from: $0) } ?? "<nil>"
+        return "{utilization=\(util), resets_at=\(resetsAt)}"
+    }
+}
+
+/// Maps the raw `subscriptionType` / `rateLimitTier` fields out of the
+/// `claudeAiOauth` keychain dict into a `ClaudePlanInfo`. Returns nil if
+/// the keychain entry doesn't exist or doesn't carry a subscription type
+/// (older Claude Code CLI builds) — in which case the caller falls back
+/// to the generic "Claude Code" label.
+///
+/// Important caveat: these fields are baked into the OAuth credential at
+/// the moment Claude Code CLI authorized, and Anthropic doesn't refresh
+/// them on token rotation. If a user upgrades from Pro to Max but never
+/// re-runs `/login` in the CLI, the keychain still reads "pro". The
+/// `/api/oauth/usage` response itself is the live source of truth for
+/// which model-specific meters actually exist for this token — see
+/// `fetchOAuthQuota` for that gate.
+private func resolveClaudePlanInfo() -> ClaudePlanInfo? {
+    guard let (creds, _) = ClaudeKeychainStore.readBest() else { return nil }
+    let raw = creds.rawOAuthDict
+
+    let subscription = (raw["subscriptionType"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ""
+    let rateLimitTier = (raw["rateLimitTier"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ""
+
+    if subscription.isEmpty { return nil }
+
+    if subscription.contains("max") {
+        // rateLimitTier values seen in the wild: "max_5x", "max_20x".
+        // Be tolerant — search both fields for the numeric multiplier.
+        let multiplierSource = rateLimitTier.isEmpty ? subscription : rateLimitTier
+        if multiplierSource.contains("20") {
+            return ClaudePlanInfo(displayName: "Max x20", isMax: true)
+        }
+        if multiplierSource.contains("5") {
+            return ClaudePlanInfo(displayName: "Max x5", isMax: true)
+        }
+        return ClaudePlanInfo(displayName: "Max", isMax: true)
+    }
+
+    if subscription.contains("pro") {
+        return ClaudePlanInfo(displayName: "Pro", isMax: false)
+    }
+
+    if subscription.contains("team") {
+        return ClaudePlanInfo(displayName: "Team", isMax: false)
+    }
+
+    if subscription.contains("enterprise") {
+        return ClaudePlanInfo(displayName: "Enterprise", isMax: false)
+    }
+
+    // Unknown subscription type — surface it as-is, capitalized, rather
+    // than silently labelling it "Claude Code".
+    return ClaudePlanInfo(displayName: subscription.capitalized, isMax: false)
+}
+
+/// Holds the parsed payload of Claude Code's keychain entry. We carry the raw
+/// `claudeAiOauth` dictionary alongside the typed fields so we can write back
+/// without losing unknown keys (subscriptionType, rateLimitTier, scopes, etc.).
+private struct ClaudeOAuthCredentials {
+    let accessToken: String
+    let refreshToken: String?
+    /// `expiresAt` from the keychain — milliseconds since the Unix epoch.
+    let expiresAtMillis: Double?
+    let scopes: [String]
+    /// Full original `claudeAiOauth` dictionary for round-tripping.
+    let rawOAuthDict: [String: Any]
+
+    var expiresAt: Date? {
+        guard let ms = expiresAtMillis else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+
+    /// Returns true when the access token will expire within `buffer`.
+    /// Treated as `false` when we have no expiry info (assume still valid; the
+    /// API call itself will surface a 401 if it's actually dead).
+    func needsRefresh(buffer: TimeInterval) -> Bool {
+        guard let expiresAt else { return false }
+        return Date().addingTimeInterval(buffer) >= expiresAt
+    }
+}
+
+/// Reads and writes the two keychain entries we treat as token stores:
+///   1. Claude Code CLI's own entry  (service "Claude Code-credentials")
+///   2. Our backup entry             (service "...ClaudeOAuthMirror")
+///
+/// When the access token is refreshed we attempt to write back to BOTH so
+/// the CLI stays in sync. If we don't own write access to Claude Code's
+/// entry the write will simply fail; our backup keeps the rotating refresh
+/// token alive across app launches regardless.
+private enum ClaudeKeychainStore {
+    static let claudeCodeService = "Claude Code-credentials"
+    static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
+
+    private static var account: String { NSUserName() }
+
+    static func readClaudeCode() -> ClaudeOAuthCredentials? { read(service: claudeCodeService) }
+    static func readBackup() -> ClaudeOAuthCredentials? { read(service: backupService) }
+
+    /// Returns the best available credential.
+    ///
+    /// **Reads the mirror first** and only falls back to Claude Code
+    /// CLI's keychain entry when our mirror is empty. This avoids the
+    /// macOS permission prompt that fires every time the CLI rewrites
+    /// its own `Claude Code-credentials` entry (which it does roughly
+    /// hourly when its OAuth token refreshes): the keychain ACL on
+    /// that item is content-bound, so any rewrite by another process
+    /// invalidates our trust list and macOS prompts again on next
+    /// read.
+    ///
+    /// Once we've successfully read the CLI entry once (one prompt),
+    /// we copy the credentials into our own mirror so steady-state
+    /// reads never touch the CLI's entry again. The token refresh
+    /// path (`performRefresh`) keeps the mirror's refresh_token
+    /// rotating; as long as that refresh_token stays valid we can
+    /// keep minting fresh access tokens without ever re-prompting.
+    static func readBest() -> (ClaudeOAuthCredentials, source: String)? {
+        if let backup = readBackup() {
+            return (backup, backupService)
+        }
+
+        // Mirror missing (first launch, or user cleared keychain) —
+        // fall back to the CLI's entry, which may prompt the user
+        // exactly once for permission. Immediately mirror what we
+        // get so future reads stay silent.
+        if let cc = readClaudeCode() {
+            _ = write(cc, service: backupService)
+            print("[ClaudeKeychain] Mirrored Claude Code credentials to backup store — future reads will avoid CLI entry")
+            return (cc, claudeCodeService)
+        }
+
+        return nil
+    }
+
+    /// Escape hatch for when the mirror's refresh_token is rejected
+    /// (rotating refresh tokens — Anthropic does this occasionally).
+    /// Called by the refresh path to grab a fresh token from the CLI's
+    /// entry. This DOES potentially prompt, but it's the recovery path
+    /// — not the steady-state path.
+    static func readClaudeCodeAsFallback() -> ClaudeOAuthCredentials? {
+        guard let cc = readClaudeCode() else { return nil }
+        _ = write(cc, service: backupService)
+        return cc
+    }
+
+    private static func read(service: String) -> ClaudeOAuthCredentials? {
+        let query: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String:  true,
+            kSecMatchLimit as String:  kSecMatchLimitOne
+        ]
+        var item: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else {
+            return nil
+        }
+
+        return ClaudeOAuthCredentials(
+            accessToken: token,
+            refreshToken: oauth["refreshToken"] as? String,
+            expiresAtMillis: (oauth["expiresAt"] as? NSNumber)?.doubleValue,
+            scopes: (oauth["scopes"] as? [String]) ?? [],
+            rawOAuthDict: oauth
+        )
+    }
+
+    /// Writes the credentials back to the named service. Returns true on success.
+    @discardableResult
+    static func write(_ creds: ClaudeOAuthCredentials, service: String) -> Bool {
+        // Re-serialize: preserve unknown keys, override the three we manage.
+        var oauthDict = creds.rawOAuthDict
+        oauthDict["accessToken"] = creds.accessToken
+        if let refreshToken = creds.refreshToken {
+            oauthDict["refreshToken"] = refreshToken
+        }
+        if let ms = creds.expiresAtMillis {
+            // Match Claude Code's storage format: integer milliseconds.
+            oauthDict["expiresAt"] = NSNumber(value: Int64(ms))
+        }
+
+        let payload: [String: Any] = ["claudeAiOauth": oauthDict]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            return false
+        }
+
+        let query: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+
+        // Try update first; if the item doesn't exist (only true for our
+        // backup service on first write), add it.
+        let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        if updateStatus == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData as String] = data
+            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            return addStatus == errSecSuccess
+        }
+        print("[ClaudeKeychainStore] SecItemUpdate for \(service) failed: OSStatus \(updateStatus)")
+        return false
+    }
+}
+
+/// Coalesces concurrent calls and refreshes Anthropic OAuth tokens when the
+/// access token in the keychain is near expiry. Falls back gracefully on
+/// network or keychain failure — callers will simply receive `nil` and the
+/// provider will fall back to local JSONL parsing.
+private actor ClaudeOAuthTokenManager {
+    static let shared = ClaudeOAuthTokenManager()
+
+    /// Refresh `buffer` seconds before the stored expiry so we never make a
+    /// request with a token that flips invalid mid-flight.
+    private let refreshBuffer: TimeInterval = 5 * 60     // 5 min
+
+    /// Hard guard: never re-attempt a failed refresh more often than this.
+    private let minRetryInterval: TimeInterval = 60
+
+    private var inflight: Task<String?, Never>?
+    private var lastFailureAt: Date?
+
+    /// Returns a usable access token, refreshing it transparently if needed.
+    /// `manualOverride` is the OAuth token the user pasted in Settings, which
+    /// always wins (we don't try to refresh hand-entered tokens).
+    func currentAccessToken(manualOverride: String?) async -> String? {
+        if let manualOverride, !manualOverride.isEmpty {
+            return manualOverride
+        }
+
+        guard let (creds, source) = ClaudeKeychainStore.readBest() else {
+            return nil
+        }
+
+        if !creds.needsRefresh(buffer: refreshBuffer) {
+            return creds.accessToken
+        }
+
+        // Don't hammer the refresh endpoint after a recent failure.
+        if let lastFailureAt, Date().timeIntervalSince(lastFailureAt) < minRetryInterval {
+            print("[ClaudeOAuth] Refresh backoff active — returning current token")
+            return creds.accessToken
+        }
+
+        if let inflight {
+            return await inflight.value
+        }
+
+        print("[ClaudeOAuth] Access token near expiry (source: \(source)) — refreshing")
+        let task = Task { [creds] in
+            await Self.performRefresh(creds: creds)
+        }
+        inflight = task
+        let result = await task.value
+        inflight = nil
+
+        if result == nil {
+            lastFailureAt = Date()
+        } else {
+            lastFailureAt = nil
+        }
+        return result
+    }
+
+    /// POSTs the refresh request, persists the new tokens to both keychain
+    /// entries, returns the new access token (or nil on failure).
+    private static func performRefresh(creds: ClaudeOAuthCredentials) async -> String? {
+        guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else {
+            print("[ClaudeOAuth] No refresh_token available — cannot refresh")
+            return nil
+        }
+
+        // Values verified against the shipped Claude Code CLI binary.
+        let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+
+        let scopeString = creds.scopes.isEmpty
+            ? "user:inference user:profile"
+            : creds.scopes.joined(separator: " ")
+
+        let body: [String: Any] = [
+            "grant_type":   "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id":    clientID,
+            "scope":        scopeString
+        ]
+
+        var request = URLRequest(url: tokenURL, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            print("[ClaudeOAuth] Refresh network error: \(error.localizedDescription)")
+            return nil
+        }
+
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let bodyStr = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            print("[ClaudeOAuth] Refresh HTTP \(status): \(bodyStr)")
+            return nil
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let newAccessToken = json["access_token"] as? String,
+              !newAccessToken.isEmpty else {
+            print("[ClaudeOAuth] Refresh response missing access_token")
+            return nil
+        }
+
+        let expiresInSec = (json["expires_in"] as? NSNumber)?.doubleValue
+        // Rotating refresh tokens: prefer the new one if the server returns it.
+        let newRefreshToken = (json["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? creds.refreshToken
+
+        let newExpiresAtMillis: Double? = expiresInSec.map {
+            (Date().timeIntervalSince1970 + $0) * 1000
+        }
+
+        let refreshed = ClaudeOAuthCredentials(
+            accessToken: newAccessToken,
+            refreshToken: newRefreshToken,
+            expiresAtMillis: newExpiresAtMillis,
+            scopes: creds.scopes,
+            rawOAuthDict: creds.rawOAuthDict
+        )
+
+        // Persist to both stores so:
+        //   - Claude Code CLI still works (if we have write permission)
+        //   - We can always refresh again on next launch (our own store)
+        let wroteCC = ClaudeKeychainStore.write(refreshed, service: ClaudeKeychainStore.claudeCodeService)
+        let wroteBackup = ClaudeKeychainStore.write(refreshed, service: ClaudeKeychainStore.backupService)
+        print("[ClaudeOAuth] Refresh OK. Wrote ClaudeCode=\(wroteCC) Backup=\(wroteBackup)")
+
+        return newAccessToken
+    }
+}
+
 /// Reads local Claude Code transcript metadata and usage snapshots.
-/// This is a no-API, user-controlled local source.
+/// If an OAuth token is supplied, fetches live 5-hour/7-day quota meters instead.
 public struct ClaudeProviderClient: ProviderClient {
     public let providerID: ProviderID = .claude
 
@@ -3405,13 +5548,79 @@ public struct ClaudeProviderClient: ProviderClient {
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        // Resolution order:
+        //   1. Token typed/pasted in Settings (always honored as-is)
+        //   2. OAuth token manager — reads keychain, refreshes if needed
+        //   3. ~/.claude/.oauth_token file (headless / CI installs)
+        let manualToken = credentials?.normalizedAccessToken
+        var oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessToken(
+            manualOverride: manualToken
+        )
+        if oauthToken == nil {
+            oauthToken = Self.autoDetectedOAuthTokenFile()
+        }
+        if let token = oauthToken, !token.isEmpty {
+            // 1) Serve fresh cached snapshot if we hit the endpoint very recently.
+            if let cached = ClaudeOAuthResponseCache.shared.fresh() {
+                print("[ClaudeProvider] Serving cached OAuth snapshot (fresh)")
+                // Do not re-store cache hits here. The dashboard can refresh
+                // every 15-60s; renewing the cache on read would keep old
+                // OAuth meter values alive indefinitely.
+                return cached
+            }
+            print("[ClaudeProvider] OAuth token found — fetching live quota")
+            do {
+                let oauthSnapshot = try await fetchOAuthQuota(token: token)
+                // Augment OAuth quota meters with locally-captured 2-hour
+                // buckets so the activity heatmap still shows Claude usage
+                // even when the OAuth path has no per-event data.
+                let events = await eventsForOAuthEnrichment(credentials: credentials)
+                // Plus AGBench's unified usage.json for any Claude runs
+                // driven through GUIGemini. No-op without the bookmark.
+                let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
+                let merged = mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
+                ClaudeOAuthResponseCache.shared.store(merged)
+                return merged
+            } catch let error as ProviderFetchError {
+                if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
+                    print("[ClaudeProvider] OAuth fetch failure (\(error)) — serving last successful OAuth snapshot to preserve meters")
+                    let events = await eventsForOAuthEnrichment(credentials: credentials)
+                    let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
+                    return mergeEvents(into: stale, events: events + agbenchEvents)
+                }
+
+                if let localSnapshot = await loadLocalSnapshotIfAvailable(
+                    credentials: credentials,
+                    context: "OAuth fetch failure (\(error.localizedDescription))"
+                ) {
+                    print("[ClaudeProvider] OAuth fetch failed and no cached OAuth snapshot available; falling back to local Claude transcript snapshot")
+                    return localSnapshot
+                }
+
+                throw error
+            }
+        }
+
+        // Fall back to local JSONL transcript parsing.
+        let localSnapshot = try await loadLocalSnapshot(credentials: credentials, qos: .userInitiated)
+        // Inject AGBench events here too so the local fallback path is
+        // symmetric with the OAuth path above.
+        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
+        guard !agbenchEvents.isEmpty else { return localSnapshot }
+        return mergeEvents(into: localSnapshot, events: localSnapshot.events + agbenchEvents)
+    }
+
+    private func loadLocalSnapshot(
+        credentials: ProviderCredential?,
+        qos: DispatchQoS.QoSClass
+    ) async throws -> QuotaSnapshot {
         let rootURL = resolvedClaudeRootURL(credentials: credentials)
         let bookmarkData = claudeBookmarkData(from: credentials)
         let reader = ClaudeCodeLocalStateReader(fileManager: fileManager)
 
         print("[ClaudeProvider] Reading local Claude Code logs from: \(rootURL.path)")
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
+        let rawSnapshot: QuotaSnapshot = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: qos).async {
                 var accessURL = rootURL
                 var didStartAccessing = false
 
@@ -3435,7 +5644,160 @@ public struct ClaudeProviderClient: ProviderClient {
                 }
             }
         }
+
+        return rawSnapshot
     }
+
+    private func loadLocalSnapshotIfAvailable(
+        credentials: ProviderCredential?,
+        context: String
+    ) async -> QuotaSnapshot? {
+        do {
+            let snapshot = try await loadLocalSnapshot(credentials: credentials, qos: .utility)
+            logLocalSnapshotOutcome(snapshot, context: context)
+            return snapshot
+        } catch {
+            print("[ClaudeProvider] Local scan FAILED during \(context) (\(error.localizedDescription))")
+            return nil
+        }
+    }
+
+    /// Best-effort local JSONL event extraction. Returns 2-hour bucketed
+    /// `UsageEvent`s seen in `~/.claude/projects/**` so the activity heatmap
+    /// still shows Claude even when the OAuth path supplies the quota meters.
+    /// Returns `[]` for any error (no bookmark, no transcripts, sandbox denial).
+    private func loadLocalEvents(credentials: ProviderCredential?) async -> [UsageEvent] {
+        guard let snapshot = await loadLocalSnapshotIfAvailable(credentials: credentials, context: "OAuth enrichment") else {
+            return []
+        }
+        return snapshot.events
+    }
+
+    private func eventsForOAuthEnrichment(credentials: ProviderCredential?) async -> [UsageEvent] {
+        // 12s ceiling, sitting just under SyncCoordinator's 15s outer
+        // per-provider timeout. The previous 4s budget was too tight and
+        // silently discarded fresh buckets on every refresh; bumping past
+        // 15s would let the outer timeout fire first and turn the whole
+        // fetch into a "refresh miss". 12s gives accounts with many
+        // active projects room to scan fully, while keeping enough slack
+        // before the outer guard. If a scan still doesn't complete in
+        // time, `loadLocalEventsWithinTimeout` lets it finish in the
+        // background and persists its events for the NEXT fetch via
+        // `persistLateClaudeScan`.
+        if let localEvents = await loadLocalEventsWithinTimeout(
+            credentials: credentials,
+            timeoutSeconds: 12
+        ), !localEvents.isEmpty {
+            return localEvents
+        }
+
+        let previousEvents = previousClaudeEvents()
+        if !previousEvents.isEmpty {
+            print("[ClaudeProvider] Reusing \(previousEvents.count) previous Claude heatmap buckets for live OAuth snapshot")
+        }
+        return previousEvents
+    }
+
+    private func loadLocalEventsWithinTimeout(
+        credentials: ProviderCredential?,
+        timeoutSeconds: TimeInterval
+    ) async -> [UsageEvent]? {
+        await withCheckedContinuation { continuation in
+            let state = ClaudeTimeoutRaceState<[UsageEvent]?>(continuation)
+            let loadTask = Task {
+                let events = await loadLocalEvents(credentials: credentials)
+                // If the timeout won the race we still finish the scan
+                // and persist its results so the NEXT fetch sees fresh
+                // buckets rather than reusing the same stale cache
+                // forever. The current fetch already returned with the
+                // cached fallback, but the heatmap will catch up on the
+                // next refresh.
+                if !state.resume(with: events) {
+                    if !events.isEmpty {
+                        persistLateClaudeScan(events: events)
+                    }
+                }
+            }
+
+            Task {
+                let nanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                if state.resume(with: nil) {
+                    print("[ClaudeProvider] Local heatmap enrichment timed out after \(timeoutSeconds.compactString)s; scan will finish in background and persist for the next fetch")
+                    // Do NOT cancel the load task — let it finish so its
+                    // events get persisted for the next refresh.
+                }
+            }
+        }
+    }
+
+    /// Updates the persisted Claude snapshot with freshly-scanned events
+    /// when a scan finishes after the OAuth fetch already returned with
+    /// cached fallback buckets. The card meters were already correct
+    /// (they come from the live OAuth response); only the heatmap events
+    /// need to be refreshed.
+    private func persistLateClaudeScan(events: [UsageEvent]) {
+        let store = QuotaSnapshotStore.shared
+        guard let existing = store.loadSnapshots().first(where: { $0.providerID == .claude }) else {
+            return
+        }
+        let updated = QuotaSnapshot(
+            id: existing.id,
+            providerID: existing.providerID,
+            displayName: existing.displayName,
+            planName: existing.planName,
+            windows: existing.windows,
+            stats: existing.stats,
+            balances: existing.balances,
+            signals: existing.signals,
+            events: events,
+            fetchState: existing.fetchState,
+            fetchedAt: existing.fetchedAt
+        )
+        store.upsert(updated)
+        print("[ClaudeProvider] Persisted \(events.count) late-arriving Claude heatmap buckets for next refresh")
+    }
+
+    private func logLocalSnapshotOutcome(_ snapshot: QuotaSnapshot, context: String) {
+        if snapshot.events.isEmpty {
+            print("[ClaudeProvider] Local scan during \(context) produced 0 heatmap buckets")
+        } else {
+            let oldest = snapshot.events.map(\.timestamp).min().map { String(describing: $0) } ?? "<unknown>"
+            let newest = snapshot.events.map(\.timestamp).max().map { String(describing: $0) } ?? "<unknown>"
+            print("[ClaudeProvider] Local scan during \(context) produced \(snapshot.events.count) heatmap buckets (oldest=\(oldest) newest=\(newest))")
+        }
+    }
+
+    private func previousClaudeEvents(lookbackDays: Int = ClaudeHeatmapEventBucketer.defaultRetentionDays) -> [UsageEvent] {
+        let horizon = Date().addingTimeInterval(-Double(lookbackDays) * 24 * 60 * 60)
+        return QuotaSnapshotStore.shared.loadSnapshots()
+            .first { $0.providerID == .claude && $0.fetchState == .success }?
+            .events
+            .filter { $0.timestamp >= horizon } ?? []
+    }
+
+    /// Returns a copy of `snapshot` with `events` attached. All other fields
+    /// preserved verbatim. Used to graft local-disk activity events onto the
+    /// server-provided OAuth quota snapshot.
+    private func mergeEvents(into snapshot: QuotaSnapshot, events: [UsageEvent]) -> QuotaSnapshot {
+        guard !events.isEmpty else { return snapshot }
+        return QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: snapshot.windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            signals: snapshot.signals,
+            events: events,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
+    }
+
+    // Claude rebuilds bounded heatmap buckets from local transcripts on each
+    // successful scan, so it does not use the raw-event history merge above.
 
     private func resolvedClaudeRootURL(credentials: ProviderCredential?) -> URL {
         if let customPath = credentials?.normalizedCustomEndpoint, !customPath.isEmpty {
@@ -3475,6 +5837,223 @@ public struct ClaudeProviderClient: ProviderClient {
             bookmarkDataIsStale: &isStale
         )
     }
+
+    /// Plain-text token file fallback used in headless / CI setups where
+    /// `claude auth login --claudeai` is impractical. Keychain-based lookup
+    /// (with auto-refresh) is handled by `ClaudeOAuthTokenManager`.
+    private static func autoDetectedOAuthTokenFile() -> String? {
+        let homePath = NSHomeDirectory()
+        let realHome: String
+        if let r = homePath.range(of: "/Library/Containers/") {
+            realHome = String(homePath[..<r.lowerBound])
+        } else {
+            realHome = homePath
+        }
+        let configDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+            ?? (realHome + "/.claude")
+        guard let raw = try? String(contentsOfFile: configDir + "/.oauth_token", encoding: .utf8) else {
+            return nil
+        }
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    // MARK: - OAuth Live Quota
+
+    private func fetchOAuthQuota(token: String) async throws -> QuotaSnapshot {
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
+            throw ProviderFetchError.networkError(underlying: URLError(.badURL))
+        }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        if let http = response as? HTTPURLResponse {
+            switch http.statusCode {
+            case 200: break
+            case 401, 403: throw ProviderFetchError.invalidCredential
+            case 429: throw ProviderFetchError.rateLimited
+            default: throw ProviderFetchError.parsingError("HTTP \(http.statusCode)")
+            }
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let string = try container.decode(String.self)
+            let withFractional = ISO8601DateFormatter()
+            withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = withFractional.date(from: string) { return date }
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            if let date = plain.date(from: string) { return date }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unparseable date: \(string)")
+        }
+
+        let usage: ClaudeOAuthUsageResponse
+        do {
+            usage = try decoder.decode(ClaudeOAuthUsageResponse.self, from: data)
+        } catch {
+            throw ProviderFetchError.parsingError("OAuth decode failed: \(error.localizedDescription)")
+        }
+
+        let plan = resolveClaudePlanInfo()
+
+        // Targeted diagnostic: one-shot dump of plan + per-model field state
+        // so we can tell, on any build, exactly why the Sonnet/Opus meters
+        // do or don't render. Prints once per process launch.
+        ClaudeSonnetGateDiagnostics.shared.logOnce(
+            plan: plan,
+            sonnet: usage.sevenDaySonnet,
+            opus: usage.sevenDayOpus
+        )
+
+        var windows: [QuotaWindow] = []
+        if let w = usage.fiveHour, let utilization = w.utilization {
+            windows.append(QuotaWindow(
+                label: "Session",
+                windowKind: .session,
+                used: utilization,
+                total: 100,
+                resetDate: w.resetAt,
+                unit: "%",
+                subtitle: "5-hour rolling window"
+            ))
+        }
+        if let w = usage.sevenDay, let utilization = w.utilization {
+            windows.append(QuotaWindow(
+                label: "Weekly",
+                windowKind: .weekly,
+                used: utilization,
+                total: 100,
+                resetDate: w.resetAt,
+                unit: "%",
+                subtitle: "7-day rolling window"
+            ))
+        }
+        // Max-plan tokens get additional weekly caps for specific models.
+        // The live response shape is the source of truth: if Anthropic sends
+        // utilization, show the meter even when `resets_at` is absent.
+        if let sonnetWindow = ClaudeOAuthModelWindowMapper.quotaWindow(
+            label: "Sonnet",
+            subtitle: "Sonnet 7-day rolling window",
+            from: usage.sevenDaySonnet
+        ) {
+            windows.append(sonnetWindow)
+        }
+        if let opusWindow = ClaudeOAuthModelWindowMapper.quotaWindow(
+            label: "Opus",
+            subtitle: "Opus 7-day rolling window",
+            from: usage.sevenDayOpus
+        ) {
+            windows.append(opusWindow)
+        }
+
+        var stats: [QuotaStat] = []
+        let modelWindows: [(String, ClaudeOAuthWindow?)] = [
+            ("Opus 7d", usage.sevenDayOpus),
+            ("Sonnet 7d", usage.sevenDaySonnet),
+            ("OAuth Apps 7d", usage.sevenDayOAuthApps)
+        ]
+        for (label, window) in modelWindows {
+            if let w = window, let utilization = w.utilization {
+                stats.append(QuotaStat(
+                    label: label,
+                    value: utilization,
+                    unit: "%",
+                    subtitle: "Model-specific weekly utilization"
+                ))
+            }
+        }
+
+        var balances: [QuotaBalance] = []
+        if let extra = usage.extraUsage, extra.isEnabled {
+            let unit = extra.currency ?? "credits"
+            if let used = extra.usedCredits, let limit = extra.monthlyLimit {
+                balances.append(QuotaBalance(
+                    label: "Extra Usage",
+                    amount: max(0, limit - used),
+                    unit: unit,
+                    subtitle: "\(used.compactString) of \(limit.compactString) \(unit) used this month",
+                    resetDate: nil
+                ))
+            } else if let used = extra.usedCredits {
+                balances.append(QuotaBalance(
+                    label: "Extra Usage",
+                    amount: used,
+                    unit: unit,
+                    subtitle: "Additional usage this month",
+                    resetDate: nil
+                ))
+            }
+        }
+
+        return QuotaSnapshot(
+            providerID: .claude,
+            displayName: "Claude Code",
+            planName: plan?.displayName ?? "Claude Code",
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            fetchState: .success,
+            fetchedAt: Date()
+        )
+    }
+}
+
+struct ClaudeHeatmapEventBucketer {
+    static let defaultRetentionDays = 35
+
+    static func events(
+        from records: [ClaudeUsageRecord],
+        now: Date = Date(),
+        calendar: Calendar = .current,
+        retentionDays: Int = defaultRetentionDays
+    ) -> [UsageEvent] {
+        let horizon = now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
+        var tokenTotals: [ClaudeHeatmapBucketKey: Double] = [:]
+        var bucketStarts: [ClaudeHeatmapBucketKey: Date] = [:]
+
+        for record in records where record.timestamp >= horizon {
+            let key = ClaudeHeatmapBucketKey(date: record.timestamp, calendar: calendar)
+            tokenTotals[key, default: 0] += record.tokens
+            bucketStarts[key] = key.bucketStart(calendar: calendar)
+        }
+
+        return tokenTotals.compactMap { key, tokens in
+            guard let bucketStart = bucketStarts[key], tokens > 0 else { return nil }
+            return UsageEvent(
+                timestamp: bucketStart,
+                tokens: tokens,
+                model: "Claude",
+                type: .bucket
+            )
+        }
+        .sorted { $0.timestamp > $1.timestamp }
+    }
+}
+
+private struct ClaudeHeatmapBucketKey: Hashable {
+    let dayStart: Date
+    let row: Int
+
+    init(date: Date, calendar: Calendar) {
+        dayStart = calendar.startOfDay(for: date)
+        let hour = calendar.component(.hour, from: date)
+        row = max(0, min(11, hour / 2))
+    }
+
+    func bucketStart(calendar: Calendar) -> Date {
+        calendar.date(byAdding: .hour, value: row * 2, to: dayStart)
+            ?? dayStart.addingTimeInterval(Double(row * 2) * 60 * 60)
+    }
 }
 
 private struct ClaudeCodeLocalStateReader {
@@ -3507,7 +6086,8 @@ private struct ClaudeCodeLocalStateReader {
         let dayStart = now.addingTimeInterval(-24 * 60 * 60)
         let weekStart = now.addingTimeInterval(-7 * 24 * 60 * 60)
         let monthStart = now.addingTimeInterval(-30 * 24 * 60 * 60)
-        let recentTranscriptInfos = transcriptInfos.filter { $0.modificationDate >= monthStart }
+        let heatmapStart = now.addingTimeInterval(-Double(ClaudeHeatmapEventBucketer.defaultRetentionDays) * 24 * 60 * 60)
+        let recentTranscriptInfos = transcriptInfos.filter { $0.modificationDate >= heatmapStart }
         let scanInfos = recentTranscriptInfos.isEmpty ? [transcriptInfos[0]] : recentTranscriptInfos
 
         var latestSessionURL: URL?
@@ -3517,7 +6097,7 @@ private struct ClaudeCodeLocalStateReader {
         var weekTokens: Double = 0
         var monthTokens: Double = 0
         var latestActivity = Date.distantPast
-        var events: [UsageEvent] = []
+        var heatmapRecords: [ClaudeUsageRecord] = []
         let metadata = loadMetadata(rootURL: rootURL)
 
         for transcriptInfo in scanInfos {
@@ -3534,12 +6114,7 @@ private struct ClaudeCodeLocalStateReader {
             }
 
             for record in records {
-                events.append(UsageEvent(
-                    timestamp: record.timestamp,
-                    tokens: record.tokens,
-                    model: "Claude",
-                    type: .message
-                ))
+                heatmapRecords.append(record)
 
                 if record.timestamp >= dayStart {
                     dayTokens += record.tokens
@@ -3695,8 +6270,7 @@ private struct ClaudeCodeLocalStateReader {
 
         let planName = rootURL.lastPathComponent.isEmpty ? "Claude Code" : "Claude Code"
         let fetchedAt = latestActivity > .distantPast ? latestActivity : now
-        let sortedEvents = events.sorted { $0.timestamp > $1.timestamp }
-        let cappedEvents = Array(sortedEvents.prefix(1000))
+        let heatmapEvents = ClaudeHeatmapEventBucketer.events(from: heatmapRecords, now: now)
 
         return QuotaSnapshot(
             providerID: .claude,
@@ -3705,7 +6279,7 @@ private struct ClaudeCodeLocalStateReader {
             windows: windows,
             stats: stats,
             signals: signals,
-            events: cappedEvents,
+            events: heatmapEvents,
             fetchState: .success,
             fetchedAt: fetchedAt
         )
@@ -3825,11 +6399,12 @@ private struct ClaudeCodeLocalStateReader {
             return 0
         }
 
-        // Cache fields can be extremely large and are often repeated across
-        // incremental transcript entries, which inflates usage snapshots.
-        // Track direct model IO tokens for stable, human-expected totals.
+        // Each JSONL line is a single API call, so cache fields are safe to include —
+        // they are not repeated across lines and they do count toward Claude Code's rate limits.
         return number("input_tokens")
             + number("output_tokens")
+            + number("cache_creation_input_tokens")
+            + number("cache_read_input_tokens")
             + number("input_audio_tokens")
             + number("output_audio_tokens")
     }
@@ -3875,7 +6450,7 @@ private struct ClaudeCodeLocalStateReader {
     }
 }
 
-private struct ClaudeUsageRecord {
+struct ClaudeUsageRecord {
     let timestamp: Date
     let tokens: Double
 }
@@ -3902,6 +6477,7 @@ private struct ClaudeLocalMetadata {
 public enum ProviderFetchError: LocalizedError {
     case notConfigured
     case invalidCredential
+    case credentialExpired(String)
     case networkError(underlying: Error)
     case parsingError(String)
     case rateLimited
@@ -3911,6 +6487,8 @@ public enum ProviderFetchError: LocalizedError {
         switch self {
         case .notConfigured:          return "Provider not configured."
         case .invalidCredential:      return "Invalid API key or session."
+        case .credentialExpired(let msg):
+            return msg
         case .networkError(let e):    return "Network error: \(e.localizedDescription)"
         case .parsingError(let msg):  return "Parse error: \(msg)"
         case .rateLimited:            return "Rate limited. Try again later."

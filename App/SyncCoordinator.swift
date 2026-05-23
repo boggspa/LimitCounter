@@ -215,6 +215,31 @@ final class SyncCoordinator {
                 ),
                 errorMessage: nil
             )
+        } catch ProviderFetchError.credentialExpired(let message) {
+            print("[SyncCoordinator] Expired credential for \(providerID.rawValue): \(message)")
+            if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
+                providerID: providerID,
+                previousSnapshot: previousSnapshot,
+                reason: message
+            ) {
+                return ProviderSyncOutcome(
+                    providerID: providerID,
+                    snapshot: preservedSnapshot,
+                    errorMessage: message
+                )
+            }
+
+            return ProviderSyncOutcome(
+                providerID: providerID,
+                snapshot: QuotaSnapshot(
+                    providerID: providerID,
+                    displayName: providerID.snapshotDisplayName,
+                    planName: nil,
+                    windows: [],
+                    fetchState: .notConfigured
+                ),
+                errorMessage: message
+            )
         } catch {
             let message = (error as? ProviderFetchError)?.errorDescription
                 ?? error.localizedDescription
@@ -253,14 +278,30 @@ final class SyncCoordinator {
         previousSnapshot: QuotaSnapshot?,
         reason: String
     ) -> QuotaSnapshot? {
-        guard providerID == .codexTelemetry,
-              let previousSnapshot,
+        guard let previousSnapshot,
               previousSnapshot.fetchState == .success,
               previousSnapshot.hasContent else {
             return nil
         }
 
-        print("[SyncCoordinator] Preserving previous Codex telemetry snapshot after refresh miss: \(reason)")
+        let shouldPreserve: Bool
+        switch providerID {
+        case .codexTelemetry:
+            shouldPreserve = true
+        case .claude:
+            shouldPreserve = true
+        case .kimi:
+            shouldPreserve =
+                reason.contains("Kimi CLI OAuth token is expired")
+                || reason.contains("Rate limited")
+                || reason.hasPrefix("Network error")
+        default:
+            shouldPreserve = false
+        }
+
+        guard shouldPreserve else { return nil }
+
+        print("[SyncCoordinator] Preserving previous \(providerID.rawValue) snapshot after refresh miss: \(reason)")
         return previousSnapshot
     }
 
@@ -301,10 +342,10 @@ final class SyncCoordinator {
     private func providerTimeout(for providerID: ProviderID) -> TimeInterval {
         switch providerID {
         case .codexTelemetry:
-            return 10
+            return 30
         case .claude, .chatgpt, .gemini:
             return 15
-        case .openai, .windsurf, .cursor:
+        case .openai, .openaiAPI, .windsurf, .cursor, .kimi:
             return 20
         case .heatmap:
             return 5
@@ -340,7 +381,8 @@ final class SyncCoordinator {
         previous: [UsageEvent],
         now: Date = Date(),
         retention: TimeInterval = 35 * 24 * 60 * 60,
-        maxEvents: Int = 5_000
+        maxEvents: Int = 5_000,
+        maxPerHeatmapBucket: Int = 8
     ) -> [UsageEvent] {
         let cutoff = now.addingTimeInterval(-retention)
         var seenIDs = Set<UUID>()
@@ -359,7 +401,34 @@ final class SyncCoordinator {
             merged.append(event)
         }
 
-        return Array(merged.sorted { $0.timestamp > $1.timestamp }.prefix(maxEvents))
+        // Re-apply the provider's per-2h-bucket cap to the merged set.
+        // Without this, each fetch picks a slightly different "newest 8"
+        // for dense recent buckets — stable IDs + unique semantic keys
+        // mean those distinct events all survive deduplication and
+        // accumulate over time. Heavy recent days balloon past 8 events
+        // per bucket, monopolize the global `maxEvents` quota via the
+        // newest-first `prefix`, and shove older days off the heatmap.
+        // Capping per bucket here bounds total events at
+        // 8 × 12 × 35 = 3360 and guarantees the full retention window
+        // gets to be represented regardless of how dense recent activity
+        // is.
+        let sorted = merged.sorted { $0.timestamp > $1.timestamp }
+        let calendar = Calendar.current
+        var bucketCounts: [HeatmapBucketKey: Int] = [:]
+        var capped: [UsageEvent] = []
+        capped.reserveCapacity(min(sorted.count, maxEvents))
+
+        for event in sorted {
+            let key = HeatmapBucketKey(timestamp: event.timestamp, calendar: calendar)
+            guard bucketCounts[key, default: 0] < maxPerHeatmapBucket else {
+                continue
+            }
+            bucketCounts[key, default: 0] += 1
+            capped.append(event)
+            if capped.count >= maxEvents { break }
+        }
+
+        return capped
     }
 
     private func applySyncOutcome(_ outcome: ProviderSyncOutcome) {
@@ -409,6 +478,20 @@ private struct UsageEventSemanticKey: Hashable {
     }
 }
 
+/// 2-hour-row × day bucket used to apply the heatmap's per-cell cap when
+/// merging Codex telemetry history. Matches `CodexTelemetryBucketKey` in
+/// CodexTelemetryProviderClient — kept as a separate private struct here
+/// rather than imported, so SyncCoordinator stays self-contained.
+private struct HeatmapBucketKey: Hashable {
+    let dayStart: Date
+    let row: Int
+
+    init(timestamp: Date, calendar: Calendar) {
+        dayStart = calendar.startOfDay(for: timestamp)
+        row = calendar.component(.hour, from: timestamp) / 2
+    }
+}
+
 private struct ProviderSyncOutcome {
     let providerID: ProviderID
     let snapshot: QuotaSnapshot
@@ -439,21 +522,86 @@ private struct SnapshotSignalDetector {
     }
 
     func enrichedSnapshot(from snapshot: QuotaSnapshot, previousSnapshot: QuotaSnapshot?) -> QuotaSnapshot {
-        var activeSignals = loadSignals()
-        pruneExpiredSignals(&activeSignals, now: snapshot.fetchedAt)
+        let correctedSnapshot = applyLockoutCorrections(current: snapshot, previous: previousSnapshot)
 
-        let newSignals = detectSignals(current: snapshot, previous: previousSnapshot)
-        merge(newSignals, into: &activeSignals, providerID: snapshot.providerID)
+        var activeSignals = loadSignals()
+        pruneExpiredSignals(&activeSignals, now: correctedSnapshot.fetchedAt)
+
+        let newSignals = detectSignals(current: correctedSnapshot, previous: previousSnapshot)
+        merge(newSignals, into: &activeSignals, providerID: correctedSnapshot.providerID)
         saveSignals(activeSignals)
 
-        guard snapshot.fetchState.isHealthy else {
-            return snapshot.withSignals([])
+        guard correctedSnapshot.fetchState.isHealthy else {
+            return correctedSnapshot.withSignals([])
         }
 
-        let providerSignals = (activeSignals[snapshot.providerID.rawValue] ?? [])
+        let providerSignals = (activeSignals[correctedSnapshot.providerID.rawValue] ?? [])
             .sorted { $0.detectedAt > $1.detectedAt }
 
-        return snapshot.withSignals(providerSignals)
+        return correctedSnapshot.withSignals(providerSignals)
+    }
+
+    /// Kimi-specific: when the rolling 5h window is exhausted, Kimi's API returns
+    /// `remaining = limit` with `resetTime` set to when the lockout ends — making
+    /// the window look like a fresh full window. Detect that pattern by comparing
+    /// against the previous snapshot and pin `used = total` so the UI shows 100%.
+    private func applyLockoutCorrections(current: QuotaSnapshot, previous: QuotaSnapshot?) -> QuotaSnapshot {
+        guard current.providerID == .kimi,
+              current.fetchState.isHealthy,
+              let previous,
+              previous.fetchState.isHealthy else {
+            return current
+        }
+
+        let elapsed = current.fetchedAt.timeIntervalSince(previous.fetchedAt)
+        guard elapsed >= 0, elapsed <= 60 * 60 else {
+            return current
+        }
+
+        let previousWindows: [WindowComparisonKey: QuotaWindow] = Dictionary(
+            uniqueKeysWithValues: previous.windows.compactMap { window -> (WindowComparisonKey, QuotaWindow)? in
+                guard window.hasExplicitLimit else { return nil }
+                return (WindowComparisonKey(window: window), window)
+            }
+        )
+
+        var didCorrect = false
+        let correctedWindows = current.windows.map { window -> QuotaWindow in
+            guard window.hasExplicitLimit,
+                  let total = window.total,
+                  total > 0 else {
+                return window
+            }
+            let key = WindowComparisonKey(window: window)
+            guard let previousWindow = previousWindows[key],
+                  let previousTotal = previousWindow.total,
+                  previousTotal > 0,
+                  abs(previousTotal - total) <= max(1, previousTotal * 0.05) else {
+                return window
+            }
+            guard previousWindow.fractionUsed >= 0.70,
+                  window.fractionUsed <= 0.10 else {
+                return window
+            }
+            guard let previousResetDate = previousWindow.resetDate,
+                  previousResetDate > current.fetchedAt else {
+                return window
+            }
+
+            didCorrect = true
+            return QuotaWindow(
+                id: window.id,
+                label: window.label,
+                windowKind: window.windowKind,
+                used: total,
+                total: total,
+                resetDate: window.resetDate,
+                unit: window.unit,
+                subtitle: window.subtitle
+            )
+        }
+
+        return didCorrect ? current.withWindows(correctedWindows) : current
     }
 
     private func detectSignals(current: QuotaSnapshot, previous: QuotaSnapshot?) -> [QuotaSignal] {
@@ -475,16 +623,84 @@ private struct SnapshotSignalDetector {
             return (WindowComparisonKey(window: window), window)
         })
 
-        return current.windows.compactMap { currentWindow in
+        return current.windows.flatMap { currentWindow -> [QuotaSignal] in
             let key = WindowComparisonKey(window: currentWindow)
-            guard let previousWindow = previousWindows[key] else { return nil }
-            return unexpectedRecoverySignal(
+            guard let previousWindow = previousWindows[key] else { return [] }
+            if let signal = scheduledResetSignal(
                 currentWindow: currentWindow,
                 previousWindow: previousWindow,
                 currentDate: current.fetchedAt,
                 previousDate: previous.fetchedAt
-            )
+            ) {
+                return [signal]
+            }
+            if let signal = unexpectedRecoverySignal(
+                currentWindow: currentWindow,
+                previousWindow: previousWindow,
+                currentDate: current.fetchedAt,
+                previousDate: previous.fetchedAt
+            ) {
+                return [signal]
+            }
+            return []
         }
+    }
+
+    private func scheduledResetSignal(
+        currentWindow: QuotaWindow,
+        previousWindow: QuotaWindow,
+        currentDate: Date,
+        previousDate: Date
+    ) -> QuotaSignal? {
+        guard currentWindow.hasExplicitLimit,
+              previousWindow.hasExplicitLimit,
+              let currentTotal = currentWindow.total,
+              let previousTotal = previousWindow.total,
+              currentTotal > 0,
+              previousTotal > 0 else {
+            return nil
+        }
+
+        let totalDelta = abs(currentTotal - previousTotal)
+        guard totalDelta <= max(1, previousTotal * 0.05) else {
+            return nil
+        }
+
+        guard let previousResetDate = previousWindow.resetDate,
+              previousResetDate <= currentDate else {
+            return nil
+        }
+
+        let elapsed = currentDate.timeIntervalSince(previousDate)
+        guard elapsed <= 6 * 60 * 60 else {
+            return nil
+        }
+
+        guard previousWindow.fractionUsed >= 0.40 else {
+            return nil
+        }
+
+        guard currentWindow.fractionUsed <= 0.10 else {
+            return nil
+        }
+
+        let message: String
+        if let newReset = currentWindow.resetDate {
+            let resetIn = durationDescription(newReset.timeIntervalSince(currentDate))
+            message = "Quota refreshed from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)%. Next reset in \(resetIn)."
+        } else {
+            message = "Quota refreshed from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)%."
+        }
+
+        return QuotaSignal(
+            kind: .scheduledReset,
+            title: "\(currentWindow.label) reset",
+            message: message,
+            severity: .info,
+            confidence: 0.95,
+            windowLabel: currentWindow.label,
+            detectedAt: currentDate
+        )
     }
 
     private func unexpectedRecoverySignal(
@@ -524,13 +740,19 @@ private struct SnapshotSignalDetector {
         }
 
         let fractionDrop = previousWindow.fractionUsed - currentWindow.fractionUsed
+        let resetToZeroEarly = currentWindow.fractionUsed <= 0.01
+            && currentWindow.used <= max(1, currentTotal * 0.01)
+            && previousWindow.fractionUsed >= 0.08
+            && fractionDrop >= 0.08
         let strongRecovery = currentWindow.fractionUsed <= 0.20
             || fractionDrop >= strongRecoveryFloor
             || currentWindow.used <= previousWindow.used * 0.4
 
-        guard previousWindow.fractionUsed >= 0.50,
-              fractionDrop >= minimumFractionDrop,
-              strongRecovery else {
+        let strongDropRecovery = previousWindow.fractionUsed >= 0.50
+            && fractionDrop >= minimumFractionDrop
+            && strongRecovery
+
+        guard resetToZeroEarly || strongDropRecovery else {
             return nil
         }
 
@@ -545,11 +767,15 @@ private struct SnapshotSignalDetector {
             currentWindow: currentWindow
         )
 
-        let recoveryTitle: String = currentWindow.fractionUsed <= 0.10
-            ? "Usage window appears refreshed early"
-            : "Unexpected quota recovery detected"
+        let recoveryTitle: String = resetToZeroEarly
+            ? "Usage window reset early"
+            : currentWindow.fractionUsed <= 0.10
+                ? "Usage window appears refreshed early"
+                : "Unexpected quota recovery detected"
 
-        var message = "\(currentWindow.label) fell from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        var message = resetToZeroEarly
+            ? "\(currentWindow.label) reset from \(previousWindow.percentageUsed)% to 0% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+            : "\(currentWindow.label) fell from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
 
         if let currentResetDate = currentWindow.resetDate {
             let resetShift = currentResetDate.timeIntervalSince(previousResetDate)

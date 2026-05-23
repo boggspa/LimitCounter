@@ -26,32 +26,85 @@ public struct GeminiProviderClient: ProviderClient {
         let rootURL = resolvedGeminiRootURL(credentials: credentials)
         let bookmarkData = geminiBookmarkData(from: credentials)
 
-        // Fetch real-time quota from CLI if not throttled
-        let cliQuota = await fetchCLIQuotaIfNecessary()
+        // Resolve security-scoped bookmark up front; both the live OAuth read
+        // (oauth_creds.json) and the local history scan share it.
+        var accessURL = rootURL
+        var didStartAccessing = false
+        if let bookmarkData,
+           let bookmarkedURL = Self.resolvedSecurityScopedURL(from: bookmarkData) {
+            accessURL = bookmarkedURL
+            didStartAccessing = accessURL.startAccessingSecurityScopedResource()
+            print("[GeminiProvider] Using security-scoped bookmark: \(accessURL.path)")
+        }
+        defer {
+            if didStartAccessing {
+                accessURL.stopAccessingSecurityScopedResource()
+            }
+        }
 
-        let reader = GeminiLocalStateReader(fileManager: fileManager, cliQuota: cliQuota)
+        // Try the live Code Assist quota endpoint first — same source the CLI
+        // uses for its `/model` view, so what we render matches `gemini` exactly.
+        var liveWindows: [QuotaWindow]? = nil
+        if let token = await GeminiOAuthTokenManager.shared.currentAccessToken(geminiRootURL: accessURL) {
+            liveWindows = await GeminiLiveQuotaFetcher.fetchWindows(accessToken: token)
+        }
 
-        print("[GeminiProvider] Reading local Gemini CLI data from: \(rootURL.path)")
-        return try await withCheckedThrowingContinuation { continuation in
+        // Always run the local reader so we still surface events, stats,
+        // signals, and balances even when the live API is reachable. The local
+        // reader's CLI-spawn path is no-op'd in sandbox; we keep its other work.
+        let reader = GeminiLocalStateReader(fileManager: fileManager, cliQuota: nil)
+        print("[GeminiProvider] Reading local Gemini CLI data from: \(accessURL.path)")
+
+        let local: QuotaSnapshot
+        do {
+            local = try await runOffMain {
+                try reader.loadSnapshot(rootURL: accessURL, credentials: credentials)
+            }
+        } catch {
+            // If the local read fails AND we have live windows, return a
+            // synthetic snapshot using only the live data. Otherwise rethrow.
+            if let liveWindows, !liveWindows.isEmpty {
+                return QuotaSnapshot(
+                    providerID: .gemini,
+                    displayName: "Gemini CLI",
+                    planName: "Google Account",
+                    windows: liveWindows,
+                    fetchState: .success,
+                    fetchedAt: Date()
+                )
+            }
+            throw error
+        }
+
+        // Merge: live windows replace the heuristic ones when available;
+        // everything else (events, stats, balances, signals) comes from local.
+        if let liveWindows, !liveWindows.isEmpty {
+            return QuotaSnapshot(
+                id: local.id,
+                providerID: local.providerID,
+                displayName: local.displayName,
+                planName: local.planName,
+                windows: liveWindows,
+                stats: local.stats,
+                balances: local.balances,
+                signals: local.signals,
+                events: local.events,
+                fetchState: .success,
+                fetchedAt: Date()
+            )
+        }
+
+        // No live data → fall back to the existing local-only snapshot.
+        return local
+    }
+
+    /// Hops to a background queue without using `withCheckedThrowingContinuation`
+    /// at the call site, so the security-scoped access bracketing stays clean.
+    private func runOffMain<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                var accessURL = rootURL
-                var didStartAccessing = false
-
-                if let bookmarkData,
-                   let bookmarkedURL = Self.resolvedSecurityScopedURL(from: bookmarkData) {
-                    accessURL = bookmarkedURL
-                    didStartAccessing = accessURL.startAccessingSecurityScopedResource()
-                    print("[GeminiProvider] Using security-scoped bookmark: \(accessURL.path)")
-                }
-
-                defer {
-                    if didStartAccessing {
-                        accessURL.stopAccessingSecurityScopedResource()
-                    }
-                }
-
                 do {
-                    continuation.resume(returning: try reader.loadSnapshot(rootURL: accessURL, credentials: credentials))
+                    continuation.resume(returning: try work())
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -158,6 +211,18 @@ private struct GeminiLocalStateReader {
         return snapshot
     }
 
+    /// Modern Gemini CLI writes session files as `.jsonl` (line-delimited
+    /// JSON: one session-metadata line followed by per-message lines).
+    /// Older versions wrote a single `.json` object. We accept both so
+    /// the cache invalidates correctly when new sessions land — without
+    /// this, only `.json` mtimes were tracked and the cache stuck on the
+    /// last `.json` file's date indefinitely once the CLI switched
+    /// formats.
+    private static func isGeminiSessionFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "json" || ext == "jsonl"
+    }
+
     private func getLatestFileModificationDate(rootURL: URL) -> Date {
         let tmpRoot = rootURL.appendingPathComponent("tmp")
         guard fileManager.fileExists(atPath: tmpRoot.path) else {
@@ -172,7 +237,7 @@ private struct GeminiLocalStateReader {
             guard fileManager.fileExists(atPath: chatsDir.path) else { continue }
 
             let sessionFiles = (try? fileManager.contentsOfDirectory(at: chatsDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-            for fileURL in sessionFiles where fileURL.pathExtension == "json" {
+            for fileURL in sessionFiles where Self.isGeminiSessionFile(fileURL) {
                 if let fileDate = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
                     latestDate = max(latestDate, fileDate)
                 }
@@ -180,6 +245,54 @@ private struct GeminiLocalStateReader {
         }
 
         return latestDate
+    }
+
+    /// Parses a single Gemini session file, transparently handling both
+    /// the legacy `.json` (one-object-per-file) and modern `.jsonl`
+    /// (one-line-per-record) formats. Returns nil if the file is neither
+    /// parseable nor recoverable.
+    private func parseGeminiSessionFile(at fileURL: URL) -> GeminiSessionFile? {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            return nil
+        }
+
+        // Try the legacy single-object format first; cheapest case.
+        if let session = try? decoder.decode(GeminiSessionFile.self, from: data) {
+            return session
+        }
+
+        // Fall back to line-delimited JSONL. First line is session
+        // metadata `{sessionId, projectHash, startTime, lastUpdated,
+        // kind}`; subsequent lines are individual messages whose schema
+        // matches `GeminiMessage`. Lines that fail to decode as either
+        // are skipped — the format includes occasional non-message
+        // records (tool calls, etc.) that we don't need to count.
+        guard let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        var sessionId: String?
+        var messages: [GeminiMessage] = []
+
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let lineData = line.data(using: .utf8) else { continue }
+
+            if let message = try? decoder.decode(GeminiMessage.self, from: lineData) {
+                messages.append(message)
+                continue
+            }
+
+            if sessionId == nil,
+               let metadata = try? decoder.decode(GeminiSessionMetadata.self, from: lineData) {
+                sessionId = metadata.sessionId
+            }
+        }
+
+        // Treat the file as a session only if we got at least one
+        // message — otherwise downstream counters would be misled by a
+        // "session with zero messages" that we couldn't actually parse.
+        guard !messages.isEmpty else { return nil }
+        return GeminiSessionFile(sessionId: sessionId ?? fileURL.lastPathComponent, messages: messages)
     }
 
     private func loadCachedSnapshot(latestFileDate: Date) -> QuotaSnapshot? {
@@ -278,11 +391,8 @@ private struct GeminiLocalStateReader {
 
                 let sessionFiles = (try? fileManager.contentsOfDirectory(at: chatsDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
 
-                for fileURL in sessionFiles where fileURL.pathExtension == "json" {
-                    guard let data = try? Data(contentsOf: fileURL) else {
-                        continue
-                    }
-                    guard let session = try? decoder.decode(GeminiSessionFile.self, from: data) else {
+                for fileURL in sessionFiles where Self.isGeminiSessionFile(fileURL) {
+                    guard let session = parseGeminiSessionFile(at: fileURL) else {
                         continue
                     }
 
@@ -562,8 +672,21 @@ private struct GeminiLocalStateReader {
             planName = metadata.authType != nil ? "Personal" : "Local"
         }
 
-        let sortedEvents = events.sorted { $0.timestamp > $1.timestamp }
-        let cappedEvents = Array(sortedEvents.prefix(1000))
+        // AGBench's unified `usage.json` records every run including
+        // Gemini CLI invocations. Merging them in lets the heatmap
+        // reflect AGBench-driven activity even where the local CLI
+        // session file might be incomplete.
+        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "gemini")
+        let combinedEvents = events + agbenchEvents
+
+        // Collapse per-message events to 2-hour heatmap buckets — same
+        // shape Claude and Kimi use. The previous `prefix(1000)` cap let
+        // dense recent days monopolize the quota and silently discarded
+        // older April activity from the heatmap, even though those events
+        // were parsed from disk. Bucketing caps at 12 buckets/day × 30 days
+        // = 360 events max, comfortably representing the full window
+        // without truncation.
+        let bucketedEvents = bucketGeminiHeatmapEvents(from: combinedEvents, now: now)
 
         return QuotaSnapshot(
             providerID: .gemini,
@@ -573,10 +696,62 @@ private struct GeminiLocalStateReader {
             stats: stats,
             balances: [],
             signals: signals,
-            events: cappedEvents,
+            events: bucketedEvents,
             fetchState: .success,
             fetchedAt: latestActivity > .distantPast ? latestActivity : now
         )
+    }
+
+    /// Aggregates per-message events into 2-hour heatmap buckets. One
+    /// `.bucket` event per (date, 2-hour) window where any activity was
+    /// observed, with summed tokens. Bounded at 12 × 30 = 360 events for
+    /// the heatmap window — naturally fits within downstream caps. The
+    /// model field is set to the most-represented model in the bucket so
+    /// `guessProviderFromModel` resolves correctly when the heatmap
+    /// renders. Same pattern as `ClaudeHeatmapEventBucketer`.
+    private func bucketGeminiHeatmapEvents(from events: [UsageEvent], now: Date) -> [UsageEvent] {
+        let calendar = Calendar.current
+        let horizon = now.addingTimeInterval(-30 * 24 * 60 * 60)
+
+        struct BucketAcc {
+            var tokens: Double = 0
+            // Track per-model contributions so the dominant model wins
+            // when the heatmap picks a representative event for the cell.
+            var modelTokens: [String: Double] = [:]
+        }
+
+        var buckets: [Date: BucketAcc] = [:]
+
+        for event in events where event.timestamp >= horizon {
+            let bucketStart = geminiBucketStart(for: event.timestamp, calendar: calendar)
+            var acc = buckets[bucketStart] ?? BucketAcc()
+            let tokens = event.tokens ?? 0
+            acc.tokens += tokens
+            if let model = event.model, !model.isEmpty {
+                acc.modelTokens[model, default: 0] += max(tokens, 1)
+            }
+            buckets[bucketStart] = acc
+        }
+
+        return buckets
+            .map { bucketStart, acc -> UsageEvent in
+                let dominantModel = acc.modelTokens.max(by: { $0.value < $1.value })?.key ?? "Gemini"
+                return UsageEvent(
+                    timestamp: bucketStart,
+                    tokens: acc.tokens > 0 ? acc.tokens : nil,
+                    model: dominantModel,
+                    type: .bucket
+                )
+            }
+            .sorted { $0.timestamp > $1.timestamp }
+    }
+
+    private func geminiBucketStart(for date: Date, calendar: Calendar) -> Date {
+        let dayStart = calendar.startOfDay(for: date)
+        let hour = calendar.component(.hour, from: date)
+        let bucketIndex = max(0, min(11, hour / 2))
+        return calendar.date(byAdding: .hour, value: bucketIndex * 2, to: dayStart)
+            ?? dayStart.addingTimeInterval(Double(bucketIndex * 2 * 3600))
     }
 
     private func loadMetadata(rootURL: URL) -> GeminiMetadata {
@@ -837,6 +1012,13 @@ private struct GeminiSessionFile: Decodable {
     let messages: [GeminiMessage]
 }
 
+/// First line of a `.jsonl` session file. The CLI writes a small metadata
+/// record before any messages — we only need the sessionId to satisfy
+/// `GeminiSessionFile`'s shape; the rest is for the Gemini CLI's own use.
+private struct GeminiSessionMetadata: Decodable {
+    let sessionId: String
+}
+
 private struct GeminiMessage: Decodable {
     let id: String?
     let timestamp: Date?
@@ -1042,5 +1224,332 @@ enum GeminiLimitPreset: String, CaseIterable, Identifiable {
         case .conservative:
             return "API Key / Free Tier ceilings: Flash + Flash Lite 1.0K/day, Pro 50/day, Weekly 7.0K."
         }
+    }
+}
+
+// MARK: - Gemini Code Assist Live Quota
+//
+// Replaces the prior heuristic (counting local history files) with the same
+// authoritative source that `gemini /model` shows in the terminal: Google's
+// internal Code Assist endpoint, called by the CLI as `retrieveUserQuota`.
+// The response includes one bucket per model with a real `remainingFraction`.
+//
+// Endpoint:  POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
+// Body:      {"project": "default"}
+// Auth:      Authorization: Bearer <google_oauth_access_token>
+// Identifiers and refresh endpoint extracted from the shipped Gemini CLI bundle.
+
+/// Snapshot of `~/.gemini/oauth_creds.json` after parsing.
+private struct GeminiOAuthCredentials {
+    let accessToken: String
+    let refreshToken: String?
+    let expiryDateMillis: Double?  // ms since epoch (Google's format)
+
+    var expiresAt: Date? {
+        expiryDateMillis.map { Date(timeIntervalSince1970: $0 / 1000) }
+    }
+
+    func needsRefresh(buffer: TimeInterval) -> Bool {
+        guard let expiresAt else { return false }
+        return Date().addingTimeInterval(buffer) >= expiresAt
+    }
+}
+
+/// Decodes the response from Google's OAuth refresh endpoint.
+private struct GeminiOAuthRefreshResponse: Decodable {
+    let accessToken: String
+    let expiresIn: Int?
+    let refreshToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken  = "access_token"
+        case expiresIn    = "expires_in"
+        case refreshToken = "refresh_token"
+    }
+}
+
+/// One quota bucket returned by `retrieveUserQuota`.
+private struct GeminiQuotaBucket: Decodable {
+    let modelId: String
+    let remainingFraction: Double?
+    let remainingAmount: String?
+    let resetTime: Date?
+    let tokenType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case modelId          = "modelId"
+        case remainingFraction = "remainingFraction"
+        case remainingAmount  = "remainingAmount"
+        case resetTime        = "resetTime"
+        case tokenType        = "tokenType"
+    }
+}
+
+private struct GeminiQuotaResponse: Decodable {
+    let buckets: [GeminiQuotaBucket]
+}
+
+/// Coalesces concurrent token reads, refreshes the Google access token when
+/// it's near expiry, and serves a usable bearer token to live-quota calls.
+/// Tokens are persisted only in memory — the user's `~/.gemini/oauth_creds.json`
+/// file is read-only for our purposes (Gemini CLI rewrites it when run).
+private actor GeminiOAuthTokenManager {
+    static let shared = GeminiOAuthTokenManager()
+
+    // Refresh slightly before the stored expiry so the live API call never
+    // races a token going invalid mid-flight.
+    private let refreshBuffer: TimeInterval = 5 * 60     // 5 min
+    private let minRetryInterval: TimeInterval = 60      // post-failure backoff
+
+    /// OAuth identifiers extracted verbatim from `chunk-B2OARGJJ.js` in the
+    /// shipped Gemini CLI bundle (variables `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET`).
+    /// They are embedded in the public CLI binary; treating them as public
+    /// "installed app" client identifiers is the standard Google pattern.
+    private let clientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+    private let clientSecret = "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"
+
+    /// In-memory override that survives the access-token expiry until the user
+    /// next runs the Gemini CLI (which re-writes the file).
+    private var refreshedAccessToken: String?
+    private var refreshedExpiresAt: Date?
+    private var inflight: Task<String?, Never>?
+    private var lastFailureAt: Date?
+
+    func currentAccessToken(geminiRootURL: URL) async -> String? {
+        // Prefer our in-memory refreshed token if still valid.
+        if let refreshedAccessToken,
+           let refreshedExpiresAt,
+           Date().addingTimeInterval(refreshBuffer) < refreshedExpiresAt {
+            return refreshedAccessToken
+        }
+
+        guard let creds = Self.readOAuthCredsFile(geminiRootURL: geminiRootURL) else {
+            return nil
+        }
+
+        if !creds.needsRefresh(buffer: refreshBuffer) {
+            return creds.accessToken
+        }
+
+        // Refresh-error backoff.
+        if let lastFailureAt, Date().timeIntervalSince(lastFailureAt) < minRetryInterval {
+            return creds.accessToken
+        }
+
+        if let inflight {
+            return await inflight.value
+        }
+
+        let task = Task { [creds] in
+            await self.performRefresh(creds: creds)
+        }
+        inflight = task
+        let result = await task.value
+        inflight = nil
+
+        if result == nil {
+            lastFailureAt = Date()
+            return creds.accessToken  // Stale but maybe still usable
+        }
+        lastFailureAt = nil
+        return result
+    }
+
+    private func performRefresh(creds: GeminiOAuthCredentials) async -> String? {
+        guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else {
+            print("[GeminiOAuth] No refresh_token available — cannot refresh")
+            return nil
+        }
+
+        let url = URL(string: "https://oauth2.googleapis.com/token")!
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        // Google's refresh request is x-www-form-urlencoded.
+        let params = [
+            "client_id":     clientID,
+            "client_secret": clientSecret,
+            "refresh_token": refreshToken,
+            "grant_type":    "refresh_token"
+        ]
+        request.httpBody = params
+            .map { "\($0.key)=\(Self.urlEncode($0.value))" }
+            .joined(separator: "&")
+            .data(using: .utf8)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                let bodyStr = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+                print("[GeminiOAuth] Refresh HTTP \(status): \(bodyStr)")
+                return nil
+            }
+            let parsed = try JSONDecoder().decode(GeminiOAuthRefreshResponse.self, from: data)
+            refreshedAccessToken = parsed.accessToken
+            refreshedExpiresAt = parsed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
+            print("[GeminiOAuth] Refresh OK. New token expires in \(parsed.expiresIn ?? -1)s")
+            return parsed.accessToken
+        } catch {
+            print("[GeminiOAuth] Refresh failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Reads and parses `oauth_creds.json` at `<geminiRootURL>/oauth_creds.json`.
+    /// Caller must already hold security-scoped access on `geminiRootURL`.
+    private static func readOAuthCredsFile(geminiRootURL: URL) -> GeminiOAuthCredentials? {
+        let credsURL = geminiRootURL.appendingPathComponent("oauth_creds.json")
+        guard let data = try? Data(contentsOf: credsURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = json["access_token"] as? String,
+              !accessToken.isEmpty else {
+            return nil
+        }
+        let refreshToken = json["refresh_token"] as? String
+        let expiry = (json["expiry_date"] as? NSNumber)?.doubleValue
+        return GeminiOAuthCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiryDateMillis: expiry
+        )
+    }
+
+    private static func urlEncode(_ value: String) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+/?")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+}
+
+/// Per-cycle cache for the live quota response so we don't hammer Google's
+/// endpoint at the dashboard's refresh interval. 90s fresh, 30 min stale fallback.
+private final class GeminiQuotaCache: @unchecked Sendable {
+    static let shared = GeminiQuotaCache()
+    private let freshTTL: TimeInterval = 90
+    private let staleTTL: TimeInterval = 30 * 60
+    private let lock = NSLock()
+    private var stored: (windows: [QuotaWindow], fetchedAt: Date)?
+
+    func fresh() -> [QuotaWindow]? {
+        lock.lock(); defer { lock.unlock() }
+        guard let stored, Date().timeIntervalSince(stored.fetchedAt) < freshTTL else { return nil }
+        return stored.windows
+    }
+    func staleFallback() -> [QuotaWindow]? {
+        lock.lock(); defer { lock.unlock() }
+        guard let stored, Date().timeIntervalSince(stored.fetchedAt) < staleTTL else { return nil }
+        return stored.windows
+    }
+    func store(_ windows: [QuotaWindow]) {
+        lock.lock(); defer { lock.unlock() }
+        stored = (windows, Date())
+    }
+}
+
+enum GeminiLiveQuotaFetcher {
+    /// Calls the Code Assist quota endpoint and returns one `QuotaWindow` per
+    /// bucket. Returns nil on auth/network failure (caller falls back to the
+    /// local heuristic).
+    static func fetchWindows(accessToken: String) async -> [QuotaWindow]? {
+        if let cached = GeminiQuotaCache.shared.fresh() {
+            return cached
+        }
+        let url = URL(string: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")!
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["project": "default"])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                print("[GeminiLiveQuota] HTTP \(status) — falling back to stale cache if any")
+                return GeminiQuotaCache.shared.staleFallback()
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .custom { decoder in
+                let raw = try decoder.singleValueContainer().decode(String.self)
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                if let d = formatter.date(from: raw) { return d }
+                let fractional = ISO8601DateFormatter()
+                fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                if let d = fractional.date(from: raw) { return d }
+                throw DecodingError.dataCorruptedError(in: try decoder.singleValueContainer(),
+                                                       debugDescription: "Unparseable date: \(raw)")
+            }
+            let parsed = try decoder.decode(GeminiQuotaResponse.self, from: data)
+
+            let windows = buildWindows(from: parsed.buckets)
+            GeminiQuotaCache.shared.store(windows)
+            return windows
+        } catch {
+            print("[GeminiLiveQuota] Fetch error: \(error.localizedDescription)")
+            return GeminiQuotaCache.shared.staleFallback()
+        }
+    }
+
+    /// Maps each bucket into a `QuotaWindow`. Order matches what Gemini CLI
+    /// shows: current-generation Pro / Flash / Flash Lite first, previews last;
+    /// most-used at the top of each tier.
+    private static func buildWindows(from buckets: [GeminiQuotaBucket]) -> [QuotaWindow] {
+        // Sort: highest "used" first within priority tiers.
+        let sorted = buckets.sorted { a, b in
+            let aUsed = 1.0 - (a.remainingFraction ?? 1.0)
+            let bUsed = 1.0 - (b.remainingFraction ?? 1.0)
+            if (priority(a.modelId) != priority(b.modelId)) {
+                return priority(a.modelId) < priority(b.modelId)
+            }
+            return aUsed > bUsed
+        }
+
+        return sorted.compactMap { bucket -> QuotaWindow? in
+            guard let remaining = bucket.remainingFraction else { return nil }
+            let usedPercent = max(0.0, min(100.0, (1.0 - remaining) * 100.0))
+            return QuotaWindow(
+                label: displayName(for: bucket.modelId),
+                windowKind: .daily,
+                used: usedPercent,
+                total: 100,
+                resetDate: bucket.resetTime,
+                unit: "%",
+                subtitle: "Live from Code Assist: \(bucket.modelId)"
+            )
+        }
+    }
+
+    /// Lower number = shown earlier. Groups by family then generation.
+    private static func priority(_ modelId: String) -> Int {
+        let id = modelId.lowercased()
+        // Newest generation first.
+        let genWeight = id.contains("3.1") ? 0 :
+                        id.contains("3-") || id.hasSuffix("-3") ? 10 :
+                        id.contains("2.5") ? 20 : 30
+        let famWeight = id.contains("flash-lite") ? 2 :
+                        id.contains("flash")      ? 1 :
+                        id.contains("pro")        ? 0 : 3
+        return genWeight + famWeight
+    }
+
+    /// Friendly label like "Pro 3.1 (preview)" or "Flash 2.5".
+    private static func displayName(for modelId: String) -> String {
+        let id = modelId.lowercased()
+        let family: String =
+            id.contains("flash-lite") ? "Flash Lite" :
+            id.contains("flash")      ? "Flash" :
+            id.contains("pro")        ? "Pro" : modelId
+        let generation: String =
+            id.contains("3.1") ? "3.1" :
+            id.contains("3-")  || id.hasSuffix("-3") ? "3" :
+            id.contains("2.5") ? "2.5" : ""
+        let isPreview = id.contains("preview")
+        let parts = [family, generation].filter { !$0.isEmpty }
+        let base = parts.joined(separator: " ")
+        return isPreview ? "\(base) (preview)" : base
     }
 }

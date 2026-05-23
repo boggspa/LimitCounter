@@ -8,10 +8,14 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     public let providerID: ProviderID = .codexTelemetry
 
     private let fileManager: FileManager
-    private let sessionScanLookback: TimeInterval = 3 * 24 * 60 * 60
-    private let maxSessionTelemetryFiles = 12
-    private let maxSessionTelemetryBytes = 4 * 1024 * 1024
+    // 30 days: matches the heatmap window so historical activity remains
+    // visible even after a multi-day quiet period on Codex CLI.
+    private let sessionScanLookback: TimeInterval = 30 * 24 * 60 * 60
+    private let maxSessionTelemetryFiles = 4
+    private let maxSessionTelemetryBytes = 1 * 1024 * 1024
     private let maxTextTelemetryBytes = 8 * 1024 * 1024
+    private let sqliteTelemetryLookback: TimeInterval = 35 * 24 * 60 * 60
+    private let maxSQLiteEventsPerHeatmapBucket = 8
 
     public init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -56,7 +60,23 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         let weekStart = now.addingTimeInterval(-7 * 24 * 60 * 60)
         let monthStart = now.addingTimeInterval(-30 * 24 * 60 * 60)
 
-        let scanFiles = discoverTelemetryURLs(in: rootURL)
+        let primaryScanFiles = discoverTelemetryURLs(in: rootURL)
+        // Codex CLI's `logs_2.sqlite` keeps only a short telemetry tail
+        // (we've observed ~10 days), but session JSONL files at
+        // `sessions/YYYY/MM/DD/rollout-*.jsonl` extend much further
+        // back. The primary scan honours `prefix(2)` for perf when
+        // SQLite is present, so older days never get scanned. This
+        // targeted backfill picks up session files only for dates that
+        // are *missing* from the persisted snapshot — typically a
+        // one-shot expense on first launch after the fix, then quiet
+        // forever because the persisted snapshot retains the buckets.
+        let backfillFiles = backfillSessionTelemetryURLs(in: rootURL, now: now)
+        let scanFiles = primaryScanFiles + backfillFiles
+        if backfillFiles.isEmpty {
+            print("[CodexTelemetry] Scanning \(scanFiles.count) telemetry sources")
+        } else {
+            print("[CodexTelemetry] Scanning \(scanFiles.count) telemetry sources (\(backfillFiles.count) historical backfill)")
+        }
 
         var sessionEvents = 0.0
         var weekEvents = 0.0
@@ -85,21 +105,21 @@ public struct CodexTelemetryProviderClient: ProviderClient {
                 ))
 
                 if record.timestamp >= now.addingTimeInterval(-5 * 60 * 60) {
-                    sessionEvents += 1
+                    sessionEvents += record.eventCount
                 }
                 if record.timestamp >= weekStart {
-                    weekEvents += 1
+                    weekEvents += record.eventCount
                 }
                 if record.timestamp >= monthStart {
-                    monthEvents += 1
+                    monthEvents += record.eventCount
                 }
 
                 if record.timestamp >= dayStart {
                     tokenCount24h += record.tokenCount
-                    if record.isPrompt { promptEvents24h += 1 }
-                    if record.isResponse { responseEvents24h += 1 }
-                    if record.isToolEvent { toolEvents24h += 1 }
-                    if record.isApprovalEvent { approvalEvents24h += 1 }
+                    if record.isPrompt { promptEvents24h += record.eventCount }
+                    if record.isResponse { responseEvents24h += record.eventCount }
+                    if record.isToolEvent { toolEvents24h += record.eventCount }
+                    if record.isApprovalEvent { approvalEvents24h += record.eventCount }
                 }
 
                 if record.timestamp >= weekStart {
@@ -116,9 +136,11 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             }
         }
 
-        guard monthEvents > 0 || tokenCount24h > 0 || !conversationIDs.isEmpty else {
-            throw ProviderFetchError.notConfigured
-        }
+        // Previous behavior threw `notConfigured` whenever the lookback window
+        // contained no recent activity, which made Codex flicker off the
+        // dashboard and heatmap during quiet periods. We now return a valid
+        // (possibly empty-events) snapshot so the provider stays configured,
+        // and the heatmap retains any older cached events.
 
         let windows = [
             QuotaWindow(
@@ -150,8 +172,17 @@ public struct CodexTelemetryProviderClient: ProviderClient {
 
         let signals: [QuotaSignal] = []
 
-        let sortedEvents = events.sorted { $0.timestamp > $1.timestamp }
-        let cappedEvents = Array(sortedEvents.prefix(1000))
+        // AGBench's unified `usage.json` records every run including
+        // Codex CLI invocations. Adding those events here means a user
+        // who drives Codex through GUIGemini sees the corresponding
+        // squares on the heatmap even if the underlying telemetry files
+        // have rotated out of Codex's own SQLite/session retention.
+        // No-op when the user hasn't granted the AGBench bookmark.
+        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "codex")
+        let mergedEvents = events + agbenchEvents
+
+        let cappedEvents = cappedHeatmapEvents(from: mergedEvents, now: now)
+        print("[CodexTelemetry] Loaded \(events.count) telemetry events + \(agbenchEvents.count) AGBench events, retaining \(cappedEvents.count) heatmap events")
 
         return QuotaSnapshot(
             providerID: .codexTelemetry,
@@ -168,6 +199,16 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     }
 
     private func discoverTelemetryURLs(in root: URL) -> [CodexTelemetryFileInfo] {
+        if isRegularFile(root) {
+            return [
+                CodexTelemetryFileInfo(
+                    url: root,
+                    modificationDate: fileModificationDate(for: root),
+                    fileSize: fileSize(for: root)
+                )
+            ]
+        }
+
         let candidateURLs = telemetryCandidateURLs(in: root)
         let existing = candidateURLs.compactMap { url -> CodexTelemetryFileInfo? in
             guard fileManager.fileExists(atPath: url.path) else { return nil }
@@ -178,7 +219,10 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             )
         }
 
-        return (existing + sessionTelemetryURLs(in: root)).sorted { lhs, rhs in
+        let hasSQLite = existing.contains { $0.url.lastPathComponent == "logs_2.sqlite" }
+        let sessionFiles = hasSQLite ? Array(sessionTelemetryURLs(in: root).prefix(2)) : sessionTelemetryURLs(in: root)
+
+        return (existing + sessionFiles).sorted { lhs, rhs in
             lhs.modificationDate > rhs.modificationDate
         }
     }
@@ -245,6 +289,88 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         )
     }
 
+    /// Cap how much we'll backfill per fetch. Each session file reads up
+    /// to `maxSessionTelemetryBytes` (1 MB) so 80 files ≈ 80 MB tops —
+    /// large enough to clear a typical multi-week gap in 1-2 fetches,
+    /// small enough to keep the first post-deploy refresh under a few
+    /// seconds. Once the persisted snapshot has events for every day in
+    /// the 30-day window, this returns [] and goes quiet.
+    private static let maxBackfillFilesPerFetch = 80
+
+    /// Returns session JSONL files for dates that have NO events in the
+    /// currently-persisted Codex snapshot, so we can fill the gap left
+    /// by Codex CLI's short SQLite retention. Ordered newest-first so
+    /// the most recently missed days backfill first.
+    ///
+    /// Why "missing dates" rather than always scanning everything: the
+    /// 30-day session-file pool can be 7+ GB on heavy users. Reading
+    /// all of it on every refresh is unworkable. But dates that already
+    /// have events in the snapshot don't need re-scanning — their
+    /// buckets are durably persisted by `SyncCoordinator`'s history
+    /// merge. So after a one-shot backfill, this stays a no-op.
+    private func backfillSessionTelemetryURLs(in root: URL, now: Date) -> [CodexTelemetryFileInfo] {
+        let sessionsRoot = root.lastPathComponent == "sessions"
+            ? root
+            : root.appendingPathComponent("sessions")
+        guard isDirectory(sessionsRoot) else { return [] }
+
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+
+        // Days already covered by the persisted snapshot — those don't
+        // need re-scanning.
+        let datesWithEvents: Set<Date> = {
+            guard let previous = QuotaSnapshotStore.shared.loadSnapshots()
+                .first(where: { $0.providerID == .codexTelemetry }) else {
+                return []
+            }
+            return Set(previous.events.map { calendar.startOfDay(for: $0.timestamp) })
+        }()
+
+        // Walk the 30-day window newest-first, collecting session files
+        // for each missing day. Stop once we hit the per-fetch file
+        // budget so a heavy backfill doesn't blow out the fetch timeout.
+        let dateFormatter = DateFormatter()
+        dateFormatter.calendar = calendar
+        dateFormatter.dateFormat = "yyyy/MM/dd"
+        dateFormatter.timeZone = calendar.timeZone
+
+        var collected: [CodexTelemetryFileInfo] = []
+
+        for daysAgo in 0..<30 {
+            guard collected.count < Self.maxBackfillFilesPerFetch,
+                  let targetDate = calendar.date(byAdding: .day, value: -daysAgo, to: today) else {
+                continue
+            }
+            if datesWithEvents.contains(targetDate) { continue }
+
+            let folderPath = dateFormatter.string(from: targetDate)
+            let folderURL = sessionsRoot.appendingPathComponent(folderPath)
+            guard isDirectory(folderURL) else { continue }
+
+            let folderContents = (try? fileManager.contentsOfDirectory(
+                at: folderURL,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+            )) ?? []
+
+            for url in folderContents where url.pathExtension == "jsonl" {
+                if collected.count >= Self.maxBackfillFilesPerFetch { break }
+                guard let values = try? url.resourceValues(
+                    forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+                ), values.isRegularFile == true else { continue }
+                collected.append(
+                    CodexTelemetryFileInfo(
+                        url: url,
+                        modificationDate: values.contentModificationDate ?? fileModificationDate(for: url),
+                        fileSize: values.fileSize ?? fileSize(for: url)
+                    )
+                )
+            }
+        }
+
+        return collected
+    }
+
     private func readTelemetryRecords(from url: URL) throws -> [CodexTelemetryRecord] {
         if url.lastPathComponent == "logs_2.sqlite" {
             return try readSQLiteTelemetryRecords(from: url)
@@ -303,21 +429,18 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             return []
         }
 
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
+        guard let db = openReadOnlySQLiteDatabase(at: url) else {
             return []
         }
         defer { sqlite3_close(db) }
 
+        let cutoff = Int64(Date().addingTimeInterval(-sqliteTelemetryLookback).timeIntervalSince1970)
         let query = """
-        SELECT ts, ts_nanos, target, feedback_log_body, thread_id
-        FROM (
-            SELECT ts, ts_nanos, target, feedback_log_body, thread_id
-            FROM logs
-            ORDER BY ts DESC, ts_nanos DESC, id DESC
-            LIMIT 50000
-        )
-        ORDER BY ts ASC, ts_nanos ASC;
+        SELECT (ts / 7200) * 7200 AS bucket_ts, COUNT(*) AS event_count
+        FROM logs
+        WHERE ts >= ?
+        GROUP BY bucket_ts
+        ORDER BY bucket_ts ASC;
         """
 
         var statement: OpaquePointer?
@@ -325,40 +448,126 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             return []
         }
         defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, cutoff)
 
         var records: [CodexTelemetryRecord] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let ts = sqlite3_column_int64(statement, 0)
-            let tsNanos = sqlite3_column_int64(statement, 1)
-            let target = stringValue(forColumn: 2, statement: statement) ?? ""
-            let body = stringValue(forColumn: 3, statement: statement) ?? ""
-            let threadID = stringValue(forColumn: 4, statement: statement)
+            let bucketTimestamp = sqlite3_column_int64(statement, 0)
+            let eventCount = max(1, sqlite3_column_int64(statement, 1))
+            let markerCount = min(maxSQLiteEventsPerHeatmapBucket, max(1, Int(ceil(log2(Double(eventCount) + 1)))))
+            let countPerMarker = Double(eventCount) / Double(markerCount)
+            let spacing = 7200.0 / Double(markerCount + 1)
 
-            let timestamp = Date(timeIntervalSince1970: Double(ts) + Double(tsNanos) / 1_000_000_000.0)
-            let embeddedJSON = embeddedJSONObject(from: body)
-            let eventName = extractEventName(from: embeddedJSON, target: target, body: body)
-            let tokenCount = tokenEstimate(
-                from: embeddedJSON,
-                eventName: eventName,
-                target: target,
-                body: body
-            )
-
-            records.append(
-                CodexTelemetryRecord(
-                    timestamp: timestamp,
-                    conversationID: threadID,
-                    eventName: eventName,
-                    tokenCount: tokenCount,
-                    isPrompt: classifyPrompt(target: target, body: body),
-                    isResponse: classifyResponse(target: target, body: body),
-                    isToolEvent: classifyToolEvent(target: target, body: body),
-                    isApprovalEvent: classifyApprovalEvent(target: target, body: body)
+            for index in 0..<markerCount {
+                records.append(
+                    CodexTelemetryRecord(
+                        timestamp: Date(timeIntervalSince1970: Double(bucketTimestamp) + spacing * Double(index + 1)),
+                        conversationID: nil,
+                        eventName: "codex.sqlite.bucket.\(bucketTimestamp).\(index)",
+                        tokenCount: 0,
+                        isPrompt: false,
+                        isResponse: false,
+                        isToolEvent: false,
+                        isApprovalEvent: false,
+                        eventCount: countPerMarker
+                    )
                 )
-            )
+            }
         }
 
         return records
+    }
+
+    private func sqliteEventName(target: String, body: String) -> String {
+        if !target.isEmpty {
+            return target
+        }
+
+        if let delimiterIndex = body.firstIndex(of: ":") {
+            let prefix = body[body.startIndex..<delimiterIndex]
+            return prefix.trimmingCharacters(in: .whitespaces)
+        }
+
+        return "codex.sqlite"
+    }
+
+    private func sqliteClassificationSample(target: String, body: String) -> String {
+        let prefix = body.prefix(4096)
+        return "\(target) \(prefix)".lowercased()
+    }
+
+    private func fastSQLiteTokenEstimate(target: String, body: String) -> Double {
+        let lowerTarget = target.lowercased()
+        guard lowerTarget.contains("response")
+                || lowerTarget.contains("completion")
+                || body.contains(#""usage""#)
+                || body.contains("total_tokens")
+                || body.contains("input_tokens")
+                || body.contains("output_tokens") else {
+            return 0
+        }
+
+        if let total = fastJSONNumber(in: body, key: "total_tokens")
+            ?? fastJSONNumber(in: body, key: "totalTokens"),
+           total > 0 {
+            return total
+        }
+
+        let input = fastJSONNumber(in: body, key: "input_tokens")
+            ?? fastJSONNumber(in: body, key: "prompt_tokens")
+            ?? fastJSONNumber(in: body, key: "cached_input_tokens")
+        let output = fastJSONNumber(in: body, key: "output_tokens")
+            ?? fastJSONNumber(in: body, key: "completion_tokens")
+
+        if let input, let output { return input + output }
+        return input ?? output ?? 0
+    }
+
+    private func fastJSONNumber(in text: String, key: String) -> Double? {
+        let quotedKey = "\"\(key)\""
+        guard let keyRange = text.range(of: quotedKey, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let afterKey = text[keyRange.upperBound...]
+        guard let colon = afterKey.firstIndex(of: ":") else {
+            return nil
+        }
+
+        var index = afterKey.index(after: colon)
+        while index < afterKey.endIndex,
+              afterKey[index].isWhitespace || afterKey[index] == "\"" {
+            index = afterKey.index(after: index)
+        }
+
+        let start = index
+        while index < afterKey.endIndex,
+              afterKey[index].isNumber || afterKey[index] == "." {
+            index = afterKey.index(after: index)
+        }
+
+        guard start < index else { return nil }
+        return Double(afterKey[start..<index])
+    }
+
+    private func openReadOnlySQLiteDatabase(at url: URL) -> OpaquePointer? {
+        var db: OpaquePointer?
+        if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db {
+            return db
+        }
+        if let db {
+            sqlite3_close(db)
+        }
+
+        db = nil
+        let uri = url.absoluteString + "?mode=ro&immutable=1"
+        if sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK, let db {
+            return db
+        }
+        if let db {
+            sqlite3_close(db)
+        }
+        return nil
     }
 
     private func parseRecord(from json: Any) -> CodexTelemetryRecord? {
@@ -405,7 +614,8 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             isPrompt: isPrompt || promptTextPresent,
             isResponse: isResponse || responseTextPresent,
             isToolEvent: isToolEvent,
-            isApprovalEvent: isApprovalEvent
+            isApprovalEvent: isApprovalEvent,
+            eventCount: 1
         )
     }
 
@@ -434,8 +644,27 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             isPrompt: false,
             isResponse: true,
             isToolEvent: false,
-            isApprovalEvent: false
+            isApprovalEvent: false,
+            eventCount: 1
         )
+    }
+
+    private func cappedHeatmapEvents(from events: [UsageEvent], now: Date) -> [UsageEvent] {
+        let cutoff = now.addingTimeInterval(-35 * 24 * 60 * 60)
+        var retained: [UsageEvent] = []
+        var bucketCounts: [CodexTelemetryBucketKey: Int] = [:]
+        let calendar = Calendar.current
+
+        for event in events.sorted(by: { $0.timestamp > $1.timestamp }) where event.timestamp >= cutoff {
+            let key = CodexTelemetryBucketKey(timestamp: event.timestamp, calendar: calendar)
+            guard bucketCounts[key, default: 0] < maxSQLiteEventsPerHeatmapBucket else {
+                continue
+            }
+            bucketCounts[key, default: 0] += 1
+            retained.append(event)
+        }
+
+        return retained.sorted { $0.timestamp > $1.timestamp }
     }
 
     private func embeddedJSONObject(from text: String) -> Any? {
@@ -596,32 +825,44 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     }
 
     private func classifyPrompt(target: String, body: String) -> Bool {
-        let text = "\(target) \(body)".lowercased()
-        return text.contains("submission_dispatch")
+        classifyPrompt(lowercasedText: "\(target) \(body)".lowercased())
+    }
+
+    private func classifyResponse(target: String, body: String) -> Bool {
+        classifyResponse(lowercasedText: "\(target) \(body)".lowercased())
+    }
+
+    private func classifyToolEvent(target: String, body: String) -> Bool {
+        classifyToolEvent(lowercasedText: "\(target) \(body)".lowercased())
+    }
+
+    private func classifyApprovalEvent(target: String, body: String) -> Bool {
+        classifyApprovalEvent(lowercasedText: "\(target) \(body)".lowercased())
+    }
+
+    private func classifyPrompt(lowercasedText text: String) -> Bool {
+        text.contains("submission_dispatch")
             || text.contains("user_input")
             || text.contains("prompt")
             || text.contains("run_sampling_request")
     }
 
-    private func classifyResponse(target: String, body: String) -> Bool {
-        let text = "\(target) \(body)".lowercased()
-        return text.contains("response.completed")
+    private func classifyResponse(lowercasedText text: String) -> Bool {
+        text.contains("response.completed")
             || text.contains("response.created")
             || text.contains("response.in_progress")
             || text.contains("responses_websocket")
     }
 
-    private func classifyToolEvent(target: String, body: String) -> Bool {
-        let text = "\(target) \(body)".lowercased()
-        return text.contains("tool")
+    private func classifyToolEvent(lowercasedText text: String) -> Bool {
+        text.contains("tool")
             || text.contains("exec_command")
             || text.contains("list_tools")
             || text.contains("function")
     }
 
-    private func classifyApprovalEvent(target: String, body: String) -> Bool {
-        let text = "\(target) \(body)".lowercased()
-        return text.contains("approval")
+    private func classifyApprovalEvent(lowercasedText text: String) -> Bool {
+        text.contains("approval")
             || text.contains("exec_policy")
             || text.contains("policy")
             || text.contains("permission")
@@ -726,12 +967,32 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         return isDirectory.boolValue
     }
 
+    private func isRegularFile(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        return !isDirectory.boolValue
+    }
+
     private func resolvedTelemetryRootURL(credentials: ProviderCredential?) -> URL {
         if let path = credentials?.customEndpoint, !path.isEmpty {
             return URL(fileURLWithPath: path)
         }
         #if os(macOS)
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        // `homeDirectoryForCurrentUser` returns the sandbox container in a
+        // sandboxed app, so we strip the container suffix from NSHomeDirectory
+        // to reach the real `~`. The actual file read still requires a
+        // security-scoped bookmark — but this gives auto-discovery and
+        // bookmark resolution a sane default to fall back on.
+        let homePath = NSHomeDirectory()
+        let realHomePath: String
+        if let containerRange = homePath.range(of: "/Library/Containers/") {
+            realHomePath = String(homePath[..<containerRange.lowerBound])
+        } else {
+            realHomePath = homePath
+        }
+        return URL(fileURLWithPath: realHomePath).appendingPathComponent(".codex")
         #else
         return FileManager.default.temporaryDirectory // Fallback for iOS
         #endif
@@ -810,4 +1071,15 @@ private struct CodexTelemetryRecord {
     let isResponse: Bool
     let isToolEvent: Bool
     let isApprovalEvent: Bool
+    let eventCount: Double
+}
+
+private struct CodexTelemetryBucketKey: Hashable {
+    let dayStart: Date
+    let row: Int
+
+    init(timestamp: Date, calendar: Calendar) {
+        dayStart = calendar.startOfDay(for: timestamp)
+        row = calendar.component(.hour, from: timestamp) / 2
+    }
 }
