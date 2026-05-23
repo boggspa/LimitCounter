@@ -3,6 +3,7 @@
 # Xcode build products and local state
 DerivedData/
 build/
+dist/
 *.xcresult
 *.moved-aside
 *.hmap
