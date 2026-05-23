@@ -11,11 +11,13 @@ import UIKit
 public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case claude
     case openai
+    case openaiAPI
     case chatgpt
     case codexTelemetry
     case windsurf
     case cursor
     case gemini
+    case kimi
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -32,12 +34,15 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .claude:   return "Claude"
         case .openai:   return "Codex"
+        case .openaiAPI:
+            return "OpenAI API"
         case .chatgpt:  return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
         case .windsurf: return "Windsurf"
         case .cursor:   return "Cursor"
         case .gemini:   return "Gemini"
+        case .kimi:     return "Kimi Code"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -46,11 +51,13 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .openai:
             return "Codex"
+        case .openaiAPI:
+            return "OpenAI API"
         case .chatgpt:
             return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .claude, .windsurf, .cursor, .gemini, .heatmap:
+        case .claude, .windsurf, .cursor, .gemini, .kimi, .heatmap:
             return displayName
         }
     }
@@ -59,26 +66,32 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .claude:   return "brain.head.profile.fill"
         case .openai:   return "terminal.fill"
+        case .openaiAPI:
+            return "chart.line.uptrend.xyaxis"
         case .chatgpt:  return "bubble.left.and.bubble.right.fill"
         case .codexTelemetry:
             return "cpu.fill"
         case .windsurf: return "wave.3.right"
         case .cursor:   return "cursorarrow.rays"
         case .gemini:   return "sparkles"
+        case .kimi:     return "moon.stars.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
 
     public var accentColorHex: String {
         switch self {
-        case .claude:   return "#F59E0B" // Amber
-        case .openai:   return "#6366F1" // Indigo
+        case .claude:   return "#B85838" // Claude Rust
+        case .openai:   return "#4D4DFF" // Electric Indigo — same hue family as the previous #6366F1 (~240°) but saturation maxed to 100% (was 84%) for stronger contrast against Gemini's Google Blue #4285F4
+        case .openaiAPI:
+            return "#10B981" // OpenAI Green
         case .chatgpt:  return "#10B981" // Emerald/OpenAI Green
         case .codexTelemetry:
-            return "#6366F1" // Indigo
+            return "#4D4DFF" // Electric Indigo — same hue family as the previous #6366F1 (~240°) but saturation maxed to 100% (was 84%) for stronger contrast against Gemini's Google Blue #4285F4
         case .windsurf: return "#2D5AB2" // Deep Windsurf Blue
         case .cursor:   return "#EAB308" // Gold
         case .gemini:   return "#4285F4" // Google Blue
+        case .kimi:     return "#6B8E23" // Kimi Olive
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -89,6 +102,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderClaudeLogo"
         case .openai:
             return "ProviderCodexLogo"
+        case .openaiAPI:
+            return "ProviderChatGPTLogo"
         case .chatgpt:
             return "ProviderChatGPTLogo"
         case .codexTelemetry:
@@ -99,6 +114,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderCursorLogo"
         case .gemini:
             return "ProviderGeminiLogo"
+        case .kimi:
+            return ""
         case .heatmap:
             return ""
         }
@@ -108,7 +125,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .chatgpt, .codexTelemetry:
             return .prototype
-        case .claude, .openai, .windsurf, .cursor, .gemini:
+        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi:
             return .session
         case .heatmap:
             return .session
@@ -121,6 +138,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Claude Code local session"
         case .openai:
             return "Codex ChatGPT session"
+        case .openaiAPI:
+            return "OpenAI organization usage API"
         case .chatgpt:
             return "ChatGPT local desktop cache"
         case .codexTelemetry:
@@ -131,6 +150,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Cursor web session and local state"
         case .gemini:
             return "Gemini CLI local session"
+        case .kimi:
+            return "Kimi Code API or CLI session"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -139,9 +160,11 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     public var configurationDescription: String {
         switch self {
         case .claude:
-            return "Reads local Claude Code transcripts under `~/.claude` and turns them into token-based usage snapshots."
+            return "Reads local Claude Code transcripts under `~/.claude` for token stats. Add an OAuth token to unlock live 5-hour and 7-day quota meters directly from Anthropic."
         case .openai:
             return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface."
+        case .openaiAPI:
+            return "Uses an OpenAI admin API key and project ID to read official 30-day usage, request, and cost history from OpenAI organization APIs."
         case .chatgpt:
             return "Reads the local ChatGPT macOS app cache and turns recent conversation activity into local usage-style snapshots."
         case .codexTelemetry:
@@ -152,6 +175,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Uses a Cursor web session or dashboard token for live usage, and can read local Cursor state for cached account metadata."
         case .gemini:
             return "Reads local Gemini CLI history and metadata from `~/.gemini` and turns it into usage snapshots."
+        case .kimi:
+            return "Uses a Kimi Code Console API key or an explicitly imported Kimi CLI OAuth file to read weekly and rolling 5-hour quota."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -163,6 +188,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Claude Code data root"
         case .openai:
             return "Codex session access token"
+        case .openaiAPI:
+            return "OpenAI admin API key"
         case .chatgpt:
             return "ChatGPT app data folder"
         case .codexTelemetry:
@@ -173,6 +200,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Cursor web session cookie or dashboard token"
         case .gemini:
             return "Gemini CLI data root"
+        case .kimi:
+            return "Kimi Code API key"
         case .heatmap:
             return ""
         }
@@ -180,8 +209,12 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
 
     public var secondaryCredentialLabel: String? {
         switch self {
-        case .claude, .chatgpt, .gemini, .codexTelemetry, .heatmap:
+        case .claude:
+            return "OAuth token (optional)"
+        case .chatgpt, .gemini, .kimi, .codexTelemetry, .heatmap:
             return nil
+        case .openaiAPI:
+            return "Project ID"
         case .openai:
             return "ChatGPT account ID"
         case .windsurf:
@@ -195,6 +228,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .openai:
             return "Use only a Codex session you intentionally import or paste from an account you control."
+        case .openaiAPI:
+            return "Use only an OpenAI admin key you intentionally create for usage reporting, and scope it to the organization/project you control."
         case .chatgpt:
             return "Use only the local ChatGPT desktop app data folder you intentionally select from an account you control."
         case .codexTelemetry:
@@ -207,6 +242,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Use only credentials the user intentionally enters or exports."
         case .gemini:
             return "Use only local Gemini CLI log folders or history you intentionally point the app at."
+        case .kimi:
+            return "Use only a Kimi Code Console API key you intentionally enter, or a Kimi CLI OAuth file you explicitly import."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -259,6 +296,10 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.openai.codex", applicationNames: ["Codex.app"]),
                 AppIconCandidate(bundleIdentifier: "com.openai.chat", applicationNames: ["ChatGPT.app"])
             ]
+        case .openaiAPI:
+            return [
+                AppIconCandidate(bundleIdentifier: "com.openai.chat", applicationNames: ["ChatGPT.app"])
+            ]
         case .chatgpt:
             return [
                 AppIconCandidate(bundleIdentifier: "com.openai.chat", applicationNames: ["ChatGPT.app"])
@@ -272,6 +313,10 @@ public extension ProviderID {
             return [
                 AppIconCandidate(bundleIdentifier: "com.cursor.Cursor", applicationNames: ["Cursor.app"]),
                 AppIconCandidate(bundleIdentifier: "com.anysphere.cursor", applicationNames: ["Cursor.app"])
+            ]
+        case .kimi:
+            return [
+                AppIconCandidate(bundleIdentifier: "com.moonshot.kimichat", applicationNames: ["Kimi.app"])
             ]
         case .gemini, .codexTelemetry, .heatmap:
             return []
@@ -311,6 +356,52 @@ public enum QuotaWindowKind: String, Codable, Hashable {
     case sliding
     case project
     case custom
+}
+
+// MARK: - Quota Pace
+
+public enum QuotaPaceState: String, Codable, Hashable {
+    case ahead
+    case onTrack
+    case behind
+
+    public var title: String {
+        switch self {
+        case .ahead:
+            return "Ahead"
+        case .onTrack:
+            return "On track"
+        case .behind:
+            return "Behind"
+        }
+    }
+}
+
+public struct QuotaPace: Codable, Equatable, Hashable {
+    public let expectedFraction: Double
+    public let actualFraction: Double
+    public let deltaFraction: Double
+    public let state: QuotaPaceState
+
+    public var shouldSurface: Bool {
+        state != .onTrack
+    }
+
+    public var compactStatusText: String {
+        let value = max(1, Int((abs(deltaFraction) * 100).rounded()))
+        return "\(state.title) \(value)%"
+    }
+
+    public var colorHex: String {
+        switch state {
+        case .ahead:
+            return "#22C55E"
+        case .onTrack:
+            return "#94A3B8"
+        case .behind:
+            return "#F97316"
+        }
+    }
 }
 
 // MARK: - Quota Window
@@ -395,6 +486,75 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
         self.unit = unit
         self.subtitle = subtitle
     }
+
+    public func pace(providerID: ProviderID? = nil, at date: Date = Date()) -> QuotaPace? {
+        guard hasExplicitLimit, let total, total > 0 else { return nil }
+        guard let resetDate, resetDate > date else { return nil }
+        guard let duration = inferredPaceDuration(providerID: providerID), duration > 0 else { return nil }
+
+        let remaining = resetDate.timeIntervalSince(date)
+        let elapsed = min(max(duration - remaining, 0), duration)
+        let expectedFraction = min(max(elapsed / duration, 0), 1)
+
+        guard expectedFraction >= 0.03, expectedFraction < 0.985 else { return nil }
+
+        let actualFraction = min(max(used / total, 0), 1)
+        guard actualFraction < 1 else { return nil }
+
+        let delta = actualFraction - expectedFraction
+        let tolerance = 0.02
+        let state: QuotaPaceState
+        if delta > tolerance {
+            state = .behind
+        } else if delta < -tolerance {
+            state = .ahead
+        } else {
+            state = .onTrack
+        }
+
+        return QuotaPace(
+            expectedFraction: expectedFraction,
+            actualFraction: actualFraction,
+            deltaFraction: delta,
+            state: state
+        )
+    }
+
+    private func inferredPaceDuration(providerID: ProviderID?) -> TimeInterval? {
+        let descriptor = "\(label) \(subtitle ?? "")".lowercased()
+
+        if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") {
+            return 5 * 60 * 60
+        }
+
+        if descriptor.contains("24h") || descriptor.contains("24-hour") || descriptor.contains("daily") {
+            return 24 * 60 * 60
+        }
+
+        if descriptor.contains("7d") || descriptor.contains("7-day") || descriptor.contains("weekly") {
+            return 7 * 24 * 60 * 60
+        }
+
+        switch windowKind {
+        case .session:
+            if descriptor.contains("session") || providerID == .openai || providerID == .claude {
+                return 5 * 60 * 60
+            }
+            return nil
+        case .daily:
+            return 24 * 60 * 60
+        case .weekly:
+            return 7 * 24 * 60 * 60
+        case .monthly:
+            return 30 * 24 * 60 * 60
+        case .yearly:
+            return 365 * 24 * 60 * 60
+        case .sliding:
+            return nil
+        case .project, .custom:
+            return nil
+        }
+    }
 }
 
 // MARK: - Supplemental Stats
@@ -458,6 +618,7 @@ public struct QuotaBalance: Codable, Identifiable, Equatable, Hashable {
 
 public enum QuotaSignalKind: String, Codable, Hashable {
     case unexpectedRecovery
+    case scheduledReset
 }
 
 public enum QuotaSignalSeverity: String, Codable, Hashable {
@@ -533,6 +694,510 @@ public struct UsageEvent: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+// MARK: - Usage Analytics
+
+public enum UsageAnalyticsSource: String, Codable, Hashable {
+    case officialAPI
+    case localEstimate
+    case localTelemetry
+}
+
+public struct UsageAnalyticsBucket: Codable, Identifiable, Equatable, Hashable {
+    public let id: String
+    public let startDate: Date
+    public let endDate: Date
+    public let model: String?
+    public let projectID: String?
+    public let inputTokens: Double
+    public let outputTokens: Double
+    public let cachedInputTokens: Double
+    public let requests: Double
+    public let costUSD: Double?
+    public let source: UsageAnalyticsSource
+    public let note: String?
+
+    public var totalTokens: Double {
+        inputTokens + outputTokens + cachedInputTokens
+    }
+
+    public var hasUsage: Bool {
+        totalTokens > 0 || requests > 0 || (costUSD ?? 0) > 0
+    }
+
+    public init(
+        id: String? = nil,
+        startDate: Date,
+        endDate: Date,
+        model: String? = nil,
+        projectID: String? = nil,
+        inputTokens: Double = 0,
+        outputTokens: Double = 0,
+        cachedInputTokens: Double = 0,
+        requests: Double = 0,
+        costUSD: Double? = nil,
+        source: UsageAnalyticsSource,
+        note: String? = nil
+    ) {
+        self.startDate = startDate
+        self.endDate = endDate
+        self.model = model
+        self.projectID = projectID
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.requests = requests
+        self.costUSD = costUSD
+        self.source = source
+        self.note = note
+        self.id = id ?? Self.stableID(
+            startDate: startDate,
+            endDate: endDate,
+            model: model,
+            projectID: projectID,
+            source: source,
+            note: note
+        )
+    }
+
+    private static func stableID(
+        startDate: Date,
+        endDate: Date,
+        model: String?,
+        projectID: String?,
+        source: UsageAnalyticsSource,
+        note: String?
+    ) -> String {
+        [
+            source.rawValue,
+            String(Int(startDate.timeIntervalSince1970)),
+            String(Int(endDate.timeIntervalSince1970)),
+            model ?? "all-models",
+            projectID ?? "all-projects",
+            note ?? ""
+        ].joined(separator: "|")
+    }
+}
+
+public struct UsageAnalyticsPeriodTotals: Equatable, Hashable {
+    public var tokens: Double
+    public var requests: Double
+    public var cost: Double
+
+    public var hasUsage: Bool {
+        tokens > 0 || requests > 0 || cost > 0
+    }
+
+    public init(tokens: Double = 0, requests: Double = 0, cost: Double = 0) {
+        self.tokens = tokens
+        self.requests = requests
+        self.cost = cost
+    }
+
+    public mutating func add(_ bucket: UsageAnalyticsBucket) {
+        tokens += bucket.totalTokens
+        requests += bucket.requests
+        cost += bucket.costUSD ?? 0
+    }
+
+    public func scaled(by factor: Double) -> UsageAnalyticsPeriodTotals {
+        UsageAnalyticsPeriodTotals(
+            tokens: tokens * factor,
+            requests: requests * factor,
+            cost: cost * factor
+        )
+    }
+}
+
+public struct UsageAnalyticsDailySummary: Identifiable, Equatable, Hashable {
+    public let id: Date
+    public let date: Date
+    public let tokens: Double
+    public let requests: Double
+    public let cost: Double
+
+    public init(date: Date, totals: UsageAnalyticsPeriodTotals) {
+        self.id = date
+        self.date = date
+        self.tokens = totals.tokens
+        self.requests = totals.requests
+        self.cost = totals.cost
+    }
+}
+
+public struct UsageAnalyticsModelSummary: Identifiable, Equatable, Hashable {
+    public let id: String
+    public let name: String
+    public let tokens: Double
+    public let requests: Double
+    public let cost: Double
+    public let fractionOfMax: Double
+    public let fractionOfTotal: Double
+
+    public init(
+        name: String,
+        tokens: Double,
+        requests: Double = 0,
+        cost: Double = 0,
+        fractionOfMax: Double,
+        fractionOfTotal: Double
+    ) {
+        self.id = name
+        self.name = name
+        self.tokens = tokens
+        self.requests = requests
+        self.cost = cost
+        self.fractionOfMax = min(max(fractionOfMax, 0), 1)
+        self.fractionOfTotal = min(max(fractionOfTotal, 0), 1)
+    }
+}
+
+public enum UsageAnalyticsInsightKind: String, Codable, Hashable {
+    case budgetStatus
+    case projectedMonth
+    case usageSpike
+    case topModel
+}
+
+public struct UsageAnalyticsInsight: Identifiable, Equatable, Hashable {
+    public let id: String
+    public let kind: UsageAnalyticsInsightKind
+    public let title: String
+    public let message: String
+    public let severity: QuotaSignalSeverity
+
+    public init(
+        id: String? = nil,
+        kind: UsageAnalyticsInsightKind,
+        title: String,
+        message: String,
+        severity: QuotaSignalSeverity
+    ) {
+        self.kind = kind
+        self.title = title
+        self.message = message
+        self.severity = severity
+        self.id = id ?? [kind.rawValue, title, message].joined(separator: "|")
+    }
+}
+
+public enum UsageBudgetState: String, Codable, Hashable {
+    case underBudget
+    case halfUsed
+    case approaching
+    case overBudget
+}
+
+public struct UsageMonthlyBudgetStatus: Equatable, Hashable {
+    public let budgetUSD: Double
+    public let monthToDateUSD: Double
+    public let projectedUSD: Double
+    public let fractionUsed: Double
+    public let projectedFraction: Double
+    public let state: UsageBudgetState
+
+    public var severity: QuotaSignalSeverity {
+        switch state {
+        case .underBudget, .halfUsed:
+            return .info
+        case .approaching:
+            return .warning
+        case .overBudget:
+            return .critical
+        }
+    }
+
+    public var statusTitle: String {
+        switch state {
+        case .underBudget:
+            return "Budget on track"
+        case .halfUsed:
+            return "50% budget mark"
+        case .approaching:
+            return "Approaching budget"
+        case .overBudget:
+            return "Over monthly budget"
+        }
+    }
+
+    public var projectedPercentageText: String {
+        "\(Int((projectedFraction * 100).rounded()))%"
+    }
+
+    public var usedPercentageText: String {
+        "\(Int((fractionUsed * 100).rounded()))%"
+    }
+
+    public var insightMessage: String {
+        switch state {
+        case .underBudget:
+            return "Projected \(formattedMetricValue(projectedUSD, unit: "$")) is \(projectedPercentageText) of the \(formattedMetricValue(budgetUSD, unit: "$")) monthly budget."
+        case .halfUsed:
+            return "Projected \(formattedMetricValue(projectedUSD, unit: "$")) reaches \(projectedPercentageText) of the \(formattedMetricValue(budgetUSD, unit: "$")) monthly budget."
+        case .approaching:
+            return "Projected \(formattedMetricValue(projectedUSD, unit: "$")) is near the \(formattedMetricValue(budgetUSD, unit: "$")) monthly budget."
+        case .overBudget:
+            return "Projected \(formattedMetricValue(projectedUSD, unit: "$")) exceeds the \(formattedMetricValue(budgetUSD, unit: "$")) monthly budget."
+        }
+    }
+
+    public init?(
+        budgetUSD: Double?,
+        monthToDate: UsageAnalyticsPeriodTotals,
+        projectedMonth: UsageAnalyticsPeriodTotals
+    ) {
+        guard
+            let budgetUSD,
+            budgetUSD.isFinite,
+            budgetUSD > 0,
+            monthToDate.cost > 0 || projectedMonth.cost > 0
+        else {
+            return nil
+        }
+
+        self.budgetUSD = budgetUSD
+        self.monthToDateUSD = monthToDate.cost
+        self.projectedUSD = projectedMonth.cost
+        self.fractionUsed = monthToDate.cost / budgetUSD
+        self.projectedFraction = projectedMonth.cost / budgetUSD
+
+        let strongestFraction = max(fractionUsed, projectedFraction)
+        if strongestFraction >= 1 {
+            self.state = .overBudget
+        } else if strongestFraction >= 0.8 {
+            self.state = .approaching
+        } else if strongestFraction >= 0.5 {
+            self.state = .halfUsed
+        } else {
+            self.state = .underBudget
+        }
+    }
+}
+
+public struct UsageAnalyticsIntelligence: Equatable, Hashable {
+    public let daily: [UsageAnalyticsDailySummary]
+    public let today: UsageAnalyticsPeriodTotals
+    public let sevenDay: UsageAnalyticsPeriodTotals
+    public let thirtyDay: UsageAnalyticsPeriodTotals
+    public let monthToDate: UsageAnalyticsPeriodTotals
+    public let projectedMonth: UsageAnalyticsPeriodTotals
+    public let monthlyBudget: UsageMonthlyBudgetStatus?
+    public let previousSevenDayAverage: UsageAnalyticsPeriodTotals
+    public let topModels: [UsageAnalyticsModelSummary]
+    public let insights: [UsageAnalyticsInsight]
+    public let elapsedMonthDays: Int
+    public let totalMonthDays: Int
+    public let axisDates: [Date]
+
+    public var hasCost: Bool {
+        daily.contains { $0.cost > 0 } || today.cost > 0 || thirtyDay.cost > 0 || projectedMonth.cost > 0
+    }
+
+    public init(
+        buckets: [UsageAnalyticsBucket],
+        monthlyBudgetUSD: Double? = nil,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) {
+        let usableBuckets = buckets.filter { $0.hasUsage && $0.startDate <= now }
+        let dayStart = calendar.startOfDay(for: now)
+        let sevenDayStart = calendar.date(byAdding: .day, value: -6, to: dayStart) ?? dayStart
+        let thirtyDayStart = calendar.date(byAdding: .day, value: -29, to: dayStart) ?? dayStart
+        let previousSevenDayStart = calendar.date(byAdding: .day, value: -7, to: dayStart) ?? dayStart
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now)) ?? dayStart
+        let totalMonthDays = calendar.range(of: .day, in: .month, for: now)?.count ?? 30
+        let elapsedMonthDays = min(
+            max((calendar.dateComponents([.day], from: monthStart, to: dayStart).day ?? 0) + 1, 1),
+            totalMonthDays
+        )
+
+        var dailyTotals: [Date: UsageAnalyticsPeriodTotals] = [:]
+        var modelTotals: [String: UsageAnalyticsPeriodTotals] = [:]
+
+        for bucket in usableBuckets where bucket.startDate >= thirtyDayStart {
+            let day = calendar.startOfDay(for: bucket.startDate)
+            var totals = dailyTotals[day] ?? UsageAnalyticsPeriodTotals()
+            totals.add(bucket)
+            dailyTotals[day] = totals
+
+            if let model = bucket.model, bucket.totalTokens > 0 || bucket.requests > 0 || (bucket.costUSD ?? 0) > 0 {
+                var modelTotal = modelTotals[model] ?? UsageAnalyticsPeriodTotals()
+                modelTotal.add(bucket)
+                modelTotals[model] = modelTotal
+            }
+        }
+
+        let daily = dailyTotals
+            .map { UsageAnalyticsDailySummary(date: $0.key, totals: $0.value) }
+            .sorted { $0.date < $1.date }
+
+        let today = Self.periodTotals(from: usableBuckets, since: dayStart)
+        let sevenDay = Self.periodTotals(from: usableBuckets, since: sevenDayStart)
+        let thirtyDay = Self.periodTotals(from: usableBuckets, since: thirtyDayStart)
+        let monthToDate = Self.periodTotals(from: usableBuckets, since: monthStart)
+        let projectedMonth = monthToDate.scaled(by: Double(totalMonthDays) / Double(elapsedMonthDays))
+        let monthlyBudget = UsageMonthlyBudgetStatus(
+            budgetUSD: monthlyBudgetUSD,
+            monthToDate: monthToDate,
+            projectedMonth: projectedMonth
+        )
+
+        let previousSevenBuckets = usableBuckets.filter {
+            $0.startDate >= previousSevenDayStart && $0.startDate < dayStart
+        }
+        let previousSevenTotals = Self.periodTotals(from: previousSevenBuckets, since: previousSevenDayStart)
+        let comparisonDays = Set(previousSevenBuckets.map { calendar.startOfDay(for: $0.startDate) })
+        let comparisonDayCount = max(1, min(7, comparisonDays.count))
+        let previousSevenDayAverage = previousSevenTotals.scaled(by: 1 / Double(comparisonDayCount))
+
+        let maxTokens = max(modelTotals.values.map(\.tokens).max() ?? 0, 1)
+        let totalModelTokens = max(modelTotals.values.reduce(0) { $0 + $1.tokens }, 1)
+        let topModels = modelTotals
+            .map {
+                UsageAnalyticsModelSummary(
+                    name: $0.key,
+                    tokens: $0.value.tokens,
+                    requests: $0.value.requests,
+                    cost: $0.value.cost,
+                    fractionOfMax: $0.value.tokens / maxTokens,
+                    fractionOfTotal: $0.value.tokens / totalModelTokens
+                )
+            }
+            .sorted {
+                if $0.tokens == $1.tokens { return $0.name < $1.name }
+                return $0.tokens > $1.tokens
+            }
+
+        self.daily = daily
+        self.today = today
+        self.sevenDay = sevenDay
+        self.thirtyDay = thirtyDay
+        self.monthToDate = monthToDate
+        self.projectedMonth = projectedMonth
+        self.monthlyBudget = monthlyBudget
+        self.previousSevenDayAverage = previousSevenDayAverage
+        self.topModels = topModels
+        self.elapsedMonthDays = elapsedMonthDays
+        self.totalMonthDays = totalMonthDays
+        self.axisDates = Self.axisDates(for: daily, calendar: calendar)
+        self.insights = Self.makeInsights(
+            today: today,
+            thirtyDay: thirtyDay,
+            projectedMonth: projectedMonth,
+            monthlyBudget: monthlyBudget,
+            previousSevenDayAverage: previousSevenDayAverage,
+            topModels: topModels,
+            elapsedMonthDays: elapsedMonthDays
+        )
+    }
+
+    private static func axisDates(for daily: [UsageAnalyticsDailySummary], calendar: Calendar) -> [Date] {
+        guard let first = daily.first?.date, let last = daily.last?.date else { return [] }
+        if calendar.isDate(first, inSameDayAs: last) {
+            return [first]
+        }
+        return [first, last]
+    }
+
+    private static func periodTotals(
+        from buckets: [UsageAnalyticsBucket],
+        since startDate: Date
+    ) -> UsageAnalyticsPeriodTotals {
+        var totals = UsageAnalyticsPeriodTotals()
+        for bucket in buckets where bucket.startDate >= startDate {
+            totals.add(bucket)
+        }
+        return totals
+    }
+
+    private static func makeInsights(
+        today: UsageAnalyticsPeriodTotals,
+        thirtyDay: UsageAnalyticsPeriodTotals,
+        projectedMonth: UsageAnalyticsPeriodTotals,
+        monthlyBudget: UsageMonthlyBudgetStatus?,
+        previousSevenDayAverage: UsageAnalyticsPeriodTotals,
+        topModels: [UsageAnalyticsModelSummary],
+        elapsedMonthDays: Int
+    ) -> [UsageAnalyticsInsight] {
+        var insights: [UsageAnalyticsInsight] = []
+
+        if let monthlyBudget {
+            insights.append(
+                UsageAnalyticsInsight(
+                    kind: .budgetStatus,
+                    title: monthlyBudget.statusTitle,
+                    message: monthlyBudget.insightMessage,
+                    severity: monthlyBudget.severity
+                )
+            )
+        }
+
+        if projectedMonth.cost > 0 {
+            let warningFloor = max(thirtyDay.cost * 1.35, thirtyDay.cost + 25)
+            insights.append(
+                UsageAnalyticsInsight(
+                    kind: .projectedMonth,
+                    title: "Projected month",
+                    message: "At the current pace, this month lands near \(formattedMetricValue(projectedMonth.cost, unit: "$")) based on \(elapsedMonthDays) \(elapsedMonthDays == 1 ? "day" : "days") of usage.",
+                    severity: projectedMonth.cost >= warningFloor ? .warning : .info
+                )
+            )
+        } else if projectedMonth.tokens > 0 {
+            insights.append(
+                UsageAnalyticsInsight(
+                    kind: .projectedMonth,
+                    title: "Projected month",
+                    message: "At the current pace, this month lands near \(projectedMonth.tokens.compactString) tokens.",
+                    severity: .info
+                )
+            )
+        }
+
+        if today.cost > 0, previousSevenDayAverage.cost > 0 {
+            let ratio = today.cost / previousSevenDayAverage.cost
+            if ratio >= 1.5 && today.cost - previousSevenDayAverage.cost >= 1 {
+                insights.append(
+                    UsageAnalyticsInsight(
+                        kind: .usageSpike,
+                        title: "Today is above usual",
+                        message: "Cost is \(Self.ratioText(ratio)) the recent daily average.",
+                        severity: ratio >= 2.5 ? .critical : .warning
+                    )
+                )
+            }
+        } else if today.tokens > 0, previousSevenDayAverage.tokens > 0 {
+            let ratio = today.tokens / previousSevenDayAverage.tokens
+            if ratio >= 1.5 && today.tokens - previousSevenDayAverage.tokens >= 25_000 {
+                insights.append(
+                    UsageAnalyticsInsight(
+                        kind: .usageSpike,
+                        title: "Today is above usual",
+                        message: "Tokens are \(Self.ratioText(ratio)) the recent daily average.",
+                        severity: ratio >= 2.5 ? .critical : .warning
+                    )
+                )
+            }
+        }
+
+        if let topModel = topModels.first, topModel.fractionOfTotal >= 0.5 {
+            let percentage = Int((topModel.fractionOfTotal * 100).rounded())
+            insights.append(
+                UsageAnalyticsInsight(
+                    kind: .topModel,
+                    title: "Top model driver",
+                    message: "\(topModel.name) accounts for \(percentage)% of 30-day token volume.",
+                    severity: .info
+                )
+            )
+        }
+
+        return insights
+    }
+
+    private static func ratioText(_ ratio: Double) -> String {
+        String(format: "%.1fx", ratio)
+    }
+}
+
 // MARK: - Snapshot
 
 public enum ProviderFetchState: String, Codable, Hashable {
@@ -540,7 +1205,7 @@ public enum ProviderFetchState: String, Codable, Hashable {
     case error
     case notConfigured
 
-    public var isHealthy: Bool {
+    public nonisolated var isHealthy: Bool {
         self == .success
     }
 }
@@ -555,6 +1220,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let balances: [QuotaBalance]
     public let signals: [QuotaSignal]
     public let events: [UsageEvent]
+    public let analyticsBuckets: [UsageAnalyticsBucket]
     public let fetchState: ProviderFetchState
     public let fetchedAt: Date
 
@@ -563,6 +1229,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
 
         if providerID == .openai {
             return "Token Usage"
+        }
+
+        if providerID == .openaiAPI {
+            return "API Usage"
         }
 
         if providerID == .codexTelemetry {
@@ -589,17 +1259,62 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             return "CLI Session & Tokens"
         }
 
+        if providerID == .kimi {
+            return "Membership Metadata"
+        }
+
         return "Periodic Usage"
     }
 
     public var balancesSectionTitle: String? {
         guard !balances.isEmpty else { return nil }
         if providerID == .openai { return "Credits / Balance" }
+        if providerID == .openaiAPI { return "API Costs" }
+        if providerID == .kimi { return "Membership Quota" }
         return "Extra Balance / Credits"
     }
 
     public var hasContent: Bool {
         !windows.isEmpty || !stats.isEmpty || !balances.isEmpty || !signals.isEmpty || !events.isEmpty
+            || !analyticsBuckets.isEmpty
+    }
+
+    public var summaryWindows: [QuotaWindow] {
+        guard providerID == .gemini else { return windows }
+
+        var selected: [QuotaWindow] = []
+        var selectedIDs = Set<UUID>()
+
+        func normalized(_ label: String) -> String {
+            label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+
+        func appendPreferred(exactLabel: String, fallbackMatches: (String) -> Bool) {
+            if let exact = windows.first(where: { normalized($0.label) == normalized(exactLabel) }),
+               selectedIDs.insert(exact.id).inserted {
+                selected.append(exact)
+                return
+            }
+
+            if let fallback = windows.first(where: { window in
+                !selectedIDs.contains(window.id) && fallbackMatches(normalized(window.label))
+            }) {
+                selectedIDs.insert(fallback.id)
+                selected.append(fallback)
+            }
+        }
+
+        appendPreferred(exactLabel: "Pro 3.1 (preview)") { label in
+            label.contains("pro") && !label.contains("flash")
+        }
+        appendPreferred(exactLabel: "Flash 3 (preview)") { label in
+            label.contains("flash") && !label.contains("flash lite") && !label.contains("flash-lite")
+        }
+        appendPreferred(exactLabel: "Flash Lite 3.1 (preview)") { label in
+            label.contains("flash lite") || label.contains("flash-lite")
+        }
+
+        return selected.isEmpty ? Array(windows.prefix(3)) : selected
     }
 
     public var primaryWindow: QuotaWindow? {
@@ -617,6 +1332,24 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             balances: balances,
             signals: newSignals,
             events: events,
+            analyticsBuckets: analyticsBuckets,
+            fetchState: fetchState,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    public func withWindows(_ newWindows: [QuotaWindow]) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: id,
+            providerID: providerID,
+            displayName: displayName,
+            planName: planName,
+            windows: newWindows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: events,
+            analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt
         )
@@ -633,6 +1366,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             balances: balances,
             signals: signals,
             events: newEvents,
+            analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt
         )
@@ -648,6 +1382,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         case balances
         case signals
         case events
+        case analyticsBuckets
         case fetchState
         case fetchedAt
     }
@@ -662,6 +1397,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         balances: [QuotaBalance] = [],
         signals: [QuotaSignal] = [],
         events: [UsageEvent] = [],
+        analyticsBuckets: [UsageAnalyticsBucket] = [],
         fetchState: ProviderFetchState = .success,
         fetchedAt: Date = Date()
     ) {
@@ -674,6 +1410,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         self.balances = balances
         self.signals = signals
         self.events = events
+        self.analyticsBuckets = analyticsBuckets
         self.fetchState = fetchState
         self.fetchedAt = fetchedAt
     }
@@ -689,6 +1426,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         balances = try container.decodeIfPresent([QuotaBalance].self, forKey: .balances) ?? []
         signals = try container.decodeIfPresent([QuotaSignal].self, forKey: .signals) ?? []
         events = try container.decodeIfPresent([UsageEvent].self, forKey: .events) ?? []
+        analyticsBuckets = try container.decodeIfPresent([UsageAnalyticsBucket].self, forKey: .analyticsBuckets) ?? []
 
         // Resilient fetchState decoding
         if let stateString = try? container.decode(String.self, forKey: .fetchState) {
@@ -734,11 +1472,26 @@ public extension Date {
 
         return "in \(parts.joined(separator: " "))"
     }
+
+    /// Compact absolute reset timestamp suitable for the compact
+    /// dashboard layout — "DD/MM HH:MM" in the user's local timezone.
+    /// Reads dense-on-purpose so the whole row (label, reset, percent)
+    /// fits on one line even on narrower windows.
+    var absoluteResetString: String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar.current
+        formatter.timeZone = TimeZone.current
+        formatter.locale = Locale.current
+        formatter.dateFormat = "dd/MM HH:mm"
+        return formatter.string(from: self)
+    }
 }
 
 public extension Double {
     var compactString: String {
-        if self >= 1_000_000 {
+        if self >= 1_000_000_000 {
+            return String(format: "%.1fB", self / 1_000_000_000).replacingOccurrences(of: ".0", with: "")
+        } else if self >= 1_000_000 {
             return String(format: "%.1fM", self / 1_000_000).replacingOccurrences(of: ".0", with: "")
         } else if self >= 1_000 {
             return String(format: "%.1fK", self / 1_000).replacingOccurrences(of: ".0", with: "")

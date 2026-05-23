@@ -118,6 +118,71 @@ public enum MockData {
         )
     }
 
+    public static var openAIAPISnapshot: QuotaSnapshot {
+        let calendar = Calendar.current
+        let now = Date()
+        let dayStart = calendar.startOfDay(for: now)
+        let buckets = (0..<18).flatMap { offset -> [UsageAnalyticsBucket] in
+            let date = calendar.date(byAdding: .day, value: -offset, to: dayStart) ?? dayStart
+            let next = calendar.date(byAdding: .day, value: 1, to: date) ?? date.addingTimeInterval(86_400)
+            let base = Double((offset % 6) + 2)
+            return [
+                UsageAnalyticsBucket(
+                    startDate: date,
+                    endDate: next,
+                    model: "gpt-5.5",
+                    projectID: "proj_demo",
+                    inputTokens: base * 72_000,
+                    outputTokens: base * 18_000,
+                    cachedInputTokens: base * 24_000,
+                    requests: base * 36,
+                    source: .officialAPI
+                ),
+                UsageAnalyticsBucket(
+                    startDate: date,
+                    endDate: next,
+                    model: "gpt-5.4-mini",
+                    projectID: "proj_demo",
+                    inputTokens: base * 18_000,
+                    outputTokens: base * 9_000,
+                    requests: base * 22,
+                    source: .officialAPI
+                ),
+                UsageAnalyticsBucket(
+                    startDate: date,
+                    endDate: next,
+                    projectID: "proj_demo",
+                    costUSD: base * 1.37,
+                    source: .officialAPI,
+                    note: "Cost"
+                )
+            ]
+        }
+
+        return QuotaSnapshot(
+            providerID: .openaiAPI,
+            displayName: "OpenAI API",
+            planName: "gpt-5.5",
+            windows: [
+                QuotaWindow(
+                    label: "Requests / Day",
+                    windowKind: .daily,
+                    used: 1_240,
+                    total: 10_000,
+                    resetDate: calendar.date(byAdding: .day, value: 1, to: dayStart),
+                    unit: "req",
+                    subtitle: "gpt-5.5 - Project proj_demo"
+                )
+            ],
+            stats: [
+                QuotaStat(label: "Today Tokens", value: 312_000, unit: "tok", subtitle: "Official usage API"),
+                QuotaStat(label: "30D Cost", value: 86.42, unit: "$", subtitle: "Official costs API")
+            ],
+            analyticsBuckets: buckets,
+            fetchState: .success
+        )
+    }
+
     public static var chatgptSnapshot: QuotaSnapshot {
         QuotaSnapshot(
             providerID: .chatgpt,
@@ -223,8 +288,43 @@ public enum MockData {
         )
     }
 
+    public static var kimiSnapshot: QuotaSnapshot {
+        QuotaSnapshot(
+            providerID: .kimi,
+            displayName: "Kimi Code",
+            planName: "Moderato",
+            windows: [
+                QuotaWindow(
+                    label: "Weekly",
+                    windowKind: .weekly,
+                    used: 420,
+                    total: 2_000,
+                    resetDate: Date().addingTimeInterval(4 * 24 * 3600),
+                    unit: "quota",
+                    subtitle: "Kimi Code membership quota"
+                ),
+                QuotaWindow(
+                    label: "5H",
+                    windowKind: .sliding,
+                    used: 61,
+                    total: 200,
+                    resetDate: Date().addingTimeInterval(2 * 3600 + 30 * 60),
+                    unit: "quota",
+                    subtitle: "Rolling 5h quota"
+                )
+            ],
+            stats: [
+                QuotaStat(label: "Parallel Limit", value: 2, unit: "tasks", subtitle: "Concurrent Kimi Code requests")
+            ],
+            balances: [
+                QuotaBalance(label: "Total Quota", amount: 1_580, unit: "quota", subtitle: "2K total membership quota")
+            ],
+            fetchState: .success
+        )
+    }
+
     public static var allSnapshots: [QuotaSnapshot] {
-        [claudeSnapshot, codexSnapshot, chatgptSnapshot, codexTelemetrySnapshot, windsurfSnapshot, cursorSnapshot]
+        [claudeSnapshot, codexSnapshot, openAIAPISnapshot, chatgptSnapshot, codexTelemetrySnapshot, windsurfSnapshot, cursorSnapshot, kimiSnapshot]
     }
 
     public static var staleSnapshot: QuotaSnapshot {
