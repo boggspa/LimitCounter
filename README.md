@@ -1,4 +1,4 @@
-# LLM Usage Counter
+# Limit Counter
 
 SwiftUI prototype for a cross-platform quota tracker covering Codex, Claude, Windsurf, and Cursor.
 
@@ -7,7 +7,7 @@ SwiftUI prototype for a cross-platform quota tracker covering Codex, Claude, Win
 - Shared quota models and card views live in `Shared/`.
 - The main app shell lives in `App/`.
 - A real WidgetKit extension target is wired in `Widget/` and embedded into the app target with shared App Group storage.
-- The Codex provider now has a real session-backed adapter that reads ChatGPT-plan 5-hour and 7-day usage from the same private usage surface used by Codex clients. Claude, Windsurf, and Cursor still use mock adapters while their real integrations are designed.
+- The Codex provider now has a real session-backed adapter that reads ChatGPT-plan 5-hour and 7-day usage from the same private usage surface used by Codex clients. OpenAI API has a separate official Admin API provider for project rate limits, 30-day token/request/cost analytics, projected monthly spend, per-provider budget thresholds, spike callouts, and top-model drivers. Claude, Windsurf, and Cursor still use mock adapters while their real integrations are designed.
 - A Codex Telemetry provider can read local Codex log folders and turn structured event logs into activity counts and token summaries.
 
 ## Safety Boundary
@@ -51,6 +51,7 @@ The app reads the local SQLite log store and local text logs only. OpenAI’s OT
 ## Next Steps
 
 1. Replace the remaining mock clients with one adapter per provider, each using a provider-approved token or first-party OAuth flow.
-2. Add a first-party in-app sign-in flow for Codex so iOS does not rely on a macOS-exported session import.
-3. Add provider-specific refresh cadence, retry/backoff, and explicit revoked/expired credential handling.
-4. Apply the Liquid Glass styling pass inspired by `PodcastPreview` and `AVCMeter`.
+2. Add local Codex session analytics as explicitly labeled local estimates, with model and cost breakdowns derived only from user-granted `~/.codex` data.
+3. Add a first-party in-app sign-in flow for Codex so iOS does not rely on a macOS-exported session import.
+4. Add provider-specific refresh cadence, retry/backoff, and explicit revoked/expired credential handling.
+5. Apply the Liquid Glass styling pass inspired by `PodcastPreview` and `AVCMeter`.
