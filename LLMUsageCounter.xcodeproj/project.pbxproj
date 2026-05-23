@@ -7,11 +7,15 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		EEBB000100000000000000B1 /* CloudAlertPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000100000000000000F1 /* CloudAlertPayload.swift */; };
+		EEBB000200000000000000B2 /* AlertNotificationContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000200000000000000F2 /* AlertNotificationContent.swift */; };
+		EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */; };
+		EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */; };
 		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
 		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
 		35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
-		53D0D4FE81308907359D330E /* AIUsageWidgetExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		53D0D4FE81308907359D330E /* Limit Counter Widget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5A7E2A5B4CC14C9AA58D915F /* CloudKitSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C938E723B134DAAACF68821 /* CloudKitSync.swift */; };
 		760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */; };
 		823855AA90207DEE5462F15A /* QuotaTimelineProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */; };
@@ -53,7 +57,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				53D0D4FE81308907359D330E /* AIUsageWidgetExtension.appex in Embed App Extensions */,
+				53D0D4FE81308907359D330E /* Limit Counter Widget.appex in Embed App Extensions */,
 			);
 			name = "Embed App Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -61,10 +65,14 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		EEAA000100000000000000F1 /* CloudAlertPayload.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudAlertPayload.swift; path = Shared/Models/CloudAlertPayload.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000200000000000000F2 /* AlertNotificationContent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AlertNotificationContent.swift; path = Shared/Notifications/AlertNotificationContent.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LocalNotificationPublisher.swift; path = App/LocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MacLocalNotificationPublisher.swift; path = App/MacLocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
 		005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GeminiProviderClient.swift; path = App/Providers/GeminiProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaSnapshotStore.swift; path = Shared/Storage/QuotaSnapshotStore.swift; sourceTree = SOURCE_ROOT; };
 		14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.macOS.entitlements; path = Widget/AIUsageWidgetExtension.macOS.entitlements; sourceTree = SOURCE_ROOT; };
-		1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AIUsageWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "Limit Counter Widget.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
 		21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LLMActivityHeatmapView.swift; path = Shared/Views/LLMActivityHeatmapView.swift; sourceTree = SOURCE_ROOT; };
 		388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaTimelineProvider.swift; path = Widget/QuotaTimelineProvider.swift; sourceTree = SOURCE_ROOT; };
 		3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaCardView.swift; path = Shared/Views/QuotaCardView.swift; sourceTree = SOURCE_ROOT; };
@@ -79,7 +87,7 @@
 		82D69C00C45CEED72F493637 /* SyncCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SyncCoordinator.swift; path = App/SyncCoordinator.swift; sourceTree = SOURCE_ROOT; };
 		8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CodexTelemetryProviderClient.swift; path = App/Providers/CodexTelemetryProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		9C38142DE1DDB3110221F8CF /* DashboardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = DashboardView.swift; path = App/Views/DashboardView.swift; sourceTree = SOURCE_ROOT; };
-		A42BC5382F9140180096DECB /* LLMUsageCounter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LLMUsageCounter.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A42BC5382F9140180096DECB /* Limit Counter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Limit Counter.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderDetailView.swift; path = App/Views/ProviderDetailView.swift; sourceTree = SOURCE_ROOT; };
 		AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderClient.swift; path = App/Providers/ProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GlassChrome.swift; path = Shared/Views/GlassChrome.swift; sourceTree = SOURCE_ROOT; };
@@ -154,6 +162,8 @@
 				F7817BF72DDD8971A8F746D3 /* Keychain */,
 				B15DFF02575EC87C5D82B4E9 /* Views */,
 				52ECCBB7247196B57F543B01 /* MenuBarController.swift */,
+				EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */,
+				EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -183,8 +193,8 @@
 		A42BC5392F9140180096DECB /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A42BC5382F9140180096DECB /* LLMUsageCounter.app */,
-				1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */,
+				A42BC5382F9140180096DECB /* Limit Counter.app */,
+				1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -226,8 +236,17 @@
 			children = (
 				C7D74721EA3E8C99B51CF09D /* MockData.swift */,
 				EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */,
+				EEAA000100000000000000F1 /* CloudAlertPayload.swift */,
 			);
 			path = Models;
+			sourceTree = "<group>";
+		};
+		EE99000100000000000000A1 /* Notifications */ = {
+			isa = PBXGroup;
+			children = (
+				EEAA000200000000000000F2 /* AlertNotificationContent.swift */,
+			);
+			path = Notifications;
 			sourceTree = "<group>";
 		};
 		EFDF0D9C31CD0D2702D8910D /* Shared */ = {
@@ -236,6 +255,7 @@
 				DC0F04A07877F47900175A40 /* Models */,
 				558DC4DE64CCE2D80E927F99 /* Storage */,
 				85A7C518E3672111E595E3FB /* Views */,
+				EE99000100000000000000A1 /* Notifications */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -264,8 +284,8 @@
 			dependencies = (
 			);
 			name = AIUsageWidgetExtension;
-			productName = AIUsageWidgetExtension;
-			productReference = 1D0D6C4C3162AFCE8932D9AA /* AIUsageWidgetExtension.appex */;
+			productName = "Limit Counter Widget";
+			productReference = 1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 		A42BC5372F9140180096DECB /* LLMUsageCounter */ = {
@@ -286,8 +306,8 @@
 				A42BC53A2F9140180096DECB /* LLMUsageCounter */,
 			);
 			name = LLMUsageCounter;
-			productName = LLMUsageCounter;
-			productReference = A42BC5382F9140180096DECB /* LLMUsageCounter.app */;
+			productName = "Limit Counter";
+			productReference = A42BC5382F9140180096DECB /* Limit Counter.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -379,6 +399,10 @@
 				760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */,
 				0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */,
 				AE3CE50218E452F2353349B8 /* LLMActivityHeatmapView.swift in Sources */,
+				EEBB000100000000000000B1 /* CloudAlertPayload.swift in Sources */,
+				EEBB000200000000000000B2 /* AlertNotificationContent.swift in Sources */,
+				EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */,
+				EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -404,9 +428,10 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
+				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Widget/AIUsageWidgetExtension-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -415,7 +440,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter.widget;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = "Limit Counter Widget";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				SKIP_INSTALL = YES;
@@ -437,9 +462,10 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
+				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Widget/AIUsageWidgetExtension-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -448,7 +474,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter.widget;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = "Limit Counter Widget";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				SKIP_INSTALL = YES;
@@ -592,6 +618,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
 				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
+				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -604,13 +632,13 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = "Limit Counter";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -642,6 +670,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
 				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
+				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -654,13 +684,13 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.chrisizatt.LLMUsageCounter;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = "Limit Counter";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

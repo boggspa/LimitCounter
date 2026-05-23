@@ -1,8 +1,8 @@
 import SwiftUI
+import UserNotifications
 #if os(iOS)
 import BackgroundTasks
 import UIKit
-import UserNotifications
 #endif
 
 @main
@@ -14,6 +14,7 @@ struct AIUsageTrackerApp: App {
     @StateObject private var appState = AppStateStore()
     #if os(macOS)
     @State private var menuBarController: MenuBarController?
+    @State private var notificationCoordinator: MacNotificationCoordinator?
     #endif
 
     var body: some Scene {
@@ -32,6 +33,10 @@ struct AIUsageTrackerApp: App {
                     if menuBarController == nil {
                         menuBarController = MenuBarController(appState: appState)
                     }
+                    if notificationCoordinator == nil {
+                        notificationCoordinator = MacNotificationCoordinator(appState: appState)
+                        await notificationCoordinator?.bootstrap()
+                    }
                     #endif
                 }
                 .onChange(of: appState.snapshots) { _ in
@@ -47,7 +52,7 @@ struct AIUsageTrackerApp: App {
         }
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 280, height: 380)
+        .defaultSize(width: 920, height: 640)
         #endif
     }
 }
@@ -62,8 +67,10 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().setNotificationCategories([AlertNotificationContent.makeCategory()])
         application.registerForRemoteNotifications()
         registerBackgroundTasks()
+        scheduleBackgroundRefresh()
 
         Task {
             do {
@@ -86,12 +93,32 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         guard let appState else {
-            completionHandler(.noData)
+            Task { @MainActor in
+                guard CloudKitSyncService.shared.isCloudKitNotification(userInfo) else {
+                    completionHandler(.noData)
+                    return
+                }
+
+                CloudKitSyncService.shared.markRemoteNotificationReceived()
+
+                var alerts = CloudKitSyncService.shared.extractAlertPayloads(from: userInfo)
+                if alerts.isEmpty {
+                    alerts = (try? await CloudKitSyncService.shared.fetchRecentAlerts(since: nil, limit: 5)) ?? []
+                }
+                if !CloudKitSyncService.shared.hasVisibleAlertPayload(userInfo) {
+                    await LocalNotificationPublisher.shared.processIncomingAlerts(alerts)
+                }
+
+                let didUpdate = await CloudSnapshotBackgroundRefresher.refreshFromCloudKit()
+                self.scheduleBackgroundRefresh()
+                completionHandler(didUpdate ? .newData : .noData)
+            }
             return
         }
 
-        Task {
+        Task { @MainActor in
             let handled = await appState.handleRemoteNotification(userInfo: userInfo)
+            self.scheduleBackgroundRefresh()
             completionHandler(handled ? .newData : .noData)
         }
     }
@@ -103,16 +130,40 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
         print("[IOSAppDelegate] Remote notifications unavailable: \(error.localizedDescription)")
     }
 
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        print("[IOSAppDelegate] Remote notifications registered")
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound]
+        [.banner, .list, .sound, .badge]
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let info = response.notification.request.content.userInfo
+        guard let providerID = CloudKitSyncService.shared.providerID(fromNotificationUserInfo: info) else { return }
+
+        switch response.actionIdentifier {
+        case AlertNotificationContent.openActionIdentifier, UNNotificationDefaultActionIdentifier:
+            await MainActor.run { self.appState?.pendingDeepLinkProviderID = providerID }
+        default:
+            break
+        }
     }
 
     func scheduleBackgroundRefresh() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: backgroundTaskIdentifier)
+
         let request = BGAppRefreshTaskRequest(identifier: backgroundTaskIdentifier)
-        request.earliestBeginDate = Date().addingTimeInterval(30 * 60)
+        request.earliestBeginDate = Date().addingTimeInterval(UsageRefreshCadence.requestedRefreshInterval)
 
         do {
             try BGTaskScheduler.shared.submit(request)
@@ -135,19 +186,67 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
     private func handleBackgroundRefresh(task: BGAppRefreshTask) {
         scheduleBackgroundRefresh()
 
-        guard let appState else {
-            task.setTaskCompleted(success: false)
-            return
-        }
-
         let work = Task { @MainActor in
-            await appState.refresh()
+            if let appState {
+                await appState.refresh()
+            } else {
+                _ = await CloudSnapshotBackgroundRefresher.refreshFromCloudKit()
+            }
             task.setTaskCompleted(success: true)
         }
 
         task.expirationHandler = {
             work.cancel()
             task.setTaskCompleted(success: false)
+        }
+    }
+}
+#endif
+
+#if os(macOS)
+@MainActor
+final class MacNotificationCoordinator: NSObject, UNUserNotificationCenterDelegate {
+    weak var appState: AppStateStore?
+
+    init(appState: AppStateStore) {
+        self.appState = appState
+        super.init()
+    }
+
+    func bootstrap() async {
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().setNotificationCategories([AlertNotificationContent.makeCategory()])
+        await MacLocalNotificationPublisher.shared.requestAuthorizationIfNeeded()
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound, .badge])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let info = response.notification.request.content.userInfo
+        let actionIdentifier = response.actionIdentifier
+        defer { completionHandler() }
+
+        guard let raw = info["providerID"] as? String,
+              let providerID = ProviderID(rawValue: raw) else { return }
+
+        switch actionIdentifier {
+        case AlertNotificationContent.openActionIdentifier, UNNotificationDefaultActionIdentifier:
+            Task { @MainActor in
+                self.appState?.pendingDeepLinkProviderID = providerID
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        default:
+            break
         }
     }
 }

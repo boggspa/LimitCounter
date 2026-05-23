@@ -20,6 +20,8 @@ private struct CloudAlertDescriptor {
     let title: String
     let body: String
     let signature: String
+    let windowLabel: String?
+    let kind: CloudAlertKind
 }
 
 struct CloudSyncOperationDebugState: Codable, Equatable {
@@ -79,6 +81,10 @@ final class CloudKitSyncService {
     private let alertRecordType = "UsageAlertEvent"
     private let statusSubscriptionID = "usage-status-silent-v1"
     private let alertSubscriptionID = "usage-alert-visible-v1"
+    private let viewerSubscriptionVersion = 5
+    private let alertPayloadKeys = ["providerID", "title", "body", "signature", "createdAt", "windowLabel", "kind"]
+    private let alertTitleLocalizationKey = "CLOUD_USAGE_ALERT_TITLE"
+    private let alertBodyLocalizationKey = "CLOUD_USAGE_ALERT_BODY"
 
     private let subscriptionVersionKey = "cloudkit.viewerSubscriptionVersion"
     private let publishedHashKey = "cloudkit.publishedStatusHashes"
@@ -107,7 +113,7 @@ final class CloudKitSyncService {
             }
 
             let installedVersion = defaults.integer(forKey: subscriptionVersionKey)
-            if installedVersion < 1 {
+            if installedVersion < viewerSubscriptionVersion {
                 let statusSubscription = CKQuerySubscription(
                     recordType: statusRecordType,
                     predicate: NSPredicate(value: true),
@@ -125,9 +131,15 @@ final class CloudKitSyncService {
                     options: [.firesOnRecordCreation]
                 )
                 let alertInfo = CKSubscription.NotificationInfo()
-                alertInfo.title = "LLM Usage Alert"
-                alertInfo.alertBody = "An important usage or availability change was detected."
+                alertInfo.shouldSendContentAvailable = true
+                alertInfo.titleLocalizationKey = alertTitleLocalizationKey
+                alertInfo.titleLocalizationArgs = ["title"]
+                alertInfo.alertLocalizationKey = alertBodyLocalizationKey
+                alertInfo.alertLocalizationArgs = ["body"]
+                alertInfo.subtitle = "Usage update"
                 alertInfo.soundName = "default"
+                alertInfo.category = AlertNotificationContent.categoryIdentifier
+                alertInfo.desiredKeys = alertPayloadKeys
                 alertSubscription.notificationInfo = alertInfo
 
                 _ = try await database.modifySubscriptions(
@@ -135,7 +147,7 @@ final class CloudKitSyncService {
                     deleting: []
                 )
 
-                defaults.set(1, forKey: subscriptionVersionKey)
+                defaults.set(viewerSubscriptionVersion, forKey: subscriptionVersionKey)
             }
 
             recordOperationSuccess(.subscriptions)
@@ -182,7 +194,8 @@ final class CloudKitSyncService {
         }
     }
 
-    func publishSnapshots(_ snapshots: [QuotaSnapshot]) async throws {
+    @discardableResult
+    func publishSnapshots(_ snapshots: [QuotaSnapshot]) async throws -> [CloudAlertPayload] {
         recordOperationAttempt(.publish)
 
         do {
@@ -192,6 +205,7 @@ final class CloudKitSyncService {
 
             var publishedHashes = defaults.dictionary(forKey: publishedHashKey) as? [String: String] ?? [:]
             var lastAlertSignatures = defaults.dictionary(forKey: lastAlertSignatureKey) as? [String: String] ?? [:]
+            var emittedAlerts: [CloudAlertPayload] = []
 
             for snapshot in snapshots {
                 let providerKey = snapshot.providerID.rawValue
@@ -207,8 +221,20 @@ final class CloudKitSyncService {
 
                 if let alertDescriptor {
                     if lastAlertSignatures[providerKey] != alertDescriptor.signature {
-                        try await saveAlertRecord(snapshot, descriptor: alertDescriptor)
+                        let createdAt = Date()
+                        try await saveAlertRecord(snapshot, descriptor: alertDescriptor, createdAt: createdAt)
                         lastAlertSignatures[providerKey] = alertDescriptor.signature
+                        emittedAlerts.append(
+                            CloudAlertPayload(
+                                providerID: snapshot.providerID,
+                                title: alertDescriptor.title,
+                                body: alertDescriptor.body,
+                                signature: alertDescriptor.signature,
+                                createdAt: createdAt,
+                                windowLabel: alertDescriptor.windowLabel,
+                                kind: alertDescriptor.kind
+                            )
+                        )
                     }
                 } else {
                     lastAlertSignatures.removeValue(forKey: providerKey)
@@ -218,6 +244,7 @@ final class CloudKitSyncService {
             defaults.set(publishedHashes, forKey: publishedHashKey)
             defaults.set(lastAlertSignatures, forKey: lastAlertSignatureKey)
             recordOperationSuccess(.publish)
+            return emittedAlerts
         } catch {
             recordOperationFailure(.publish, error: error)
             throw error
@@ -230,6 +257,114 @@ final class CloudKitSyncService {
 
     func markRemoteNotificationReceived() {
         defaults.set(Date(), forKey: lastRemoteNotificationDateKey)
+    }
+
+    func hasVisibleAlertPayload(_ userInfo: [AnyHashable: Any]) -> Bool {
+        guard let aps = userInfo["aps"] as? [AnyHashable: Any],
+              let alert = aps["alert"] else {
+            return false
+        }
+
+        if let text = alert as? String {
+            return !text.isEmpty
+        }
+
+        if let fields = alert as? [AnyHashable: Any] {
+            return !fields.isEmpty
+        }
+
+        return false
+    }
+
+    func providerID(fromNotificationUserInfo userInfo: [AnyHashable: Any]) -> ProviderID? {
+        if let raw = userInfo["providerID"] as? String,
+           let providerID = ProviderID(rawValue: raw) {
+            return providerID
+        }
+
+        return extractAlertPayloads(from: userInfo).first?.providerID
+    }
+
+    func extractAlertPayloads(from userInfo: [AnyHashable: Any]) -> [CloudAlertPayload] {
+        guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo) as? CKQueryNotification,
+              notification.subscriptionID == alertSubscriptionID,
+              let fields = notification.recordFields else {
+            return []
+        }
+        guard let payload = decodeAlertFields(fields) else { return [] }
+        return [payload]
+    }
+
+    func fetchRecentAlerts(since: Date?, limit: Int = 20) async throws -> [CloudAlertPayload] {
+        guard try await container.accountStatus() == .available else {
+            throw CloudKitSyncError.accountUnavailable
+        }
+
+        let predicate: NSPredicate
+        if let since {
+            predicate = NSPredicate(format: "createdAt > %@", since as NSDate)
+        } else {
+            predicate = NSPredicate(value: true)
+        }
+
+        let query = CKQuery(recordType: alertRecordType, predicate: predicate)
+        query.sortDescriptors = [NSSortDescriptor(key: "createdAt", ascending: false)]
+
+        let operation = CKQueryOperation(query: query)
+        operation.resultsLimit = limit
+        operation.qualityOfService = .userInitiated
+        operation.desiredKeys = alertPayloadKeys
+
+        var collected: [CloudAlertPayload] = []
+        operation.recordMatchedBlock = { _, result in
+            if case .success(let record) = result {
+                var fields: [String: Any] = [:]
+                for key in record.allKeys() {
+                    if let value = record[key] {
+                        fields[key] = value
+                    }
+                }
+                if let payload = self.decodeAlertFields(fields) {
+                    collected.append(payload)
+                }
+            }
+        }
+
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[CloudAlertPayload], Error>) in
+            operation.queryResultBlock = { result in
+                switch result {
+                case .success:
+                    continuation.resume(returning: collected)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+            self.database.add(operation)
+        }
+    }
+
+    private func decodeAlertFields(_ fields: [String: Any]) -> CloudAlertPayload? {
+        guard let providerRaw = fields["providerID"] as? String,
+              let providerID = ProviderID(rawValue: providerRaw),
+              let title = fields["title"] as? String,
+              let body = fields["body"] as? String,
+              let signature = fields["signature"] as? String else {
+            return nil
+        }
+        let parsed = CloudAlertPayload.parse(signature: signature)
+        let createdAt = (fields["createdAt"] as? Date) ?? Date()
+        let fieldLabel = (fields["windowLabel"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fieldKind = (fields["kind"] as? String).flatMap(CloudAlertKind.init(rawValue:))
+        return CloudAlertPayload(
+            providerID: providerID,
+            title: title,
+            body: body,
+            signature: signature,
+            createdAt: createdAt,
+            windowLabel: fieldLabel?.isEmpty == false ? fieldLabel : parsed.windowLabel,
+            kind: fieldKind ?? parsed.kind
+        )
     }
 
     func reinstallViewerSubscriptions() async throws {
@@ -299,7 +434,7 @@ final class CloudKitSyncService {
         }
     }
 
-    private func saveAlertRecord(_ snapshot: QuotaSnapshot, descriptor: CloudAlertDescriptor) async throws {
+    private func saveAlertRecord(_ snapshot: QuotaSnapshot, descriptor: CloudAlertDescriptor, createdAt: Date) async throws {
         let recordID = CKRecord.ID(recordName: "alert.\(UUID().uuidString)")
         let record = CKRecord(recordType: alertRecordType, recordID: recordID)
 
@@ -307,7 +442,11 @@ final class CloudKitSyncService {
         record["title"] = descriptor.title as NSString
         record["body"] = descriptor.body as NSString
         record["signature"] = descriptor.signature as NSString
-        record["createdAt"] = Date() as NSDate
+        record["kind"] = descriptor.kind.rawValue as NSString
+        if let windowLabel = descriptor.windowLabel, !windowLabel.isEmpty {
+            record["windowLabel"] = windowLabel as NSString
+        }
+        record["createdAt"] = createdAt as NSDate
         record["statusRecordName"] = statusRecordName(for: snapshot.providerID) as NSString
 
         let operation = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: [])
@@ -438,11 +577,22 @@ final class CloudKitSyncService {
     }
 
     private func alertDescriptor(for snapshot: QuotaSnapshot) -> CloudAlertDescriptor? {
-        if let signal = snapshot.signals.first(where: { $0.kind == .unexpectedRecovery }) {
+        guard snapshot.providerID != .heatmap,
+              snapshot.providerID != .codexTelemetry else {
+            return nil
+        }
+
+        if let resetAlert = UsageResetAlertBuilder.resetAlert(
+            for: snapshot,
+            noticedAt: Date(),
+            freshnessWindow: 30 * 60
+        ) {
             return CloudAlertDescriptor(
-                title: signal.title,
-                body: signal.message,
-                signature: "signal|\(signal.kind.rawValue)|\(signal.windowLabel ?? signal.title)"
+                title: resetAlert.title,
+                body: resetAlert.body,
+                signature: resetAlert.signature,
+                windowLabel: resetAlert.windowLabel,
+                kind: resetAlert.kind
             )
         }
 
@@ -451,29 +601,57 @@ final class CloudKitSyncService {
             return CloudAlertDescriptor(
                 title: "\(snapshot.displayName) sync issue",
                 body: "Check your local credentials and logs.",
-                signature: "error"
+                signature: "error",
+                windowLabel: nil,
+                kind: .error
             )
         case .success, .notConfigured:
             break
         }
 
-        if let criticalWindow = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.95 }) {
+        if let exhausted = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 1.0 }) {
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) nearly exhausted",
-                body: "\(criticalWindow.label) is at \(criticalWindow.percentageUsed)%.",
-                signature: "critical|\(criticalWindow.label)"
+                title: "\(snapshot.displayName) — 100% used",
+                body: "\(exhausted.label): \(exhausted.measurementSummary). Resets in \(resetCountdown(for: exhausted.resetDate)).",
+                signature: "exhausted|\(exhausted.label)",
+                windowLabel: exhausted.label,
+                kind: .threshold
             )
         }
 
-        if let warningWindow = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.80 }) {
+        if let critical = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.95 }) {
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) usage is high",
-                body: "\(warningWindow.label) is at \(warningWindow.percentageUsed)%.",
-                signature: "warning|\(warningWindow.label)"
+                title: "\(snapshot.displayName) — 95% used",
+                body: "\(critical.label): \(critical.measurementSummary). Resets in \(resetCountdown(for: critical.resetDate)).",
+                signature: "critical|\(critical.label)",
+                windowLabel: critical.label,
+                kind: .threshold
+            )
+        }
+
+        if let warning = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.90 }) {
+            return CloudAlertDescriptor(
+                title: "\(snapshot.displayName) — 90% used",
+                body: "\(warning.label): \(warning.measurementSummary). Resets in \(resetCountdown(for: warning.resetDate)).",
+                signature: "warning|\(warning.label)",
+                windowLabel: warning.label,
+                kind: .threshold
             )
         }
 
         return nil
+    }
+
+    private func resetCountdown(for date: Date?) -> String {
+        guard let date else { return "soon" }
+        let seconds = date.timeIntervalSinceNow
+        guard seconds > 0 else { return "now" }
+        let totalMinutes = max(Int(seconds / 60), 1)
+        let h = totalMinutes / 60
+        let m = totalMinutes % 60
+        if h > 0 && m > 0 { return "\(h)h \(m)m" }
+        if h > 0 { return "\(h)h" }
+        return "\(m)m"
     }
 
     private func formatMetric(_ value: Double) -> String {
