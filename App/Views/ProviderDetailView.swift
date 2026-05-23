@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 
 struct ProviderDetailView: View {
@@ -7,7 +8,7 @@ struct ProviderDetailView: View {
 
     var body: some View {
         ZStack {
-            LiquidGlassBackdrop(style: .ultraThinMaterial)
+            LiquidGlassBackdrop(intensity: .settings)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -28,6 +29,10 @@ struct ProviderDetailView: View {
 
                         if !snapshot.windows.isEmpty {
                             windowsSection
+                        }
+
+                        if !snapshot.analyticsBuckets.isEmpty {
+                            analyticsSection
                         }
 
                         if snapshot.statsSectionTitle != nil {
@@ -107,8 +112,21 @@ struct ProviderDetailView: View {
 
             ForEach(snapshot.windows) { window in
                 GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
-                    QuotaWindowRow(window: window, accentColor: accent)
+                    QuotaWindowRow(window: window, accentColor: accent, providerID: snapshot.providerID)
                 }
+            }
+        }
+    }
+
+    private var analyticsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Analytics")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+
+            GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
+                UsageAnalyticsOverviewView(providerID: snapshot.providerID, buckets: snapshot.analyticsBuckets, accent: accent)
             }
         }
     }
@@ -209,10 +227,231 @@ struct ProviderDetailView: View {
     }
 }
 
+private struct UsageAnalyticsOverviewView: View {
+    let providerID: ProviderID
+    let buckets: [UsageAnalyticsBucket]
+    let accent: Color
+    @ObservedObject private var budgetStore = ProviderMonthlyBudgetStore.shared
+
+    private var model: UsageAnalyticsIntelligence {
+        UsageAnalyticsIntelligence(
+            buckets: buckets,
+            monthlyBudgetUSD: budgetStore.budgetUSD(for: providerID)
+        )
+    }
+
+    var body: some View {
+        let model = model
+        VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                analyticsTile(title: "Today", value: model.today.tokens.compactString, subtitle: costSubtitle(model.today))
+                analyticsTile(title: "7D", value: model.sevenDay.tokens.compactString, subtitle: costSubtitle(model.sevenDay))
+                analyticsTile(title: "30D", value: model.thirtyDay.tokens.compactString, subtitle: costSubtitle(model.thirtyDay))
+                analyticsTile(title: "Projected", value: projectedValue(model.projectedMonth), subtitle: projectedSubtitle(model))
+            }
+
+            if !model.insights.isEmpty {
+                VStack(spacing: 7) {
+                    ForEach(model.insights.prefix(3)) { insight in
+                        UsageAnalyticsInsightRow(insight: insight, accent: accent)
+                    }
+                }
+            }
+
+            if !model.daily.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Tokens")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Chart(model.daily) { day in
+                        BarMark(
+                            x: .value("Day", day.date, unit: .day),
+                            y: .value("Tokens", day.tokens)
+                        )
+                        .foregroundStyle(accent)
+                        .opacity(day.tokens > 0 ? 0.82 : 0.16)
+                    }
+                    .chartYAxis(.hidden)
+                    .chartXAxis {
+                        AxisMarks(values: model.axisDates) { _ in
+                            AxisGridLine().foregroundStyle(Color.clear)
+                            AxisTick().foregroundStyle(Color.clear)
+                            AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(height: 104)
+                }
+            }
+
+            if model.hasCost {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Cost")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Chart(model.daily) { day in
+                        BarMark(
+                            x: .value("Day", day.date, unit: .day),
+                            y: .value("USD", day.cost)
+                        )
+                        .foregroundStyle(Color(hex: "#22C55E"))
+                        .opacity(day.cost > 0 ? 0.78 : 0.14)
+                    }
+                    .chartYAxis(.hidden)
+                    .chartXAxis(.hidden)
+                    .frame(height: 62)
+                }
+            }
+
+            if !model.topModels.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Top Models")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    ForEach(model.topModels.prefix(4)) { item in
+                        HStack(spacing: 8) {
+                            Text(item.name)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Text(item.tokens.compactString)
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        .overlay(alignment: .bottomLeading) {
+                            GeometryReader { proxy in
+                                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                    .fill(accent.opacity(0.24))
+                                    .frame(width: proxy.size.width * item.fractionOfMax, height: 2)
+                                    .offset(y: 5)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func analyticsTile(title: String, value: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+            Text(subtitle)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(accent.opacity(0.075), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func costSubtitle(_ totals: UsageAnalyticsPeriodTotals) -> String {
+        if totals.cost > 0 {
+            return formattedMetricValue(totals.cost, unit: "$")
+        }
+        return "\(totals.requests.compactString) reqs"
+    }
+
+    private func projectedValue(_ totals: UsageAnalyticsPeriodTotals) -> String {
+        if totals.cost > 0 {
+            return formattedMetricValue(totals.cost, unit: "$")
+        }
+        return totals.tokens.compactString
+    }
+
+    private func projectedSubtitle(_ model: UsageAnalyticsIntelligence) -> String {
+        if let budget = model.monthlyBudget {
+            return "\(budget.projectedPercentageText) of budget"
+        }
+
+        if model.projectedMonth.cost > 0, model.projectedMonth.tokens > 0 {
+            return "\(model.projectedMonth.tokens.compactString) tokens"
+        }
+        return "\(model.projectedMonth.requests.compactString) reqs"
+    }
+}
+
+private struct UsageAnalyticsInsightRow: View {
+    let insight: UsageAnalyticsInsight
+    let accent: Color
+
+    private var color: Color {
+        switch insight.severity {
+        case .info:
+            return accent
+        case .warning:
+            return .yellow
+        case .critical:
+            return .red
+        }
+    }
+
+    private var iconName: String {
+        switch insight.kind {
+        case .budgetStatus:
+            return "gauge.with.dots.needle.67percent"
+        case .projectedMonth:
+            return "calendar.badge.clock"
+        case .usageSpike:
+            return "exclamationmark.triangle.fill"
+        case .topModel:
+            return "cpu.fill"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: iconName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 20, height: 20)
+                .background(color.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(insight.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text(insight.message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.065), lineWidth: 1)
+        )
+    }
+}
+
 struct ProviderDetailView_Previews: PreviewProvider {
     static var previews: some View {
         NavigationStack {
-            ProviderDetailView(snapshot: MockData.codexSnapshot)
+            ProviderDetailView(snapshot: MockData.openAIAPISnapshot)
         }
         .preferredColorScheme(.dark)
     }
@@ -228,7 +467,7 @@ struct CodexDetailView: View {
 
     var body: some View {
         ZStack {
-            LiquidGlassBackdrop(style: .ultraThinMaterial)
+            LiquidGlassBackdrop(intensity: .settings)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -249,6 +488,10 @@ struct CodexDetailView: View {
 
                         if !usageSnapshot.windows.isEmpty {
                             windowsSection
+                        }
+
+                        if !usageSnapshot.analyticsBuckets.isEmpty {
+                            analyticsSection(usageSnapshot.analyticsBuckets)
                         }
 
                         if let telemetrySnapshot, telemetrySnapshot.statsSectionTitle != nil {
@@ -320,8 +563,21 @@ struct CodexDetailView: View {
 
             ForEach(usageSnapshot.windows) { window in
                 GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
-                    QuotaWindowRow(window: window, accentColor: accent)
+                    QuotaWindowRow(window: window, accentColor: accent, providerID: usageSnapshot.providerID)
                 }
+            }
+        }
+    }
+
+    private func analyticsSection(_ buckets: [UsageAnalyticsBucket]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Analytics")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+
+            GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
+                UsageAnalyticsOverviewView(providerID: usageSnapshot.providerID, buckets: buckets, accent: accent)
             }
         }
     }

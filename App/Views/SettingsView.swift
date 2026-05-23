@@ -1,22 +1,35 @@
 import SwiftUI
+import WidgetKit
 #if os(macOS)
 import AppKit
 import UniformTypeIdentifiers
+#elseif os(iOS)
+import UIKit
 #endif
 
 struct SettingsView: View {
     @StateObject private var visibilityStore = ProviderVisibilityStore.shared
+    @StateObject private var monthlyBudgetStore = ProviderMonthlyBudgetStore.shared
     @AppStorage("dashboardRefreshIntervalSeconds") private var dashboardRefreshIntervalSeconds: Int = 60
+    @State private var requestedRefreshIntervalMinutes = UsageRefreshCadence.requestedRefreshIntervalMinutes
     @State private var cloudSyncDebug = CloudSyncDebugInfo.placeholder
     @State private var isRefreshingCloudSync = false
     @State private var isRepairingSubscriptions = false
     @State private var cloudSyncActionMessage: String?
     @State private var showRawDataDebug = false
 
+    private var monthlyBudgetRows: [SettingsProviderRowIdentity] {
+        ProviderID.userFacingCases.map { SettingsProviderRowIdentity(section: "budget", providerID: $0) }
+    }
+
+    private var providerConfigurationRows: [SettingsProviderRowIdentity] {
+        ProviderID.userFacingCases.map { SettingsProviderRowIdentity(section: "provider", providerID: $0) }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
-                LiquidGlassBackdrop(style: .ultraThinMaterial)
+                LiquidGlassBackdrop(intensity: .settings)
 
                 List {
                     Section {
@@ -138,6 +151,54 @@ struct SettingsView: View {
                         Text("This controls how often the dashboard refreshes visible status while the app is open.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+
+                        Picker(requestedRefreshPickerTitle, selection: $requestedRefreshIntervalMinutes) {
+                            ForEach(UsageRefreshCadence.allowedIntervalMinutes, id: \.self) { minutes in
+                                Text(UsageRefreshCadence.intervalLabel(for: minutes)).tag(minutes)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .onChange(of: requestedRefreshIntervalMinutes) { newValue in
+                            updateRequestedRefreshInterval(to: newValue)
+                        }
+
+                        Text(requestedRefreshHelpText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .listRowBackground(Color.white.opacity(0.04))
+
+                    #if os(iOS)
+                    Section("Dashboard Services") {
+                        ForEach(ProviderID.userFacingCases) { providerID in
+                            ProviderVisibilitySettingsRow(
+                                providerID: providerID,
+                                isVisible: visibilityStore.binding(for: providerID)
+                            )
+                        }
+                    }
+                    .listRowBackground(Color.white.opacity(0.04))
+                    #endif
+
+                    Section("Dashboard Extras") {
+                        ProviderVisibilitySettingsRow(
+                            providerID: .heatmap,
+                            isVisible: visibilityStore.binding(for: .heatmap)
+                        )
+                    }
+                    .listRowBackground(Color.white.opacity(0.04))
+
+                    Section("Monthly Budgets") {
+                        ForEach(monthlyBudgetRows) { row in
+                            ProviderMonthlyBudgetSettingsRow(
+                                providerID: row.providerID,
+                                budgetStore: monthlyBudgetStore
+                            )
+                        }
+
+                        Text("Budgets are local monthly USD targets used for projected spend and threshold callouts.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     .listRowBackground(Color.white.opacity(0.04))
 
@@ -157,14 +218,19 @@ struct SettingsView: View {
 
                     #if os(macOS)
                     Section("Providers") {
-                        ForEach(ProviderID.userFacingCases) { providerID in
+                        ForEach(providerConfigurationRows) { row in
                             ProviderSettingsRow(
-                                providerID: providerID,
-                                onConfigure: { openProviderConfiguration(providerID) },
-                                isVisible: visibilityStore.binding(for: providerID)
+                                providerID: row.providerID,
+                                onConfigure: { openProviderConfiguration(row.providerID) },
+                                isVisible: visibilityStore.binding(for: row.providerID)
                             )
                             .listRowBackground(Color.white.opacity(0.03))
                         }
+                    }
+
+                    Section("AGBench Data Source") {
+                        AGBenchDataSourceRow()
+                            .listRowBackground(Color.white.opacity(0.03))
                     }
                     #endif
                 }
@@ -186,6 +252,31 @@ struct SettingsView: View {
     private func openProviderConfiguration(_ providerID: ProviderID) {
         #if os(macOS)
         ProviderConfigurationWindowManager.shared.show(providerID: providerID)
+        #endif
+    }
+
+    private var requestedRefreshPickerTitle: String {
+        #if os(iOS)
+        "Background/widget refresh"
+        #else
+        "Widget timeline refresh"
+        #endif
+    }
+
+    private var requestedRefreshHelpText: String {
+        #if os(iOS)
+        "CloudKit pushes still update the iPhone as soon as iOS delivers them. This is the requested fallback cadence for iPhone background fetch and widget timeline reloads; iOS may throttle it."
+        #else
+        "Widgets request fresh timelines at this cadence. The Mac app still reloads widgets immediately after local data refreshes."
+        #endif
+    }
+
+    private func updateRequestedRefreshInterval(to minutes: Int) {
+        UsageRefreshCadence.setRequestedRefreshIntervalMinutes(minutes)
+        WidgetCenter.shared.reloadAllTimelines()
+
+        #if os(iOS)
+        (UIApplication.shared.delegate as? IOSAppDelegate)?.scheduleBackgroundRefresh()
         #endif
     }
 
@@ -222,6 +313,16 @@ struct SettingsView: View {
     }
 }
 
+private struct SettingsProviderRowIdentity: Identifiable {
+    let id: String
+    let providerID: ProviderID
+
+    init(section: String, providerID: ProviderID) {
+        self.id = "\(section).\(providerID.rawValue)"
+        self.providerID = providerID
+    }
+}
+
 // MARK: - Raw Data Debug View
 
 struct RawDataDebugView: View {
@@ -234,7 +335,7 @@ struct RawDataDebugView: View {
 
     var body: some View {
         NavigationStack {
-            List {
+                      List {
                 if let selectedProvider {
                     providerDetailSection(selectedProvider)
                 } else {
@@ -293,6 +394,7 @@ struct RawDataDebugView: View {
                     InfoRow(label: "Fetched At", value: formatDate(snapshot.fetchedAt))
                     InfoRow(label: "Windows", value: "\(snapshot.windows.count)")
                     InfoRow(label: "Stats", value: "\(snapshot.stats.count)")
+                    InfoRow(label: "Analytics Buckets", value: "\(snapshot.analyticsBuckets.count)")
                     InfoRow(label: "Events", value: "\(snapshot.events.count)")
                     InfoRow(label: "Signals", value: "\(snapshot.signals.count)")
                 } else {
@@ -324,6 +426,31 @@ struct RawDataDebugView: View {
                             Text(event.type.rawValue)
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
+            if let snapshot, !snapshot.analyticsBuckets.isEmpty {
+                Section(header: Text("Analytics Buckets (Recent 50)")) {
+                    ForEach(Array(snapshot.analyticsBuckets.prefix(50)), id: \.id) { bucket in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(formatDate(bucket.startDate))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(bucket.source.rawValue)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Text(bucket.model ?? bucket.note ?? "All usage")
+                                .font(.caption2)
+                                .foregroundStyle(.primary)
+                            Text("\(bucket.totalTokens.compactString) tokens - \(bucket.requests.compactString) requests - \(formattedMetricValue(bucket.costUSD ?? 0, unit: "$"))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                         .padding(.vertical, 2)
                     }
@@ -456,6 +583,199 @@ private func formatCloudSyncDebugDate(_ date: Date) -> String {
 }
 
 // MARK: - Row
+
+private struct ProviderVisibilitySettingsRow: View {
+    let providerID: ProviderID
+    let isVisible: Binding<Bool>
+
+    private var accent: Color { Color(hex: providerID.accentColorHex) }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ProviderBrandIconView(providerID: providerID, size: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(providerID.displayName)
+                    .foregroundStyle(.primary)
+
+                Text(providerID.configurationDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+
+            Toggle(isOn: isVisible) {
+                Text("Shown on Dashboard")
+                    .font(.caption2.weight(.semibold))
+            }
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(accent)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ProviderMonthlyBudgetSettingsRow: View {
+    let providerID: ProviderID
+    @ObservedObject var budgetStore: ProviderMonthlyBudgetStore
+    @State private var budgetText = ""
+
+    private var accent: Color { Color(hex: providerID.accentColorHex) }
+    private var storedBudget: Double? { budgetStore.budgetUSD(for: providerID) }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ProviderBrandIconView(providerID: providerID, size: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(providerID.displayName)
+                    .foregroundStyle(.primary)
+
+                Text(storedBudget.map { "\(formattedMetricValue($0, unit: "$")) monthly target" } ?? "No monthly target")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 5) {
+                Text("$")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                TextField("None", text: $budgetText)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .monospacedDigit()
+                    .frame(width: 86)
+                    #if os(iOS)
+                    .keyboardType(.decimalPad)
+                    #endif
+
+                if storedBudget != nil || !budgetText.isEmpty {
+                    Button {
+                        budgetText = ""
+                        budgetStore.setBudgetUSD(nil, for: providerID)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear monthly budget")
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            budgetText = budgetStore.formattedBudgetText(for: providerID)
+        }
+        .onChange(of: budgetText) { _, newValue in
+            commitBudgetText(newValue)
+        }
+    }
+
+    private func commitBudgetText(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            budgetStore.setBudgetUSD(nil, for: providerID)
+            return
+        }
+
+        guard let parsed = ProviderMonthlyBudgetStore.parsedBudgetUSD(from: trimmed) else { return }
+        budgetStore.setBudgetUSD(parsed, for: providerID)
+    }
+}
+
+/// AGBench (GUIGemini) telemetry source row. Lets the user grant the
+/// app sandboxed access to `~/Library/Application Support/agbench/`
+/// so providers (Kimi, Codex, Gemini, Claude) can read `usage.json`
+/// and surface AGBench-driven runs on the activity heatmap.
+private struct AGBenchDataSourceRow: View {
+    @State private var hasBookmark: Bool = AGBenchBookmarkStore.hasBookmark
+    @State private var lastErrorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: hasBookmark ? "checkmark.seal.fill" : "shippingbox")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(hasBookmark ? Color.green : Color.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("AGBench (GUIGemini)")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(hasBookmark
+                         ? "Connected — usage.json is being read for Kimi, Codex, Gemini, and Claude."
+                         : "Not configured. Grant access to surface AGBench runs on the heatmap.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                Button(hasBookmark ? "Re-grant Access" : "Grant Access") {
+                    grantAccess()
+                }
+                .buttonStyle(.bordered)
+
+                if hasBookmark {
+                    Button("Remove") {
+                        AGBenchBookmarkStore.clear()
+                        hasBookmark = false
+                        lastErrorMessage = nil
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                }
+            }
+
+            if let lastErrorMessage {
+                Text(lastErrorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            Text("Pick the folder at: ~/Library/Application Support/agbench")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func grantAccess() {
+        #if os(macOS)
+        let panel = NSOpenPanel()
+        panel.title = "Grant access to AGBench data"
+        panel.message = "Select the agbench folder under ~/Library/Application Support/"
+        panel.prompt = "Grant"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        // Default to the typical location so the user only has to click "Grant".
+        let defaultURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Application Support/agbench")
+        if FileManager.default.fileExists(atPath: defaultURL.path) {
+            panel.directoryURL = defaultURL
+        }
+
+        if panel.runModal() == .OK, let url = panel.url {
+            if AGBenchBookmarkStore.save(url: url) {
+                hasBookmark = true
+                lastErrorMessage = nil
+            } else {
+                lastErrorMessage = "Failed to save bookmark. Try selecting the folder again."
+            }
+        }
+        #endif
+    }
+}
 
 private struct ProviderSettingsRow: View {
     let providerID: ProviderID
@@ -614,7 +934,7 @@ struct ProviderCredentialView: View {
 
     var body: some View {
         ZStack {
-            LiquidGlassBackdrop(style: .ultraThinMaterial)
+            LiquidGlassBackdrop(intensity: .settings)
 
             Form {
                 Section("Connection") {
@@ -747,11 +1067,19 @@ struct ProviderCredentialView: View {
                     }
 
                     if let secondaryCredentialLabel = providerID.secondaryCredentialLabel {
-                        TextField(secondaryCredentialLabel, text: $accountIdentifier)
-                            .autocorrectionDisabled()
-                        #if os(iOS)
-                            .textInputAutocapitalization(.never)
-                        #endif
+                        if providerID == .claude {
+                            SecureField(secondaryCredentialLabel, text: $accountIdentifier)
+                                .autocorrectionDisabled()
+                            #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                            #endif
+                        } else {
+                            TextField(secondaryCredentialLabel, text: $accountIdentifier)
+                                .autocorrectionDisabled()
+                            #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                            #endif
+                        }
                     }
                 }
                 .padding(.horizontal, 12)
@@ -759,7 +1087,7 @@ struct ProviderCredentialView: View {
 
                 Section("Advanced") {
                     if providerID == .claude {
-                        Text("This provider reads the local `~/.claude` workspace folder. Leave the field above pointed at that folder, or choose a different Claude Code root if you keep it elsewhere.")
+                        Text("The data root field above points to your `~/.claude` folder for local token tracking. Optionally paste an OAuth bearer token in the field below to enable live 5-hour and 7-day quota meters from Anthropic's servers — no model call is made to fetch quota.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -769,12 +1097,22 @@ struct ProviderCredentialView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .codexTelemetry {
-                        Text("Use the import button to grant access to `~/.codex` or a Codex log subfolder. The app reads the local SQLite log store and text logs, then turns them into activity counts.")
+                        Text("Use the import button to grant access to the full `~/.codex` folder for reliable Codex activity. Selecting only `logs_2.sqlite` works as a limited fallback, but it cannot discover session files.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .openaiAPI {
+                        Text("Use an OpenAI admin API key plus a project ID. This provider reads official organization usage and costs endpoints only; it does not inspect browser sessions or local app credentials.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        TextField("Custom Endpoint (optional)", text: $customEndpoint)
+                            .autocorrectionDisabled()
+                        #if os(iOS)
+                            .textInputAutocapitalization(.never)
+                        #endif
                     } else if providerID == .cursor {
-                        Text("Use the in-app Cursor session import flow above for live usage meters. You can still import `state.vscdb` with the file picker for cached account metadata and local AI activity stats.")
+                        Text("Use the in-app Cursor session import flow above for live usage meters. You can also import Cursor's `globalStorage` folder or `state.vscdb` for cached account metadata and local AI activity stats.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -795,6 +1133,11 @@ struct ProviderCredentialView: View {
                         }
                         .pickerStyle(.menu)
                         Text(selectedGeminiLimitPreset.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .kimi {
+                        Text("Paste a Kimi Code Console API key above, or import the `~/.kimi` folder for the CLI OAuth file. The app reads the current access token only while it is valid; if Kimi CLI refreshes it, the folder bookmark lets the app pick up the new token.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -867,7 +1210,7 @@ struct ProviderCredentialView: View {
     private var codexTelemetrySection: some View {
         Section("Codex Local Activity") {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Local Codex logs supply the expanded card details and activity heatmap entries for Codex.")
+                Text("Local Codex logs supply the expanded card details and activity heatmap entries for Codex. Grant the `~/.codex` folder for the most reliable heatmap history.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -992,14 +1335,8 @@ struct ProviderCredentialView: View {
     }
 
     private func importCodexTelemetryCredential(_ detected: CredentialImportService.DetectedCredential) {
-        do {
-            let credential = try CredentialImportService.importFromURL(detected.fileURL, for: .codexTelemetry)
-            saveCodexTelemetryCredential(credential)
-        } catch {
-            importError = (error as? CredentialImportService.ImportError)?.errorDescription
-                ?? error.localizedDescription
-            showImportError = true
-        }
+        _ = detected
+        importCodexTelemetryFromFile()
     }
 
     private func saveCodexTelemetryCredential(_ imported: CredentialImportService.ImportedCredential) {
@@ -1048,7 +1385,8 @@ struct ProviderCredentialView: View {
     private func loadExisting() {
         if let cred = KeychainService.shared.credential(for: providerID) {
             if providerID == .claude {
-                accessToken = cred.customEndpoint ?? cred.accessToken ?? ""
+                accessToken = cred.customEndpoint ?? ""
+                accountIdentifier = cred.accessToken ?? ""
             } else {
                 accessToken = cred.accessToken ?? ""
             }
@@ -1134,7 +1472,7 @@ struct ProviderCredentialView: View {
         }
 
         let credential = ProviderCredential(
-            accessToken: providerID == .claude ? nil : (accessToken.isEmpty ? nil : accessToken),
+            accessToken: providerID == .claude ? (accountIdentifier.isEmpty ? nil : accountIdentifier) : (accessToken.isEmpty ? nil : accessToken),
             accountIdentifier: accountIdentifier.isEmpty ? nil : accountIdentifier,
             customEndpoint: resolvedCustomEndpoint,
             extraFields: extraFields.isEmpty ? nil : extraFields
@@ -1159,7 +1497,7 @@ struct ProviderCredentialView: View {
             ? (accessToken.isEmpty ? nil : accessToken)
             : (customEndpoint.isEmpty ? nil : customEndpoint)
         let credential = ProviderCredential(
-            accessToken: providerID == .claude ? nil : (accessToken.isEmpty ? nil : accessToken),
+            accessToken: providerID == .claude ? (accountIdentifier.isEmpty ? nil : accountIdentifier) : (accessToken.isEmpty ? nil : accessToken),
             accountIdentifier: accountIdentifier.isEmpty ? nil : accountIdentifier,
             customEndpoint: resolvedCustomEndpoint,
             extraFields: extraFields.isEmpty ? nil : extraFields
@@ -1180,6 +1518,11 @@ struct ProviderCredentialView: View {
     }
 
     private func applyImportedCredential(_ credential: CredentialImportService.ImportedCredential) {
+        if providerID == .cursor {
+            applyImportedCursorCredential(credential)
+            return
+        }
+
         accessToken = credential.accessToken ?? ""
         accountIdentifier = credential.accountIdentifier ?? ""
         customEndpoint = credential.customEndpoint ?? ""
@@ -1200,7 +1543,46 @@ struct ProviderCredentialView: View {
         }
     }
 
+    private func applyImportedCursorCredential(_ credential: CredentialImportService.ImportedCredential) {
+        let existing = KeychainService.shared.credential(for: .cursor)
+
+        let resolvedAccessToken = credential.accessToken
+            ?? (accessToken.isEmpty ? existing?.accessToken : accessToken)
+        let resolvedAccountIdentifier = credential.accountIdentifier
+            ?? (accountIdentifier.isEmpty ? existing?.accountIdentifier : accountIdentifier)
+        let resolvedCustomEndpoint = credential.customEndpoint
+            ?? (customEndpoint.isEmpty ? existing?.customEndpoint : customEndpoint)
+
+        accessToken = resolvedAccessToken ?? ""
+        accountIdentifier = resolvedAccountIdentifier ?? ""
+        customEndpoint = resolvedCustomEndpoint ?? ""
+
+        var extraFields = existing?.extraFields ?? storedExtraFields
+        for (key, value) in credential.extraFields ?? [:] {
+            extraFields[key] = value
+        }
+        if let bookmarkData = credential.bookmarkData {
+            let bookmarkBase64 = bookmarkData.base64EncodedString()
+            print("[SettingsView] Got Cursor bookmark data (length: \(bookmarkData.count), base64 length: \(bookmarkBase64.count))")
+            extraFields["bookmarkData"] = bookmarkBase64
+        }
+
+        let hasCookie = extraFields["cursorCookieHeader"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasLocalState = !(customEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || extraFields["bookmarkData"]?.isEmpty == false
+        if hasCookie {
+            extraFields["cursorAuthMode"] = "cookie"
+        } else if hasLocalState {
+            extraFields["cursorAuthMode"] = "localState"
+        }
+
+        saveCredentialWithExtraFields(extraFields)
+    }
+
     private func deleteCredential() {
+        if providerID == .cursor {
+            CursorSessionImportModel.clearStoredWebsiteData()
+        }
         KeychainService.shared.delete(for: providerID)
         accessToken = ""
         accountIdentifier = ""

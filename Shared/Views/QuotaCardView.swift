@@ -96,20 +96,44 @@ public struct ProviderCardTitleText: View {
     public var body: some View {
         Text(title)
             .font(.headline.weight(.semibold))
-            .foregroundStyle(.primary)
-            .shadow(color: accentColor.opacity(0.45), radius: 3, x: 0, y: 0)
-            .shadow(color: accentColor.opacity(0.18), radius: 10, x: 0, y: 0)
+            .foregroundStyle(.white.opacity(0.92))
+            .shadow(color: accentColor.opacity(0.18), radius: 6, x: 0, y: 0)
             .overlay {
                 Text(title)
                     .font(.headline.weight(.semibold))
-                    .foregroundStyle(accentColor.opacity(0.22))
-                    .blur(radius: 0.4)
-                    .offset(x: 0.4, y: 0.2)
+                    .foregroundStyle(accentColor.opacity(0.10))
+                    .blur(radius: 0.6)
+                    .offset(x: 0.3, y: 0.2)
                     .mask(
                         Text(title)
                             .font(.headline.weight(.semibold))
                     )
             }
+    }
+}
+
+@ViewBuilder
+private func headerMetadataLine(plan: String?, updatedAt: Date) -> some View {
+    let updatedText = "Updated \(updatedAt.relativeString)"
+
+    if let plan, !plan.isEmpty {
+        HStack(spacing: 4) {
+            Text(plan)
+                .foregroundStyle(.secondary)
+            Text("-")
+                .foregroundStyle(.tertiary)
+            Text(updatedText)
+                .foregroundStyle(.tertiary)
+        }
+        .font(.caption.weight(.medium))
+        .lineLimit(1)
+        .minimumScaleFactor(0.78)
+    } else {
+        Text(updatedText)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
     }
 }
 
@@ -142,7 +166,6 @@ public struct QuotaCardView: View {
             cardHeader
             Divider().overlay(Color.white.opacity(0.10))
             cardBody
-            cardFooter
         }
         .overlay(alignment: .topTrailing) {
             if hasTelemetryContent {
@@ -151,9 +174,12 @@ public struct QuotaCardView: View {
                     .padding(.trailing, 8)
             }
         }
-        .background(
-            GlassPanel(style: .panel, accent: accentColor, shape: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        )
+        // Apply Liquid Glass via the new container-level modifier
+        // instead of `.background(GlassPanel(...))`. The modifier
+        // routes `.regularMaterial` + `.glassEffect()` at the correct
+        // z-order so card content stays foreground regardless of
+        // backing-material density.
+        .glassCardBackground(accent: accentColor, cornerRadius: 16)
         .overlay {
             if isRefreshing {
                 RefreshHaloOverlay(accentColor: accentColor, cornerRadius: 16)
@@ -170,11 +196,7 @@ public struct QuotaCardView: View {
             VStack(alignment: .leading, spacing: 1) {
                 ProviderCardTitleText(title: snapshot.displayName, accentColor: accentColor)
 
-                if let plan = snapshot.planName {
-                    Text(plan)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
+                headerMetadataLine(plan: snapshot.planName, updatedAt: snapshot.fetchedAt)
             }
 
             Spacer()
@@ -182,6 +204,16 @@ public struct QuotaCardView: View {
             fetchStateIndicator
         }
         .padding(10)
+        .background(
+            LinearGradient(
+                colors: [
+                    accentColor.opacity(0.13),
+                    accentColor.opacity(0.0)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
     }
 
     @ViewBuilder
@@ -223,15 +255,37 @@ public struct QuotaCardView: View {
                         }
                     }
 
-                    if !snapshot.windows.isEmpty {
-                        VStack(spacing: 8) {
-                            ForEach(snapshot.windows) { window in
-                                QuotaWindowRow(window: window, accentColor: accentColor)
+                    let windows = snapshot.summaryWindows
+                    if !windows.isEmpty {
+                        VStack(spacing: 6) {
+                            ForEach(windows) { window in
+                                QuotaWindowRow(window: window, accentColor: accentColor, providerID: snapshot.providerID)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .fill(accentColor.opacity(0.06))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .strokeBorder(
+                                                        LinearGradient(
+                                                            colors: [
+                                                                Color.white.opacity(0.13),
+                                                                Color.white.opacity(0.03)
+                                                            ],
+                                                            startPoint: .topLeading,
+                                                            endPoint: .bottomTrailing
+                                                        ),
+                                                        lineWidth: 0.5
+                                                    )
+                                            )
+                                    )
                             }
                         }
                     }
 
-                    if showsTelemetryDetails, let statsTitle = snapshot.statsSectionTitle {
+                    if showsTelemetryDetails, snapshot.providerID != .kimi,
+                       let statsTitle = snapshot.statsSectionTitle {
                         supplementalSection(title: statsTitle) {
                             SnapshotMetricListView(
                                 items: snapshot.stats.map {
@@ -247,7 +301,8 @@ public struct QuotaCardView: View {
                         }
                     }
 
-                    if showsTelemetryDetails, let balancesTitle = snapshot.balancesSectionTitle {
+                    if showsTelemetryDetails, snapshot.providerID != .kimi,
+                       let balancesTitle = snapshot.balancesSectionTitle {
                         supplementalSection(title: balancesTitle) {
                             SnapshotMetricListView(
                                 items: snapshot.balances.map {
@@ -291,7 +346,9 @@ public struct QuotaCardView: View {
     // MARK: - Footer
 
     private var hasTelemetryContent: Bool {
-        !snapshot.signals.isEmpty || !snapshot.stats.isEmpty || !snapshot.balances.isEmpty
+        if !snapshot.signals.isEmpty { return true }
+        if snapshot.providerID == .kimi { return false }
+        return !snapshot.stats.isEmpty || !snapshot.balances.isEmpty
     }
 
     private var telemetryToggleButton: some View {
@@ -328,18 +385,6 @@ public struct QuotaCardView: View {
 
             content()
         }
-    }
-
-    private var cardFooter: some View {
-        HStack {
-            Spacer()
-            Text("Updated \(snapshot.fetchedAt.relativeString)")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 6)
-        .padding(.top, 2)
     }
 
     // MARK: - Background
@@ -409,7 +454,6 @@ public struct CodexOverviewCardView: View {
             combinedHeader
             Divider().overlay(Color.white.opacity(0.10))
             combinedBody
-            combinedFooter
         }
         .overlay(alignment: .topTrailing) {
             if hasTelemetryContent {
@@ -418,9 +462,7 @@ public struct CodexOverviewCardView: View {
                     .padding(.trailing, 8)
             }
         }
-        .background(
-            GlassPanel(style: .panel, accent: accentColor, shape: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        )
+        .glassCardBackground(accent: accentColor, cornerRadius: 16)
         .overlay {
             if isRefreshing {
                 RefreshHaloOverlay(accentColor: accentColor, cornerRadius: 16)
@@ -435,11 +477,7 @@ public struct CodexOverviewCardView: View {
             VStack(alignment: .leading, spacing: 1) {
                 ProviderCardTitleText(title: usageSnapshot.displayName, accentColor: accentColor)
 
-                if let plan = usageSnapshot.planName {
-                    Text(plan)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
+                headerMetadataLine(plan: usageSnapshot.planName, updatedAt: latestUpdatedAt)
             }
 
             Spacer()
@@ -467,10 +505,10 @@ public struct CodexOverviewCardView: View {
 
     private var combinedBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if !usageSnapshot.windows.isEmpty {
+            if !usageSnapshot.summaryWindows.isEmpty {
                 VStack(spacing: 8) {
-                    ForEach(usageSnapshot.windows) { window in
-                        QuotaWindowRow(window: window, accentColor: accentColor)
+                    ForEach(usageSnapshot.summaryWindows) { window in
+                        QuotaWindowRow(window: window, accentColor: accentColor, providerID: usageSnapshot.providerID)
                     }
                 }
             }
@@ -536,18 +574,6 @@ public struct CodexOverviewCardView: View {
             }
         }
         .padding(10)
-    }
-
-    private var combinedFooter: some View {
-        HStack {
-            Spacer()
-            Text("Updated \(latestUpdatedAt.relativeString)")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 6)
-        .padding(.top, 2)
     }
 
     private func supplementalSection<Content: View>(
@@ -665,7 +691,11 @@ public struct SnapshotMetricListView: View {
                 }
             }
         }
-        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(Color.white.opacity(0.032), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.065), lineWidth: 1)
+        )
     }
 }
 
@@ -704,13 +734,17 @@ public struct SnapshotMetricRow: View {
 public struct QuotaWindowRow: View {
     let window: QuotaWindow
     let accentColor: Color
+    let providerID: ProviderID?
 
-    public init(window: QuotaWindow, accentColor: Color) {
+    public init(window: QuotaWindow, accentColor: Color, providerID: ProviderID? = nil) {
         self.window = window
         self.accentColor = accentColor
+        self.providerID = providerID
     }
 
     public var body: some View {
+        let pace = window.pace(providerID: providerID)
+
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(window.label)
@@ -725,7 +759,8 @@ public struct QuotaWindowRow: View {
             if window.hasExplicitLimit {
                 QuotaProgressBar(
                     fraction: window.fractionUsed,
-                    accentColor: accentColor
+                    accentColor: accentColor,
+                    pace: pace
                 )
             }
 
@@ -734,6 +769,9 @@ public struct QuotaWindowRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if let pace, pace.shouldSurface {
+                    PaceBadge(pace: pace)
+                }
                 if let resetDate = window.resetDate {
                     Text("Resets \(resetDate.countdownString)")
                         .font(.caption2.weight(.medium))
@@ -741,12 +779,30 @@ public struct QuotaWindowRow: View {
                 }
             }
 
-            if let subtitle = window.subtitle {
-                Text(subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
         }
+    }
+}
+
+private struct PaceBadge: View {
+    let pace: QuotaPace
+
+    private var color: Color {
+        Color(hex: pace.colorHex)
+    }
+
+    var body: some View {
+        Text(pace.compactStatusText)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.12), in: Capsule(style: .continuous))
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(color.opacity(0.18), lineWidth: 0.5)
+            )
     }
 }
 
@@ -769,6 +825,8 @@ struct SnapshotSignalNotice: View {
         switch signal.kind {
         case .unexpectedRecovery:
             return "sparkles.rectangle.stack"
+        case .scheduledReset:
+            return "arrow.clockwise.circle"
         }
     }
 
@@ -809,7 +867,11 @@ struct SnapshotSignalNotice: View {
             }
         }
         .padding(8)
-        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.065), lineWidth: 1)
+        )
     }
 }
 
@@ -818,27 +880,78 @@ struct SnapshotSignalNotice: View {
 public struct QuotaProgressBar: View {
     let fraction: Double
     let accentColor: Color
+    let pace: QuotaPace?
     var height: CGFloat = 8
 
-    public init(fraction: Double, accentColor: Color, height: CGFloat = 8) {
+    public init(fraction: Double, accentColor: Color, height: CGFloat = 8, pace: QuotaPace? = nil) {
         self.fraction = fraction
         self.accentColor = accentColor
         self.height = height
+        self.pace = pace
     }
 
     public var body: some View {
         GeometryReader { geo in
             let clampedFraction = min(max(fraction, 0), 1)
             let fillColor = usageColor(for: clampedFraction, accentColor: accentColor)
+            let fillWidth = geo.size.width * clampedFraction
+            let markerWidth = max(2, height * 0.28)
+
             ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color.white.opacity(0.07))
+                // Glass tube track
+                RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                    .fill(Color.white.opacity(0.055))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                            .strokeBorder(
+                                LinearGradient(
+                                    colors: [
+                                        Color.white.opacity(0.22),
+                                        Color.white.opacity(0.05)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                ),
+                                lineWidth: 0.5
+                            )
+                    )
                     .frame(height: height)
 
-                Rectangle()
-                    .fill(progressiveMeterGradient(fraction: clampedFraction, accentColor: accentColor))
-                    .frame(width: geo.size.width * clampedFraction, height: height)
-                    .shadow(color: fillColor.opacity(0.35), radius: 4, y: 0)
+                if clampedFraction > 0 {
+                    // Liquid fill with specular glass highlight
+                    RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                        .fill(progressiveMeterGradient(fraction: clampedFraction, accentColor: accentColor))
+                        .frame(width: fillWidth, height: height)
+                        .shadow(color: fillColor.opacity(0.5), radius: 5, y: 0)
+                        .overlay(alignment: .top) {
+                            // Specular highlight — top ~45% of fill appears as glass refraction
+                            RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [
+                                            Color.white.opacity(0.58),
+                                            Color.white.opacity(0.0)
+                                        ],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    )
+                                )
+                                .frame(width: fillWidth, height: height * 0.46)
+                        }
+                }
+
+                if let pace, pace.shouldSurface {
+                    let markerX = min(
+                        max((geo.size.width * pace.expectedFraction) - (markerWidth / 2), 0),
+                        max(geo.size.width - markerWidth, 0)
+                    )
+                    Capsule(style: .continuous)
+                        .fill(Color(hex: pace.colorHex).opacity(0.95))
+                        .frame(width: markerWidth, height: height + 4)
+                        .offset(x: markerX)
+                        .shadow(color: Color(hex: pace.colorHex).opacity(0.55), radius: 3, y: 0)
+                        .accessibilityLabel("Quota pace guide")
+                }
             }
         }
         .frame(height: height)
@@ -858,7 +971,7 @@ public struct QuotaCardSmallView: View {
     }
 
     private var accent: Color { Color(hex: snapshot.providerID.accentColorHex) }
-    private var windows: [QuotaWindow] { Array(snapshot.windows.prefix(4)) }
+    private var windows: [QuotaWindow] { Array(snapshot.summaryWindows.prefix(4)) }
 
     public var body: some View {
         GlassCardContainer(style: style, accent: accent, cornerRadius: 16) {
@@ -915,7 +1028,12 @@ public struct QuotaCardSmallView: View {
             }
 
             if window.hasExplicitLimit {
-                QuotaProgressBar(fraction: window.fractionUsed, accentColor: accent, height: 3.5)
+                QuotaProgressBar(
+                    fraction: window.fractionUsed,
+                    accentColor: accent,
+                    height: 3.5,
+                    pace: window.pace(providerID: snapshot.providerID)
+                )
             } else if compactResetText(for: window) == nil {
                 Text(window.measurementSummary)
                     .font(.system(size: 9))

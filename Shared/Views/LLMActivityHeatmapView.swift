@@ -49,7 +49,7 @@ public struct LLMActivityHeatmapView: View {
     }
 
     public var body: some View {
-        GlassCardContainer(style: .panel, accent: Color(hex: "#5B8AF5"), cornerRadius: 16) {
+        GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 summaryHeader
 
@@ -85,15 +85,26 @@ public struct LLMActivityHeatmapView: View {
 
             Spacer()
 
-            if let total = totalTokensToday(), total > 0 {
-                Text("\(total.compactString) today")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color(hex: "#5B8AF5"))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color(hex: "#5B8AF5").opacity(0.12), in: Capsule())
+            let totals = tokenTotals()
+            if totals.thirtyDay > 0 {
+                HStack(spacing: 4) {
+                    tokenPill(value: totals.today, label: "today")
+                    tokenPill(value: totals.sevenDay, label: "7D")
+                    tokenPill(value: totals.thirtyDay, label: "30D")
+                }
             }
         }
+    }
+
+    private func tokenPill(value: Double, label: String) -> some View {
+        Text("\(value.compactString) \(label)")
+            .font(.system(size: 9, weight: .semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .foregroundStyle(ProGlassTheme.accent)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(ProGlassTheme.accent.opacity(0.12), in: Capsule())
     }
 
     private var timeLabels: some View {
@@ -175,7 +186,7 @@ public struct LLMActivityHeatmapView: View {
             }
         }
 
-        guard !providerWeights.isEmpty else { return Color(hex: "#5B8AF5") }
+        guard !providerWeights.isEmpty else { return ProGlassTheme.accent }
         let totalWeight = providerWeights.values.reduce(0, +)
 
         let sorted = providerWeights.sorted { $0.value > $1.value }
@@ -196,17 +207,37 @@ public struct LLMActivityHeatmapView: View {
         if model.contains("gemini") { return .gemini }
         if model.contains("codex") { return .openai }
         if model.contains("gpt") { return .chatgpt }
+        if model.contains("kimi") { return .kimi }
         if model.contains("cursor") { return .cursor }
+        if model.contains("windsurf") { return .windsurf }
         return nil
     }
 
-    private func totalTokensToday() -> Double? {
-        let now = Calendar.current.startOfDay(for: Date())
-        let sum = allEvents
-            .filter { $0.timestamp >= now }
-            .compactMap(\.tokens)
-            .reduce(0, +)
-        return sum > 0 ? sum : nil
+    private func tokenTotals() -> HeatmapTokenTotals {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: Date())
+        let sevenDayStart = calendar.date(byAdding: .day, value: -6, to: todayStart) ?? todayStart
+        let thirtyDayStart = calendar.date(byAdding: .day, value: -(columns - 1), to: todayStart) ?? todayStart
+
+        var today = 0.0
+        var sevenDay = 0.0
+        var thirtyDay = 0.0
+
+        for event in allEvents {
+            guard let tokens = event.tokens, tokens > 0, event.timestamp >= thirtyDayStart else {
+                continue
+            }
+
+            thirtyDay += tokens
+            if event.timestamp >= sevenDayStart {
+                sevenDay += tokens
+            }
+            if event.timestamp >= todayStart {
+                today += tokens
+            }
+        }
+
+        return HeatmapTokenTotals(today: today, sevenDay: sevenDay, thirtyDay: thirtyDay)
     }
 
     private func dayAbbreviation(for date: Date) -> String {
@@ -226,6 +257,12 @@ public struct LLMActivityHeatmapView: View {
 private struct HeatmapBucketKey: Hashable {
     let dayStart: Date
     let row: Int
+}
+
+private struct HeatmapTokenTotals {
+    let today: Double
+    let sevenDay: Double
+    let thirtyDay: Double
 }
 
 // MARK: - Color Interpolation Helper

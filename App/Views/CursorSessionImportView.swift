@@ -57,7 +57,7 @@ struct CursorSessionImportView: View {
             .padding(.horizontal, 20)
             .padding(.top, 18)
 
-            Text("We only capture cookies from the Cursor session you just signed into. Nothing is pulled from Safari, Chrome, or any other app.")
+            Text("We only capture cookies from this embedded Cursor session. The session is kept in this app's WebKit store so you can refresh it later without signing in again.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
@@ -123,13 +123,15 @@ struct CursorSessionImportView: View {
 }
 
 @MainActor
-final class CursorSessionImportModel {
+final class CursorSessionImportModel: NSObject, WKUIDelegate {
     let webView: WKWebView
 
-    init() {
+    override init() {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
+        configuration.websiteDataStore = .default()
         webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
     }
 
@@ -141,8 +143,11 @@ final class CursorSessionImportModel {
     func captureCookieHeader() async throws -> String {
         let cookies = try await webView.allCookies()
         let relevantCookies = cookies.filter { cookie in
-            let domain = cookie.domain.lowercased()
-            return domain.contains("cursor.com") || domain.contains("cursor.sh")
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "cursor.com"
+                || domain.hasSuffix(".cursor.com")
+                || domain == "cursor.sh"
+                || domain.hasSuffix(".cursor.sh")
         }
 
         guard !relevantCookies.isEmpty else {
@@ -159,6 +164,35 @@ final class CursorSessionImportModel {
         }
 
         return header
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
+    static func clearStoredWebsiteData() {
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let cursorRecords = records.filter { record in
+                let name = record.displayName.lowercased()
+                return name == "cursor.com"
+                    || name.hasSuffix(".cursor.com")
+                    || name == "cursor.sh"
+                    || name.hasSuffix(".cursor.sh")
+                    || name.contains("cursor")
+            }
+            guard !cursorRecords.isEmpty else { return }
+            store.removeData(ofTypes: dataTypes, for: cursorRecords) {}
+        }
     }
 }
 
