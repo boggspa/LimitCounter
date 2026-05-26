@@ -5146,7 +5146,7 @@ private final class ClaudeTimeoutRaceState<Value>: @unchecked Sendable {
 /// Resolved Claude subscription tier, derived from the keychain payload.
 /// Used both to label the card header and to gate per-model meters that
 /// only Max plans receive (e.g. weekly Sonnet utilization).
-private struct ClaudePlanInfo {
+private nonisolated struct ClaudePlanInfo {
     /// Human-readable label for the card subtitle (e.g. "Pro", "Max x20").
     let displayName: String
     /// True for any flavour of Max plan — gates Max-only supplemental meters.
@@ -5195,7 +5195,7 @@ private final class ClaudeSonnetGateDiagnostics: @unchecked Sendable {
 /// `/api/oauth/usage` response itself is the live source of truth for
 /// which model-specific meters actually exist for this token — see
 /// `fetchOAuthQuota` for that gate.
-private func resolveClaudePlanInfo() -> ClaudePlanInfo? {
+private nonisolated func resolveClaudePlanInfo() -> ClaudePlanInfo? {
     guard let (creds, _) = ClaudeKeychainStore.readBest() else { return nil }
     let raw = creds.rawOAuthDict
 
@@ -5241,7 +5241,7 @@ private func resolveClaudePlanInfo() -> ClaudePlanInfo? {
 /// Holds the parsed payload of Claude Code's keychain entry. We carry the raw
 /// `claudeAiOauth` dictionary alongside the typed fields so we can write back
 /// without losing unknown keys (subscriptionType, rateLimitTier, scopes, etc.).
-private struct ClaudeOAuthCredentials {
+private nonisolated struct ClaudeOAuthCredentials {
     let accessToken: String
     let refreshToken: String?
     /// `expiresAt` from the keychain — milliseconds since the Unix epoch.
@@ -5272,7 +5272,7 @@ private struct ClaudeOAuthCredentials {
 /// the CLI stays in sync. If we don't own write access to Claude Code's
 /// entry the write will simply fail; our backup keeps the rotating refresh
 /// token alive across app launches regardless.
-private enum ClaudeKeychainStore {
+private nonisolated enum ClaudeKeychainStore {
     static let claudeCodeService = "Claude Code-credentials"
     static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
 
@@ -5445,8 +5445,15 @@ private actor ClaudeOAuthTokenManager {
             await Self.performRefresh(creds: creds)
         }
         inflight = task
-        let result = await task.value
+        var result = await task.value
         inflight = nil
+
+        if result == nil, source != ClaudeKeychainStore.claudeCodeService {
+            result = await recoverFromClaudeCodeKeychain(
+                rejectedToken: creds.accessToken,
+                reason: "refresh failed"
+            )
+        }
 
         if result == nil {
             lastFailureAt = Date()
@@ -5454,6 +5461,43 @@ private actor ClaudeOAuthTokenManager {
             lastFailureAt = nil
         }
         return result
+    }
+
+    /// Recovery path for when our mirrored OAuth token was invalidated or
+    /// endpoint-throttled after Claude Code rewrote its own keychain item.
+    /// This can prompt, so callers use it only after the mirror already failed.
+    func accessTokenAfterOAuthFailure(
+        manualOverride: String?,
+        rejectedToken: String?,
+        reason: String
+    ) async -> String? {
+        if let manualOverride, !manualOverride.isEmpty {
+            return nil
+        }
+
+        return await recoverFromClaudeCodeKeychain(
+            rejectedToken: rejectedToken,
+            reason: reason
+        )
+    }
+
+    private func recoverFromClaudeCodeKeychain(
+        rejectedToken: String?,
+        reason: String
+    ) async -> String? {
+        guard let fallback = ClaudeKeychainStore.readClaudeCodeAsFallback() else {
+            return nil
+        }
+
+        if let rejectedToken, fallback.accessToken == rejectedToken {
+            return nil
+        }
+
+        print("[ClaudeOAuth] \(reason) — retrying with current Claude Code keychain token")
+        if fallback.needsRefresh(buffer: refreshBuffer) {
+            return await Self.performRefresh(creds: fallback)
+        }
+        return fallback.accessToken
     }
 
     /// POSTs the refresh request, persists the new tokens to both keychain
@@ -5570,20 +5614,35 @@ public struct ClaudeProviderClient: ProviderClient {
             }
             print("[ClaudeProvider] OAuth token found — fetching live quota")
             do {
-                let oauthSnapshot = try await fetchOAuthQuota(token: token)
-                // Augment OAuth quota meters with locally-captured 2-hour
-                // buckets so the activity heatmap still shows Claude usage
-                // even when the OAuth path has no per-event data.
-                let events = await eventsForOAuthEnrichment(credentials: credentials)
-                // Plus AGBench's unified usage.json for any Claude runs
-                // driven through GUIGemini. No-op without the bookmark.
-                let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
-                let merged = mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
+                let merged = try await fetchOAuthSnapshotAndMerge(
+                    token: token,
+                    credentials: credentials
+                )
                 ClaudeOAuthResponseCache.shared.store(merged)
                 return merged
             } catch let error as ProviderFetchError {
+                var effectiveError = error
+                if error.shouldRecoverClaudeOAuthFromKeychain,
+                   let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
+                    manualOverride: manualToken,
+                    rejectedToken: token,
+                    reason: "OAuth usage fetch failed (\(error.localizedDescription))"
+                   ) {
+                    do {
+                        let recovered = try await fetchOAuthSnapshotAndMerge(
+                            token: recoveredToken,
+                            credentials: credentials
+                        )
+                        ClaudeOAuthResponseCache.shared.store(recovered)
+                        return recovered
+                    } catch let retryError as ProviderFetchError {
+                        print("[ClaudeProvider] Claude Code keychain recovery retry failed (\(retryError.localizedDescription))")
+                        effectiveError = retryError
+                    }
+                }
+
                 if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
-                    print("[ClaudeProvider] OAuth fetch failure (\(error)) — serving last successful OAuth snapshot to preserve meters")
+                    print("[ClaudeProvider] OAuth fetch failure (\(effectiveError)) — serving last successful OAuth snapshot to preserve meters")
                     let events = await eventsForOAuthEnrichment(credentials: credentials)
                     let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
                     return mergeEvents(into: stale, events: events + agbenchEvents)
@@ -5591,13 +5650,13 @@ public struct ClaudeProviderClient: ProviderClient {
 
                 if let localSnapshot = await loadLocalSnapshotIfAvailable(
                     credentials: credentials,
-                    context: "OAuth fetch failure (\(error.localizedDescription))"
+                    context: "OAuth fetch failure (\(effectiveError.localizedDescription))"
                 ) {
                     print("[ClaudeProvider] OAuth fetch failed and no cached OAuth snapshot available; falling back to local Claude transcript snapshot")
                     return localSnapshot
                 }
 
-                throw error
+                throw effectiveError
             }
         }
 
@@ -5608,6 +5667,21 @@ public struct ClaudeProviderClient: ProviderClient {
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
         guard !agbenchEvents.isEmpty else { return localSnapshot }
         return mergeEvents(into: localSnapshot, events: localSnapshot.events + agbenchEvents)
+    }
+
+    private func fetchOAuthSnapshotAndMerge(
+        token: String,
+        credentials: ProviderCredential?
+    ) async throws -> QuotaSnapshot {
+        let oauthSnapshot = try await fetchOAuthQuota(token: token)
+        // Augment OAuth quota meters with locally-captured 2-hour buckets so
+        // the activity heatmap still shows Claude usage even when the OAuth
+        // path has no per-event data.
+        let events = await eventsForOAuthEnrichment(credentials: credentials)
+        // Plus AGBench's unified usage.json for any Claude runs driven
+        // through GUIGemini. No-op without the bookmark.
+        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
+        return mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
     }
 
     private func loadLocalSnapshot(
@@ -6493,6 +6567,17 @@ public enum ProviderFetchError: LocalizedError {
         case .parsingError(let msg):  return "Parse error: \(msg)"
         case .rateLimited:            return "Rate limited. Try again later."
         case .unknown:                return "An unknown error occurred."
+        }
+    }
+}
+
+private extension ProviderFetchError {
+    var shouldRecoverClaudeOAuthFromKeychain: Bool {
+        switch self {
+        case .invalidCredential, .rateLimited:
+            return true
+        case .notConfigured, .credentialExpired, .networkError, .parsingError, .unknown:
+            return false
         }
     }
 }
