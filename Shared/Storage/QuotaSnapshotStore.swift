@@ -596,7 +596,8 @@ public final class ProviderCardOrderStore: ObservableObject {
         .windsurf,
         .cursor,
         .gemini,
-        .kimi
+        .kimi,
+        .grok
     ]
 }
 
