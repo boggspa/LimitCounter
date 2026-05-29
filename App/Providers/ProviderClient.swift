@@ -184,6 +184,138 @@ enum AGBenchBookmarkStore {
     }
 }
 
+// MARK: - Grok Provider (via AGBench bridge)
+
+/// Surfaces xAI Grok (SuperGrok) usage by reading the snapshot AGBench
+/// writes to its app-support folder. xAI exposes no usage HTTP API, and
+/// the SuperGrok credit meter is only available via the interactive
+/// `grok` CLI screen — which a sandboxed app can't spawn. AGBench
+/// (unsandboxed) does that PTY scrape and writes the result to
+/// `grok-usage-snapshot.json`; we read it through the AGBench bookmark
+/// the user already granted. Heatmap activity comes from the same
+/// `usage.json` the other providers read.
+public struct GrokProviderClient: ProviderClient {
+    public let providerID: ProviderID = .grok
+
+    public init() {}
+
+    /// Mirrors GUIGemini's `GrokUsageSnapshot` shape.
+    private struct GrokUsageSnapshot: Decodable {
+        let creditsUsedPercent: Double?
+        let creditsUsedDisplay: String?
+        let resetAtText: String?
+        let resetAt: String?
+        let planLabel: String?
+        let payAsYouGoEnabled: Bool?
+        let refreshedAt: String?
+        let confidence: String?
+    }
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        guard let scoped = AGBenchBookmarkStore.startAccess() else {
+            // No AGBench bookmark granted yet — the user needs to grant
+            // it in Settings → AGBench Data Source.
+            throw ProviderFetchError.notConfigured
+        }
+        defer { scoped.stop() }
+
+        // Heatmap activity from the shared usage.json (provider == "grok").
+        let events = AGBenchUsageReader.events(forProviderKey: "grok", rootURL: scoped.url)
+
+        // Credit meter from the bridge snapshot.
+        let snapshotURL = grokSnapshotURL(rootURL: scoped.url)
+        let snapshot = readGrokSnapshot(at: snapshotURL)
+
+        var windows: [QuotaWindow] = []
+        var planName = "SuperGrok"
+
+        if let snapshot, snapshot.confidence == "observed", let percent = snapshot.creditsUsedPercent {
+            if let plan = snapshot.planLabel, !plan.isEmpty {
+                planName = plan
+            }
+            let resetDate = parseGrokResetDate(snapshot)
+            windows.append(
+                QuotaWindow(
+                    label: "Credits",
+                    windowKind: .sliding,
+                    used: percent,
+                    total: 100,
+                    resetDate: resetDate,
+                    unit: "%",
+                    subtitle: snapshot.resetAtText.map { "Resets \($0)" } ?? "SuperGrok subscription credits"
+                )
+            )
+        }
+
+        // If we have neither a credit meter nor events, treat as
+        // not-yet-configured so the card shows setup guidance rather
+        // than an empty success state. (Happens before AGBench has been
+        // rebuilt with the bridge / run a probe.)
+        if windows.isEmpty && events.isEmpty {
+            throw ProviderFetchError.notConfigured
+        }
+
+        // Placeholder window when we have events but no credit snapshot
+        // yet — keeps the card coherent ("connected, awaiting meter").
+        // total:100 so it renders as a 0-100 meter (empty), matching
+        // the filled meter the real reading produces, rather than a
+        // bare number.
+        if windows.isEmpty {
+            windows.append(
+                QuotaWindow(
+                    label: "Credits",
+                    windowKind: .sliding,
+                    used: 0,
+                    total: 100,
+                    resetDate: nil,
+                    unit: "%",
+                    subtitle: "Awaiting SuperGrok meter from AGBench"
+                )
+            )
+        }
+
+        return QuotaSnapshot(
+            providerID: .grok,
+            displayName: "Grok",
+            planName: planName,
+            windows: windows,
+            stats: [],
+            balances: [],
+            signals: [],
+            events: events.sorted { $0.timestamp > $1.timestamp },
+            fetchState: .success,
+            fetchedAt: Date()
+        )
+    }
+
+    private func grokSnapshotURL(rootURL: URL) -> URL {
+        if rootURL.lastPathComponent == "grok-usage-snapshot.json" {
+            return rootURL
+        }
+        return rootURL.appendingPathComponent("grok-usage-snapshot.json")
+    }
+
+    private func readGrokSnapshot(at url: URL) -> GrokUsageSnapshot? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(GrokUsageSnapshot.self, from: data)
+    }
+
+    private func parseGrokResetDate(_ snapshot: GrokUsageSnapshot) -> Date? {
+        // Prefer the robust ISO timestamp; fall back to nil (we keep the
+        // human-readable resetAtText in the subtitle either way).
+        guard let iso = snapshot.resetAt, !iso.isEmpty else { return nil }
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: iso) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: iso)
+    }
+}
+
 /// Every provider implements this protocol.
 /// Receives credentials from KeychainService, returns a normalized QuotaSnapshot.
 /// Never writes to storage directly — SyncCoordinator does that.
@@ -1687,7 +1819,9 @@ public enum CredentialImportService {
             )
         case .kimi:
             return try parseKimiJSON(json, sourceURL: sourceURL)
-        case .heatmap:
+        case .grok, .heatmap:
+            // Grok has no file-import flow — it sources data from the
+            // AGBench bridge snapshot, not a user-selected credential.
             throw ImportError.unsupportedProvider
         }
     }
@@ -1956,6 +2090,8 @@ public extension CredentialImportService {
                 panel.directoryURL = home.appendingPathComponent(".gemini")
             case .kimi:
                 panel.directoryURL = home.appendingPathComponent(".kimi")
+            case .grok:
+                panel.directoryURL = home.appendingPathComponent("Library/Application Support/agbench")
             case .heatmap:
                 break
             }
@@ -3670,6 +3806,23 @@ public struct CursorProviderClient: ProviderClient {
         print("[CursorProvider] Starting fetch...")
         let localState = try? await loadLocalStateSnapshot(credentials: credentials)
 
+        // PRIMARY: modern dashboard usage endpoint (percentage model).
+        // Cursor migrated from the legacy per-model request counts to a
+        // spend/percentage model (Included-in-Pro / Auto+Composer / API).
+        // The legacy `GET /api/usage` now returns zeros, which is why the
+        // card only showed the placeholder. The modern data lives behind
+        // a Connect-RPC endpoint authenticated with the access token that
+        // the Cursor editor stores in `state.vscdb`.
+        if let accessToken = localState?.accessToken, !accessToken.isEmpty {
+            do {
+                let modern = try await fetchModernCursorUsage(accessToken: accessToken, localState: localState)
+                print("[CursorProvider] Modern usage endpoint succeeded")
+                return modern
+            } catch {
+                print("[CursorProvider] Modern usage endpoint failed (\(error.localizedDescription)) — falling back to legacy path")
+            }
+        }
+
         // Try to get a real web credential first. The local editor DB remains a
         // metadata source unless the user explicitly imports a web session or
         // dashboard token.
@@ -3727,6 +3880,158 @@ public struct CursorProviderClient: ProviderClient {
         }
 
         return try parseUsageResponse(data: data, localState: localState)
+    }
+
+    /// Modern Cursor usage via the dashboard Connect-RPC endpoint.
+    /// Returns the same percentage model the cursor.com/dashboard UI
+    /// shows: Included-in-Pro total %, Auto+Composer %, API %, billing
+    /// cycle reset date, and on-demand spend limits.
+    ///
+    /// This is a reverse-engineered, undocumented endpoint (the same
+    /// one the dashboard itself calls). It can change without notice —
+    /// callers fall back to the legacy `/api/usage` path on any error.
+    private func fetchModernCursorUsage(
+        accessToken: String,
+        localState: CursorLocalStateSnapshot?
+    ) async throws -> QuotaSnapshot {
+        guard let url = URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage") else {
+            throw ProviderFetchError.networkError(underlying: URLError(.badURL))
+        }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.httpBody = Data("{}".utf8)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ProviderFetchError.networkError(underlying: URLError(.badServerResponse))
+        }
+        guard http.statusCode == 200 else {
+            throw ProviderFetchError.parsingError("Cursor dashboard usage HTTP \(http.statusCode)")
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderFetchError.parsingError("Cursor dashboard usage: invalid JSON")
+        }
+
+        return try parseModernCursorUsage(json: json, localState: localState)
+    }
+
+    private func parseModernCursorUsage(
+        json: [String: Any],
+        localState: CursorLocalStateSnapshot?
+    ) throws -> QuotaSnapshot {
+        func number(_ value: Any?) -> Double? {
+            if let v = value as? Double { return v }
+            if let v = value as? Int { return Double(v) }
+            if let v = value as? NSNumber { return v.doubleValue }
+            if let v = value as? String { return Double(v) }
+            return nil
+        }
+
+        let planUsage = json["planUsage"] as? [String: Any] ?? [:]
+
+        // billingCycleEnd is a unix-millisecond timestamp (string or num).
+        let resetDate: Date? = number(json["billingCycleEnd"]).map {
+            Date(timeIntervalSince1970: $0 / 1000.0)
+        }
+
+        var windows: [QuotaWindow] = []
+
+        if let total = number(planUsage["totalPercentUsed"]) {
+            windows.append(
+                QuotaWindow(
+                    label: "Included in Pro",
+                    windowKind: .monthly,
+                    used: total,
+                    total: 100,
+                    resetDate: resetDate,
+                    unit: "%",
+                    subtitle: "Total plan usage this cycle"
+                )
+            )
+        }
+        if let auto = number(planUsage["autoPercentUsed"]) {
+            windows.append(
+                QuotaWindow(
+                    label: "Auto + Composer",
+                    windowKind: .monthly,
+                    used: auto,
+                    total: 100,
+                    resetDate: resetDate,
+                    unit: "%",
+                    subtitle: "Agent / Composer usage"
+                )
+            )
+        }
+        if let api = number(planUsage["apiPercentUsed"]) {
+            windows.append(
+                QuotaWindow(
+                    label: "API",
+                    windowKind: .monthly,
+                    used: api,
+                    total: 100,
+                    resetDate: resetDate,
+                    unit: "%",
+                    subtitle: "API model usage"
+                )
+            )
+        }
+
+        // On-demand spend (cents → dollars) as a balance, if present.
+        var balances: [QuotaBalance] = []
+        if let spend = json["spendLimitUsage"] as? [String: Any] {
+            let individualLimit = number(spend["individualLimit"]) ?? 0
+            let individualRemaining = number(spend["individualRemaining"]) ?? 0
+            if individualLimit > 0 {
+                let usedCents = max(0, individualLimit - individualRemaining)
+                balances.append(
+                    QuotaBalance(
+                        label: "On-Demand Spend",
+                        amount: individualRemaining / 100.0,
+                        unit: "USD",
+                        subtitle: "\((usedCents / 100).compactString) of \((individualLimit / 100).compactString) USD on-demand used",
+                        resetDate: resetDate
+                    )
+                )
+            }
+        }
+
+        // If the endpoint returned a healthy 200 but no usable windows
+        // (e.g. brand-new account), fall back to a zero placeholder so
+        // the card still reads "connected".
+        if windows.isEmpty {
+            windows.append(
+                QuotaWindow(
+                    label: "Included in Pro",
+                    windowKind: .monthly,
+                    used: 0,
+                    total: 100,
+                    resetDate: resetDate,
+                    unit: "%",
+                    subtitle: "No usage yet this cycle"
+                )
+            )
+        }
+
+        let planName = cursorPlanName(from: nil, localMembershipType: localState?.membershipType)
+        let supplemental = cursorSupplementalContent(localState: localState, now: Date())
+        let events = cursorActivityEvents(from: localState)
+
+        return QuotaSnapshot(
+            providerID: .cursor,
+            displayName: "Cursor",
+            planName: planName,
+            windows: windows,
+            stats: supplemental.stats,
+            balances: balances,
+            signals: supplemental.signals,
+            events: events.sorted { $0.timestamp > $1.timestamp },
+            fetchState: .success,
+            fetchedAt: Date()
+        )
     }
 
     private enum AuthMaterial {

@@ -93,6 +93,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(CursorProviderClient())
         coordinator.register(GeminiProviderClient())
         coordinator.register(KimiProviderClient())
+        coordinator.register(GrokProviderClient())
         #endif
 
         self.syncCoordinator = coordinator

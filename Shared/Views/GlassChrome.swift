@@ -116,13 +116,23 @@ public struct LiquidGlassBackdrop: View {
             switch style {
             case .liquidGlass:
                 ZStack {
-                    // Window backdrop has no material — the desktop /
-                    // anything behind the app shows through cleanly.
-                    // Card-level `.glassEffect()` provides per-card
-                    // texture; HUD pills bring their own materials.
-                    // Ambient gradients below add a hint of color
-                    // depth without contributing to opacity.
-                    Color.clear
+                    // Backdrop material is intensity-dependent:
+                    //   • `.dashboard` (the main window) → NO material,
+                    //     so the desktop shows through cleanly and the
+                    //     per-card `.glassEffect()` does the work.
+                    //   • Everything else — `.settings`, `.popover`,
+                    //     `.floatingPanel`, `.widget` — KEEPS the
+                    //     `.ultraThinMaterial` so config sheets, the
+                    //     menu-bar popover, and provider windows stay
+                    //     readable. Stripping it globally (an earlier
+                    //     change) made those surfaces transparent and
+                    //     unusable.
+                    if intensity == .dashboard {
+                        Color.clear
+                    } else {
+                        Color.clear
+                            .background(.ultraThinMaterial)
+                    }
 
                     ProGlassTheme.ink.opacity(intensity.backdropInkOpacity)
 

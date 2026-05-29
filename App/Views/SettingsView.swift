@@ -823,6 +823,12 @@ private struct ProviderSettingsRow: View {
             return FileManager.default.fileExists(atPath: geminiRoot.path)
                 && FileManager.default.fileExists(atPath: tmpDir.path)
         }
+        if providerID == .grok {
+            // Grok has no keychain credential — it's "configured" once
+            // the shared AGBench Data Source bookmark is granted, since
+            // that's where it reads the SuperGrok snapshot + activity.
+            return AGBenchBookmarkStore.hasBookmark
+        }
         #endif
         return false
     }
@@ -933,6 +939,52 @@ struct ProviderCredentialView: View {
     }
 
     var body: some View {
+        if providerID == .grok {
+            grokConfigBody
+        } else {
+            standardConfigBody
+        }
+    }
+
+    /// Grok has no per-provider credential — it reads the SuperGrok
+    /// snapshot AGBench writes, via the shared AGBench Data Source
+    /// bookmark. So its config window is just an explainer + status,
+    /// not the generic credential-file picker.
+    private var grokConfigBody: some View {
+        ZStack {
+            LiquidGlassBackdrop(intensity: .settings)
+
+            Form {
+                Section("How Grok usage works") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 8) {
+                            Image(systemName: AGBenchBookmarkStore.hasBookmark ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(AGBenchBookmarkStore.hasBookmark ? Color.green : Color.orange)
+                            Text(AGBenchBookmarkStore.hasBookmark
+                                 ? "Connected via the AGBench Data Source."
+                                 : "Not connected yet.")
+                                .font(.subheadline.weight(.semibold))
+                        }
+
+                        Text("xAI exposes no usage API, and the SuperGrok credit meter is only readable from the interactive grok CLI — which this sandboxed app can't run. Instead, AGBench (GUIGemini) captures the meter and writes it to its app-support folder, and Limit Counter reads it through the shared AGBench Data Source bookmark.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("There's nothing to configure here. Grant (or re-grant) the AGBench Data Source bookmark in the main Settings window, then open AGBench and view its usage panel so it writes a fresh Grok snapshot.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+        }
+    }
+
+    private var standardConfigBody: some View {
         ZStack {
             LiquidGlassBackdrop(intensity: .settings)
 

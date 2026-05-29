@@ -18,6 +18,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case cursor
     case gemini
     case kimi
+    case grok
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -43,6 +44,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cursor:   return "Cursor"
         case .gemini:   return "Gemini"
         case .kimi:     return "Kimi Code"
+        case .grok:     return "Grok"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -57,7 +59,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .claude, .windsurf, .cursor, .gemini, .kimi, .heatmap:
+        case .claude, .windsurf, .cursor, .gemini, .kimi, .grok, .heatmap:
             return displayName
         }
     }
@@ -75,6 +77,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cursor:   return "cursorarrow.rays"
         case .gemini:   return "sparkles"
         case .kimi:     return "moon.stars.fill"
+        case .grok:     return "bolt.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -92,6 +95,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cursor:   return "#EAB308" // Gold
         case .gemini:   return "#4285F4" // Google Blue
         case .kimi:     return "#6B8E23" // Kimi Olive
+        case .grok:     return "#EC4899" // Grok Magenta — distinct from every other provider's hue region (no other pink/magenta)
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -116,6 +120,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderGeminiLogo"
         case .kimi:
             return ""
+        case .grok:
+            return "ProviderGrokLogo"
         case .heatmap:
             return ""
         }
@@ -125,7 +131,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .chatgpt, .codexTelemetry:
             return .prototype
-        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi:
+        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi, .grok:
             return .session
         case .heatmap:
             return .session
@@ -152,6 +158,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Gemini CLI local session"
         case .kimi:
             return "Kimi Code API or CLI session"
+        case .grok:
+            return "Grok (SuperGrok) via AGBench bridge"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -177,6 +185,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Reads local Gemini CLI history and metadata from `~/.gemini` and turns it into usage snapshots."
         case .kimi:
             return "Uses a Kimi Code Console API key or an explicitly imported Kimi CLI OAuth file to read weekly and rolling 5-hour quota."
+        case .grok:
+            return "Reads the SuperGrok credit meter that AGBench (GUIGemini) captures from the grok CLI and writes to its app-support folder. Grant the AGBench Data Source bookmark in Settings to enable."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -202,6 +212,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Gemini CLI data root"
         case .kimi:
             return "Kimi Code API key"
+        case .grok:
+            return "AGBench data folder (shared)"
         case .heatmap:
             return ""
         }
@@ -211,7 +223,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .claude:
             return "OAuth token (optional)"
-        case .chatgpt, .gemini, .kimi, .codexTelemetry, .heatmap:
+        case .chatgpt, .gemini, .kimi, .grok, .codexTelemetry, .heatmap:
             return nil
         case .openaiAPI:
             return "Project ID"
@@ -244,6 +256,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Use only local Gemini CLI log folders or history you intentionally point the app at."
         case .kimi:
             return "Use only a Kimi Code Console API key you intentionally enter, or a Kimi CLI OAuth file you explicitly import."
+        case .grok:
+            return "Reads only the Grok usage snapshot AGBench writes to its own app-support folder, via a bookmark you grant. No xAI credentials are read."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -317,6 +331,11 @@ public extension ProviderID {
         case .kimi:
             return [
                 AppIconCandidate(bundleIdentifier: "com.moonshot.kimichat", applicationNames: ["Kimi.app"])
+            ]
+        case .grok:
+            return [
+                AppIconCandidate(bundleIdentifier: "ai.x.grok", applicationNames: ["Grok.app"]),
+                AppIconCandidate(bundleIdentifier: "com.x.grok", applicationNames: ["Grok.app"])
             ]
         case .gemini, .codexTelemetry, .heatmap:
             return []

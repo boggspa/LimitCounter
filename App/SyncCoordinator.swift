@@ -138,7 +138,11 @@ final class SyncCoordinator {
         let credential = keychain.credential(for: providerID)
         print("[SyncCoordinator] Credential for \(providerID.rawValue): \(credential != nil ? "present" : "nil")")
 
-        // Allow auto-discovery clients (local logs, Windsurf, Cursor, Gemini) to proceed without stored credentials
+        // Allow auto-discovery clients (local logs, Windsurf, Cursor,
+        // Gemini, Grok) to proceed without stored credentials. Grok in
+        // particular has no keychain credential at all — it reads the
+        // SuperGrok snapshot AGBench writes, via the shared AGBench
+        // bookmark, so it must be allowed through this gate.
         let canAutoDiscover =
             client is ClaudeProviderClient
             || client is CodexTelemetryProviderClient
@@ -146,6 +150,7 @@ final class SyncCoordinator {
             || client is WindsurfProviderClient
             || client is CursorProviderClient
             || client is GeminiProviderClient
+            || client is GrokProviderClient
         guard credential != nil || client is MockProviderClient || canAutoDiscover else {
             print("[SyncCoordinator] No credentials for \(providerID.rawValue), skipping")
             if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
@@ -345,7 +350,7 @@ final class SyncCoordinator {
             return 30
         case .claude, .chatgpt, .gemini:
             return 15
-        case .openai, .openaiAPI, .windsurf, .cursor, .kimi:
+        case .openai, .openaiAPI, .windsurf, .cursor, .kimi, .grok:
             return 20
         case .heatmap:
             return 5
