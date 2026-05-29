@@ -95,7 +95,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cursor:   return "#EAB308" // Gold
         case .gemini:   return "#4285F4" // Google Blue
         case .kimi:     return "#6B8E23" // Kimi Olive
-        case .grok:     return "#EC4899" // Grok Magenta — distinct from every other provider's hue region (no other pink/magenta)
+        case .grok:     return "#C7CCD4" // Grok Silver — monochrome to match xAI's black/white brand. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
