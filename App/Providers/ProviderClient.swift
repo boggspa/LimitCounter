@@ -5603,11 +5603,11 @@ private nonisolated struct ClaudeOAuthCredentials {
 enum ClaudeOAuthCredentialPolicy {
     static let keychainAccessEnabledKey = "claudeKeychainOAuthEnabled"
 
-    static func isKeychainAccessEnabled(in credentials: ProviderCredential?) -> Bool {
-        isKeychainAccessEnabled(extraFields: credentials?.extraFields)
+    static func isClaudeCodeKeychainFallbackEnabled(in credentials: ProviderCredential?) -> Bool {
+        isClaudeCodeKeychainFallbackEnabled(extraFields: credentials?.extraFields)
     }
 
-    static func isKeychainAccessEnabled(extraFields: [String: String]?) -> Bool {
+    static func isClaudeCodeKeychainFallbackEnabled(extraFields: [String: String]?) -> Bool {
         guard let rawValue = extraFields?[keychainAccessEnabledKey] else {
             return false
         }
@@ -5620,7 +5620,7 @@ enum ClaudeOAuthCredentialPolicy {
         }
     }
 
-    static func setKeychainAccessEnabled(_ enabled: Bool, in extraFields: inout [String: String]) {
+    static func setClaudeCodeKeychainFallbackEnabled(_ enabled: Bool, in extraFields: inout [String: String]) {
         if enabled {
             extraFields[keychainAccessEnabledKey] = "true"
         } else {
@@ -5782,9 +5782,12 @@ private actor ClaudeOAuthTokenManager {
     private var inflight: Task<String?, Never>?
     private var lastFailureAt: Date?
 
-    /// Returns a usable keychain-backed access token, refreshing it transparently if needed.
-    func currentAccessTokenFromKeychain() async -> String? {
-        guard let (creds, source) = ClaudeKeychainStore.readBest(allowClaudeCodeFallback: true) else {
+    /// Returns a usable mirrored access token, refreshing it transparently if needed.
+    /// Reads Claude Code's own keychain item only when explicitly allowed.
+    func currentAccessTokenFromKeychain(allowClaudeCodeFallback: Bool) async -> String? {
+        guard let (creds, source) = ClaudeKeychainStore.readBest(
+            allowClaudeCodeFallback: allowClaudeCodeFallback
+        ) else {
             return nil
         }
 
@@ -5810,7 +5813,7 @@ private actor ClaudeOAuthTokenManager {
         var result = await task.value
         inflight = nil
 
-        if result == nil, source != ClaudeKeychainStore.claudeCodeService {
+        if result == nil, allowClaudeCodeFallback, source != ClaudeKeychainStore.claudeCodeService {
             result = await recoverFromClaudeCodeKeychain(
                 rejectedToken: creds.accessToken,
                 reason: "refresh failed"
@@ -5830,8 +5833,13 @@ private actor ClaudeOAuthTokenManager {
     /// This can prompt, so callers use it only after the mirror already failed.
     func accessTokenAfterOAuthFailure(
         rejectedToken: String?,
-        reason: String
+        reason: String,
+        allowClaudeCodeFallback: Bool
     ) async -> String? {
+        guard allowClaudeCodeFallback else {
+            return nil
+        }
+
         return await recoverFromClaudeCodeKeychain(
             rejectedToken: rejectedToken,
             reason: reason
@@ -5951,17 +5959,20 @@ public struct ClaudeProviderClient: ProviderClient {
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
-        //   2. OAuth token manager, only when the user explicitly enabled Claude Code Keychain access
-        //   3. ~/.claude/.oauth_token file (headless / CI installs)
+        //   2. Limit Counter's mirrored OAuth token, if available
+        //   3. Claude Code's own keychain item, only when explicitly enabled
+        //   4. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
-        let keychainOAuthEnabled = ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(in: credentials)
+        let claudeCodeKeychainFallbackEnabled = ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: credentials)
         var oauthToken = manualToken
         var tokenAllowsKeychainRecovery = false
         var tokenAllowsKeychainPlanLookup = false
 
-        if oauthToken == nil && keychainOAuthEnabled {
-            oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain()
-            tokenAllowsKeychainRecovery = oauthToken != nil
+        if oauthToken == nil {
+            oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
+                allowClaudeCodeFallback: claudeCodeKeychainFallbackEnabled
+            )
+            tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeKeychainFallbackEnabled
             tokenAllowsKeychainPlanLookup = oauthToken != nil
         }
         if oauthToken == nil {
@@ -5991,7 +6002,8 @@ public struct ClaudeProviderClient: ProviderClient {
                    error.shouldRecoverClaudeOAuthFromKeychain,
                    let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
                     rejectedToken: token,
-                    reason: "OAuth usage fetch failed (\(error.localizedDescription))"
+                    reason: "OAuth usage fetch failed (\(error.localizedDescription))",
+                    allowClaudeCodeFallback: claudeCodeKeychainFallbackEnabled
                    ) {
                     do {
                         let recovered = try await fetchOAuthSnapshotAndMerge(

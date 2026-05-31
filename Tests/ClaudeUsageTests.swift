@@ -146,27 +146,27 @@ private func testClaudeOAuthCacheFreshReadsDoNotSlideTTL() throws {
     )
 }
 
-private func testClaudeKeychainOAuthIsOptIn() throws {
+private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     try expect(
-        !ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(in: nil),
-        "missing Claude credentials should not enable keychain OAuth"
+        !ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: nil),
+        "missing Claude credentials should not enable Claude Code keychain fallback"
     )
     try expect(
-        !ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(
+        !ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(
             in: ProviderCredential(extraFields: ["unrelated": "true"])
         ),
-        "unrelated fields should not enable keychain OAuth"
+        "unrelated fields should not enable Claude Code keychain fallback"
     )
     try expect(
-        ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(
+        ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(
             in: ProviderCredential(extraFields: [ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey: "true"])
         ),
-        "explicit true should enable keychain OAuth"
+        "explicit true should enable Claude Code keychain fallback"
     )
 
     var extraFields = [ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey: "true"]
-    ClaudeOAuthCredentialPolicy.setKeychainAccessEnabled(false, in: &extraFields)
-    try expectEqual(extraFields[ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey], nil, "disabled keychain OAuth flag should not be persisted")
+    ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(false, in: &extraFields)
+    try expectEqual(extraFields[ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey], nil, "disabled Claude Code keychain fallback flag should not be persisted")
 }
 
 private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {
@@ -212,7 +212,7 @@ private enum ClaudeUsageTestRunner {
         try testClaudeMissingSonnetWindowDoesNotDisplay()
         try testClaudeOpusWindowUsesSameRule()
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
-        try testClaudeKeychainOAuthIsOptIn()
+        try testClaudeCodeKeychainFallbackIsOptIn()
         try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()
         print("Claude usage tests passed")
     }

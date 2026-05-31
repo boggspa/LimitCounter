@@ -938,13 +938,13 @@ struct ProviderCredentialView: View {
         )
     }
 
-    private var claudeKeychainOAuthEnabled: Binding<Bool> {
+    private var claudeCodeKeychainFallbackEnabled: Binding<Bool> {
         Binding(
             get: {
-                ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(extraFields: storedExtraFields)
+                ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(extraFields: storedExtraFields)
             },
             set: { isEnabled in
-                ClaudeOAuthCredentialPolicy.setKeychainAccessEnabled(isEnabled, in: &storedExtraFields)
+                ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(isEnabled, in: &storedExtraFields)
             }
         )
     }
@@ -1150,8 +1150,8 @@ struct ProviderCredentialView: View {
 
                 Section("Advanced") {
                     if providerID == .claude {
-                        Toggle("Use Claude Code Keychain OAuth", isOn: claudeKeychainOAuthEnabled)
-                        Text("The data root field above points to your `~/.claude` folder for local token tracking. Leave Keychain OAuth off to avoid macOS prompts; paste an OAuth bearer token instead if you want live 5-hour and 7-day quota meters without reading Claude Code's keychain item.")
+                        Toggle("Recover from Claude Code Keychain", isOn: claudeCodeKeychainFallbackEnabled)
+                        Text("Limit Counter uses its own mirrored OAuth token for live quota meters when available. Leave this off to avoid reading Claude Code's keychain item; enable it only to import or recover the mirror from Claude Code.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
