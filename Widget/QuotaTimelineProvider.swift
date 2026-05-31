@@ -18,10 +18,9 @@ public struct QuotaWidgetEntry: TimelineEntry {
     public let date: Date
     public let snapshots: [QuotaSnapshot]
     public let allSnapshots: [QuotaSnapshot]
-    public let allEvents: [UsageEvent]
 
     public static var placeholder: QuotaWidgetEntry {
-        QuotaWidgetEntry(date: .now, snapshots: [MockData.claudeSnapshot], allSnapshots: MockData.allSnapshots, allEvents: [])
+        QuotaWidgetEntry(date: .now, snapshots: [MockData.claudeSnapshot], allSnapshots: MockData.allSnapshots)
     }
 }
 
@@ -39,16 +38,14 @@ public struct QuotaTimelineProvider: TimelineProvider {
     public func getSnapshot(in context: Context, completion: @escaping (QuotaWidgetEntry) -> Void) {
         let rawSnapshots = context.isPreview ? MockData.allSnapshots : store.loadSnapshots()
         let snapshots = widgetSnapshots(from: rawSnapshots, at: .now)
-        let events = rawSnapshots.flatMap(\.events).sorted { $0.timestamp > $1.timestamp }
-        completion(QuotaWidgetEntry(date: .now, snapshots: snapshots, allSnapshots: rawSnapshots, allEvents: events))
+        completion(QuotaWidgetEntry(date: .now, snapshots: snapshots, allSnapshots: rawSnapshots))
     }
 
     public func getTimeline(in context: Context, completion: @escaping (Timeline<QuotaWidgetEntry>) -> Void) {
         let now = Date()
         let rawSnapshots = store.loadSnapshots()
         let snapshots = widgetSnapshots(from: rawSnapshots, at: now)
-        let events = rawSnapshots.flatMap(\.events).sorted { $0.timestamp > $1.timestamp }
-        let entry = QuotaWidgetEntry(date: now, snapshots: snapshots, allSnapshots: rawSnapshots, allEvents: events)
+        let entry = QuotaWidgetEntry(date: now, snapshots: snapshots, allSnapshots: rawSnapshots)
 
         // Refresh policy: at the next reset date, or at the user-requested widget cadence.
         let nextReset = snapshots
@@ -1644,15 +1641,13 @@ public struct SelectQuotaTimelineProvider: AppIntentTimelineProvider {
     public func snapshot(for configuration: SelectQuotaIntent, in context: Context) async -> QuotaWidgetEntry {
         let snapshots = store.loadSnapshots()
         let filtered = filteredSnapshots(snapshots, for: configuration)
-        let events = snapshots.flatMap(\.events).sorted { $0.timestamp > $1.timestamp }
-        return QuotaWidgetEntry(date: .now, snapshots: filtered, allSnapshots: snapshots, allEvents: events)
+        return QuotaWidgetEntry(date: .now, snapshots: filtered, allSnapshots: snapshots)
     }
 
     public func timeline(for configuration: SelectQuotaIntent, in context: Context) async -> Timeline<QuotaWidgetEntry> {
         let snapshots = store.loadSnapshots()
         let filtered = filteredSnapshots(snapshots, for: configuration)
-        let events = snapshots.flatMap(\.events).sorted { $0.timestamp > $1.timestamp }
-        let entry = QuotaWidgetEntry(date: .now, snapshots: filtered, allSnapshots: snapshots, allEvents: events)
+        let entry = QuotaWidgetEntry(date: .now, snapshots: filtered, allSnapshots: snapshots)
 
         return Timeline(entries: [entry], policy: .after(.now.addingTimeInterval(UsageRefreshCadence.requestedRefreshInterval)))
     }
@@ -2029,42 +2024,42 @@ struct AIUsageWidget_Previews: PreviewProvider {
     static var previews: some View {
         Group {
             QuotaWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.claudeSnapshot], allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.claudeSnapshot], allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemSmall))
 
             QuotaWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots, allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots, allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemMedium))
 
             QuotaWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots, allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots, allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemLarge))
 
             SingleProviderWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.codexSnapshot], allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.codexSnapshot], allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemMedium))
 
             SingleProviderWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.codexSnapshot], allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: [MockData.codexSnapshot], allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemLarge))
 
             DoubleProviderWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: Array(MockData.allSnapshots.prefix(2)), allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: Array(MockData.allSnapshots.prefix(2)), allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemMedium))
 
             DoubleProviderWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: Array(MockData.allSnapshots.prefix(2)), allSnapshots: MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: Array(MockData.allSnapshots.prefix(2)), allSnapshots: MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemLarge))
 
             WideWidgetEntryView(
-                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots + MockData.allSnapshots, allSnapshots: MockData.allSnapshots + MockData.allSnapshots, allEvents: [])
+                entry: QuotaWidgetEntry(date: .now, snapshots: MockData.allSnapshots + MockData.allSnapshots, allSnapshots: MockData.allSnapshots + MockData.allSnapshots)
             )
             .previewContext(WidgetPreviewContext(family: .systemLarge))
         }

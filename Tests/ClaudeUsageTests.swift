@@ -146,6 +146,64 @@ private func testClaudeOAuthCacheFreshReadsDoNotSlideTTL() throws {
     )
 }
 
+private func testClaudeKeychainOAuthIsOptIn() throws {
+    try expect(
+        !ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(in: nil),
+        "missing Claude credentials should not enable keychain OAuth"
+    )
+    try expect(
+        !ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(
+            in: ProviderCredential(extraFields: ["unrelated": "true"])
+        ),
+        "unrelated fields should not enable keychain OAuth"
+    )
+    try expect(
+        ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(
+            in: ProviderCredential(extraFields: [ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey: "true"])
+        ),
+        "explicit true should enable keychain OAuth"
+    )
+
+    var extraFields = [ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey: "true"]
+    ClaudeOAuthCredentialPolicy.setKeychainAccessEnabled(false, in: &extraFields)
+    try expectEqual(extraFields[ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey], nil, "disabled keychain OAuth flag should not be persisted")
+}
+
+private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("claude-jsonl-reader-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let url = directory.appendingPathComponent("session.jsonl")
+    let payload = [
+        """
+        {"timestamp":"2026-05-16T00:00:00Z","requestId":"r1","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5}}}
+        """,
+        """
+        {"timestamp":"2026-05-16T00:00:00Z","requestId":"r1","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5}}}
+        """,
+        """
+        {"timestamp":"2026-05-16T02:00:00Z","usage":{"input_tokens":2,"cache_read_input_tokens":3}}
+        """
+    ].joined(separator: "\n")
+    try payload.write(to: url, atomically: true, encoding: .utf8)
+
+    let formatter = ISO8601DateFormatter()
+    let records = try ClaudeJSONLUsageRecordReader.readUsageRecords(
+        from: url,
+        chunkSize: 32,
+        parseTimestamp: { value in
+            value.flatMap(formatter.date(from:))
+        }
+    )
+
+    try expectEqual(records.count, 2, "duplicate lines should be deduped")
+    try expectEqual(records[0].tokens, 15, "nested usage token total")
+    try expectEqual(records[1].tokens, 5, "top-level usage token total")
+    try expectEqual(records[1].timestamp, makeDate("2026-05-16T02:00:00Z"), "final unterminated line is parsed")
+}
+
 @main
 private enum ClaudeUsageTestRunner {
     static func main() throws {
@@ -154,6 +212,8 @@ private enum ClaudeUsageTestRunner {
         try testClaudeMissingSonnetWindowDoesNotDisplay()
         try testClaudeOpusWindowUsesSameRule()
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
+        try testClaudeKeychainOAuthIsOptIn()
+        try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()
         print("Claude usage tests passed")
     }
 }

@@ -4862,7 +4862,7 @@ public struct ChatGPTLocalProviderClient: ProviderClient {
     }
 }
 
-private struct ChatGPTDesktopLocalStateReader {
+private struct ChatGPTDesktopLocalStateReader: @unchecked Sendable {
     private let fileManager: FileManager
 
     init(fileManager: FileManager) {
@@ -5446,6 +5446,34 @@ private final class ClaudeTimeoutRaceState<Value>: @unchecked Sendable {
     }
 }
 
+private actor ClaudeLocalEventScanCoordinator {
+    static let shared = ClaudeLocalEventScanCoordinator()
+
+    private var activeTask: Task<[UsageEvent], Never>?
+
+    func startIfIdle(_ operation: @escaping @Sendable () async -> [UsageEvent]) -> Task<[UsageEvent], Never>? {
+        guard activeTask == nil else {
+            return nil
+        }
+
+        let task = Task {
+            await operation()
+        }
+        activeTask = task
+
+        Task {
+            _ = await task.value
+            clear()
+        }
+
+        return task
+    }
+
+    private func clear() {
+        activeTask = nil
+    }
+}
+
 // MARK: - Claude OAuth Token Management
 
 /// Resolved Claude subscription tier, derived from the keychain payload.
@@ -5500,8 +5528,11 @@ private final class ClaudeSonnetGateDiagnostics: @unchecked Sendable {
 /// `/api/oauth/usage` response itself is the live source of truth for
 /// which model-specific meters actually exist for this token — see
 /// `fetchOAuthQuota` for that gate.
-private nonisolated func resolveClaudePlanInfo() -> ClaudePlanInfo? {
-    guard let (creds, _) = ClaudeKeychainStore.readBest() else { return nil }
+private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> ClaudePlanInfo? {
+    guard allowKeychainLookup,
+          let (creds, _) = ClaudeKeychainStore.readBest(allowClaudeCodeFallback: false) else {
+        return nil
+    }
     let raw = creds.rawOAuthDict
 
     let subscription = (raw["subscriptionType"] as? String)?
@@ -5569,14 +5600,42 @@ private nonisolated struct ClaudeOAuthCredentials {
     }
 }
 
-/// Reads and writes the two keychain entries we treat as token stores:
+enum ClaudeOAuthCredentialPolicy {
+    static let keychainAccessEnabledKey = "claudeKeychainOAuthEnabled"
+
+    static func isKeychainAccessEnabled(in credentials: ProviderCredential?) -> Bool {
+        isKeychainAccessEnabled(extraFields: credentials?.extraFields)
+    }
+
+    static func isKeychainAccessEnabled(extraFields: [String: String]?) -> Bool {
+        guard let rawValue = extraFields?[keychainAccessEnabledKey] else {
+            return false
+        }
+
+        switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "enabled":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func setKeychainAccessEnabled(_ enabled: Bool, in extraFields: inout [String: String]) {
+        if enabled {
+            extraFields[keychainAccessEnabledKey] = "true"
+        } else {
+            extraFields.removeValue(forKey: keychainAccessEnabledKey)
+        }
+    }
+}
+
+/// Reads the two keychain entries we treat as token stores:
 ///   1. Claude Code CLI's own entry  (service "Claude Code-credentials")
 ///   2. Our backup entry             (service "...ClaudeOAuthMirror")
 ///
-/// When the access token is refreshed we attempt to write back to BOTH so
-/// the CLI stays in sync. If we don't own write access to Claude Code's
-/// entry the write will simply fail; our backup keeps the rotating refresh
-/// token alive across app launches regardless.
+/// Limit Counter only writes its own backup entry. Claude Code owns and
+/// refreshes its item independently, and writing it from the background can
+/// trigger repeat macOS password prompts.
 private nonisolated enum ClaudeKeychainStore {
     static let claudeCodeService = "Claude Code-credentials"
     static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
@@ -5603,9 +5662,13 @@ private nonisolated enum ClaudeKeychainStore {
     /// path (`performRefresh`) keeps the mirror's refresh_token
     /// rotating; as long as that refresh_token stays valid we can
     /// keep minting fresh access tokens without ever re-prompting.
-    static func readBest() -> (ClaudeOAuthCredentials, source: String)? {
+    static func readBest(allowClaudeCodeFallback: Bool) -> (ClaudeOAuthCredentials, source: String)? {
         if let backup = readBackup() {
             return (backup, backupService)
+        }
+
+        guard allowClaudeCodeFallback else {
+            return nil
         }
 
         // Mirror missing (first launch, or user cleared keychain) —
@@ -5719,15 +5782,9 @@ private actor ClaudeOAuthTokenManager {
     private var inflight: Task<String?, Never>?
     private var lastFailureAt: Date?
 
-    /// Returns a usable access token, refreshing it transparently if needed.
-    /// `manualOverride` is the OAuth token the user pasted in Settings, which
-    /// always wins (we don't try to refresh hand-entered tokens).
-    func currentAccessToken(manualOverride: String?) async -> String? {
-        if let manualOverride, !manualOverride.isEmpty {
-            return manualOverride
-        }
-
-        guard let (creds, source) = ClaudeKeychainStore.readBest() else {
+    /// Returns a usable keychain-backed access token, refreshing it transparently if needed.
+    func currentAccessTokenFromKeychain() async -> String? {
+        guard let (creds, source) = ClaudeKeychainStore.readBest(allowClaudeCodeFallback: true) else {
             return nil
         }
 
@@ -5772,14 +5829,9 @@ private actor ClaudeOAuthTokenManager {
     /// endpoint-throttled after Claude Code rewrote its own keychain item.
     /// This can prompt, so callers use it only after the mirror already failed.
     func accessTokenAfterOAuthFailure(
-        manualOverride: String?,
         rejectedToken: String?,
         reason: String
     ) async -> String? {
-        if let manualOverride, !manualOverride.isEmpty {
-            return nil
-        }
-
         return await recoverFromClaudeCodeKeychain(
             rejectedToken: rejectedToken,
             reason: reason
@@ -5805,8 +5857,8 @@ private actor ClaudeOAuthTokenManager {
         return fallback.accessToken
     }
 
-    /// POSTs the refresh request, persists the new tokens to both keychain
-    /// entries, returns the new access token (or nil on failure).
+    /// POSTs the refresh request, persists the new tokens to our keychain
+    /// mirror, returns the new access token (or nil on failure).
     private static func performRefresh(creds: ClaudeOAuthCredentials) async -> String? {
         guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else {
             print("[ClaudeOAuth] No refresh_token available — cannot refresh")
@@ -5874,12 +5926,12 @@ private actor ClaudeOAuthTokenManager {
             rawOAuthDict: creds.rawOAuthDict
         )
 
-        // Persist to both stores so:
-        //   - Claude Code CLI still works (if we have write permission)
-        //   - We can always refresh again on next launch (our own store)
-        let wroteCC = ClaudeKeychainStore.write(refreshed, service: ClaudeKeychainStore.claudeCodeService)
+        // Keep Limit Counter's mirror fresh without mutating Claude Code's
+        // own keychain item. Claude Code manages its entry independently,
+        // and rewriting it from a background refresh can trigger repeat
+        // macOS password prompts.
         let wroteBackup = ClaudeKeychainStore.write(refreshed, service: ClaudeKeychainStore.backupService)
-        print("[ClaudeOAuth] Refresh OK. Wrote ClaudeCode=\(wroteCC) Backup=\(wroteBackup)")
+        print("[ClaudeOAuth] Refresh OK. Wrote Backup=\(wroteBackup)")
 
         return newAccessToken
     }
@@ -5899,12 +5951,19 @@ public struct ClaudeProviderClient: ProviderClient {
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
-        //   2. OAuth token manager — reads keychain, refreshes if needed
+        //   2. OAuth token manager, only when the user explicitly enabled Claude Code Keychain access
         //   3. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
-        var oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessToken(
-            manualOverride: manualToken
-        )
+        let keychainOAuthEnabled = ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(in: credentials)
+        var oauthToken = manualToken
+        var tokenAllowsKeychainRecovery = false
+        var tokenAllowsKeychainPlanLookup = false
+
+        if oauthToken == nil && keychainOAuthEnabled {
+            oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain()
+            tokenAllowsKeychainRecovery = oauthToken != nil
+            tokenAllowsKeychainPlanLookup = oauthToken != nil
+        }
         if oauthToken == nil {
             oauthToken = Self.autoDetectedOAuthTokenFile()
         }
@@ -5921,22 +5980,24 @@ public struct ClaudeProviderClient: ProviderClient {
             do {
                 let merged = try await fetchOAuthSnapshotAndMerge(
                     token: token,
-                    credentials: credentials
+                    credentials: credentials,
+                    allowKeychainPlanLookup: tokenAllowsKeychainPlanLookup
                 )
                 ClaudeOAuthResponseCache.shared.store(merged)
                 return merged
             } catch let error as ProviderFetchError {
                 var effectiveError = error
-                if error.shouldRecoverClaudeOAuthFromKeychain,
+                if tokenAllowsKeychainRecovery,
+                   error.shouldRecoverClaudeOAuthFromKeychain,
                    let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
-                    manualOverride: manualToken,
                     rejectedToken: token,
                     reason: "OAuth usage fetch failed (\(error.localizedDescription))"
                    ) {
                     do {
                         let recovered = try await fetchOAuthSnapshotAndMerge(
                             token: recoveredToken,
-                            credentials: credentials
+                            credentials: credentials,
+                            allowKeychainPlanLookup: true
                         )
                         ClaudeOAuthResponseCache.shared.store(recovered)
                         return recovered
@@ -5976,9 +6037,13 @@ public struct ClaudeProviderClient: ProviderClient {
 
     private func fetchOAuthSnapshotAndMerge(
         token: String,
-        credentials: ProviderCredential?
+        credentials: ProviderCredential?,
+        allowKeychainPlanLookup: Bool
     ) async throws -> QuotaSnapshot {
-        let oauthSnapshot = try await fetchOAuthQuota(token: token)
+        let oauthSnapshot = try await fetchOAuthQuota(
+            token: token,
+            allowKeychainPlanLookup: allowKeychainPlanLookup
+        )
         // Augment OAuth quota meters with locally-captured 2-hour buckets so
         // the activity heatmap still shows Claude usage even when the OAuth
         // path has no per-event data.
@@ -6081,10 +6146,17 @@ public struct ClaudeProviderClient: ProviderClient {
         credentials: ProviderCredential?,
         timeoutSeconds: TimeInterval
     ) async -> [UsageEvent]? {
-        await withCheckedContinuation { continuation in
+        guard let loadTask = await ClaudeLocalEventScanCoordinator.shared.startIfIdle({
+            await loadLocalEvents(credentials: credentials)
+        }) else {
+            print("[ClaudeProvider] Local heatmap enrichment scan already in progress; reusing previous Claude heatmap buckets")
+            return nil
+        }
+
+        return await withCheckedContinuation { continuation in
             let state = ClaudeTimeoutRaceState<[UsageEvent]?>(continuation)
-            let loadTask = Task {
-                let events = await loadLocalEvents(credentials: credentials)
+            Task {
+                let events = await loadTask.value
                 // If the timeout won the race we still finish the scan
                 // and persist its results so the NEXT fetch sees fresh
                 // buckets rather than reusing the same stale cache
@@ -6239,7 +6311,10 @@ public struct ClaudeProviderClient: ProviderClient {
 
     // MARK: - OAuth Live Quota
 
-    private func fetchOAuthQuota(token: String) async throws -> QuotaSnapshot {
+    private func fetchOAuthQuota(
+        token: String,
+        allowKeychainPlanLookup: Bool
+    ) async throws -> QuotaSnapshot {
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             throw ProviderFetchError.networkError(underlying: URLError(.badURL))
         }
@@ -6283,7 +6358,7 @@ public struct ClaudeProviderClient: ProviderClient {
             throw ProviderFetchError.parsingError("OAuth decode failed: \(error.localizedDescription)")
         }
 
-        let plan = resolveClaudePlanInfo()
+        let plan = resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
 
         // Targeted diagnostic: one-shot dump of plan + per-model field state
         // so we can tell, on any build, exactly why the Sonnet/Opus meters
@@ -6435,7 +6510,7 @@ private struct ClaudeHeatmapBucketKey: Hashable {
     }
 }
 
-private struct ClaudeCodeLocalStateReader {
+private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
     private let fileManager: FileManager
 
     private static let iso8601WithFractionalSeconds: ISO8601DateFormatter = {
@@ -6737,55 +6812,10 @@ private struct ClaudeCodeLocalStateReader {
     }
 
     private func readUsageRecords(from url: URL) throws -> [ClaudeUsageRecord] {
-        let data = try Data(contentsOf: url)
-        guard let text = String(data: data, encoding: .utf8) else {
-            return []
-        }
-
-        var records: [ClaudeUsageRecord] = []
-        var seenUsageKeys = Set<String>()
-        for line in text.split(whereSeparator: \.isNewline) {
-            guard
-                let lineData = line.data(using: .utf8),
-                let json = try JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                let timestamp = parseTimestamp(json["timestamp"] as? String)
-            else {
-                continue
-            }
-
-            let usageObject = (json["usage"] as? [String: Any]) ?? (json["message"] as? [String: Any])?["usage"] as? [String: Any]
-            guard let usageObject else { continue }
-
-            let tokens = tokenCount(from: usageObject)
-            guard tokens > 0 else { continue }
-
-            let requestID = (json["requestId"] as? String) ?? ""
-            let messageID = ((json["message"] as? [String: Any])?["id"] as? String) ?? ""
-            let dedupeKey = "\(requestID)|\(messageID)|\(Int(timestamp.timeIntervalSince1970))|\(Int(tokens))"
-            guard seenUsageKeys.insert(dedupeKey).inserted else { continue }
-
-            records.append(ClaudeUsageRecord(timestamp: timestamp, tokens: tokens))
-        }
-
-        return records
-    }
-
-    private func tokenCount(from usage: [String: Any]) -> Double {
-        func number(_ key: String) -> Double {
-            if let value = usage[key] as? Double { return value }
-            if let value = usage[key] as? Int { return Double(value) }
-            if let value = usage[key] as? NSNumber { return value.doubleValue }
-            return 0
-        }
-
-        // Each JSONL line is a single API call, so cache fields are safe to include —
-        // they are not repeated across lines and they do count toward Claude Code's rate limits.
-        return number("input_tokens")
-            + number("output_tokens")
-            + number("cache_creation_input_tokens")
-            + number("cache_read_input_tokens")
-            + number("input_audio_tokens")
-            + number("output_audio_tokens")
+        try ClaudeJSONLUsageRecordReader.readUsageRecords(
+            from: url,
+            parseTimestamp: parseTimestamp(_:)
+        )
     }
 
     private func parseTimestamp(_ string: String?) -> Date? {
@@ -6826,6 +6856,113 @@ private struct ClaudeCodeLocalStateReader {
         }
 
         return contents.filter { $0.lastPathComponent.hasPrefix(prefix) }.count
+    }
+}
+
+struct ClaudeJSONLUsageRecordReader {
+    private static let defaultChunkSize = 1024 * 1024
+
+    static func readUsageRecords(
+        from url: URL,
+        chunkSize: Int = defaultChunkSize,
+        parseTimestamp: (String?) -> Date?
+    ) throws -> [ClaudeUsageRecord] {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var records: [ClaudeUsageRecord] = []
+        var seenUsageKeys = Set<String>()
+        var buffer = Data()
+        let readSize = max(4096, chunkSize)
+
+        while let chunk = try handle.read(upToCount: readSize), !chunk.isEmpty {
+            buffer.append(chunk)
+            consumeCompleteLines(
+                from: &buffer,
+                records: &records,
+                seenUsageKeys: &seenUsageKeys,
+                parseTimestamp: parseTimestamp
+            )
+        }
+
+        if !buffer.isEmpty {
+            appendUsageRecord(
+                from: buffer,
+                records: &records,
+                seenUsageKeys: &seenUsageKeys,
+                parseTimestamp: parseTimestamp
+            )
+        }
+
+        return records
+    }
+
+    private static func consumeCompleteLines(
+        from buffer: inout Data,
+        records: inout [ClaudeUsageRecord],
+        seenUsageKeys: inout Set<String>,
+        parseTimestamp: (String?) -> Date?
+    ) {
+        var lineStart = buffer.startIndex
+
+        while lineStart < buffer.endIndex,
+              let newline = buffer[lineStart..<buffer.endIndex].firstIndex(of: 0x0A) {
+            appendUsageRecord(
+                from: Data(buffer[lineStart..<newline]),
+                records: &records,
+                seenUsageKeys: &seenUsageKeys,
+                parseTimestamp: parseTimestamp
+            )
+            lineStart = buffer.index(after: newline)
+        }
+
+        if lineStart > buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex..<lineStart)
+        }
+    }
+
+    private static func appendUsageRecord(
+        from lineData: Data,
+        records: inout [ClaudeUsageRecord],
+        seenUsageKeys: inout Set<String>,
+        parseTimestamp: (String?) -> Date?
+    ) {
+        guard !lineData.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+              let timestamp = parseTimestamp(json["timestamp"] as? String) else {
+            return
+        }
+
+        let usageObject = (json["usage"] as? [String: Any]) ?? (json["message"] as? [String: Any])?["usage"] as? [String: Any]
+        guard let usageObject else { return }
+
+        let tokens = tokenCount(from: usageObject)
+        guard tokens > 0 else { return }
+
+        let requestID = (json["requestId"] as? String) ?? ""
+        let messageID = ((json["message"] as? [String: Any])?["id"] as? String) ?? ""
+        let dedupeKey = "\(requestID)|\(messageID)|\(Int(timestamp.timeIntervalSince1970))|\(Int(tokens))"
+        guard seenUsageKeys.insert(dedupeKey).inserted else { return }
+
+        records.append(ClaudeUsageRecord(timestamp: timestamp, tokens: tokens))
+    }
+
+    private static func tokenCount(from usage: [String: Any]) -> Double {
+        func number(_ key: String) -> Double {
+            if let value = usage[key] as? Double { return value }
+            if let value = usage[key] as? Int { return Double(value) }
+            if let value = usage[key] as? NSNumber { return value.doubleValue }
+            return 0
+        }
+
+        // Each JSONL line is a single API call, so cache fields are safe to include:
+        // they are not repeated across lines and they do count toward Claude Code's rate limits.
+        return number("input_tokens")
+            + number("output_tokens")
+            + number("cache_creation_input_tokens")
+            + number("cache_read_input_tokens")
+            + number("input_audio_tokens")
+            + number("output_audio_tokens")
     }
 }
 

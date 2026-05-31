@@ -938,6 +938,17 @@ struct ProviderCredentialView: View {
         )
     }
 
+    private var claudeKeychainOAuthEnabled: Binding<Bool> {
+        Binding(
+            get: {
+                ClaudeOAuthCredentialPolicy.isKeychainAccessEnabled(extraFields: storedExtraFields)
+            },
+            set: { isEnabled in
+                ClaudeOAuthCredentialPolicy.setKeychainAccessEnabled(isEnabled, in: &storedExtraFields)
+            }
+        )
+    }
+
     var body: some View {
         if providerID == .grok {
             grokConfigBody
@@ -1139,7 +1150,8 @@ struct ProviderCredentialView: View {
 
                 Section("Advanced") {
                     if providerID == .claude {
-                        Text("The data root field above points to your `~/.claude` folder for local token tracking. Optionally paste an OAuth bearer token in the field below to enable live 5-hour and 7-day quota meters from Anthropic's servers — no model call is made to fetch quota.")
+                        Toggle("Use Claude Code Keychain OAuth", isOn: claudeKeychainOAuthEnabled)
+                        Text("The data root field above points to your `~/.claude` folder for local token tracking. Leave Keychain OAuth off to avoid macOS prompts; paste an OAuth bearer token instead if you want live 5-hour and 7-day quota meters without reading Claude Code's keychain item.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

@@ -168,7 +168,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     public var configurationDescription: String {
         switch self {
         case .claude:
-            return "Reads local Claude Code transcripts under `~/.claude` for token stats. Add an OAuth token to unlock live 5-hour and 7-day quota meters directly from Anthropic."
+            return "Reads local Claude Code transcripts under `~/.claude` for token stats. Paste an OAuth token or explicitly enable Claude Code Keychain OAuth to unlock live 5-hour and 7-day quota meters."
         case .openai:
             return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface."
         case .openaiAPI:
@@ -247,7 +247,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Use only local Codex log folders or exports you intentionally point the app at."
         case .claude:
-            return "Use only Claude Code logs or settings you intentionally export or select yourself."
+            return "Use only Claude Code logs, OAuth tokens, or keychain access you intentionally provide."
         case .cursor:
             return "Use only a Cursor web credential you intentionally import. Local Cursor state is read only for cached metadata."
         case .windsurf:

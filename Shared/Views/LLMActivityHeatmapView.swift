@@ -1,8 +1,6 @@
 import SwiftUI
 
 public struct LLMActivityHeatmapView: View {
-    let snapshots: [QuotaSnapshot]
-
     private let columns = 30 // Days
     private let rows = 12    // 2-hour blocks
 
@@ -12,8 +10,6 @@ public struct LLMActivityHeatmapView: View {
     private let bucketMap: [HeatmapBucketKey: [UsageEvent]]
 
     public init(snapshots: [QuotaSnapshot]) {
-        self.snapshots = snapshots
-
         // 1. De-duplicate and extract all events once
         var seen = Set<UUID>()
         let events = snapshots.flatMap(\.events)
