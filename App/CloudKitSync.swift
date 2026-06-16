@@ -7,11 +7,14 @@ import UserNotifications
 
 enum CloudKitSyncError: LocalizedError {
     case accountUnavailable
+    case statusPublishFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .accountUnavailable:
             return "iCloud is unavailable for CloudKit sync."
+        case .statusPublishFailed(let message):
+            return message
         }
     }
 }
@@ -203,9 +206,16 @@ final class CloudKitSyncService {
                 throw CloudKitSyncError.accountUnavailable
             }
 
+            let shouldForceStatusRepublish = loadOperationState(.publish).lastErrorDescription != nil
             var publishedHashes = defaults.dictionary(forKey: publishedHashKey) as? [String: String] ?? [:]
+            if shouldForceStatusRepublish {
+                publishedHashes = [:]
+                print("[CloudKitSync] Previous publish failed — forcing full status republish")
+            }
             var lastAlertSignatures = defaults.dictionary(forKey: lastAlertSignatureKey) as? [String: String] ?? [:]
             var emittedAlerts: [CloudAlertPayload] = []
+            var statusFailures: [String] = []
+            var alertFailures: [String] = []
 
             for snapshot in snapshots {
                 let providerKey = snapshot.providerID.rawValue
@@ -213,8 +223,15 @@ final class CloudKitSyncService {
                 let previousHash = publishedHashes[providerKey]
 
                 if previousHash != currentHash {
-                    try await saveStatusRecord(snapshot, statusHash: currentHash)
-                    publishedHashes[providerKey] = currentHash
+                    do {
+                        try await saveStatusRecord(snapshot, statusHash: currentHash)
+                        publishedHashes[providerKey] = currentHash
+                    } catch {
+                        let detail = cloudKitErrorDescription(error)
+                        statusFailures.append("\(providerKey): \(detail)")
+                        print("[CloudKitSync] Status publish failed for \(providerKey): \(detail)")
+                        continue
+                    }
                 }
 
                 let alertDescriptor = alertDescriptor(for: snapshot)
@@ -222,19 +239,25 @@ final class CloudKitSyncService {
                 if let alertDescriptor {
                     if lastAlertSignatures[providerKey] != alertDescriptor.signature {
                         let createdAt = Date()
-                        try await saveAlertRecord(snapshot, descriptor: alertDescriptor, createdAt: createdAt)
-                        lastAlertSignatures[providerKey] = alertDescriptor.signature
-                        emittedAlerts.append(
-                            CloudAlertPayload(
-                                providerID: snapshot.providerID,
-                                title: alertDescriptor.title,
-                                body: alertDescriptor.body,
-                                signature: alertDescriptor.signature,
-                                createdAt: createdAt,
-                                windowLabel: alertDescriptor.windowLabel,
-                                kind: alertDescriptor.kind
+                        do {
+                            try await saveAlertRecord(snapshot, descriptor: alertDescriptor, createdAt: createdAt)
+                            lastAlertSignatures[providerKey] = alertDescriptor.signature
+                            emittedAlerts.append(
+                                CloudAlertPayload(
+                                    providerID: snapshot.providerID,
+                                    title: alertDescriptor.title,
+                                    body: alertDescriptor.body,
+                                    signature: alertDescriptor.signature,
+                                    createdAt: createdAt,
+                                    windowLabel: alertDescriptor.windowLabel,
+                                    kind: alertDescriptor.kind
+                                )
                             )
-                        )
+                        } catch {
+                            let detail = cloudKitErrorDescription(error)
+                            alertFailures.append("\(providerKey): \(detail)")
+                            print("[CloudKitSync] Alert publish failed for \(providerKey): \(detail)")
+                        }
                     }
                 } else {
                     lastAlertSignatures.removeValue(forKey: providerKey)
@@ -243,6 +266,16 @@ final class CloudKitSyncService {
 
             defaults.set(publishedHashes, forKey: publishedHashKey)
             defaults.set(lastAlertSignatures, forKey: lastAlertSignatureKey)
+
+            if !statusFailures.isEmpty {
+                let message = "Failed to publish CloudKit status records: \(statusFailures.joined(separator: "; "))"
+                throw CloudKitSyncError.statusPublishFailed(message)
+            }
+
+            if !alertFailures.isEmpty {
+                print("[CloudKitSync] Status records published; alert publish failures ignored: \(alertFailures.joined(separator: "; "))")
+            }
+
             recordOperationSuccess(.publish)
             return emittedAlerts
         } catch {
@@ -691,6 +724,30 @@ final class CloudKitSyncService {
         defaults.set(data, forKey: debugStateKey(for: operation))
     }
 
+    private func cloudKitErrorDescription(_ error: Error, depth: Int = 0) -> String {
+        guard let ckError = error as? CKError else {
+            return error.localizedDescription
+        }
+
+        var parts = [
+            "\(ckError.localizedDescription) [\(ckError.code)]"
+        ]
+
+        if depth < 2,
+           let partialErrors = ckError.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: Error],
+           !partialErrors.isEmpty {
+            let partialSummary = partialErrors
+                .sorted { $0.key.recordName < $1.key.recordName }
+                .map { recordID, partialError in
+                    "\(recordID.recordName)=\(cloudKitErrorDescription(partialError, depth: depth + 1))"
+                }
+                .joined(separator: ", ")
+            parts.append("partialErrors{\(partialSummary)}")
+        }
+
+        return parts.joined(separator: " ")
+    }
+
     private func recordOperationAttempt(_ operation: CloudDebugOperation) {
         var state = loadOperationState(operation)
         state.lastAttemptAt = Date()
@@ -709,7 +766,7 @@ final class CloudKitSyncService {
     private func recordOperationFailure(_ operation: CloudDebugOperation, error: Error) {
         var state = loadOperationState(operation)
         state.lastAttemptAt = Date()
-        state.lastErrorDescription = error.localizedDescription
+        state.lastErrorDescription = cloudKitErrorDescription(error)
         saveOperationState(state, for: operation)
     }
 
