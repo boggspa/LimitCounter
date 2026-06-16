@@ -112,9 +112,58 @@ public struct ProviderCardTitleText: View {
     }
 }
 
+/// How stale a snapshot's `fetchedAt` is, used to escalate the "Updated …"
+/// line from quiet tertiary text to a prominent amber/red warning. This is
+/// what surfaces an iOS viewer that has fallen hours/days behind the Mac
+/// publisher (CloudKit silent-push / background-refresh starvation) at a
+/// glance. On macOS the app refreshes locally, so it effectively never trips.
+private enum SnapshotStaleness {
+    case fresh
+    case stale
+    case veryStale
+
+    static let staleThreshold: TimeInterval = 12 * 60 * 60      // 12 hours
+    static let veryStaleThreshold: TimeInterval = 24 * 60 * 60  // 24 hours
+
+    init(age: TimeInterval) {
+        if age >= Self.veryStaleThreshold {
+            self = .veryStale
+        } else if age >= Self.staleThreshold {
+            self = .stale
+        } else {
+            self = .fresh
+        }
+    }
+
+    /// nil when fresh (keep the original quiet tertiary styling).
+    var warningColor: Color? {
+        switch self {
+        case .fresh: return nil
+        case .stale: return Color(hex: "#F59E0B")      // amber — matches meter severity
+        case .veryStale: return Color(hex: "#DC2626")  // red — matches meter severity
+        }
+    }
+}
+
+@ViewBuilder
+private func updatedMetadataLabel(_ text: String, staleness: SnapshotStaleness) -> some View {
+    if let color = staleness.warningColor {
+        HStack(spacing: 3) {
+            Image(systemName: "clock.badge.exclamationmark")
+            Text(text)
+        }
+        .foregroundStyle(color)
+        .fontWeight(.semibold)
+    } else {
+        Text(text)
+            .foregroundStyle(.tertiary)
+    }
+}
+
 @ViewBuilder
 private func headerMetadataLine(plan: String?, updatedAt: Date) -> some View {
     let updatedText = "Updated \(updatedAt.relativeString)"
+    let staleness = SnapshotStaleness(age: Date().timeIntervalSince(updatedAt))
 
     if let plan, !plan.isEmpty {
         HStack(spacing: 4) {
@@ -122,16 +171,14 @@ private func headerMetadataLine(plan: String?, updatedAt: Date) -> some View {
                 .foregroundStyle(.secondary)
             Text("-")
                 .foregroundStyle(.tertiary)
-            Text(updatedText)
-                .foregroundStyle(.tertiary)
+            updatedMetadataLabel(updatedText, staleness: staleness)
         }
         .font(.caption.weight(.medium))
         .lineLimit(1)
         .minimumScaleFactor(0.78)
     } else {
-        Text(updatedText)
+        updatedMetadataLabel(updatedText, staleness: staleness)
             .font(.caption2.weight(.medium))
-            .foregroundStyle(.tertiary)
             .lineLimit(1)
             .minimumScaleFactor(0.78)
     }
