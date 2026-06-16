@@ -295,6 +295,10 @@ final class SyncCoordinator {
             shouldPreserve = true
         case .claude:
             shouldPreserve = true
+        case .openai:
+            // A transient Codex usage decode/network miss should keep the last
+            // good card rather than blanking every meter to "Update failed".
+            shouldPreserve = true
         case .kimi:
             shouldPreserve =
                 reason.contains("Kimi CLI OAuth token is expired")

@@ -236,7 +236,7 @@ private struct MenuBarPopoverView: View {
                     MiniStatusRow(title: "No usage windows", systemImage: "chart.bar", color: .secondary)
                 } else {
                     VStack(spacing: 7) {
-                        ForEach(snapshot.summaryWindows.prefix(3)) { window in
+                        ForEach(snapshot.summaryWindows.prefix(4)) { window in
                             MiniQuotaWindowRow(window: window, providerID: snapshot.providerID, accent: accent)
                         }
 
@@ -478,7 +478,7 @@ private struct FloatingProviderPanelView: View {
                         MiniStatusRow(title: "Update failed", systemImage: "exclamationmark.triangle.fill", color: .red)
                     } else {
                         VStack(spacing: 8) {
-                            ForEach(snapshot.summaryWindows.prefix(3)) { window in
+                            ForEach(snapshot.summaryWindows.prefix(4)) { window in
                                 MiniQuotaWindowRow(window: window, providerID: snapshot.providerID, accent: accent)
                             }
 

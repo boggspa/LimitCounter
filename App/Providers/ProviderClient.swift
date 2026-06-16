@@ -3003,9 +3003,17 @@ public struct CodexSessionProviderClient: ProviderClient {
         _ aggregateWindow: QuotaWindow,
         comparedTo additionalWindows: [QuotaWindow]
     ) -> Bool {
+        // Only a window whose reset has ALREADY passed can be a stale,
+        // rolled-over duplicate. A saturated window whose reset is still in
+        // the future is a *real* active 100% and must stay visible — without
+        // this gate the Session/Weekly row vanishes the instant the user hits
+        // their cap, because a freshly-reset near-empty per-model ("Spark")
+        // twin satisfies the comparison below and the live aggregate gets
+        // suppressed even though it is the current, correct reading.
         guard let aggregateTotal = aggregateWindow.total,
               aggregateTotal > 0,
               let aggregateResetDate = aggregateWindow.resetDate,
+              aggregateResetDate < Date(),
               usageFraction(for: aggregateWindow) >= 0.98 else {
             return false
         }
