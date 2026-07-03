@@ -139,10 +139,9 @@ final class SyncCoordinator {
         print("[SyncCoordinator] Credential for \(providerID.rawValue): \(credential != nil ? "present" : "nil")")
 
         // Allow auto-discovery clients (local logs, Windsurf, Cursor,
-        // Gemini, Grok) to proceed without stored credentials. Grok in
-        // particular has no keychain credential at all — it reads the
-        // SuperGrok snapshot AGBench writes, via the shared AGBench
-        // bookmark, so it must be allowed through this gate.
+        // Gemini, Grok) to proceed without stored credentials. Grok can
+        // run from the local ~/.grok CLI folder in development builds or
+        // fall back to TaskWraith activity data when that bookmark exists.
         let canAutoDiscover =
             client is ClaudeProviderClient
             || client is CodexTelemetryProviderClient

@@ -1,13 +1,16 @@
 import Foundation
 import Security
 import SQLite3
+#if os(macOS)
+import Darwin
+#endif
 
 // MARK: - AGBench Unified Telemetry Source
 
 /// Reads AGBench's unified usage telemetry (`usage.json`) and emits
 /// per-provider `UsageEvent` records.
 ///
-/// AGBench (a.k.a. GUIGemini) maintains a JSON array at
+/// TaskWraith maintains a JSON array at
 /// `~/Library/Application Support/agbench/usage.json` that records every
 /// chat/run across providers — Kimi, Gemini, Codex, Claude — in a clean
 /// structured form. This is a richer signal than per-provider local
@@ -184,92 +187,1293 @@ enum AGBenchBookmarkStore {
     }
 }
 
-// MARK: - Grok Provider (via AGBench bridge)
+// MARK: - Grok Provider
 
-/// Surfaces xAI Grok (SuperGrok) usage by reading the snapshot AGBench
-/// writes to its app-support folder. xAI exposes no usage HTTP API, and
-/// the SuperGrok credit meter is only available via the interactive
-/// `grok` CLI screen — which a sandboxed app can't spawn. AGBench
-/// (unsandboxed) does that PTY scrape and writes the result to
-/// `grok-usage-snapshot.json`; we read it through the AGBench bookmark
-/// the user already granted. Heatmap activity comes from the same
-/// `usage.json` the other providers read.
+/// Mirrors TaskWraith's `GrokUsageSnapshot` bridge shape.
+///
+/// The bridge originally reported the older SuperGrok subscription-credit
+/// meter (`creditsUsedPercent`). Grok's `/usage` screen now reports a weekly
+/// quota, so the decoder accepts both the new weekly fields and the legacy
+/// credit fields until every installed TaskWraith build has moved over.
+struct GrokUsageSnapshot: Decodable {
+    let usageKind: String?
+    let weeklyLimitUsedPercent: Double?
+    let weeklyUsedPercent: Double?
+    let limitUsedPercent: Double?
+    let usedPercent: Double?
+    let weeklyLimitUsedDisplay: String?
+    let weeklyUsedDisplay: String?
+    let weeklyLimitLeftPercent: Double?
+    let weeklyLeftPercent: Double?
+    let limitLeftPercent: Double?
+    let remainingPercent: Double?
+    let weeklyLimitLeftDisplay: String?
+    let weeklyLeftDisplay: String?
+    let creditsUsedPercent: Double?
+    let creditsUsedDisplay: String?
+    let resetAtText: String?
+    let weeklyResetAtText: String?
+    let nextResetText: String?
+    let resetAt: String?
+    let weeklyResetAt: String?
+    let nextResetAt: String?
+    let limitWindowSeconds: Double?
+    let planLabel: String?
+    let payAsYouGoEnabled: Bool?
+    let refreshedAt: String?
+    let confidence: String?
+
+    init(
+        usageKind: String?,
+        weeklyLimitUsedPercent: Double? = nil,
+        weeklyUsedPercent: Double? = nil,
+        limitUsedPercent: Double? = nil,
+        usedPercent: Double? = nil,
+        weeklyLimitUsedDisplay: String? = nil,
+        weeklyUsedDisplay: String? = nil,
+        weeklyLimitLeftPercent: Double? = nil,
+        weeklyLeftPercent: Double? = nil,
+        limitLeftPercent: Double? = nil,
+        remainingPercent: Double? = nil,
+        weeklyLimitLeftDisplay: String? = nil,
+        weeklyLeftDisplay: String? = nil,
+        creditsUsedPercent: Double? = nil,
+        creditsUsedDisplay: String? = nil,
+        resetAtText: String? = nil,
+        weeklyResetAtText: String? = nil,
+        nextResetText: String? = nil,
+        resetAt: String? = nil,
+        weeklyResetAt: String? = nil,
+        nextResetAt: String? = nil,
+        limitWindowSeconds: Double? = nil,
+        planLabel: String? = nil,
+        payAsYouGoEnabled: Bool? = nil,
+        refreshedAt: String? = nil,
+        confidence: String? = nil
+    ) {
+        self.usageKind = usageKind
+        self.weeklyLimitUsedPercent = weeklyLimitUsedPercent
+        self.weeklyUsedPercent = weeklyUsedPercent
+        self.limitUsedPercent = limitUsedPercent
+        self.usedPercent = usedPercent
+        self.weeklyLimitUsedDisplay = weeklyLimitUsedDisplay
+        self.weeklyUsedDisplay = weeklyUsedDisplay
+        self.weeklyLimitLeftPercent = weeklyLimitLeftPercent
+        self.weeklyLeftPercent = weeklyLeftPercent
+        self.limitLeftPercent = limitLeftPercent
+        self.remainingPercent = remainingPercent
+        self.weeklyLimitLeftDisplay = weeklyLimitLeftDisplay
+        self.weeklyLeftDisplay = weeklyLeftDisplay
+        self.creditsUsedPercent = creditsUsedPercent
+        self.creditsUsedDisplay = creditsUsedDisplay
+        self.resetAtText = resetAtText
+        self.weeklyResetAtText = weeklyResetAtText
+        self.nextResetText = nextResetText
+        self.resetAt = resetAt
+        self.weeklyResetAt = weeklyResetAt
+        self.nextResetAt = nextResetAt
+        self.limitWindowSeconds = limitWindowSeconds
+        self.planLabel = planLabel
+        self.payAsYouGoEnabled = payAsYouGoEnabled
+        self.refreshedAt = refreshedAt
+        self.confidence = confidence
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case usageKind
+        case weeklyLimitUsedPercent
+        case weeklyUsedPercent
+        case limitUsedPercent
+        case usedPercent
+        case weeklyLimitUsedDisplay
+        case weeklyUsedDisplay
+        case weeklyLimitLeftPercent
+        case weeklyLeftPercent
+        case limitLeftPercent
+        case remainingPercent
+        case weeklyLimitLeftDisplay
+        case weeklyLeftDisplay
+        case creditsUsedPercent
+        case creditsUsedDisplay
+        case resetAtText
+        case weeklyResetAtText
+        case nextResetText
+        case resetAt
+        case weeklyResetAt
+        case nextResetAt
+        case limitWindowSeconds
+        case planLabel
+        case payAsYouGoEnabled
+        case refreshedAt
+        case confidence
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        usageKind = try container.decodeIfPresent(String.self, forKey: .usageKind)
+        weeklyLimitUsedPercent = Self.decodeFlexibleDouble(container, .weeklyLimitUsedPercent)
+        weeklyUsedPercent = Self.decodeFlexibleDouble(container, .weeklyUsedPercent)
+        limitUsedPercent = Self.decodeFlexibleDouble(container, .limitUsedPercent)
+        usedPercent = Self.decodeFlexibleDouble(container, .usedPercent)
+        weeklyLimitUsedDisplay = try container.decodeIfPresent(String.self, forKey: .weeklyLimitUsedDisplay)
+        weeklyUsedDisplay = try container.decodeIfPresent(String.self, forKey: .weeklyUsedDisplay)
+        weeklyLimitLeftPercent = Self.decodeFlexibleDouble(container, .weeklyLimitLeftPercent)
+        weeklyLeftPercent = Self.decodeFlexibleDouble(container, .weeklyLeftPercent)
+        limitLeftPercent = Self.decodeFlexibleDouble(container, .limitLeftPercent)
+        remainingPercent = Self.decodeFlexibleDouble(container, .remainingPercent)
+        weeklyLimitLeftDisplay = try container.decodeIfPresent(String.self, forKey: .weeklyLimitLeftDisplay)
+        weeklyLeftDisplay = try container.decodeIfPresent(String.self, forKey: .weeklyLeftDisplay)
+        creditsUsedPercent = Self.decodeFlexibleDouble(container, .creditsUsedPercent)
+        creditsUsedDisplay = try container.decodeIfPresent(String.self, forKey: .creditsUsedDisplay)
+        resetAtText = try container.decodeIfPresent(String.self, forKey: .resetAtText)
+        weeklyResetAtText = try container.decodeIfPresent(String.self, forKey: .weeklyResetAtText)
+        nextResetText = try container.decodeIfPresent(String.self, forKey: .nextResetText)
+        resetAt = try container.decodeIfPresent(String.self, forKey: .resetAt)
+        weeklyResetAt = try container.decodeIfPresent(String.self, forKey: .weeklyResetAt)
+        nextResetAt = try container.decodeIfPresent(String.self, forKey: .nextResetAt)
+        limitWindowSeconds = Self.decodeFlexibleDouble(container, .limitWindowSeconds)
+        planLabel = try container.decodeIfPresent(String.self, forKey: .planLabel)
+        payAsYouGoEnabled = Self.decodeFlexibleBool(container, .payAsYouGoEnabled)
+        refreshedAt = try container.decodeIfPresent(String.self, forKey: .refreshedAt)
+        confidence = try container.decodeIfPresent(String.self, forKey: .confidence)
+    }
+
+    var isObserved: Bool {
+        (confidence ?? "observed").lowercased() == "observed"
+    }
+
+    var resolvedPlanName: String {
+        guard let plan = planLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !plan.isEmpty else {
+            return "SuperGrok"
+        }
+        return plan
+    }
+
+    private static func decodeFlexibleDouble(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ key: CodingKeys
+    ) -> Double? {
+        if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+            return value
+        }
+        guard let string = try? container.decodeIfPresent(String.self, forKey: key) else {
+            return nil
+        }
+        let normalized = string
+            .replacingOccurrences(of: ",", with: "")
+            .replacingOccurrences(of: "%", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "<> ").union(.whitespacesAndNewlines))
+        return Double(normalized)
+    }
+
+    private static func decodeFlexibleBool(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ key: CodingKeys
+    ) -> Bool? {
+        if let value = try? container.decodeIfPresent(Bool.self, forKey: key) {
+            return value
+        }
+        guard let string = try? container.decodeIfPresent(String.self, forKey: key) else {
+            return nil
+        }
+        switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "true", "enabled", "on", "yes":
+            return true
+        case "false", "disabled", "off", "no":
+            return false
+        default:
+            return nil
+        }
+    }
+}
+
+enum GrokUsageWindowMapper {
+    static func quotaWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
+        guard snapshot.isObserved else { return nil }
+        if let weeklyWindow = weeklyQuotaWindow(from: snapshot, now: now) {
+            return weeklyWindow
+        }
+        return legacyCreditWindow(from: snapshot, now: now)
+    }
+
+    static func weeklyQuotaWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
+        let usageKind = snapshot.usageKind?.lowercased() ?? ""
+        let resetText = firstNonEmpty(
+            snapshot.weeklyResetAtText,
+            snapshot.nextResetText,
+            snapshot.resetAtText
+        )
+        let hasWeeklySignal = usageKind.contains("weekly")
+            || snapshot.weeklyLimitUsedPercent != nil
+            || snapshot.weeklyUsedPercent != nil
+            || snapshot.limitUsedPercent != nil
+            || snapshot.usedPercent != nil
+            || snapshot.weeklyLimitUsedDisplay?.isEmpty == false
+            || snapshot.weeklyUsedDisplay?.isEmpty == false
+            || snapshot.weeklyLimitLeftPercent != nil
+            || snapshot.weeklyLeftPercent != nil
+            || snapshot.limitLeftPercent != nil
+            || snapshot.remainingPercent != nil
+            || snapshot.weeklyLimitLeftDisplay?.isEmpty == false
+            || snapshot.weeklyLeftDisplay?.isEmpty == false
+            || resetText?.localizedCaseInsensitiveContains("weekly") == true
+        guard hasWeeklySignal else { return nil }
+
+        let directUsed = firstFinite(
+            snapshot.weeklyLimitUsedPercent,
+            snapshot.weeklyUsedPercent,
+            snapshot.limitUsedPercent,
+            snapshot.usedPercent,
+            parsePercent(firstNonEmpty(snapshot.weeklyLimitUsedDisplay, snapshot.weeklyUsedDisplay))
+        )
+        let left = firstFinite(
+            snapshot.weeklyLimitLeftPercent,
+            snapshot.weeklyLeftPercent,
+            snapshot.limitLeftPercent,
+            snapshot.remainingPercent,
+            parsePercent(firstNonEmpty(snapshot.weeklyLimitLeftDisplay, snapshot.weeklyLeftDisplay))
+        )
+
+        let usedPercent: Double
+        if let directUsed {
+            usedPercent = clampedPercent(directUsed)
+        } else if let left {
+            usedPercent = clampedPercent(100 - left)
+        } else {
+            return nil
+        }
+
+        let resetDate = parseResetDate(
+            iso: firstNonEmpty(snapshot.weeklyResetAt, snapshot.nextResetAt, snapshot.resetAt),
+            text: resetText,
+            refreshedAt: snapshot.refreshedAt,
+            now: now
+        )
+        if let resetDate, resetDate < now.addingTimeInterval(-5 * 60) {
+            return nil
+        }
+
+        return QuotaWindow(
+            label: "Weekly",
+            windowKind: .weekly,
+            used: usedPercent,
+            total: 100,
+            resetDate: resetDate,
+            unit: "%",
+            subtitle: resetText.map { "Weekly limit resets \(formatResetText($0))" } ?? "Grok weekly usage limit"
+        )
+    }
+
+    static func legacyCreditWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
+        guard let percent = firstFinite(
+            snapshot.creditsUsedPercent,
+            parsePercent(snapshot.creditsUsedDisplay)
+        ) else {
+            return nil
+        }
+
+        let resetText = snapshot.resetAtText
+        let resetDate = parseResetDate(
+            iso: snapshot.resetAt,
+            text: resetText,
+            refreshedAt: snapshot.refreshedAt,
+            now: now
+        )
+
+        // The old monthly credit snapshot can remain on disk after Grok has
+        // switched to weekly quota output. Avoid rendering an expired legacy
+        // "Credits" row as if it were current data.
+        if let resetDate, resetDate < now {
+            return nil
+        }
+
+        return QuotaWindow(
+            label: "Credits",
+            windowKind: .sliding,
+            used: clampedPercent(percent),
+            total: 100,
+            resetDate: resetDate,
+            unit: "%",
+            subtitle: resetText.map { "Resets \(formatResetText($0))" } ?? "Legacy Grok credit meter"
+        )
+    }
+
+    static func parseResetDate(
+        iso: String?,
+        text: String?,
+        refreshedAt: String?,
+        now: Date = Date()
+    ) -> Date? {
+        if let iso = firstNonEmpty(iso),
+           let date = parseISODate(iso) {
+            return date
+        }
+
+        guard let text = firstNonEmpty(text) else { return nil }
+        let reference: Date
+        if let refreshedAt, let parsedRefreshedAt = parseISODate(refreshedAt) {
+            reference = parsedRefreshedAt
+        } else {
+            reference = now
+        }
+        return parsePacificResetText(text, reference: reference)
+    }
+
+    static func parsePercent(_ value: String?) -> Double? {
+        guard var value = firstNonEmpty(value) else { return nil }
+        value = value.replacingOccurrences(of: ",", with: "")
+        guard let match = value.range(
+            of: #"[<>]?\s*([0-9]+(?:\.[0-9]+)?)\s*%"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+        let raw = String(value[match])
+            .replacingOccurrences(of: "<", with: "")
+            .replacingOccurrences(of: ">", with: "")
+            .replacingOccurrences(of: "%", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(raw)
+    }
+
+    private static func parseISODate(_ value: String) -> Date? {
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: value) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: value)
+    }
+
+    private static func parsePacificResetText(_ value: String, reference: Date) -> Date? {
+        let cleaned = formatResetText(value)
+            .replacingOccurrences(
+                of: #"(?i)^(next\s+reset|resets?)\s*:?\s*"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})\s*(PT|PST|PDT)$"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+        let nsRange = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+        guard let match = regex.firstMatch(in: cleaned, range: nsRange),
+              match.numberOfRanges == 6,
+              let monthRange = Range(match.range(at: 1), in: cleaned),
+              let dayRange = Range(match.range(at: 2), in: cleaned),
+              let hourRange = Range(match.range(at: 3), in: cleaned),
+              let minuteRange = Range(match.range(at: 4), in: cleaned),
+              let month = monthNumber(String(cleaned[monthRange])),
+              let day = Int(cleaned[dayRange]),
+              let hour = Int(cleaned[hourRange]),
+              let minute = Int(cleaned[minuteRange]) else {
+            return nil
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles") ?? .gmt
+        let referenceYear = calendar.component(.year, from: reference)
+
+        func makeDate(year: Int) -> Date? {
+            var components = DateComponents()
+            components.calendar = calendar
+            components.timeZone = calendar.timeZone
+            components.year = year
+            components.month = month
+            components.day = day
+            components.hour = hour
+            components.minute = minute
+            return calendar.date(from: components)
+        }
+
+        guard var date = makeDate(year: referenceYear) else { return nil }
+        if date <= reference.addingTimeInterval(-60 * 60),
+           let nextYear = makeDate(year: referenceYear + 1) {
+            date = nextYear
+        }
+        return date
+    }
+
+    private static func monthNumber(_ value: String) -> Int? {
+        let key = value.prefix(3).lowercased()
+        let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        guard let index = months.firstIndex(of: String(key)) else { return nil }
+        return index + 1
+    }
+
+    private static func formatResetText(_ value: String) -> String {
+        value
+            .replacingOccurrences(
+                of: #"([A-Za-z])(\d)"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(\d)([A-Za-z]{2,})"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #",(?=\S)"#,
+                with: ", ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func firstNonEmpty(_ values: String?...) -> String? {
+        for value in values {
+            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty else {
+                continue
+            }
+            return trimmed
+        }
+        return nil
+    }
+
+    private static func firstFinite(_ values: Double?...) -> Double? {
+        for value in values {
+            guard let value, value.isFinite else { continue }
+            return value
+        }
+        return nil
+    }
+
+    private static func clampedPercent(_ value: Double) -> Double {
+        min(max(value, 0), 100)
+    }
+}
+
+enum GrokCLIUsageParser {
+    private struct RegexMatch {
+        let values: [String?]
+
+        subscript(_ index: Int) -> String? {
+            guard values.indices.contains(index) else { return nil }
+            return values[index]
+        }
+    }
+
+    static func parse(_ rawText: String, refreshedAt: Date = Date()) -> GrokUsageSnapshot {
+        let text = stripANSI(rawText)
+        let refreshedAtText = isoString(refreshedAt)
+
+        if let weeklySnapshot = parseWeeklySnapshot(text, refreshedAt: refreshedAt, refreshedAtText: refreshedAtText) {
+            return weeklySnapshot
+        }
+
+        if let legacySnapshot = parseLegacyCreditSnapshot(text, refreshedAt: refreshedAt, refreshedAtText: refreshedAtText) {
+            return legacySnapshot
+        }
+
+        return GrokUsageSnapshot(
+            usageKind: nil,
+            refreshedAt: refreshedAtText,
+            confidence: "unavailable"
+        )
+    }
+
+    static func stripANSI(_ input: String) -> String {
+        let scalars = Array(input.unicodeScalars)
+        var output = String.UnicodeScalarView()
+        var index = 0
+
+        while index < scalars.count {
+            let scalar = scalars[index]
+
+            if scalar.value == 0x1B {
+                index += 1
+                guard index < scalars.count else { break }
+
+                let marker = scalars[index].value
+                switch marker {
+                case 0x5B: // CSI
+                    index += 1
+                    while index < scalars.count {
+                        let value = scalars[index].value
+                        index += 1
+                        if value >= 0x40 && value <= 0x7E {
+                            break
+                        }
+                    }
+                case 0x5D: // OSC
+                    index += 1
+                    while index < scalars.count {
+                        if scalars[index].value == 0x07 {
+                            index += 1
+                            break
+                        }
+                        if scalars[index].value == 0x1B,
+                           index + 1 < scalars.count,
+                           scalars[index + 1].value == 0x5C {
+                            index += 2
+                            break
+                        }
+                        index += 1
+                    }
+                case 0x50: // DCS
+                    index += 1
+                    while index < scalars.count {
+                        if scalars[index].value == 0x1B,
+                           index + 1 < scalars.count,
+                           scalars[index + 1].value == 0x5C {
+                            index += 2
+                            break
+                        }
+                        index += 1
+                    }
+                default:
+                    index += 1
+                }
+                continue
+            }
+
+            switch scalar.value {
+            case 0x0D:
+                output.append(UnicodeScalar(0x0A)!)
+            case 0x08:
+                if !output.isEmpty {
+                    output.removeLast()
+                }
+            case 0x00...0x07, 0x0B...0x1F, 0x7F:
+                break
+            default:
+                output.append(scalar)
+            }
+            index += 1
+        }
+
+        return String(output)
+    }
+
+    private static func parseWeeklySnapshot(
+        _ text: String,
+        refreshedAt: Date,
+        refreshedAtText: String
+    ) -> GrokUsageSnapshot? {
+        let usedMatch = firstMatch(
+            #"Weekly\s*limit\s*:\s*(<\s*)?([0-9]+(?:\.[0-9]+)?)\s*%"#,
+            in: text
+        )
+        let leftMatch = firstMatch(
+            #"Weekly\s*limit\s*left\s*:\s*(<\s*)?([0-9]+(?:\.[0-9]+)?)\s*%"#,
+            in: text
+        )
+
+        guard usedMatch != nil || leftMatch != nil else {
+            return nil
+        }
+
+        let directUsed = usedMatch.flatMap { percentValue(lessThanPrefix: $0[1], rawValue: $0[2]) }
+        let left = leftMatch.flatMap { percentValue(lessThanPrefix: $0[1], rawValue: $0[2]) }
+        let used = directUsed ?? left.map { 100 - $0 }
+        let resetText = resetText(from: text)
+        let resetAt = resetText.flatMap {
+            GrokUsageWindowMapper.parseResetDate(
+                iso: nil,
+                text: $0,
+                refreshedAt: refreshedAtText,
+                now: refreshedAt
+            )
+        }
+
+        return GrokUsageSnapshot(
+            usageKind: "weekly_limit",
+            weeklyLimitUsedPercent: used.map(clampedPercent),
+            weeklyLimitUsedDisplay: usedMatch.map { percentDisplay(lessThanPrefix: $0[1], rawValue: $0[2]) }
+                ?? used.map(usedDisplayFromInvertedLeft),
+            weeklyLimitLeftPercent: left.map(clampedPercent),
+            weeklyLimitLeftDisplay: leftMatch.map { percentDisplay(lessThanPrefix: $0[1], rawValue: $0[2]) },
+            resetAtText: resetText,
+            weeklyResetAtText: resetText,
+            nextResetText: resetText,
+            resetAt: resetAt.map(isoString),
+            weeklyResetAt: resetAt.map(isoString),
+            nextResetAt: resetAt.map(isoString),
+            limitWindowSeconds: 7 * 24 * 60 * 60,
+            planLabel: "SuperGrok",
+            refreshedAt: refreshedAtText,
+            confidence: "observed"
+        )
+    }
+
+    private static func parseLegacyCreditSnapshot(
+        _ text: String,
+        refreshedAt: Date,
+        refreshedAtText: String
+    ) -> GrokUsageSnapshot? {
+        let creditsMatch = firstMatch(
+            #"Credits\s*used\s*:\s*(<\s*)?([0-9]+(?:\.[0-9]+)?)\s*%"#,
+            in: text
+        )
+        let fallbackUsedMatch = creditsMatch == nil
+            ? firstMatch(#"\b([0-9]+(?:\.[0-9]+)?)\s*%\s+used\b"#, in: text)
+            : nil
+
+        let creditsUsed = creditsMatch.flatMap { percentValue(lessThanPrefix: $0[1], rawValue: $0[2]) }
+            ?? fallbackUsedMatch.flatMap { percentValue(lessThanPrefix: nil, rawValue: $0[1]) }
+
+        guard let creditsUsed else {
+            return nil
+        }
+
+        let resetText = resetText(from: text)
+        let resetAt = resetText.flatMap {
+            GrokUsageWindowMapper.parseResetDate(
+                iso: nil,
+                text: $0,
+                refreshedAt: refreshedAtText,
+                now: refreshedAt
+            )
+        }
+
+        return GrokUsageSnapshot(
+            usageKind: "subscription_credits",
+            creditsUsedPercent: clampedPercent(creditsUsed),
+            creditsUsedDisplay: creditsMatch.map { percentDisplay(lessThanPrefix: $0[1], rawValue: $0[2]) }
+                ?? "\(compactPercent(creditsUsed))%",
+            resetAtText: resetText,
+            resetAt: resetAt.map(isoString),
+            limitWindowSeconds: 30 * 24 * 60 * 60,
+            planLabel: "SuperGrok",
+            refreshedAt: refreshedAtText,
+            confidence: "observed"
+        )
+    }
+
+    private static func resetText(from text: String) -> String? {
+        guard let match = firstMatch(
+            #"\b(?:Next\s*reset|Resets?)\s*:?\s*([A-Za-z]+)\s*(\d{1,2}),?\s*(\d{1,2}):(\d{2})\s*(PT|PST|PDT)"#,
+            in: text
+        ) else {
+            return nil
+        }
+
+        guard let month = match[1],
+              let day = match[2],
+              let hour = match[3],
+              let minute = match[4],
+              let timeZone = match[5] else {
+            return nil
+        }
+        return "\(month) \(day), \(hour):\(minute) \(timeZone)"
+    }
+
+    private static func firstMatch(_ pattern: String, in text: String) -> RegexMatch? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else {
+            return nil
+        }
+
+        var values: [String?] = []
+        values.reserveCapacity(match.numberOfRanges)
+        for index in 0..<match.numberOfRanges {
+            let range = match.range(at: index)
+            guard range.location != NSNotFound,
+                  let swiftRange = Range(range, in: text) else {
+                values.append(nil)
+                continue
+            }
+            values.append(String(text[swiftRange]))
+        }
+        return RegexMatch(values: values)
+    }
+
+    private static func percentValue(lessThanPrefix: String?, rawValue: String?) -> Double? {
+        guard let rawValue, let value = Double(rawValue) else { return nil }
+        if lessThanPrefix?.contains("<") == true {
+            return min(value, 0.5)
+        }
+        return value
+    }
+
+    private static func percentDisplay(lessThanPrefix: String?, rawValue: String?) -> String {
+        let prefix = lessThanPrefix?.contains("<") == true ? "<" : ""
+        return "\(prefix)\(rawValue ?? "0")%"
+    }
+
+    private static func usedDisplayFromInvertedLeft(_ value: Double) -> String {
+        if value >= 99.5 {
+            return ">99%"
+        }
+        return "\(compactPercent(value))%"
+    }
+
+    private static func compactPercent(_ value: Double) -> String {
+        let rounded = value.rounded()
+        if abs(value - rounded) < 0.005 {
+            return String(Int(rounded))
+        }
+        return String(format: "%.1f", value)
+    }
+
+    private static func clampedPercent(_ value: Double) -> Double {
+        min(max(value, 0), 100)
+    }
+
+    private static func isoString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}
+
+enum GrokCLIUsageProbe {
+    static func fetchSnapshot(credentials: ProviderCredential?) async -> GrokUsageSnapshot? {
+        #if os(macOS)
+        guard let access = GrokCLIUsageAccess.resolve(credentials: credentials) else {
+            return nil
+        }
+        defer { access.stop() }
+        if let snapshot = runGrokUsageProbe(binaryURL: access.binaryURL, grokHomeURL: access.rootURL) {
+            return snapshot
+        }
+        return GrokLocalBillingLogReader.latestSnapshot(rootURL: access.rootURL)
+        #else
+        return nil
+        #endif
+    }
+}
+
+#if os(macOS)
+private struct GrokCLIUsageAccess {
+    let rootURL: URL
+    let binaryURL: URL
+    let stop: () -> Void
+
+    static func resolve(credentials: ProviderCredential?) -> GrokCLIUsageAccess? {
+        if let bookmarkData = credentialBookmarkData(credentials),
+           let scoped = resolveBookmark(bookmarkData) {
+            let rootURL = normalizedGrokRootURL(from: scoped.url)
+            if let binaryURL = findGrokBinary(in: rootURL) {
+                return GrokCLIUsageAccess(rootURL: rootURL, binaryURL: binaryURL, stop: scoped.stop)
+            }
+            scoped.stop()
+        }
+
+        if let endpoint = credentials?.normalizedCustomEndpoint {
+            let rootURL = normalizedGrokRootURL(from: URL(fileURLWithPath: endpoint))
+            let didStart = rootURL.startAccessingSecurityScopedResource()
+            if let binaryURL = findGrokBinary(in: rootURL) {
+                return GrokCLIUsageAccess(rootURL: rootURL, binaryURL: binaryURL) {
+                    if didStart {
+                        rootURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+            }
+            if didStart {
+                rootURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        if let home = detectedHomeDirectory() {
+            let rootURL = home.appendingPathComponent(".grok")
+            if let binaryURL = findGrokBinary(in: rootURL) {
+                return GrokCLIUsageAccess(rootURL: rootURL, binaryURL: binaryURL, stop: {})
+            }
+        }
+
+        return nil
+    }
+
+    private static func credentialBookmarkData(_ credentials: ProviderCredential?) -> Data? {
+        if let bookmarkData = credentials?.bookmarkData {
+            return bookmarkData
+        }
+        guard let bookmarkBase64 = credentials?.extraFields?["bookmarkData"] else {
+            return nil
+        }
+        return Data(base64Encoded: bookmarkBase64)
+    }
+
+    private static func resolveBookmark(_ bookmarkData: Data) -> (url: URL, stop: () -> Void)? {
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: .withSecurityScope,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            return nil
+        }
+
+        if isStale {
+            print("[GrokCLIUsage] Grok folder bookmark is stale; re-importing ~/.grok is recommended")
+        }
+
+        let didStart = url.startAccessingSecurityScopedResource()
+        return (url, {
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        })
+    }
+
+    private static func normalizedGrokRootURL(from selectedURL: URL) -> URL {
+        let fileManager = FileManager.default
+        let resourceValues = try? selectedURL.resourceValues(forKeys: [.isDirectoryKey])
+        let isDirectory = resourceValues?.isDirectory ?? selectedURL.hasDirectoryPath
+
+        if isDirectory {
+            if selectedURL.lastPathComponent == "bin" || selectedURL.lastPathComponent == "downloads" {
+                return selectedURL.deletingLastPathComponent()
+            }
+            return selectedURL
+        }
+
+        let parent = selectedURL.deletingLastPathComponent()
+        if parent.lastPathComponent == "bin" || parent.lastPathComponent == "downloads" {
+            return parent.deletingLastPathComponent()
+        }
+
+        if fileManager.fileExists(atPath: parent.appendingPathComponent("bin/grok").path) {
+            return parent
+        }
+        return parent
+    }
+
+    private static func findGrokBinary(in rootURL: URL) -> URL? {
+        let fileManager = FileManager.default
+        let binURL = rootURL.appendingPathComponent("bin/grok")
+        if fileManager.fileExists(atPath: binURL.path) || fileManager.isExecutableFile(atPath: binURL.path) {
+            return binURL
+        }
+
+        let downloadsURL = rootURL.appendingPathComponent("downloads")
+        guard let candidates = try? fileManager.contentsOfDirectory(
+            at: downloadsURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        return candidates
+            .filter { $0.lastPathComponent.hasPrefix("grok-") }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .first { fileManager.isExecutableFile(atPath: $0.path) }
+    }
+
+    private static func detectedHomeDirectory() -> URL? {
+        if let pw = getpwuid(getuid())?.pointee,
+           let homeCString = pw.pw_dir {
+            return URL(fileURLWithPath: String(cString: homeCString), isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+    }
+}
+
+private struct GrokTerminalQueryState {
+    var answeredCursorPosition = false
+    var answeredXtermVersion = false
+    var answeredPrimaryAttributes = false
+    var answeredSecondaryAttributes = false
+}
+
+private func runGrokUsageProbe(binaryURL: URL, grokHomeURL: URL) -> GrokUsageSnapshot? {
+    let fileManager = FileManager.default
+    let tempURL = fileManager.temporaryDirectory
+        .appendingPathComponent("limit-counter-grok-\(UUID().uuidString)", isDirectory: true)
+    try? fileManager.createDirectory(at: tempURL, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: tempURL) }
+
+    var masterFD: Int32 = -1
+    var slaveFD: Int32 = -1
+    var terminalSize = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
+    guard openpty(&masterFD, &slaveFD, nil, nil, &terminalSize) == 0 else {
+        print("[GrokCLIUsage] openpty failed")
+        return nil
+    }
+    defer {
+        if masterFD >= 0 {
+            close(masterFD)
+        }
+    }
+
+    let process = Process()
+    process.executableURL = binaryURL
+    process.arguments = ["--no-auto-update", "--no-alt-screen"]
+    process.currentDirectoryURL = tempURL
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "GROK_HOME": grokHomeURL.path,
+        "TERM": "xterm-256color",
+        "NO_COLOR": "1",
+        "GROK_DISABLE_AUTOUPDATER": "1"
+    ]) { _, new in new }
+
+    let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
+    process.standardInput = slaveHandle
+    process.standardOutput = slaveHandle
+    process.standardError = slaveHandle
+
+    do {
+        try process.run()
+        slaveHandle.closeFile()
+    } catch {
+        print("[GrokCLIUsage] Failed to launch grok CLI: \(error.localizedDescription)")
+        slaveHandle.closeFile()
+        return nil
+    }
+    defer {
+        if process.isRunning {
+            process.terminate()
+            usleep(200_000)
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+    }
+
+    let flags = fcntl(masterFD, F_GETFL)
+    if flags >= 0 {
+        _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
+    }
+
+    var data = Data()
+    var queryState = GrokTerminalQueryState()
+    let startedAt = Date()
+    let deadline = startedAt.addingTimeInterval(12)
+    var sentUsageCommand = false
+    var sentFallbackEnter = false
+
+    while Date() < deadline {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let bufferCount = buffer.count
+        let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+            read(masterFD, rawBuffer.baseAddress, bufferCount)
+        }
+
+        if bytesRead > 0 {
+            data.append(contentsOf: buffer.prefix(Int(bytesRead)))
+        }
+
+        let rawText = String(decoding: data, as: UTF8.self)
+        respondToGrokTerminalQueries(in: rawText, masterFD: masterFD, state: &queryState)
+
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let cleanText = GrokCLIUsageParser.stripANSI(rawText)
+
+        if !sentUsageCommand, elapsed >= 1.8 {
+            writePTYString("/usage\r", to: masterFD)
+            sentUsageCommand = true
+        }
+
+        if sentUsageCommand,
+           !sentFallbackEnter,
+           elapsed >= 4.0,
+           !hasFullGrokUsageScreen(cleanText) {
+            writePTYString("\r", to: masterFD)
+            sentFallbackEnter = true
+        }
+
+        if hasFullGrokUsageScreen(cleanText) {
+            let snapshot = GrokCLIUsageParser.parse(rawText)
+            if GrokUsageWindowMapper.quotaWindow(from: snapshot) != nil {
+                return snapshot
+            }
+        }
+
+        usleep(100_000)
+    }
+
+    let snapshot = GrokCLIUsageParser.parse(String(decoding: data, as: UTF8.self))
+    if GrokUsageWindowMapper.quotaWindow(from: snapshot) != nil {
+        return snapshot
+    }
+    return nil
+}
+
+private func hasFullGrokUsageScreen(_ text: String) -> Bool {
+    let compact = text
+        .lowercased()
+        .replacingOccurrences(of: #"[\s\u{00A0}]"#, with: "", options: .regularExpression)
+    return compact.contains("weeklylimit:")
+        || compact.contains("creditsused:")
+        || compact.contains("nextreset:")
+}
+
+private func respondToGrokTerminalQueries(
+    in rawText: String,
+    masterFD: Int32,
+    state: inout GrokTerminalQueryState
+) {
+    if !state.answeredCursorPosition, rawText.contains("\u{001B}[6n") {
+        writePTYString("\u{001B}[1;1R", to: masterFD)
+        state.answeredCursorPosition = true
+    }
+
+    if !state.answeredXtermVersion,
+       (rawText.contains("\u{001B}[>q") || rawText.contains("\u{001B}[>0q")) {
+        writePTYString("\u{001B}P>|LimitCounter 1.0\u{001B}\\", to: masterFD)
+        state.answeredXtermVersion = true
+    }
+
+    if !state.answeredSecondaryAttributes, rawText.contains("\u{001B}[>c") {
+        writePTYString("\u{001B}[>0;276;0c", to: masterFD)
+        state.answeredSecondaryAttributes = true
+    }
+
+    if !state.answeredPrimaryAttributes, rawText.contains("\u{001B}[c") {
+        writePTYString("\u{001B}[?1;2c", to: masterFD)
+        state.answeredPrimaryAttributes = true
+    }
+}
+
+private func writePTYString(_ string: String, to fd: Int32) {
+    let bytes = Array(string.utf8)
+    bytes.withUnsafeBufferPointer { pointer in
+        guard let baseAddress = pointer.baseAddress else { return }
+        _ = write(fd, baseAddress, pointer.count)
+    }
+}
+#endif
+
+enum GrokLocalBillingLogReader {
+    private static let maxTailBytes: UInt64 = 1_000_000
+
+    static func latestSnapshot(rootURL: URL, now: Date = Date()) -> GrokUsageSnapshot? {
+        let logURL = rootURL.appendingPathComponent("logs/unified.jsonl")
+        guard let text = readTailText(from: logURL) else {
+            return nil
+        }
+
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        let decoder = JSONDecoder()
+
+        for line in lines.reversed() {
+            guard let data = String(line).data(using: .utf8),
+                  let entry = try? decoder.decode(BillingLogEntry.self, from: data),
+                  entry.messageContainsBillingConfig,
+                  let snapshot = snapshot(from: entry, now: now) else {
+                continue
+            }
+            return snapshot
+        }
+
+        return nil
+    }
+
+    private static func readTailText(from url: URL) -> String? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        let fileSize = size.uint64Value
+        let offset = fileSize > maxTailBytes ? fileSize - maxTailBytes : 0
+        do {
+            try handle.seek(toOffset: offset)
+            let data = handle.readDataToEndOfFile()
+            guard !data.isEmpty else { return nil }
+            var text = String(decoding: data, as: UTF8.self)
+            if offset > 0, let firstNewline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: firstNewline)...])
+            }
+            return text
+        } catch {
+            return nil
+        }
+    }
+
+    private static func snapshot(from entry: BillingLogEntry, now: Date) -> GrokUsageSnapshot? {
+        guard let config = entry.ctx?.config,
+              let used = config.creditUsagePercent else {
+            return nil
+        }
+
+        let periodType = config.currentPeriod?.type?.uppercased() ?? ""
+        let periodStart = firstNonEmpty(config.currentPeriod?.start, config.billingPeriodStart)
+        let periodEnd = firstNonEmpty(config.currentPeriod?.end, config.billingPeriodEnd)
+        let periodStartDate = periodStart.flatMap(parseISODate)
+        let periodEndDate = periodEnd.flatMap(parseISODate)
+        let isWeekly = periodType.contains("WEEKLY")
+            || periodDurationSeconds(start: periodStartDate, end: periodEndDate).map { $0 <= 8 * 24 * 60 * 60 } == true
+        let refreshedAtDate = entry.ts.flatMap(parseISODate) ?? now
+        let refreshedAt = isoString(refreshedAtDate)
+        let resetAt = periodEndDate.map(isoString) ?? periodEnd
+        let windowSeconds = periodDurationSeconds(start: periodStartDate, end: periodEndDate)
+
+        if isWeekly {
+            return GrokUsageSnapshot(
+                usageKind: "weekly_limit",
+                weeklyLimitUsedPercent: clampedPercent(used),
+                weeklyLimitUsedDisplay: "\(compactPercent(used))%",
+                resetAt: resetAt,
+                weeklyResetAt: resetAt,
+                nextResetAt: resetAt,
+                limitWindowSeconds: windowSeconds ?? 7 * 24 * 60 * 60,
+                planLabel: entry.ctx?.subscriptionTier,
+                refreshedAt: refreshedAt,
+                confidence: "observed"
+            )
+        }
+
+        return GrokUsageSnapshot(
+            usageKind: "subscription_credits",
+            creditsUsedPercent: clampedPercent(used),
+            creditsUsedDisplay: "\(compactPercent(used))%",
+            resetAt: resetAt,
+            limitWindowSeconds: windowSeconds ?? 30 * 24 * 60 * 60,
+            planLabel: entry.ctx?.subscriptionTier,
+            refreshedAt: refreshedAt,
+            confidence: "observed"
+        )
+    }
+
+    private static func periodDurationSeconds(start: Date?, end: Date?) -> Double? {
+        guard let start, let end, end > start else { return nil }
+        return end.timeIntervalSince(start)
+    }
+
+    private static func parseISODate(_ value: String) -> Date? {
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: value) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: value)
+    }
+
+    private static func isoString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func compactPercent(_ value: Double) -> String {
+        let rounded = value.rounded()
+        if abs(value - rounded) < 0.005 {
+            return String(Int(rounded))
+        }
+        return String(format: "%.1f", value)
+    }
+
+    private static func clampedPercent(_ value: Double) -> Double {
+        min(max(value, 0), 100)
+    }
+
+    private static func firstNonEmpty(_ values: String?...) -> String? {
+        for value in values {
+            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty else {
+                continue
+            }
+            return trimmed
+        }
+        return nil
+    }
+
+    private struct BillingLogEntry: Decodable {
+        let ts: String?
+        let msg: String?
+        let ctx: BillingContext?
+
+        var messageContainsBillingConfig: Bool {
+            msg?.localizedCaseInsensitiveContains("billing: fetched credits config") == true
+        }
+    }
+
+    private struct BillingContext: Decodable {
+        let config: BillingConfig?
+        let subscriptionTier: String?
+    }
+
+    private struct BillingConfig: Decodable {
+        let creditUsagePercent: Double?
+        let currentPeriod: BillingPeriod?
+        let billingPeriodStart: String?
+        let billingPeriodEnd: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case creditUsagePercent
+            case currentPeriod
+            case billingPeriodStart
+            case billingPeriodEnd
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            creditUsagePercent = Self.decodeFlexibleDouble(container, .creditUsagePercent)
+            currentPeriod = try container.decodeIfPresent(BillingPeriod.self, forKey: .currentPeriod)
+            billingPeriodStart = try container.decodeIfPresent(String.self, forKey: .billingPeriodStart)
+            billingPeriodEnd = try container.decodeIfPresent(String.self, forKey: .billingPeriodEnd)
+        }
+
+        private static func decodeFlexibleDouble(
+            _ container: KeyedDecodingContainer<CodingKeys>,
+            _ key: CodingKeys
+        ) -> Double? {
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return value
+            }
+            guard let string = try? container.decodeIfPresent(String.self, forKey: key) else {
+                return nil
+            }
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    private struct BillingPeriod: Decodable {
+        let type: String?
+        let start: String?
+        let end: String?
+    }
+}
+
+/// Surfaces xAI Grok usage by running the local `grok` CLI against a
+/// user-granted `~/.grok` folder and parsing the interactive `/usage` screen.
+/// TaskWraith remains an optional activity/bridge fallback, but the weekly
+/// quota meter no longer depends on another app writing `grok-usage-snapshot`.
 public struct GrokProviderClient: ProviderClient {
     public let providerID: ProviderID = .grok
 
     public init() {}
 
-    /// Mirrors GUIGemini's `GrokUsageSnapshot` shape.
-    private struct GrokUsageSnapshot: Decodable {
-        let creditsUsedPercent: Double?
-        let creditsUsedDisplay: String?
-        let resetAtText: String?
-        let resetAt: String?
-        let planLabel: String?
-        let payAsYouGoEnabled: Bool?
-        let refreshedAt: String?
-        let confidence: String?
-    }
-
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
-        guard let scoped = AGBenchBookmarkStore.startAccess() else {
-            // No AGBench bookmark granted yet — the user needs to grant
-            // it in Settings → AGBench Data Source.
-            throw ProviderFetchError.notConfigured
-        }
-        defer { scoped.stop() }
-
-        // Heatmap activity from the shared usage.json (provider == "grok").
-        let events = AGBenchUsageReader.events(forProviderKey: "grok", rootURL: scoped.url)
-
-        // Credit meter from the bridge snapshot.
-        let snapshotURL = grokSnapshotURL(rootURL: scoped.url)
-        let snapshot = readGrokSnapshot(at: snapshotURL)
-
+        let agbenchData = readTaskWraithGrokData()
         var windows: [QuotaWindow] = []
         var planName = "SuperGrok"
 
-        if let snapshot, snapshot.confidence == "observed", let percent = snapshot.creditsUsedPercent {
-            if let plan = snapshot.planLabel, !plan.isEmpty {
-                planName = plan
-            }
-            let resetDate = parseGrokResetDate(snapshot)
-            windows.append(
-                QuotaWindow(
-                    label: "Credits",
-                    windowKind: .sliding,
-                    used: percent,
-                    total: 100,
-                    resetDate: resetDate,
-                    unit: "%",
-                    subtitle: snapshot.resetAtText.map { "Resets \($0)" } ?? "SuperGrok subscription credits"
-                )
-            )
+        if let cliSnapshot = await GrokCLIUsageProbe.fetchSnapshot(credentials: credentials),
+           let cliWindow = GrokUsageWindowMapper.quotaWindow(from: cliSnapshot) {
+            planName = cliSnapshot.resolvedPlanName
+            windows.append(cliWindow)
+        } else if let bridgeSnapshot = agbenchData.snapshot,
+                  let bridgeWindow = GrokUsageWindowMapper.quotaWindow(from: bridgeSnapshot) {
+            planName = bridgeSnapshot.resolvedPlanName
+            windows.append(bridgeWindow)
         }
 
-        // If we have neither a credit meter nor events, treat as
-        // not-yet-configured so the card shows setup guidance rather
-        // than an empty success state. (Happens before AGBench has been
-        // rebuilt with the bridge / run a probe.)
-        if windows.isEmpty && events.isEmpty {
+        if windows.isEmpty && agbenchData.events.isEmpty {
             throw ProviderFetchError.notConfigured
         }
 
-        // Placeholder window when we have events but no credit snapshot
-        // yet — keeps the card coherent ("connected, awaiting meter").
-        // total:100 so it renders as a 0-100 meter (empty), matching
-        // the filled meter the real reading produces, rather than a
-        // bare number.
         if windows.isEmpty {
             windows.append(
                 QuotaWindow(
-                    label: "Credits",
-                    windowKind: .sliding,
+                    label: "Weekly",
+                    windowKind: .weekly,
                     used: 0,
                     total: 100,
                     resetDate: nil,
                     unit: "%",
-                    subtitle: "Awaiting SuperGrok meter from AGBench"
+                    subtitle: "Import ~/.grok to read Grok weekly usage directly"
                 )
             )
         }
@@ -282,10 +1486,21 @@ public struct GrokProviderClient: ProviderClient {
             stats: [],
             balances: [],
             signals: [],
-            events: events.sorted { $0.timestamp > $1.timestamp },
+            events: agbenchData.events.sorted { $0.timestamp > $1.timestamp },
             fetchState: .success,
             fetchedAt: Date()
         )
+    }
+
+    private func readTaskWraithGrokData() -> (events: [UsageEvent], snapshot: GrokUsageSnapshot?) {
+        guard let scoped = AGBenchBookmarkStore.startAccess() else {
+            return ([], nil)
+        }
+        defer { scoped.stop() }
+
+        let events = AGBenchUsageReader.events(forProviderKey: "grok", rootURL: scoped.url)
+        let snapshot = readGrokSnapshot(at: grokSnapshotURL(rootURL: scoped.url))
+        return (events, snapshot)
     }
 
     private func grokSnapshotURL(rootURL: URL) -> URL {
@@ -301,18 +1516,6 @@ public struct GrokProviderClient: ProviderClient {
             return nil
         }
         return try? JSONDecoder().decode(GrokUsageSnapshot.self, from: data)
-    }
-
-    private func parseGrokResetDate(_ snapshot: GrokUsageSnapshot) -> Date? {
-        // Prefer the robust ISO timestamp; fall back to nil (we keep the
-        // human-readable resetAtText in the subtitle either way).
-        guard let iso = snapshot.resetAt, !iso.isEmpty else { return nil }
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFractional.date(from: iso) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: iso)
     }
 }
 
@@ -1496,6 +2699,16 @@ public enum CredentialImportService {
             ))
         }
 
+        // Grok CLI: ~/.grok/bin/grok
+        let grokRoot = home.appendingPathComponent(".grok")
+        if grokRootContainsExecutable(grokRoot) {
+            detected.append(DetectedCredential(
+                providerID: .grok,
+                fileURL: grokRoot,
+                description: "Grok CLI data folder"
+            ))
+        }
+
         return detected
     }
 
@@ -1627,6 +2840,23 @@ public enum CredentialImportService {
                     "kimiCredentialSource": "directory"
                 ],
                 bookmarkData: makeSecurityScopedBookmarkData(for: url)
+            )
+        }
+
+        if providerID == .grok {
+            let selectedRoot = grokRootURL(fromSelectedURL: url)
+            guard grokRootContainsExecutable(selectedRoot) else {
+                throw ImportError.missingRequiredField("bin/grok")
+            }
+
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: selectedRoot.path,
+                extraFields: [
+                    "grokSource": "directory"
+                ],
+                bookmarkData: makeSecurityScopedReadWriteBookmarkData(for: selectedRoot)
             )
         }
 
@@ -1820,8 +3050,6 @@ public enum CredentialImportService {
         case .kimi:
             return try parseKimiJSON(json, sourceURL: sourceURL)
         case .grok, .heatmap:
-            // Grok has no file-import flow — it sources data from the
-            // AGBench bridge snapshot, not a user-selected credential.
             throw ImportError.unsupportedProvider
         }
     }
@@ -2034,6 +3262,66 @@ public enum CredentialImportService {
         return nil
         #endif
     }
+
+    private static func makeSecurityScopedReadWriteBookmarkData(for url: URL) -> Data? {
+        #if os(macOS)
+        do {
+            let didStartAccessing = url.startAccessingSecurityScopedResource()
+            defer {
+                if didStartAccessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            return try url.bookmarkData(options: [.withSecurityScope])
+        } catch {
+            print("[CredentialImportService] Failed to create read-write bookmark: \(error)")
+            return nil
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    private static func grokRootURL(fromSelectedURL url: URL) -> URL {
+        let resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey])
+        let isDirectory = resourceValues?.isDirectory ?? url.hasDirectoryPath
+
+        if isDirectory {
+            if url.lastPathComponent == "bin" || url.lastPathComponent == "downloads" {
+                return url.deletingLastPathComponent()
+            }
+            return url
+        }
+
+        let parent = url.deletingLastPathComponent()
+        if parent.lastPathComponent == "bin" || parent.lastPathComponent == "downloads" {
+            return parent.deletingLastPathComponent()
+        }
+        return parent
+    }
+
+    private static func grokRootContainsExecutable(_ rootURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        let binURL = rootURL.appendingPathComponent("bin/grok")
+        if fileManager.fileExists(atPath: binURL.path) || fileManager.isExecutableFile(atPath: binURL.path) {
+            return true
+        }
+
+        let downloadsURL = rootURL.appendingPathComponent("downloads")
+        guard let candidates = try? fileManager.contentsOfDirectory(
+            at: downloadsURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        return candidates.contains { candidate in
+            candidate.lastPathComponent.hasPrefix("grok-")
+                && fileManager.isExecutableFile(atPath: candidate.path)
+        }
+    }
 }
 
 // MARK: - macOS File Picker Extension
@@ -2056,16 +3344,18 @@ public extension CredentialImportService {
                     return "Select the ~/.codex folder for complete Codex activity, or one log file for limited access."
                 case .cursor:
                     return "Select Cursor's globalStorage folder or state.vscdb for local metadata. Use the web session import for live usage."
+                case .grok:
+                    return "Select your ~/.grok folder so Limit Counter can run /usage locally."
                 default:
                     return "Select credential file for \(providerID.displayName)"
                 }
             }()
             panel.prompt = "Import"
-            panel.allowedContentTypes = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi
+            panel.allowedContentTypes = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi || providerID == .grok
                 ? [UTType.folder, UTType.json, UTType.plainText, UTType.data]
                 : [UTType.json, UTType.plainText, UTType.data]
             panel.allowsMultipleSelection = false
-            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi
+            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi || providerID == .grok
 
             // Suggest starting directory based on provider
             let home = FileManager.default.homeDirectoryForCurrentUser
@@ -2091,7 +3381,7 @@ public extension CredentialImportService {
             case .kimi:
                 panel.directoryURL = home.appendingPathComponent(".kimi")
             case .grok:
-                panel.directoryURL = home.appendingPathComponent("Library/Application Support/agbench")
+                panel.directoryURL = home.appendingPathComponent(".grok")
             case .heatmap:
                 break
             }
@@ -2161,7 +3451,7 @@ public struct KimiProviderClient: ProviderClient {
             // bookmark to `kimi-code.json` itself).
             let cliEvents = loadLocalKimiEvents(credentials: credentials)
             // Additional source: AGBench's unified usage.json tracks every
-            // run the user invokes through GUIGemini, including Kimi runs.
+            // run the user invokes through TaskWraith, including Kimi runs.
             // For users who drive activity through AGBench this is the
             // richer signal (61 records vs whatever wire.jsonl has on its
             // own). No-op when the user hasn't granted the bookmark.
@@ -5317,9 +6607,75 @@ enum ClaudeOAuthModelWindowMapper {
             subtitle: subtitle
         )
     }
+
+    static func fableQuotaWindow(from window: ClaudeOAuthWindow?) -> QuotaWindow? {
+        quotaWindow(
+            label: "Fable",
+            subtitle: fableSubtitle(for: window?.utilization),
+            from: window
+        )
+    }
+
+    private static func fableSubtitle(for utilization: Double?) -> String {
+        guard let utilization, utilization <= 0 else {
+            return "Fable 7-day rolling window"
+        }
+        return "You haven't used Fable yet"
+    }
 }
 
-private struct ClaudeOAuthExtraUsage: Decodable {
+struct ClaudeOAuthLimit: Decodable {
+    let group: String?
+    let kind: String?
+    let percent: Double?
+    let resetAt: Date?
+    let scope: String?
+
+    enum CodingKeys: String, CodingKey {
+        case group
+        case kind
+        case percent
+        case resetAt = "resets_at"
+        case scope
+    }
+
+    init(group: String?, kind: String?, percent: Double?, resetAt: Date?, scope: String?) {
+        self.group = group
+        self.kind = kind
+        self.percent = percent
+        self.resetAt = resetAt
+        self.scope = scope
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        group = try container.decodeIfPresent(String.self, forKey: .group)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind)
+        percent = try container.decodeIfPresent(Double.self, forKey: .percent)
+        resetAt = try container.decodeIfPresent(Date.self, forKey: .resetAt)
+        scope = try? container.decodeIfPresent(String.self, forKey: .scope)
+    }
+
+    var isFableWeeklyLimit: Bool {
+        let normalizedGroup = group?.lowercased()
+        let normalizedKind = kind?.lowercased()
+        let normalizedScope = scope?.lowercased()
+
+        return normalizedGroup == "weekly"
+            && (
+                normalizedKind == "weekly_scoped"
+                    || normalizedKind?.contains("fable") == true
+                    || normalizedScope?.contains("fable") == true
+            )
+    }
+
+    var oauthWindow: ClaudeOAuthWindow? {
+        guard let percent else { return nil }
+        return ClaudeOAuthWindow(utilization: percent, resetAt: resetAt)
+    }
+}
+
+struct ClaudeOAuthExtraUsage: Decodable {
     let isEnabled: Bool
     let monthlyLimit: Double?
     let usedCredits: Double?
@@ -5335,21 +6691,31 @@ private struct ClaudeOAuthExtraUsage: Decodable {
     }
 }
 
-private struct ClaudeOAuthUsageResponse: Decodable {
+struct ClaudeOAuthUsageResponse: Decodable {
     let fiveHour: ClaudeOAuthWindow?
     let sevenDay: ClaudeOAuthWindow?
     let sevenDayOpus: ClaudeOAuthWindow?
+    let sevenDayFable: ClaudeOAuthWindow?
     let sevenDaySonnet: ClaudeOAuthWindow?
     let sevenDayOAuthApps: ClaudeOAuthWindow?
+    let limits: [ClaudeOAuthLimit]?
     let extraUsage: ClaudeOAuthExtraUsage?
 
     enum CodingKeys: String, CodingKey {
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case sevenDayOpus = "seven_day_opus"
+        case sevenDayFable = "seven_day_fable"
         case sevenDaySonnet = "seven_day_sonnet"
         case sevenDayOAuthApps = "seven_day_oauth_apps"
+        case limits
         case extraUsage = "extra_usage"
+    }
+
+    var fableWeeklyWindow: ClaudeOAuthWindow? {
+        sevenDayFable
+            ?? limits?.first { $0.isFableWeeklyLimit }?.oauthWindow
+            ?? sevenDaySonnet
     }
 }
 
@@ -5486,7 +6852,7 @@ private actor ClaudeLocalEventScanCoordinator {
 
 /// Resolved Claude subscription tier, derived from the keychain payload.
 /// Used both to label the card header and to gate per-model meters that
-/// only Max plans receive (e.g. weekly Sonnet utilization).
+/// only Max plans receive (e.g. weekly Fable utilization).
 private nonisolated struct ClaudePlanInfo {
     /// Human-readable label for the card subtitle (e.g. "Pro", "Max x20").
     let displayName: String
@@ -5495,24 +6861,25 @@ private nonisolated struct ClaudePlanInfo {
 }
 
 /// One-shot diagnostic — prints the plan info we resolved from the keychain
-/// alongside the live `seven_day_sonnet` / `seven_day_opus` fields from the
+/// alongside live Fable / Sonnet / Opus usage fields from the
 /// /api/oauth/usage response, so we can confirm on any build whether the
 /// model-specific meter gate sees what we expect. Fires at most once per
 /// process launch to avoid log spam.
-private final class ClaudeSonnetGateDiagnostics: @unchecked Sendable {
-    static let shared = ClaudeSonnetGateDiagnostics()
+private final class ClaudeModelLimitDiagnostics: @unchecked Sendable {
+    static let shared = ClaudeModelLimitDiagnostics()
     private let lock = NSLock()
     private var logged = false
 
-    func logOnce(plan: ClaudePlanInfo?, sonnet: ClaudeOAuthWindow?, opus: ClaudeOAuthWindow?) {
+    func logOnce(plan: ClaudePlanInfo?, fable: ClaudeOAuthWindow?, sonnet: ClaudeOAuthWindow?, opus: ClaudeOAuthWindow?) {
         lock.lock(); defer { lock.unlock() }
         guard !logged else { return }
         logged = true
 
         let planSummary: String = plan.map { "displayName=\($0.displayName) isMax=\($0.isMax)" } ?? "<nil>"
+        let fableSummary = Self.summarize(fable)
         let sonnetSummary = Self.summarize(sonnet)
         let opusSummary = Self.summarize(opus)
-        print("[ClaudeOAuth-Diag] plan=\(planSummary) sonnet=\(sonnetSummary) opus=\(opusSummary)")
+        print("[ClaudeOAuth-Diag] plan=\(planSummary) fable=\(fableSummary) sonnetLegacy=\(sonnetSummary) opus=\(opusSummary)")
     }
 
     private static func summarize(_ window: ClaudeOAuthWindow?) -> String {
@@ -6069,7 +7436,7 @@ public struct ClaudeProviderClient: ProviderClient {
         // path has no per-event data.
         let events = await eventsForOAuthEnrichment(credentials: credentials)
         // Plus AGBench's unified usage.json for any Claude runs driven
-        // through GUIGemini. No-op without the bookmark.
+        // through TaskWraith. No-op without the bookmark.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
         return mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
     }
@@ -6380,11 +7747,14 @@ public struct ClaudeProviderClient: ProviderClient {
 
         let plan = resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
 
+        let fableWeeklyWindow = usage.fableWeeklyWindow
+
         // Targeted diagnostic: one-shot dump of plan + per-model field state
-        // so we can tell, on any build, exactly why the Sonnet/Opus meters
+        // so we can tell, on any build, exactly why the Fable/Opus meters
         // do or don't render. Prints once per process launch.
-        ClaudeSonnetGateDiagnostics.shared.logOnce(
+        ClaudeModelLimitDiagnostics.shared.logOnce(
             plan: plan,
+            fable: fableWeeklyWindow,
             sonnet: usage.sevenDaySonnet,
             opus: usage.sevenDayOpus
         )
@@ -6415,12 +7785,10 @@ public struct ClaudeProviderClient: ProviderClient {
         // Max-plan tokens get additional weekly caps for specific models.
         // The live response shape is the source of truth: if Anthropic sends
         // utilization, show the meter even when `resets_at` is absent.
-        if let sonnetWindow = ClaudeOAuthModelWindowMapper.quotaWindow(
-            label: "Sonnet",
-            subtitle: "Sonnet 7-day rolling window",
-            from: usage.sevenDaySonnet
+        if let fableWindow = ClaudeOAuthModelWindowMapper.fableQuotaWindow(
+            from: fableWeeklyWindow
         ) {
-            windows.append(sonnetWindow)
+            windows.append(fableWindow)
         }
         if let opusWindow = ClaudeOAuthModelWindowMapper.quotaWindow(
             label: "Opus",
@@ -6433,7 +7801,7 @@ public struct ClaudeProviderClient: ProviderClient {
         var stats: [QuotaStat] = []
         let modelWindows: [(String, ClaudeOAuthWindow?)] = [
             ("Opus 7d", usage.sevenDayOpus),
-            ("Sonnet 7d", usage.sevenDaySonnet),
+            ("Fable 7d", fableWeeklyWindow),
             ("OAuth Apps 7d", usage.sevenDayOAuthApps)
         ]
         for (label, window) in modelWindows {

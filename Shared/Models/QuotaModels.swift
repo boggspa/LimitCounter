@@ -159,7 +159,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .kimi:
             return "Kimi Code API or CLI session"
         case .grok:
-            return "Grok (SuperGrok) via AGBench bridge"
+            return "Grok CLI weekly quota"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -186,7 +186,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .kimi:
             return "Uses a Kimi Code Console API key or an explicitly imported Kimi CLI OAuth file to read weekly and rolling 5-hour quota."
         case .grok:
-            return "Reads the SuperGrok credit meter that AGBench (GUIGemini) captures from the grok CLI and writes to its app-support folder. Grant the AGBench Data Source bookmark in Settings to enable."
+            return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -213,7 +213,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .kimi:
             return "Kimi Code API key"
         case .grok:
-            return "AGBench data folder (shared)"
+            return "Grok CLI data folder"
         case .heatmap:
             return ""
         }
@@ -257,7 +257,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .kimi:
             return "Use only a Kimi Code Console API key you intentionally enter, or a Kimi CLI OAuth file you explicitly import."
         case .grok:
-            return "Reads only the Grok usage snapshot AGBench writes to its own app-support folder, via a bookmark you grant. No xAI credentials are read."
+            return "Runs only the local Grok CLI `/usage` command against the `~/.grok` folder you grant. No prompts are sent and no xAI credentials are extracted."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -345,7 +345,9 @@ public extension ProviderID {
 #elseif canImport(UIKit)
 public extension ProviderID {
     var bundledLogoImage: UIImage? {
-        UIImage(named: bundledLogoAssetName)
+        let assetName = bundledLogoAssetName
+        guard !assetName.isEmpty else { return nil }
+        return UIImage(named: assetName)
     }
 }
 #endif

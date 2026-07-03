@@ -84,16 +84,26 @@ enum CursorCredentialTestRunner {
         }
         defer { sqlite3_close(db) }
 
+        let trackedDate = recentCursorDailyStatDateString()
+
         try exec("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);", db: db)
         try insert(key: "cursorAuth/cachedEmail", value: "cursor@example.com", db: db)
         try insert(key: "cursorAuth/cachedMembershipType", value: "pro", db: db)
         try insert(
-            key: "aiCodeTracking.dailyStats.2026-05-12",
+            key: "aiCodeTracking.dailyStats.\(trackedDate)",
             value: """
-            {"date":"2026-05-12","tabSuggestedLines":7,"tabAcceptedLines":3,"composerSuggestedLines":11,"composerAcceptedLines":5}
+            {"date":"\(trackedDate)","tabSuggestedLines":7,"tabAcceptedLines":3,"composerSuggestedLines":11,"composerAcceptedLines":5}
             """,
             db: db
         )
+    }
+
+    private static func recentCursorDailyStatDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     private static func insert(key: String, value: String, db: OpaquePointer) throws {

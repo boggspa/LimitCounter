@@ -228,7 +228,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    Section("AGBench Data Source") {
+                    Section("TaskWraith Data Source") {
                         AGBenchDataSourceRow()
                             .listRowBackground(Color.white.opacity(0.03))
                     }
@@ -690,10 +690,9 @@ private struct ProviderMonthlyBudgetSettingsRow: View {
     }
 }
 
-/// AGBench (GUIGemini) telemetry source row. Lets the user grant the
-/// app sandboxed access to `~/Library/Application Support/agbench/`
-/// so providers (Kimi, Codex, Gemini, Claude) can read `usage.json`
-/// and surface AGBench-driven runs on the activity heatmap.
+/// TaskWraith telemetry source row. Lets the user grant the app sandboxed
+/// access to the TaskWraith app-support folder so providers can read
+/// `usage.json` and surface TaskWraith-driven runs on the activity heatmap.
 private struct AGBenchDataSourceRow: View {
     @State private var hasBookmark: Bool = AGBenchBookmarkStore.hasBookmark
     @State private var lastErrorMessage: String?
@@ -706,11 +705,11 @@ private struct AGBenchDataSourceRow: View {
                     .foregroundStyle(hasBookmark ? Color.green : Color.secondary)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("AGBench (GUIGemini)")
+                    Text("TaskWraith")
                         .font(.system(size: 14, weight: .semibold))
                     Text(hasBookmark
-                         ? "Connected — usage.json is being read for Kimi, Codex, Gemini, and Claude."
-                         : "Not configured. Grant access to surface AGBench runs on the heatmap.")
+                         ? "Connected - usage.json is being read for Kimi, Codex, Gemini, Claude, and Grok."
+                         : "Not configured. Grant access to surface TaskWraith runs on the heatmap.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -751,8 +750,8 @@ private struct AGBenchDataSourceRow: View {
     private func grantAccess() {
         #if os(macOS)
         let panel = NSOpenPanel()
-        panel.title = "Grant access to AGBench data"
-        panel.message = "Select the agbench folder under ~/Library/Application Support/"
+        panel.title = "Grant access to TaskWraith data"
+        panel.message = "Select the TaskWraith data folder under ~/Library/Application Support/"
         panel.prompt = "Grant"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -824,10 +823,7 @@ private struct ProviderSettingsRow: View {
                 && FileManager.default.fileExists(atPath: tmpDir.path)
         }
         if providerID == .grok {
-            // Grok has no keychain credential — it's "configured" once
-            // the shared AGBench Data Source bookmark is granted, since
-            // that's where it reads the SuperGrok snapshot + activity.
-            return AGBenchBookmarkStore.hasBookmark
+            return false
         }
         #endif
         return false
@@ -950,49 +946,7 @@ struct ProviderCredentialView: View {
     }
 
     var body: some View {
-        if providerID == .grok {
-            grokConfigBody
-        } else {
-            standardConfigBody
-        }
-    }
-
-    /// Grok has no per-provider credential — it reads the SuperGrok
-    /// snapshot AGBench writes, via the shared AGBench Data Source
-    /// bookmark. So its config window is just an explainer + status,
-    /// not the generic credential-file picker.
-    private var grokConfigBody: some View {
-        ZStack {
-            LiquidGlassBackdrop(intensity: .settings)
-
-            Form {
-                Section("How Grok usage works") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(spacing: 8) {
-                            Image(systemName: AGBenchBookmarkStore.hasBookmark ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(AGBenchBookmarkStore.hasBookmark ? Color.green : Color.orange)
-                            Text(AGBenchBookmarkStore.hasBookmark
-                                 ? "Connected via the AGBench Data Source."
-                                 : "Not connected yet.")
-                                .font(.subheadline.weight(.semibold))
-                        }
-
-                        Text("xAI exposes no usage API, and the SuperGrok credit meter is only readable from the interactive grok CLI — which this sandboxed app can't run. Instead, AGBench (GUIGemini) captures the meter and writes it to its app-support folder, and Limit Counter reads it through the shared AGBench Data Source bookmark.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        Text("There's nothing to configure here. Grant (or re-grant) the AGBench Data Source bookmark in the main Settings window, then open AGBench and view its usage panel so it writes a fresh Grok snapshot.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-        }
+        standardConfigBody
     }
 
     private var standardConfigBody: some View {
@@ -1053,13 +1007,15 @@ struct ProviderCredentialView: View {
                     Button(action: importFromFile) {
                         HStack {
                             Image(systemName: "folder.badge.person.crop")
-                            Text("Select credential file...")
+                            Text(providerID == .grok ? "Select Grok folder..." : "Select credential file...")
                             Spacer()
                         }
                     }
                     .foregroundStyle(accent)
 
-                    Text("Import credentials from a JSON or text file you exported from the provider.")
+                    Text(providerID == .grok
+                         ? "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
+                         : "Import credentials from a JSON or text file you exported from the provider.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1115,7 +1071,7 @@ struct ProviderCredentialView: View {
                         #if os(iOS)
                             .textInputAutocapitalization(.never)
                         #endif
-                    } else if providerID == .codexTelemetry || providerID == .chatgpt || providerID == .gemini {
+                    } else if providerID == .codexTelemetry || providerID == .chatgpt || providerID == .gemini || providerID == .grok {
                         TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
                             .autocorrectionDisabled()
                         #if os(iOS)
@@ -1197,6 +1153,11 @@ struct ProviderCredentialView: View {
                         }
                         .pickerStyle(.menu)
                         Text(selectedGeminiLimitPreset.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .grok {
+                        Text("Use the import button to grant access to `~/.grok`. Limit Counter runs the local `grok` CLI with `/usage`, parses the weekly quota screen, and keeps TaskWraith data optional for activity enrichment.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1520,7 +1481,7 @@ struct ProviderCredentialView: View {
         // For local providers, create a security-scoped bookmark if a path is provided
         var extraFields = storedExtraFields
         if let path = resolvedCustomEndpoint,
-           providerID == .gemini || providerID == .claude || providerID == .codexTelemetry || providerID == .chatgpt || providerID == .windsurf {
+           providerID == .gemini || providerID == .claude || providerID == .codexTelemetry || providerID == .chatgpt || providerID == .windsurf || providerID == .grok {
             let url = URL(fileURLWithPath: path)
             if url.isFileURL {
                 #if os(macOS)

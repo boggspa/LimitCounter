@@ -1745,10 +1745,10 @@ public struct SelectQuotaTrioIntent: WidgetConfigurationIntent {
 public struct SelectQuotaTrioMeterRow: Identifiable, Hashable {
     public let id: String
     public let providerID: ProviderID
-    /// Window label — "Session", "Weekly", "Sonnet", "Pro 3.1 (preview)" etc.
+    /// Window label — "Session", "Weekly", "Fable", "Pro 3.1 (preview)" etc.
     /// We deliberately use the window label (not the provider's display
     /// name) so a user picking three Claude meters sees "Session / Weekly
-    /// / Sonnet" rather than "Claude Code" three times. The provider icon
+    /// / Fable" rather than "Claude Code" three times. The provider icon
     /// disambiguates when rows span multiple providers.
     public let title: String
     public let valueText: String

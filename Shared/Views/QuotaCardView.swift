@@ -74,7 +74,9 @@ public struct ProviderBrandIconView: View {
     #if os(macOS)
     private var bundledLogoImage: NSImage? {
         if providerID == .openai { return nil } // Favor SF symbol for Codex consistency
-        return NSImage(named: providerID.bundledLogoAssetName)
+        let assetName = providerID.bundledLogoAssetName
+        guard !assetName.isEmpty else { return nil }
+        return NSImage(named: assetName)
     }
     #elseif canImport(UIKit)
     private var bundledLogoImage: UIImage? {

@@ -33,6 +33,22 @@ private func utcCalendar() -> Calendar {
     return calendar
 }
 
+private func claudeOAuthDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .custom { decoder in
+        let container = try decoder.singleValueContainer()
+        let string = try container.decode(String.self)
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: string) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        if let date = plain.date(from: string) { return date }
+        throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unparseable date: \(string)")
+    }
+    return decoder
+}
+
 private func testClaudeHeatmapBucketingRetainsFullWindow() throws {
     let calendar = utcCalendar()
     let now = makeDate("2026-05-16T23:59:00Z")
@@ -68,36 +84,89 @@ private func testClaudeHeatmapBucketingRetainsFullWindow() throws {
     try expectEqual(events.map(\.timestamp).min(), oldestExpectedDay, "oldest retained bucket")
 }
 
-private func testClaudeSonnetWindowWithoutResetStillDisplays() throws {
+private func testClaudeFableWindowWithoutResetStillDisplays() throws {
     let window = ClaudeOAuthModelWindowMapper.quotaWindow(
-        label: "Sonnet",
-        subtitle: "Sonnet 7-day rolling window",
+        label: "Fable",
+        subtitle: "Fable 7-day rolling window",
         from: ClaudeOAuthWindow(utilization: 0, resetAt: nil)
     )
 
-    try expect(window != nil, "Sonnet utilization should create window without reset")
-    try expectEqual(window?.label, "Sonnet", "Sonnet label")
-    try expectEqual(window?.used, 0, "Sonnet utilization")
-    try expectEqual(window?.resetDate, nil, "Sonnet reset remains nil")
+    try expect(window != nil, "Fable utilization should create window without reset")
+    try expectEqual(window?.label, "Fable", "Fable label")
+    try expectEqual(window?.used, 0, "Fable utilization")
+    try expectEqual(window?.resetDate, nil, "Fable reset remains nil")
 }
 
-private func testClaudeMissingSonnetWindowDoesNotDisplay() throws {
+private func testClaudeMissingFableWindowDoesNotDisplay() throws {
     try expect(
         ClaudeOAuthModelWindowMapper.quotaWindow(
-            label: "Sonnet",
-            subtitle: "Sonnet 7-day rolling window",
+            label: "Fable",
+            subtitle: "Fable 7-day rolling window",
             from: nil
         ) == nil,
-        "missing Sonnet response should not create window"
+        "missing Fable response should not create window"
     )
 
     try expect(
         ClaudeOAuthModelWindowMapper.quotaWindow(
-            label: "Sonnet",
-            subtitle: "Sonnet 7-day rolling window",
+            label: "Fable",
+            subtitle: "Fable 7-day rolling window",
             from: ClaudeOAuthWindow(utilization: nil, resetAt: nil)
         ) == nil,
-        "Sonnet response without utilization should not create window"
+        "Fable response without utilization should not create window"
+    )
+}
+
+private func testClaudeFableWindowFromWeeklyScopedLimit() throws {
+    let reset = makeDate("2026-07-07T07:00:00Z")
+    let limit = ClaudeOAuthLimit(
+        group: "weekly",
+        kind: "weekly_scoped",
+        percent: 0,
+        resetAt: reset,
+        scope: nil
+    )
+
+    let window = ClaudeOAuthModelWindowMapper.fableQuotaWindow(from: limit.oauthWindow)
+
+    try expect(limit.isFableWeeklyLimit, "weekly_scoped Claude limit should map to Fable")
+    try expect(window != nil, "Fable limit should create a quota window")
+    try expectEqual(window?.label, "Fable", "Fable scoped label")
+    try expectEqual(window?.used, 0, "Fable scoped utilization")
+    try expectEqual(window?.resetDate, reset, "Fable scoped reset")
+    try expectEqual(window?.subtitle, "You haven't used Fable yet", "Fable zero-use subtitle")
+}
+
+private func testClaudeUsageResponseBuildsFableFromLimits() throws {
+    let payload = """
+    {
+      "seven_day_sonnet": { "utilization": 88.0 },
+      "limits": [
+        {
+          "group": "weekly",
+          "kind": "weekly_all",
+          "percent": 49,
+          "resets_at": "2026-07-07T07:00:00.000000+00:00"
+        },
+        {
+          "group": "weekly",
+          "kind": "weekly_scoped",
+          "percent": 0,
+          "resets_at": "2026-07-07T06:59:59.516637+00:00",
+          "scope": { "label": "Fable" }
+        }
+      ]
+    }
+    """
+
+    let usage = try claudeOAuthDecoder().decode(ClaudeOAuthUsageResponse.self, from: Data(payload.utf8))
+    let fable = usage.fableWeeklyWindow
+
+    try expectEqual(fable?.utilization, 0, "Fable should prefer weekly_scoped limits entry over legacy Sonnet")
+    let expectedReset = makeDate("2026-07-07T06:59:59Z").addingTimeInterval(0.516637)
+    try expect(
+        fable?.resetAt.map { abs($0.timeIntervalSince(expectedReset)) < 0.001 } == true,
+        "Fable scoped reset should decode"
     )
 }
 
@@ -208,8 +277,10 @@ private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {
 private enum ClaudeUsageTestRunner {
     static func main() throws {
         try testClaudeHeatmapBucketingRetainsFullWindow()
-        try testClaudeSonnetWindowWithoutResetStillDisplays()
-        try testClaudeMissingSonnetWindowDoesNotDisplay()
+        try testClaudeFableWindowWithoutResetStillDisplays()
+        try testClaudeMissingFableWindowDoesNotDisplay()
+        try testClaudeFableWindowFromWeeklyScopedLimit()
+        try testClaudeUsageResponseBuildsFableFromLimits()
         try testClaudeOpusWindowUsesSameRule()
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
         try testClaudeCodeKeychainFallbackIsOptIn()

@@ -174,7 +174,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
 
         // AGBench's unified `usage.json` records every run including
         // Codex CLI invocations. Adding those events here means a user
-        // who drives Codex through GUIGemini sees the corresponding
+        // who drives Codex through TaskWraith sees the corresponding
         // squares on the heatmap even if the underlying telemetry files
         // have rotated out of Codex's own SQLite/session retention.
         // No-op when the user hasn't granted the AGBench bookmark.

@@ -674,7 +674,7 @@ private struct GeminiLocalStateReader {
 
         // AGBench's unified `usage.json` records every run including
         // Gemini CLI invocations. Merging them in lets the heatmap
-        // reflect AGBench-driven activity even where the local CLI
+        // reflect TaskWraith-driven activity even where the local CLI
         // session file might be incomplete.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "gemini")
         let combinedEvents = events + agbenchEvents
