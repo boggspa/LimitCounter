@@ -388,7 +388,7 @@ struct GrokUsageSnapshot: Decodable {
     }
 }
 
-enum GrokUsageWindowMapper {
+nonisolated enum GrokUsageWindowMapper {
     static func quotaWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
         guard snapshot.isObserved else { return nil }
         if let weeklyWindow = weeklyQuotaWindow(from: snapshot, now: now) {
@@ -655,7 +655,7 @@ enum GrokUsageWindowMapper {
     }
 }
 
-enum GrokCLIUsageParser {
+nonisolated enum GrokCLIUsageParser {
     private struct RegexMatch {
         let values: [String?]
 
@@ -1241,7 +1241,7 @@ private func writePTYString(_ string: String, to fd: Int32) {
 }
 #endif
 
-enum GrokLocalBillingLogReader {
+nonisolated enum GrokLocalBillingLogReader {
     private static let maxTailBytes: UInt64 = 1_000_000
 
     static func latestSnapshot(rootURL: URL, now: Date = Date()) -> GrokUsageSnapshot? {
@@ -1559,7 +1559,7 @@ public protocol ProviderClient {
 /// `.activity` events typically have `tokens == nil` so the choice
 /// doesn't matter there; tokens is included only for consistency with
 /// `.message`.
-private struct UsageEventContentKey: Hashable {
+private nonisolated struct UsageEventContentKey: Hashable {
     let timestamp: Date
     let type: UsageEvent.EventType
     let model: String?
