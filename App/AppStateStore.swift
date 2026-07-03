@@ -215,6 +215,14 @@ final class AppStateStore: ObservableObject {
         } catch {
             print("[AppStateStore] CloudKit subscription setup skipped: \(error.localizedDescription)")
         }
+
+        #if os(iOS)
+        _ = await CloudSnapshotBackgroundRefresher.refreshFromCloudKit()
+        let loaded = store.loadSnapshots()
+        snapshots = loaded.isEmpty ? Self.initialSnapshots : loaded
+        lastSyncDate = loaded.map(\.fetchedAt).max()
+        syncErrors = [:]
+        #endif
     }
 
     func refresh() async {

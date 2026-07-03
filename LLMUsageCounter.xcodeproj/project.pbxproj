@@ -97,10 +97,21 @@
 		EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaModels.swift; path = Shared/Models/QuotaModels.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		EEF100000000000000000001 /* Exceptions for "LLMUsageCounter" folder in "LLMUsageCounter" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				"LLMUsageCounter.iOS-Info.plist",
+			);
+			target = A42BC5372F9140180096DECB /* LLMUsageCounter */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		A42BC53A2F9140180096DECB /* LLMUsageCounter */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
+				EEF100000000000000000001 /* Exceptions for "LLMUsageCounter" folder in "LLMUsageCounter" target */,
 			);
 			path = LLMUsageCounter;
 			sourceTree = "<group>";
@@ -616,16 +627,16 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
-				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				"GENERATE_INFOPLIST_FILE[sdk=iphoneos*]" = NO;
+				"GENERATE_INFOPLIST_FILE[sdk=iphonesimulator*]" = NO;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
 				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*]" = "fetch remote-notification";
-				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*]" = "fetch remote-notification";
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
@@ -668,16 +679,16 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphoneos*]" = com.chrisizatt.LLMUsageCounter.refresh;
-				"INFOPLIST_KEY_BGTaskSchedulerPermittedIdentifiers[sdk=iphonesimulator*]" = com.chrisizatt.LLMUsageCounter.refresh;
+				"GENERATE_INFOPLIST_FILE[sdk=iphoneos*]" = NO;
+				"GENERATE_INFOPLIST_FILE[sdk=iphonesimulator*]" = NO;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
 				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*]" = "fetch remote-notification";
-				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*]" = "fetch remote-notification";
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
