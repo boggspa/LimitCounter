@@ -100,6 +100,11 @@ final class CloudKitSyncService {
     private let defaults = UserDefaults.standard
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let cloudStatusEventRetention: TimeInterval = 31 * 24 * 60 * 60
+    private let maxCloudStatusEventBuckets = 30 * 12
+    private let cloudStatusAnalyticsRetention: TimeInterval = 60 * 24 * 60 * 60
+    private let maxCloudStatusAnalyticsBuckets = 120
+    private let maxCloudStatusPayloadBytes = 750_000
 
     init() {
         database = container.privateCloudDatabase
@@ -218,13 +223,14 @@ final class CloudKitSyncService {
             var alertFailures: [String] = []
 
             for snapshot in snapshots {
+                let statusSnapshot = cloudStatusSnapshot(for: snapshot)
                 let providerKey = snapshot.providerID.rawValue
-                let currentHash = statusHash(for: snapshot)
+                let currentHash = statusHash(for: statusSnapshot)
                 let previousHash = publishedHashes[providerKey]
 
                 if previousHash != currentHash {
                     do {
-                        try await saveStatusRecord(snapshot, statusHash: currentHash)
+                        try await saveStatusRecord(statusSnapshot, statusHash: currentHash)
                         publishedHashes[providerKey] = currentHash
                     } catch {
                         let detail = cloudKitErrorDescription(error)
@@ -448,8 +454,15 @@ final class CloudKitSyncService {
         record["fetchedAt"] = snapshot.fetchedAt as NSDate
         record["summary"] = snapshotSummary(for: snapshot) as NSString
         record["statusHash"] = statusHash as NSString
-        record["payloadVersion"] = 1 as NSNumber
-        record["payloadData"] = try encoder.encode(snapshot) as NSData
+        var payloadSnapshot = snapshot
+        var payloadData = try encoder.encode(payloadSnapshot)
+        if payloadData.count > maxCloudStatusPayloadBytes {
+            payloadSnapshot = statusOnlySnapshot(from: payloadSnapshot)
+            payloadData = try encoder.encode(payloadSnapshot)
+            print("[CloudKitSync] Reduced \(snapshot.providerID.rawValue) status payload to status-only (\(payloadData.count) bytes)")
+        }
+        record["payloadVersion"] = 2 as NSNumber
+        record["payloadData"] = payloadData as NSData
 
         let operation = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: [])
         operation.savePolicy = .changedKeys
@@ -500,6 +513,107 @@ final class CloudKitSyncService {
 
     private func statusRecordName(for providerID: ProviderID) -> String {
         "status.\(providerID.rawValue)"
+    }
+
+    private func cloudStatusSnapshot(for snapshot: QuotaSnapshot) -> QuotaSnapshot {
+        let now = Date()
+        let eventCutoff = now.addingTimeInterval(-cloudStatusEventRetention)
+        let analyticsCutoff = now.addingTimeInterval(-cloudStatusAnalyticsRetention)
+        let compactEvents = compactCloudStatusEvents(
+            snapshot.events,
+            cutoff: eventCutoff,
+            maxBuckets: maxCloudStatusEventBuckets
+        )
+        let compactAnalytics = snapshot.analyticsBuckets
+            .filter { $0.endDate >= analyticsCutoff }
+            .sorted { lhs, rhs in
+                if lhs.endDate == rhs.endDate {
+                    return lhs.id > rhs.id
+                }
+                return lhs.endDate > rhs.endDate
+            }
+            .prefix(maxCloudStatusAnalyticsBuckets)
+
+        return copySnapshot(
+            snapshot,
+            events: Array(compactEvents),
+            analyticsBuckets: Array(compactAnalytics)
+        )
+    }
+
+    private func statusOnlySnapshot(from snapshot: QuotaSnapshot) -> QuotaSnapshot {
+        copySnapshot(snapshot, events: [], analyticsBuckets: [])
+    }
+
+    private func copySnapshot(
+        _ snapshot: QuotaSnapshot,
+        events: [UsageEvent],
+        analyticsBuckets: [UsageAnalyticsBucket]
+    ) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: snapshot.windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            signals: snapshot.signals,
+            events: events,
+            analyticsBuckets: analyticsBuckets,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
+    }
+
+    private func compactCloudStatusEvents(
+        _ events: [UsageEvent],
+        cutoff: Date,
+        maxBuckets: Int
+    ) -> [UsageEvent] {
+        guard !events.isEmpty, maxBuckets > 0 else { return [] }
+
+        let calendar = Calendar.current
+        let recentEvents = events.filter { $0.timestamp >= cutoff }
+        let grouped = Dictionary(grouping: recentEvents) { event in
+            cloudStatusEventBucketStart(for: event.timestamp, calendar: calendar)
+        }
+
+        return grouped.map { bucketStart, bucketEvents in
+            let tokenTotal = bucketEvents.compactMap(\.tokens).reduce(0, +)
+            return UsageEvent(
+                timestamp: bucketStart,
+                tokens: tokenTotal > 0 ? tokenTotal : nil,
+                model: dominantModel(in: bucketEvents),
+                type: .bucket
+            )
+        }
+        .sorted { $0.timestamp > $1.timestamp }
+        .prefix(maxBuckets)
+        .map { $0 }
+    }
+
+    private func cloudStatusEventBucketStart(for date: Date, calendar: Calendar) -> Date {
+        let dayStart = calendar.startOfDay(for: date)
+        let hour = calendar.component(.hour, from: date)
+        return calendar.date(byAdding: .hour, value: (hour / 2) * 2, to: dayStart) ?? date
+    }
+
+    private func dominantModel(in events: [UsageEvent]) -> String? {
+        var weights: [String: Double] = [:]
+        for event in events {
+            guard let model = event.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !model.isEmpty else {
+                continue
+            }
+            weights[model, default: 0] += event.tokens ?? 1
+        }
+        return weights.max { lhs, rhs in
+            if lhs.value == rhs.value {
+                return lhs.key > rhs.key
+            }
+            return lhs.value < rhs.value
+        }?.key
     }
 
     private func snapshotSummary(for snapshot: QuotaSnapshot) -> String {
@@ -592,6 +706,14 @@ final class CloudKitSyncService {
         parts.append("events:\(snapshot.events.count)")
         if let latest = snapshot.events.map(\.timestamp).max() {
             parts.append("latestEvent:\(Int(latest.timeIntervalSince1970))")
+        }
+        let eventTokenTotal = snapshot.events.compactMap(\.tokens).reduce(0, +)
+        if eventTokenTotal > 0 {
+            parts.append("eventTokens:\(formatMetric(eventTokenTotal))")
+        }
+        parts.append("analytics:\(snapshot.analyticsBuckets.count)")
+        if let latestAnalytics = snapshot.analyticsBuckets.map(\.endDate).max() {
+            parts.append("latestAnalytics:\(Int(latestAnalytics.timeIntervalSince1970))")
         }
 
         let digest = SHA256.hash(data: Data(parts.joined(separator: "\n").utf8))
