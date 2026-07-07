@@ -116,7 +116,9 @@ struct DashboardView: View {
         }
         #else
         GeometryReader { proxy in
-            if shouldUseIPadDashboard(size: proxy.size) {
+            if layoutModeStore.mode == .compact {
+                compactDashboardShell
+            } else if shouldUseIPadDashboard(size: proxy.size) {
                 iPadDashboardShell(size: proxy.size)
             } else {
                 compactDashboardShell
