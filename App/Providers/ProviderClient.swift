@@ -2689,13 +2689,20 @@ public enum CredentialImportService {
             ))
         }
 
-        // Kimi Code: ~/.kimi/credentials/kimi-code.json
-        let kimiCredentialsPath = home.appendingPathComponent(".kimi/credentials/kimi-code.json")
-        if FileManager.default.fileExists(atPath: kimiCredentialsPath.path) {
+        // Kimi Code 0.26+ migrated from ~/.kimi to ~/.kimi-code.
+        let kimiRoots = [".kimi-code", ".kimi"]
+        let detectedKimiRoot = kimiRoots
+            .map { home.appendingPathComponent($0, isDirectory: true) }
+            .first(where: {
+                FileManager.default.fileExists(
+                    atPath: $0.appendingPathComponent("credentials/kimi-code.json").path
+                )
+            })
+        if let kimiRoot = detectedKimiRoot {
             detected.append(DetectedCredential(
                 providerID: .kimi,
-                fileURL: kimiCredentialsPath,
-                description: "Kimi Code CLI OAuth file"
+                fileURL: kimiRoot,
+                description: "Kimi Code CLI session"
             ))
         }
 
@@ -2839,7 +2846,7 @@ public enum CredentialImportService {
                     "kimiAuthMode": "oauthFile",
                     "kimiCredentialSource": "directory"
                 ],
-                bookmarkData: makeSecurityScopedBookmarkData(for: url)
+                bookmarkData: makeSecurityScopedReadWriteBookmarkData(for: url)
             )
         }
 
@@ -3194,7 +3201,7 @@ public enum CredentialImportService {
                 extraFields: [
                     "kimiAuthMode": "oauthFile"
                 ],
-                bookmarkData: makeSecurityScopedBookmarkData(for: sourceURL)
+                bookmarkData: makeSecurityScopedReadWriteBookmarkData(for: sourceURL)
             )
         }
 
@@ -3351,11 +3358,14 @@ public extension CredentialImportService {
                 }
             }()
             panel.prompt = "Import"
-            panel.allowedContentTypes = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi || providerID == .grok
-                ? [UTType.folder, UTType.json, UTType.plainText, UTType.data]
-                : [UTType.json, UTType.plainText, UTType.data]
+            panel.allowedContentTypes = providerID == .kimi
+                ? [UTType.folder]
+                : providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .grok
+                    ? [UTType.folder, UTType.json, UTType.plainText, UTType.data]
+                    : [UTType.json, UTType.plainText, UTType.data]
             panel.allowsMultipleSelection = false
             panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi || providerID == .grok
+            panel.canChooseFiles = providerID != .kimi
 
             // Suggest starting directory based on provider
             let home = FileManager.default.homeDirectoryForCurrentUser
@@ -3379,7 +3389,13 @@ public extension CredentialImportService {
             case .gemini:
                 panel.directoryURL = home.appendingPathComponent(".gemini")
             case .kimi:
-                panel.directoryURL = home.appendingPathComponent(".kimi")
+                let currentRoot = home.appendingPathComponent(".kimi-code")
+                panel.message = "Select ~/.kimi-code so Limit Counter can follow the Kimi CLI OAuth session and local activity."
+                panel.prompt = "Grant Access"
+                // Do not gate this on `fileExists`: before Powerbox grants the
+                // new folder, the sandbox can report false and incorrectly
+                // redirect migrated users back into the old ~/.kimi scope.
+                panel.directoryURL = currentRoot
             case .grok:
                 panel.directoryURL = home.appendingPathComponent(".grok")
             case .heatmap:
@@ -3418,7 +3434,7 @@ public struct KimiProviderClient: ProviderClient {
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         guard let credentials else { throw ProviderFetchError.notConfigured }
 
-        let accessToken = try resolvedAccessToken(from: credentials)
+        let accessToken = try await resolvedAccessToken(from: credentials)
         guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
 
         let usageURL = try resolvedUsageURL(from: credentials)
@@ -3445,7 +3461,7 @@ public struct KimiProviderClient: ProviderClient {
         switch httpResponse.statusCode {
         case 200..<300:
             let apiSnapshot = try KimiUsageNormalizer.snapshot(from: data, fetchedAt: Date())
-            // Best-effort augmentation: read local `~/.kimi/sessions/**/wire.jsonl`
+            // Best-effort augmentation: read local Kimi CLI session logs.
             // so per-turn activity events surface on the heatmap. Returns [] if
             // the sandbox denies the read (typical when the user only granted a
             // bookmark to `kimi-code.json` itself).
@@ -3511,12 +3527,13 @@ public struct KimiProviderClient: ProviderClient {
         return KimiLocalTranscriptReader.loadEvents(kimiRootURL: accessURL)
     }
 
-    /// Resolves the Kimi config root (`~/.kimi`) in a sandbox-aware way.
+    /// Resolves the Kimi config root in a sandbox-aware way.
     /// Used as the fallback path before/after attempting bookmark resolution.
     private func resolvedKimiRoot(from credentials: ProviderCredential) -> URL {
         if let endpoint = credentials.normalizedCustomEndpoint, !endpoint.isEmpty {
             let url = URL(fileURLWithPath: endpoint)
-            // If the credential points to `kimi-code.json`, navigate up to `~/.kimi`.
+            // If the credential points to `kimi-code.json`, navigate up to
+            // the selected Kimi config root.
             return url.lastPathComponent.hasSuffix(".json")
                 ? url.deletingLastPathComponent().deletingLastPathComponent()
                 : url
@@ -3529,7 +3546,11 @@ public struct KimiProviderClient: ProviderClient {
         } else {
             realHome = homePath
         }
-        return URL(fileURLWithPath: realHome).appendingPathComponent(".kimi")
+        let home = URL(fileURLWithPath: realHome)
+        let currentRoot = home.appendingPathComponent(".kimi-code")
+        return FileManager.default.fileExists(atPath: currentRoot.path)
+            ? currentRoot
+            : home.appendingPathComponent(".kimi")
     }
 
     /// Returns a copy of `snapshot` with `events` attached (no-op when empty).
@@ -3552,9 +3573,9 @@ public struct KimiProviderClient: ProviderClient {
         )
     }
 
-    private func resolvedAccessToken(from credentials: ProviderCredential) throws -> String {
+    private func resolvedAccessToken(from credentials: ProviderCredential) async throws -> String {
         if shouldUseOAuthFile(credentials),
-           let token = try accessTokenFromOAuthFile(credentials) {
+           let token = try await accessTokenFromOAuthFile(credentials) {
             return token
         }
 
@@ -3577,40 +3598,51 @@ public struct KimiProviderClient: ProviderClient {
         return endpoint.hasSuffix("kimi-code.json")
     }
 
-    private func accessTokenFromOAuthFile(_ credentials: ProviderCredential) throws -> String? {
-        guard let url = resolvedOAuthFileURL(from: credentials) else {
+    private func accessTokenFromOAuthFile(_ credentials: ProviderCredential) async throws -> String? {
+        guard let access = resolvedOAuthFileAccess(from: credentials) else {
             throw ProviderFetchError.notConfigured
         }
 
-        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        let didStartAccessing = access.scopeURL.startAccessingSecurityScopedResource()
         defer {
             if didStartAccessing {
-                url.stopAccessingSecurityScopedResource()
+                access.scopeURL.stopAccessingSecurityScopedResource()
             }
         }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch {
-            throw ProviderFetchError.networkError(underlying: error)
+        let migratedURL = migratedOAuthFileURL(from: access.fileURL)
+        let url: URL
+        if credentials.kimiBookmarkData == nil,
+           let migratedURL,
+           FileManager.default.isReadableFile(atPath: migratedURL.path) {
+            url = migratedURL
+        } else {
+            url = access.fileURL
         }
 
-        let oauthFile: KimiOAuthFile
-        do {
-            oauthFile = try JSONDecoder().decode(KimiOAuthFile.self, from: data)
-        } catch {
-            throw ProviderFetchError.parsingError("Unable to read Kimi CLI OAuth file.")
-        }
-
-        guard oauthFile.expiresAt > Date().timeIntervalSince1970 else {
-            throw ProviderFetchError.credentialExpired("Kimi CLI OAuth token is expired. Paste a Kimi Code Console API key, or run `/login` in Kimi CLI and re-import `~/.kimi/credentials/kimi-code.json`.")
-        }
-
-        return oauthFile.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await KimiOAuthRefreshCoordinator.shared.accessToken(
+            fileURL: url,
+            session: session,
+            refreshDisabledMessage: migratedURL != nil && url == access.fileURL
+                ? "Kimi Code moved its live session to ~/.kimi-code. Import ~/.kimi-code in Kimi settings so Limit Counter can resume refreshes."
+                : nil
+        )
     }
 
-    private func resolvedOAuthFileURL(from credentials: ProviderCredential) -> URL? {
+    private func migratedOAuthFileURL(from selectedURL: URL) -> URL? {
+        let selectedRoot = selectedURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard selectedRoot.lastPathComponent == ".kimi" else { return nil }
+
+        return selectedRoot
+            .deletingLastPathComponent()
+            .appendingPathComponent(".kimi-code", isDirectory: true)
+            .appendingPathComponent("credentials", isDirectory: true)
+            .appendingPathComponent("kimi-code.json")
+    }
+
+    private func resolvedOAuthFileAccess(from credentials: ProviderCredential) -> KimiOAuthFileAccess? {
         if let bookmarkData = credentials.kimiBookmarkData {
             #if os(macOS)
             var isStale = false
@@ -3621,15 +3653,21 @@ public struct KimiProviderClient: ProviderClient {
             ) {
                 if resolvedURL.hasDirectoryPath {
                     if resolvedURL.lastPathComponent == "credentials" {
-                        return resolvedURL.appendingPathComponent("kimi-code.json")
+                        return KimiOAuthFileAccess(
+                            fileURL: resolvedURL.appendingPathComponent("kimi-code.json"),
+                            scopeURL: resolvedURL
+                        )
                     }
 
-                    return resolvedURL
-                        .appendingPathComponent("credentials", isDirectory: true)
-                        .appendingPathComponent("kimi-code.json")
+                    return KimiOAuthFileAccess(
+                        fileURL: resolvedURL
+                            .appendingPathComponent("credentials", isDirectory: true)
+                            .appendingPathComponent("kimi-code.json"),
+                        scopeURL: resolvedURL
+                    )
                 }
 
-                return resolvedURL
+                return KimiOAuthFileAccess(fileURL: resolvedURL, scopeURL: resolvedURL)
             }
             #endif
         }
@@ -3637,7 +3675,8 @@ public struct KimiProviderClient: ProviderClient {
         guard let path = credentials.normalizedCustomEndpoint else {
             return nil
         }
-        return URL(fileURLWithPath: path)
+        let fileURL = URL(fileURLWithPath: path)
+        return KimiOAuthFileAccess(fileURL: fileURL, scopeURL: fileURL)
     }
 
     private func resolvedUsageURL(from credentials: ProviderCredential) throws -> URL {
@@ -3670,13 +3709,378 @@ private extension ProviderCredential {
     }
 }
 
-private struct KimiOAuthFile: Decodable {
+private nonisolated struct KimiOAuthFileAccess {
+    let fileURL: URL
+    let scopeURL: URL
+}
+
+private nonisolated struct KimiOAuthFile: Decodable {
     let accessToken: String
+    let refreshToken: String?
     let expiresAt: TimeInterval
+    let expiresIn: TimeInterval?
+    let scope: String?
+    let tokenType: String?
 
     private enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
+        case refreshToken = "refresh_token"
         case expiresAt = "expires_at"
+        case expiresIn = "expires_in"
+        case scope
+        case tokenType = "token_type"
+    }
+}
+
+private nonisolated struct KimiOAuthRefreshResponse: Decodable {
+    let accessToken: String
+    let refreshToken: String
+    let expiresIn: TimeInterval
+    let scope: String?
+    let tokenType: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresIn = "expires_in"
+        case scope
+        case tokenType = "token_type"
+    }
+}
+
+private nonisolated enum KimiOAuthRefreshFailure: Error {
+    case rejected
+}
+
+private actor KimiOAuthRefreshCoordinator {
+    static let shared = KimiOAuthRefreshCoordinator()
+
+    private static let oauthHost = URL(string: "https://auth.kimi.com/api/oauth/token")!
+    private static let clientID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+    private static let minimumRefreshLeeway: TimeInterval = 5 * 60
+    private static let lockWaitTimeout: TimeInterval = 15
+
+    func accessToken(
+        fileURL: URL,
+        session: URLSession,
+        refreshDisabledMessage: String?
+    ) async throws -> String {
+        let initial = try loadOAuthFile(at: fileURL)
+        guard !initial.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ProviderFetchError.invalidCredential
+        }
+
+        if !shouldRefresh(initial) {
+            return initial.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if let refreshDisabledMessage {
+            throw ProviderFetchError.credentialExpired(refreshDisabledMessage)
+        }
+
+        guard let refreshToken = initial.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !refreshToken.isEmpty else {
+            throw ProviderFetchError.credentialExpired(
+                "Kimi CLI OAuth token is expired and has no refresh token. Run `/login` in Kimi CLI, then import `~/.kimi-code` again."
+            )
+        }
+
+        let configRoot = configRootURL(for: fileURL)
+        let lockURL = try await acquireRefreshLock(configRoot: configRoot)
+        let heartbeat = heartbeatLock(at: lockURL)
+        defer {
+            heartbeat.cancel()
+            try? FileManager.default.removeItem(at: lockURL)
+        }
+        try verifyCredentialDirectoryIsWritable(fileURL: fileURL)
+
+        // Another Kimi process may have refreshed while this app waited.
+        let afterLock = try loadOAuthFile(at: fileURL)
+        if !shouldRefresh(afterLock) {
+            return afterLock.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let activeRefreshToken = afterLock.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !activeRefreshToken.isEmpty else {
+            throw ProviderFetchError.credentialExpired(
+                "Kimi CLI OAuth token is expired and has no refresh token. Run `/login` in Kimi CLI, then import `~/.kimi-code` again."
+            )
+        }
+
+        let refreshed: KimiOAuthRefreshResponse
+        do {
+            refreshed = try await refresh(
+                refreshToken: activeRefreshToken,
+                configRoot: configRoot,
+                session: session
+            )
+        } catch KimiOAuthRefreshFailure.rejected {
+            // A different Kimi process may have completed rotation despite a
+            // stale or ignored lock. Prefer its newly persisted token before
+            // asking the user to authenticate again.
+            let recovered = try loadOAuthFile(at: fileURL)
+            if recovered.refreshToken != activeRefreshToken,
+               !shouldRefresh(recovered) {
+                return recovered.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            throw ProviderFetchError.credentialExpired(
+                "Kimi rejected the saved refresh token. Run `/login` in Kimi CLI, then import `~/.kimi-code` again."
+            )
+        }
+        try persist(refreshed, preserving: afterLock, at: fileURL)
+        return refreshed.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func shouldRefresh(_ oauthFile: KimiOAuthFile, now: Date = Date()) -> Bool {
+        let dynamicLeeway = max(
+            Self.minimumRefreshLeeway,
+            (oauthFile.expiresIn ?? 0) * 0.5
+        )
+        return oauthFile.expiresAt - now.timeIntervalSince1970 < dynamicLeeway
+    }
+
+    private func loadOAuthFile(at url: URL) throws -> KimiOAuthFile {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        do {
+            return try JSONDecoder().decode(KimiOAuthFile.self, from: data)
+        } catch {
+            throw ProviderFetchError.parsingError("Unable to read Kimi CLI OAuth file.")
+        }
+    }
+
+    private func configRootURL(for fileURL: URL) -> URL {
+        let parent = fileURL.deletingLastPathComponent()
+        return parent.lastPathComponent == "credentials"
+            ? parent.deletingLastPathComponent()
+            : parent
+    }
+
+    private func acquireRefreshLock(configRoot: URL) async throws -> URL {
+        let fileManager = FileManager.default
+        let oauthDirectory = configRoot.appendingPathComponent("oauth", isDirectory: true)
+        let lockTarget = oauthDirectory.appendingPathComponent("kimi-code")
+        let lockURL = oauthDirectory.appendingPathComponent("kimi-code.lock", isDirectory: true)
+
+        do {
+            try fileManager.createDirectory(
+                at: oauthDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            if !fileManager.fileExists(atPath: lockTarget.path) {
+                guard fileManager.createFile(
+                    atPath: lockTarget.path,
+                    contents: Data(),
+                    attributes: [.posixPermissions: 0o600]
+                ) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            }
+        } catch {
+            throw ProviderFetchError.credentialExpired(
+                "Limit Counter needs read/write access to `~/.kimi-code` to renew Kimi's rotating OAuth token. Import the folder again in Kimi settings."
+            )
+        }
+
+        let deadline = Date().addingTimeInterval(Self.lockWaitTimeout)
+        while true {
+            do {
+                try fileManager.createDirectory(
+                    at: lockURL,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                return lockURL
+            } catch {
+                guard fileManager.fileExists(atPath: lockURL.path) else {
+                    throw ProviderFetchError.networkError(underlying: error)
+                }
+
+                if let modifiedAt = try? lockURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                   Date().timeIntervalSince(modifiedAt) > 10 {
+                    try? fileManager.removeItem(at: lockURL)
+                    continue
+                }
+
+                guard Date() < deadline else {
+                    if fileManager.fileExists(atPath: lockURL.path) {
+                        throw ProviderFetchError.networkError(
+                            underlying: CocoaError(.fileLocking)
+                        )
+                    }
+                    continue
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    private func heartbeatLock(at lockURL: URL) -> Task<Void, Never> {
+        Task {
+            while !Task.isCancelled {
+                try? FileManager.default.setAttributes(
+                    [.modificationDate: Date()],
+                    ofItemAtPath: lockURL.path
+                )
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func verifyCredentialDirectoryIsWritable(fileURL: URL) throws {
+        let probeURL = fileURL.deletingLastPathComponent()
+            .appendingPathComponent(".limit-counter-write-probe-\(UUID().uuidString)")
+        do {
+            try Data().write(to: probeURL, options: .withoutOverwriting)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: probeURL.path
+            )
+            try FileManager.default.removeItem(at: probeURL)
+        } catch {
+            try? FileManager.default.removeItem(at: probeURL)
+            throw ProviderFetchError.credentialExpired(
+                "Limit Counter needs read/write access to `~/.kimi-code` to renew Kimi's rotating OAuth token. Import the folder again in Kimi settings."
+            )
+        }
+    }
+
+    private func refresh(
+        refreshToken: String,
+        configRoot: URL,
+        session: URLSession
+    ) async throws -> KimiOAuthRefreshResponse {
+        var request = URLRequest(url: Self.oauthHost)
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 30
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addDeviceHeaders(to: &request, configRoot: configRoot)
+
+        var components = URLComponents()
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: Self.clientID),
+            URLQueryItem(name: "grant_type", value: "refresh_token"),
+            URLQueryItem(name: "refresh_token", value: refreshToken)
+        ]
+        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ProviderFetchError.unknown
+        }
+
+        let oauthErrorCode = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+        if httpResponse.statusCode == 401
+            || httpResponse.statusCode == 403
+            || oauthErrorCode == "invalid_grant" {
+            throw KimiOAuthRefreshFailure.rejected
+        }
+
+        switch httpResponse.statusCode {
+        case 200..<300:
+            do {
+                let refreshed = try JSONDecoder().decode(KimiOAuthRefreshResponse.self, from: data)
+                guard !refreshed.accessToken.isEmpty,
+                      !refreshed.refreshToken.isEmpty,
+                      refreshed.expiresIn > 0 else {
+                    throw ProviderFetchError.parsingError("Kimi OAuth refresh returned incomplete credentials.")
+                }
+                return refreshed
+            } catch let error as ProviderFetchError {
+                throw error
+            } catch {
+                throw ProviderFetchError.parsingError("Unable to parse Kimi OAuth refresh response.")
+            }
+        case 429:
+            throw ProviderFetchError.rateLimited
+        default:
+            throw ProviderFetchError.parsingError(
+                "Kimi OAuth refresh returned HTTP \(httpResponse.statusCode)."
+            )
+        }
+    }
+
+    private func addDeviceHeaders(to request: inout URLRequest, configRoot: URL) {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "1.0"
+        let deviceIDURL = configRoot.appendingPathComponent("device_id")
+        let deviceID = (try? String(contentsOf: deviceIDURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        request.setValue("kimi_code_cli", forHTTPHeaderField: "X-Msh-Platform")
+        request.setValue(asciiHeader(version), forHTTPHeaderField: "X-Msh-Version")
+        request.setValue(asciiHeader(ProcessInfo.processInfo.hostName), forHTTPHeaderField: "X-Msh-Device-Name")
+        #if os(macOS)
+        let platformName = "macOS"
+        #else
+        let platformName = "iOS"
+        #endif
+        request.setValue(asciiHeader("\(platformName) \(ProcessInfo.processInfo.operatingSystemVersionString)"), forHTTPHeaderField: "X-Msh-Device-Model")
+        request.setValue(asciiHeader(ProcessInfo.processInfo.operatingSystemVersionString), forHTTPHeaderField: "X-Msh-Os-Version")
+        if let deviceID, !deviceID.isEmpty {
+            request.setValue(asciiHeader(deviceID), forHTTPHeaderField: "X-Msh-Device-Id")
+        }
+    }
+
+    private func asciiHeader(_ value: String) -> String {
+        let scalars = value.unicodeScalars.filter { $0.value >= 0x20 && $0.value <= 0x7e }
+        let sanitized = String(String.UnicodeScalarView(scalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? "unknown" : sanitized
+    }
+
+    private func persist(
+        _ refreshed: KimiOAuthRefreshResponse,
+        preserving previous: KimiOAuthFile,
+        at fileURL: URL,
+        now: Date = Date()
+    ) throws {
+        let data: Data
+        do {
+            let currentData = try Data(contentsOf: fileURL)
+            guard var json = try JSONSerialization.jsonObject(with: currentData) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            json["access_token"] = refreshed.accessToken
+            json["refresh_token"] = refreshed.refreshToken
+            json["expires_at"] = floor(now.timeIntervalSince1970 + refreshed.expiresIn)
+            json["expires_in"] = refreshed.expiresIn
+            json["scope"] = refreshed.scope ?? previous.scope ?? "kimi-code"
+            json["token_type"] = refreshed.tokenType ?? previous.tokenType ?? "Bearer"
+            data = try JSONSerialization.data(
+                withJSONObject: json,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            )
+        } catch {
+            throw ProviderFetchError.parsingError("Unable to update Kimi CLI OAuth credentials.")
+        }
+
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
+        } catch {
+            throw ProviderFetchError.credentialExpired(
+                "Limit Counter needs read/write access to `~/.kimi-code` to save Kimi's rotated OAuth token. Import the folder again in Kimi settings."
+            )
+        }
     }
 }
 
@@ -3945,13 +4349,21 @@ enum KimiUsageNormalizer {
     ) -> QuotaWindow? {
         let limit = number(detail["limit"])
         let remaining = number(detail["remaining"])
+        let explicitUsed = number(detail["used"])
+        let resetDate = date(detail["resetTime"] ?? detail["reset_time"] ?? detail["resetAt"] ?? detail["reset_at"])
 
-        guard limit != nil || remaining != nil else {
+        guard limit != nil || remaining != nil || explicitUsed != nil else {
             return nil
         }
 
         let used: Double
-        if let limit, let remaining {
+        if let explicitUsed {
+            if let limit {
+                used = min(max(explicitUsed, 0), limit)
+            } else {
+                used = max(explicitUsed, 0)
+            }
+        } else if let limit, let remaining {
             used = min(max(limit - remaining, 0), limit)
         } else {
             used = 0
@@ -3962,7 +4374,7 @@ enum KimiUsageNormalizer {
             windowKind: kind,
             used: used,
             total: limit,
-            resetDate: date(detail["resetTime"] ?? detail["reset_time"] ?? detail["resetAt"] ?? detail["reset_at"]),
+            resetDate: resetDate,
             unit: "quota",
             subtitle: subtitle
         )
@@ -4181,23 +4593,13 @@ public struct CodexSessionProviderClient: ProviderClient {
         var additionalWindows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
 
-        // Primary window: typically the 5-hour rolling window
-        if let primary = payload.primaryWindow {
+        // The API's primary/secondary positions are not semantic. In the
+        // current quota shape, the account-wide weekly allowance arrives as
+        // primary_window; older payloads placed the same duration second.
+        if let weekly = aggregateWeeklyWindow(in: payload) {
             aggregateWindows.append(
                 quotaWindow(
-                    from: primary,
-                    label: "Session",
-                    windowKind: .session,
-                    subtitle: "5-hour rolling window"
-                )
-            )
-        }
-
-        // Secondary window: typically the 7-day rolling window
-        if let secondary = payload.secondaryWindow {
-            aggregateWindows.append(
-                quotaWindow(
-                    from: secondary,
+                    from: weekly,
                     label: "Weekly",
                     windowKind: .weekly,
                     subtitle: "7-day rolling window"
@@ -4209,27 +4611,17 @@ public struct CodexSessionProviderClient: ProviderClient {
             guard let rateLimit = additionalLimit.rateLimit else { continue }
             let name = additionalLimit.displayName
 
-            if let primary = rateLimit.primaryWindow {
+            if isCodexSparkLimit(name), let weekly = weeklyWindow(in: rateLimit) {
                 additionalWindows.append(
                     quotaWindow(
-                        from: primary,
-                        label: "\(name) 5h",
-                        windowKind: .session,
-                        subtitle: "5-hour usage limit"
-                    )
-                )
-            }
-
-            if let secondary = rateLimit.secondaryWindow {
-                additionalWindows.append(
-                    quotaWindow(
-                        from: secondary,
+                        from: weekly,
                         label: "\(name) Weekly",
                         windowKind: .weekly,
                         subtitle: "7-day usage limit"
                     )
                 )
             }
+
         }
 
         if let credits = payload.credits,
@@ -4248,10 +4640,7 @@ public struct CodexSessionProviderClient: ProviderClient {
             providerID: .openai,
             displayName: "Codex",
             planName: chatGPTPlanName(from: payload.planType),
-            windows: reconciledCodexWindows(
-                aggregateWindows: aggregateWindows,
-                additionalWindows: additionalWindows
-            ),
+            windows: aggregateWindows + additionalWindows,
             balances: balances,
             fetchState: .success,
             fetchedAt: now
@@ -4279,63 +4668,21 @@ public struct CodexSessionProviderClient: ProviderClient {
         )
     }
 
-    private func reconciledCodexWindows(
-        aggregateWindows: [QuotaWindow],
-        additionalWindows: [QuotaWindow]
-    ) -> [QuotaWindow] {
-        let activeAggregateWindows = aggregateWindows.filter {
-            !isStaleAggregateWindow($0, comparedTo: additionalWindows)
-        }
-        return activeAggregateWindows + additionalWindows
+    private func isCodexSparkLimit(_ name: String) -> Bool {
+        let normalizedName = name.lowercased().filter { $0.isLetter || $0.isNumber }
+        return normalizedName.contains("53codexspark")
     }
 
-    private func isStaleAggregateWindow(
-        _ aggregateWindow: QuotaWindow,
-        comparedTo additionalWindows: [QuotaWindow]
-    ) -> Bool {
-        // Only a window whose reset has ALREADY passed can be a stale,
-        // rolled-over duplicate. A saturated window whose reset is still in
-        // the future is a *real* active 100% and must stay visible — without
-        // this gate the Session/Weekly row vanishes the instant the user hits
-        // their cap, because a freshly-reset near-empty per-model ("Spark")
-        // twin satisfies the comparison below and the live aggregate gets
-        // suppressed even though it is the current, correct reading.
-        guard let aggregateTotal = aggregateWindow.total,
-              aggregateTotal > 0,
-              let aggregateResetDate = aggregateWindow.resetDate,
-              aggregateResetDate < Date(),
-              usageFraction(for: aggregateWindow) >= 0.98 else {
-            return false
-        }
-
-        let resetShiftThreshold = staleAggregateResetShiftThreshold(for: aggregateWindow)
-
-        return additionalWindows.contains { additionalWindow in
-            guard additionalWindow.windowKind == aggregateWindow.windowKind,
-                  let additionalTotal = additionalWindow.total,
-                  additionalTotal > 0,
-                  let additionalResetDate = additionalWindow.resetDate,
-                  abs(additionalTotal - aggregateTotal) <= max(0.01, aggregateTotal * 0.05),
-                  usageFraction(for: additionalWindow) <= 0.20 else {
-                return false
-            }
-
-            return additionalResetDate.timeIntervalSince(aggregateResetDate) >= resetShiftThreshold
-        }
+    private func aggregateWeeklyWindow(in payload: CodexUsagePayload) -> CodexWindow? {
+        [payload.primaryWindow, payload.secondaryWindow]
+            .compactMap { $0 }
+            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
     }
 
-    private func usageFraction(for window: QuotaWindow) -> Double {
-        guard let total = window.total, total > 0 else { return 0 }
-        return min(max(window.used / total, 0), 1)
-    }
-
-    private func staleAggregateResetShiftThreshold(for window: QuotaWindow) -> TimeInterval {
-        guard let totalHours = window.total, totalHours > 0 else {
-            return 30 * 60
-        }
-
-        let duration = totalHours * 3_600
-        return min(max(duration * 0.05, 30 * 60), 12 * 60 * 60)
+    private func weeklyWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
+        [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+            .compactMap { $0 }
+            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
     }
 
     private func chatGPTPlanName(from planType: String?) -> String {
@@ -6824,6 +7171,15 @@ private actor ClaudeLocalEventScanCoordinator {
     static let shared = ClaudeLocalEventScanCoordinator()
 
     private var activeTask: Task<[UsageEvent], Never>?
+    private var cachedEvents: [UsageEvent] = []
+    private var cachedAt: Date?
+
+    func cachedEvents(maxAge: TimeInterval, now: Date = Date()) -> [UsageEvent]? {
+        guard let cachedAt, now.timeIntervalSince(cachedAt) < maxAge else {
+            return nil
+        }
+        return cachedEvents
+    }
 
     func startIfIdle(_ operation: @escaping @Sendable () async -> [UsageEvent]) -> Task<[UsageEvent], Never>? {
         guard activeTask == nil else {
@@ -6836,14 +7192,16 @@ private actor ClaudeLocalEventScanCoordinator {
         activeTask = task
 
         Task {
-            _ = await task.value
-            clear()
+            let events = await task.value
+            finish(events: events)
         }
 
         return task
     }
 
-    private func clear() {
+    private func finish(events: [UsageEvent]) {
+        cachedEvents = events
+        cachedAt = Date()
         activeTask = nil
     }
 }
@@ -7476,7 +7834,11 @@ public struct ClaudeProviderClient: ProviderClient {
             }
         }
 
-        return rawSnapshot
+        let events = ClaudeHeatmapEventHistory.merged(
+            current: rawSnapshot.events,
+            previous: previousClaudeEvents()
+        )
+        return rawSnapshot.withEvents(events)
     }
 
     private func loadLocalSnapshotIfAvailable(
@@ -7533,6 +7895,11 @@ public struct ClaudeProviderClient: ProviderClient {
         credentials: ProviderCredential?,
         timeoutSeconds: TimeInterval
     ) async -> [UsageEvent]? {
+        if let cached = await ClaudeLocalEventScanCoordinator.shared.cachedEvents(maxAge: 5 * 60) {
+            print("[ClaudeProvider] Reusing \(cached.count) locally-scanned Claude heatmap buckets")
+            return cached
+        }
+
         guard let loadTask = await ClaudeLocalEventScanCoordinator.shared.startIfIdle({
             await loadLocalEvents(credentials: credentials)
         }) else {
@@ -7882,6 +8249,48 @@ struct ClaudeHeatmapEventBucketer {
     }
 }
 
+struct ClaudeHeatmapEventHistory {
+    static func merged(
+        current: [UsageEvent],
+        previous: [UsageEvent],
+        now: Date = Date(),
+        retentionDays: Int = ClaudeHeatmapEventBucketer.defaultRetentionDays
+    ) -> [UsageEvent] {
+        let cutoff = now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
+        var eventsByBucket: [ClaudeHeatmapHistoryKey: UsageEvent] = [:]
+
+        for event in previous where event.timestamp >= cutoff {
+            eventsByBucket[ClaudeHeatmapHistoryKey(event: event)] = event
+        }
+
+        for event in current where event.timestamp >= cutoff {
+            let key = ClaudeHeatmapHistoryKey(event: event)
+            guard let existing = eventsByBucket[key] else {
+                eventsByBucket[key] = event
+                continue
+            }
+
+            if (event.tokens ?? 0) >= (existing.tokens ?? 0) {
+                eventsByBucket[key] = event
+            }
+        }
+
+        return eventsByBucket.values.sorted { $0.timestamp > $1.timestamp }
+    }
+}
+
+private struct ClaudeHeatmapHistoryKey: Hashable {
+    let timestamp: Date
+    let model: String
+    let type: UsageEvent.EventType
+
+    init(event: UsageEvent) {
+        timestamp = event.timestamp
+        model = event.model ?? ""
+        type = event.type
+    }
+}
+
 private struct ClaudeHeatmapBucketKey: Hashable {
     let dayStart: Date
     let row: Int
@@ -7900,6 +8309,20 @@ private struct ClaudeHeatmapBucketKey: Hashable {
 
 private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
     private let fileManager: FileManager
+    // These caps bounded the cost of re-parsing every transcript on every
+    // refresh. TelemetryParseCache removes that cost — an unchanged transcript
+    // is never parsed twice — so they can be set for accuracy instead.
+    //
+    // They were expensive: a 512 KB tail dropped the early turns of any long
+    // session, and selecting 64 newest + 3/day up to 160 files silently
+    // excluded in-window transcripts once enough newer chats existed, which
+    // made long-window totals drift down as new chats arrived. `nil` reads the
+    // whole file; `nil` scan cap keeps every transcript in the window.
+    private static let newestTranscriptFilesPerScan: Int? = nil
+    private static let historicalTranscriptFilesPerDay = 3
+    private static let maxTranscriptFilesPerScan: Int? = nil
+    private static let maxTranscriptBytesPerFile: Int? = nil
+    private static let parseCacheProvider = "claude"
 
     private static let iso8601WithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -7930,7 +8353,13 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
         let monthStart = now.addingTimeInterval(-30 * 24 * 60 * 60)
         let heatmapStart = now.addingTimeInterval(-Double(ClaudeHeatmapEventBucketer.defaultRetentionDays) * 24 * 60 * 60)
         let recentTranscriptInfos = transcriptInfos.filter { $0.modificationDate >= heatmapStart }
-        let scanInfos = recentTranscriptInfos.isEmpty ? [transcriptInfos[0]] : recentTranscriptInfos
+        let eligibleInfos = recentTranscriptInfos.isEmpty ? [transcriptInfos[0]] : recentTranscriptInfos
+        let scanInfos = plannedTranscriptScan(from: eligibleInfos)
+        let byteBudget = Self.maxTranscriptBytesPerFile.map { "max \($0 / 1024) KB each" } ?? "whole file"
+        print(
+            "[ClaudeProvider] Scanning \(scanInfos.count) of \(eligibleInfos.count) eligible transcripts "
+                + "(\(byteBudget))"
+        )
 
         var latestSessionURL: URL?
         var latestSessionDate = Date.distantPast
@@ -7942,10 +8371,27 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
         var heatmapRecords: [ClaudeUsageRecord] = []
         let metadata = loadMetadata(rootURL: rootURL)
 
+        // Resuming or forking a chat rewrites the whole prior transcript into a
+        // new file, so the same API call legitimately appears in several of
+        // them. Per-file dedupe cannot see that; this can. It matters more now
+        // that the scan covers every transcript rather than a recent subset.
+        var seenCallsAcrossTranscripts = Set<String>()
+
+        // Bounded to the transcripts actually in the scan window; chats that
+        // rotate out of it stop being looked up.
+        TelemetryParseCache.shared.prune(
+            provider: Self.parseCacheProvider,
+            keepingNewest: max(scanInfos.count * 2, 512)
+        )
+
         for transcriptInfo in scanInfos {
             let transcriptURL = transcriptInfo.url
             let fileDate = transcriptInfo.modificationDate
-            let records = (try? readUsageRecords(from: transcriptURL)) ?? []
+            let allRecords = (try? readUsageRecords(from: transcriptURL)) ?? []
+            let records = allRecords.filter { record in
+                guard let identity = record.callIdentity else { return true }
+                return seenCallsAcrossTranscripts.insert(identity).inserted
+            }
             guard !records.isEmpty else { continue }
 
             let transcriptTokens = records.reduce(0.0) { $0 + $1.tokens }
@@ -7973,6 +8419,9 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
                 latestActivity = recordDate
             }
         }
+
+        // No-op unless this scan parsed a transcript it hadn't seen before.
+        TelemetryParseCache.shared.persist()
 
         guard latestSessionURL != nil else {
             throw ProviderFetchError.notConfigured
@@ -8199,11 +8648,71 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
         }
     }
 
+    private func plannedTranscriptScan(from infos: [ClaudeTranscriptInfo]) -> [ClaudeTranscriptInfo] {
+        guard let maxFiles = Self.maxTranscriptFilesPerScan,
+              let newestFiles = Self.newestTranscriptFilesPerScan,
+              infos.count > maxFiles else {
+            return infos
+        }
+
+        var selected = Array(infos.prefix(newestFiles))
+        var selectedPaths = Set(selected.map { $0.url.path })
+        let calendar = Calendar.current
+        var selectedPerDay: [Date: Int] = [:]
+
+        for info in selected {
+            selectedPerDay[calendar.startOfDay(for: info.modificationDate), default: 0] += 1
+        }
+
+        for info in infos {
+            guard selected.count < maxFiles else { break }
+            guard !selectedPaths.contains(info.url.path) else { continue }
+
+            let day = calendar.startOfDay(for: info.modificationDate)
+            guard selectedPerDay[day, default: 0] < Self.historicalTranscriptFilesPerDay else {
+                continue
+            }
+
+            selected.append(info)
+            selectedPaths.insert(info.url.path)
+            selectedPerDay[day, default: 0] += 1
+        }
+
+        return selected
+    }
+
+    /// Transcripts are append-only, so a parsed one stays valid until its mtime
+    /// or size moves. Caching per file is what makes reading them whole — and
+    /// reading all of them — affordable on a periodic refresh.
     private func readUsageRecords(from url: URL) throws -> [ClaudeUsageRecord] {
-        try ClaudeJSONLUsageRecordReader.readUsageRecords(
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modifiedAt = (attributes?[.modificationDate] as? Date) ?? .distantPast
+        let size = (attributes?[.size] as? Int) ?? 0
+
+        if let payload = TelemetryParseCache.shared.payload(
+            provider: Self.parseCacheProvider,
+            path: url.path,
+            modifiedAt: modifiedAt,
+            size: size
+        ), let cached = try? JSONDecoder().decode([ClaudeUsageRecord].self, from: payload) {
+            return cached
+        }
+
+        let records = try ClaudeJSONLUsageRecordReader.readUsageRecords(
             from: url,
+            maxBytes: Self.maxTranscriptBytesPerFile,
             parseTimestamp: parseTimestamp(_:)
         )
+        if let payload = try? JSONEncoder().encode(records) {
+            TelemetryParseCache.shared.store(
+                provider: Self.parseCacheProvider,
+                path: url.path,
+                modifiedAt: modifiedAt,
+                size: size,
+                payload: payload
+            )
+        }
+        return records
     }
 
     private func parseTimestamp(_ string: String?) -> Date? {
@@ -8253,18 +8762,32 @@ struct ClaudeJSONLUsageRecordReader {
     static func readUsageRecords(
         from url: URL,
         chunkSize: Int = defaultChunkSize,
+        maxBytes: Int? = nil,
         parseTimestamp: (String?) -> Date?
     ) throws -> [ClaudeUsageRecord] {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
+        let endOffset = try handle.seekToEnd()
+        let byteLimit = maxBytes.map { UInt64(max(1, $0)) }
+        let startOffset = byteLimit.map { endOffset > $0 ? endOffset - $0 : 0 } ?? 0
+        try handle.seek(toOffset: startOffset)
+
         var records: [ClaudeUsageRecord] = []
         var seenUsageKeys = Set<String>()
         var buffer = Data()
         let readSize = max(4096, chunkSize)
+        var discardLeadingPartialLine = startOffset > 0
 
         while let chunk = try handle.read(upToCount: readSize), !chunk.isEmpty {
             buffer.append(chunk)
+            if discardLeadingPartialLine {
+                guard let newline = buffer.firstIndex(of: 0x0A) else {
+                    continue
+                }
+                buffer.removeSubrange(buffer.startIndex...newline)
+                discardLeadingPartialLine = false
+            }
             consumeCompleteLines(
                 from: &buffer,
                 records: &records,
@@ -8273,13 +8796,15 @@ struct ClaudeJSONLUsageRecordReader {
             )
         }
 
-        if !buffer.isEmpty {
-            appendUsageRecord(
-                from: buffer,
-                records: &records,
-                seenUsageKeys: &seenUsageKeys,
-                parseTimestamp: parseTimestamp
-            )
+        if !discardLeadingPartialLine, !buffer.isEmpty {
+            autoreleasepool {
+                appendUsageRecord(
+                    from: buffer,
+                    records: &records,
+                    seenUsageKeys: &seenUsageKeys,
+                    parseTimestamp: parseTimestamp
+                )
+            }
         }
 
         return records
@@ -8295,12 +8820,15 @@ struct ClaudeJSONLUsageRecordReader {
 
         while lineStart < buffer.endIndex,
               let newline = buffer[lineStart..<buffer.endIndex].firstIndex(of: 0x0A) {
-            appendUsageRecord(
-                from: Data(buffer[lineStart..<newline]),
-                records: &records,
-                seenUsageKeys: &seenUsageKeys,
-                parseTimestamp: parseTimestamp
-            )
+            let lineData = Data(buffer[lineStart..<newline])
+            autoreleasepool {
+                appendUsageRecord(
+                    from: lineData,
+                    records: &records,
+                    seenUsageKeys: &seenUsageKeys,
+                    parseTimestamp: parseTimestamp
+                )
+            }
             lineStart = buffer.index(after: newline)
         }
 
@@ -8327,12 +8855,25 @@ struct ClaudeJSONLUsageRecordReader {
         let tokens = tokenCount(from: usageObject)
         guard tokens > 0 else { return }
 
+        // One assistant message spanning several content blocks is written as
+        // one row per block, and every row repeats the SAME usage object — a
+        // 12-tool-call turn writes 12 rows each restating the whole turn's
+        // tokens. requestId + messageId identifies the single API call behind
+        // them. The timestamp must stay OUT of the key: those rows differ by
+        // sub-second write time, so including it meant the key never matched
+        // and each block was billed in full (~2.2x over-count measured against
+        // this machine's transcripts).
         let requestID = (json["requestId"] as? String) ?? ""
         let messageID = ((json["message"] as? [String: Any])?["id"] as? String) ?? ""
-        let dedupeKey = "\(requestID)|\(messageID)|\(Int(timestamp.timeIntervalSince1970))|\(Int(tokens))"
+        let callIdentity = requestID.isEmpty && messageID.isEmpty
+            ? "ts:\(timestamp.timeIntervalSince1970)"
+            : "\(requestID)|\(messageID)"
+        let dedupeKey = "\(callIdentity)|\(Int(tokens))"
         guard seenUsageKeys.insert(dedupeKey).inserted else { return }
 
-        records.append(ClaudeUsageRecord(timestamp: timestamp, tokens: tokens))
+        records.append(
+            ClaudeUsageRecord(timestamp: timestamp, tokens: tokens, callIdentity: dedupeKey)
+        )
     }
 
     private static func tokenCount(from usage: [String: Any]) -> Double {
@@ -8354,9 +8895,24 @@ struct ClaudeJSONLUsageRecordReader {
     }
 }
 
-struct ClaudeUsageRecord {
+struct ClaudeUsageRecord: Codable {
     let timestamp: Date
     let tokens: Double
+    /// requestId+messageId of the API call this row came from, used to dedupe
+    /// the same call across transcripts. Nil when the row carried neither id.
+    let callIdentity: String?
+
+    init(timestamp: Date, tokens: Double, callIdentity: String? = nil) {
+        self.timestamp = timestamp
+        self.tokens = tokens
+        self.callIdentity = callIdentity
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case timestamp = "t"
+        case tokens = "k"
+        case callIdentity = "c"
+    }
 }
 
 private struct ClaudeTranscriptInfo {

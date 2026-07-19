@@ -9,6 +9,7 @@ cd "$ROOT_DIR"
 xcrun --sdk macosx swiftc -enable-testing \
   Shared/Models/QuotaModels.swift \
   Shared/Storage/QuotaSnapshotStore.swift \
+  Shared/Storage/TelemetryParseCache.swift \
   App/Providers/ProviderClient.swift \
   Tests/GrokUsageTests.swift \
   -o "$OUTPUT" \

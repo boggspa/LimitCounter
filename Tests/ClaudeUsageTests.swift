@@ -273,6 +273,58 @@ private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {
     try expectEqual(records[1].timestamp, makeDate("2026-05-16T02:00:00Z"), "final unterminated line is parsed")
 }
 
+private func testClaudeJSONLReaderBoundsOversizedTranscriptsToTail() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("claude-jsonl-tail-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let url = directory.appendingPathComponent("oversized.jsonl")
+    let oldRecord = #"{"timestamp":"2026-05-01T00:00:00Z","usage":{"input_tokens":99}}"#
+    let recentRecord = #"{"timestamp":"2026-05-16T04:00:00Z","usage":{"output_tokens":7}}"#
+    let payload = oldRecord + "\n" + String(repeating: "x", count: 4_096) + "\n" + recentRecord
+    try payload.write(to: url, atomically: true, encoding: .utf8)
+
+    let formatter = ISO8601DateFormatter()
+    let records = try ClaudeJSONLUsageRecordReader.readUsageRecords(
+        from: url,
+        chunkSize: 31,
+        maxBytes: 256,
+        parseTimestamp: { value in value.flatMap(formatter.date(from:)) }
+    )
+
+    try expectEqual(records.count, 1, "bounded reader should parse only complete records in the tail")
+    try expectEqual(records[0].tokens, 7, "bounded reader should retain the latest usage record")
+    try expectEqual(records[0].timestamp, makeDate("2026-05-16T04:00:00Z"), "bounded reader latest timestamp")
+}
+
+private func testClaudeHeatmapHistoryPreservesUnscannedBuckets() throws {
+    let now = makeDate("2026-05-16T12:00:00Z")
+    let preservedTimestamp = makeDate("2026-05-15T02:00:00Z")
+    let newTimestamp = makeDate("2026-05-16T04:00:00Z")
+    let previous = [
+        UsageEvent(timestamp: preservedTimestamp, tokens: 20, model: "Claude", type: .bucket)
+    ]
+    let current = [
+        UsageEvent(timestamp: preservedTimestamp, tokens: 5, model: "Claude", type: .bucket),
+        UsageEvent(timestamp: newTimestamp, tokens: 8, model: "Claude", type: .bucket)
+    ]
+
+    let merged = ClaudeHeatmapEventHistory.merged(current: current, previous: previous, now: now)
+
+    try expectEqual(merged.count, 2, "history merge should retain unscanned buckets")
+    try expectEqual(
+        merged.first { $0.timestamp == preservedTimestamp }?.tokens,
+        20,
+        "partial tail scans should not reduce a previously complete bucket"
+    )
+    try expectEqual(
+        merged.first { $0.timestamp == newTimestamp }?.tokens,
+        8,
+        "new buckets should be added"
+    )
+}
+
 @main
 private enum ClaudeUsageTestRunner {
     static func main() throws {
@@ -285,6 +337,8 @@ private enum ClaudeUsageTestRunner {
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
         try testClaudeCodeKeychainFallbackIsOptIn()
         try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()
+        try testClaudeJSONLReaderBoundsOversizedTranscriptsToTail()
+        try testClaudeHeatmapHistoryPreservesUnscannedBuckets()
         print("Claude usage tests passed")
     }
 }
