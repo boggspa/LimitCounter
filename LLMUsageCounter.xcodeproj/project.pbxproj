@@ -7,10 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		EEBB000100000000000000B1 /* CloudAlertPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000100000000000000F1 /* CloudAlertPayload.swift */; };
-		EEBB000200000000000000B2 /* AlertNotificationContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000200000000000000F2 /* AlertNotificationContent.swift */; };
-		EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */; };
-		EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */; };
 		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
 		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
@@ -28,6 +24,7 @@
 		B1A64D48BC5A4D97A3A61B0F /* GlassChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */; };
 		B6D67D7E3C8B4F2AB0C6C99C /* GlassChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */; };
 		C277E330E1E1A288294467FB /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */; };
+		C54B4765A7CC70B9189CAA3D /* TelemetryParseCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */; };
 		C5890563D5868124AC951D99 /* AIUsageTrackerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */; };
 		D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */; };
 		DD5B5E4FABB1AA1A8D5E4B64 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78232D955058B7DEEE4A12CF /* Foundation.framework */; };
@@ -35,6 +32,10 @@
 		E5F58CBAF2274B5E6338D4D1 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
 		EAFB87C29D9F037A4DC1A183 /* AppStateStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */; };
 		EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
+		EEBB000100000000000000B1 /* CloudAlertPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000100000000000000F1 /* CloudAlertPayload.swift */; };
+		EEBB000200000000000000B2 /* AlertNotificationContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000200000000000000F2 /* AlertNotificationContent.swift */; };
+		EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */; };
+		EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */; };
 		F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */; };
 		F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */; };
 		F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
@@ -65,15 +66,12 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		EEAA000100000000000000F1 /* CloudAlertPayload.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudAlertPayload.swift; path = Shared/Models/CloudAlertPayload.swift; sourceTree = SOURCE_ROOT; };
-		EEAA000200000000000000F2 /* AlertNotificationContent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AlertNotificationContent.swift; path = Shared/Notifications/AlertNotificationContent.swift; sourceTree = SOURCE_ROOT; };
-		EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LocalNotificationPublisher.swift; path = App/LocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
-		EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MacLocalNotificationPublisher.swift; path = App/MacLocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
 		005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GeminiProviderClient.swift; path = App/Providers/GeminiProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaSnapshotStore.swift; path = Shared/Storage/QuotaSnapshotStore.swift; sourceTree = SOURCE_ROOT; };
 		14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.macOS.entitlements; path = Widget/AIUsageWidgetExtension.macOS.entitlements; sourceTree = SOURCE_ROOT; };
 		1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "Limit Counter Widget.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
 		21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LLMActivityHeatmapView.swift; path = Shared/Views/LLMActivityHeatmapView.swift; sourceTree = SOURCE_ROOT; };
+		30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = TelemetryParseCache.swift; path = Shared/Storage/TelemetryParseCache.swift; sourceTree = SOURCE_ROOT; };
 		388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaTimelineProvider.swift; path = Widget/QuotaTimelineProvider.swift; sourceTree = SOURCE_ROOT; };
 		3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaCardView.swift; path = Shared/Views/QuotaCardView.swift; sourceTree = SOURCE_ROOT; };
 		453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AIUsageTrackerApp.swift; path = App/AIUsageTrackerApp.swift; sourceTree = SOURCE_ROOT; };
@@ -95,6 +93,10 @@
 		C7D74721EA3E8C99B51CF09D /* MockData.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MockData.swift; path = Shared/Models/MockData.swift; sourceTree = SOURCE_ROOT; };
 		CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = KeychainService.swift; path = App/Keychain/KeychainService.swift; sourceTree = SOURCE_ROOT; };
 		EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaModels.swift; path = Shared/Models/QuotaModels.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000100000000000000F1 /* CloudAlertPayload.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudAlertPayload.swift; path = Shared/Models/CloudAlertPayload.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000200000000000000F2 /* AlertNotificationContent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AlertNotificationContent.swift; path = Shared/Notifications/AlertNotificationContent.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LocalNotificationPublisher.swift; path = App/LocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
+		EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MacLocalNotificationPublisher.swift; path = App/MacLocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -141,6 +143,7 @@
 			isa = PBXGroup;
 			children = (
 				0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */,
+				30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */,
 			);
 			path = Storage;
 			sourceTree = "<group>";
@@ -414,6 +417,7 @@
 				EEBB000200000000000000B2 /* AlertNotificationContent.swift in Sources */,
 				EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */,
 				EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */,
+				C54B4765A7CC70B9189CAA3D /* TelemetryParseCache.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

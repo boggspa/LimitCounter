@@ -11,11 +11,22 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     // 30 days: matches the heatmap window so historical activity remains
     // visible even after a multi-day quiet period on Codex CLI.
     private let sessionScanLookback: TimeInterval = 30 * 24 * 60 * 60
-    private let maxSessionTelemetryFiles = 4
-    private let maxSessionTelemetryBytes = 1 * 1024 * 1024
+    // A heavy day spans ~200 session files, so the previous cap of 4 could not
+    // see a day's usage at all. Matches the file budget the backfill path
+    // already declares acceptable below; the cost of raising both this and
+    // `maxSessionTelemetryBytes` is carried by TelemetryParseCache, which makes
+    // re-scanning an unchanged session free.
+    private let maxSessionTelemetryFiles = 80
+    // Sessions are tail-read. At 1 MB a busy day's rollouts surrendered only
+    // their last few turns — measured against this machine's logs, 1 MB
+    // recovered 12% of a day's tokens where 8 MB recovers 93%, because the
+    // per-turn deltas that make up the bulk of a session sit further back in
+    // the file. Matches `maxTextTelemetryBytes`.
+    private let maxSessionTelemetryBytes = 8 * 1024 * 1024
     private let maxTextTelemetryBytes = 8 * 1024 * 1024
     private let sqliteTelemetryLookback: TimeInterval = 35 * 24 * 60 * 60
     private let maxSQLiteEventsPerHeatmapBucket = 8
+    private static let parseCacheProvider = "codexTelemetry"
 
     public init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -64,14 +75,19 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         // Codex CLI's `logs_2.sqlite` keeps only a short telemetry tail
         // (we've observed ~10 days), but session JSONL files at
         // `sessions/YYYY/MM/DD/rollout-*.jsonl` extend much further
-        // back. The primary scan honours `prefix(2)` for perf when
-        // SQLite is present, so older days never get scanned. This
-        // targeted backfill picks up session files only for dates that
-        // are *missing* from the persisted snapshot — typically a
-        // one-shot expense on first launch after the fix, then quiet
-        // forever because the persisted snapshot retains the buckets.
+        // back, and the primary scan is bounded by
+        // `maxSessionTelemetryFiles`. This targeted backfill picks up
+        // session files only for dates that are *missing* from the
+        // persisted snapshot — typically a one-shot expense on first
+        // launch, then quiet forever because the persisted snapshot
+        // retains the buckets.
         let backfillFiles = backfillSessionTelemetryURLs(in: rootURL, now: now)
-        let scanFiles = primaryScanFiles + backfillFiles
+        // The two lists overlap whenever a recent day is also a missing
+        // day, and parsing one file twice counts its tokens twice.
+        var seenScanPaths = Set<String>()
+        let scanFiles = (primaryScanFiles + backfillFiles).filter {
+            seenScanPaths.insert($0.url.path).inserted
+        }
         if backfillFiles.isEmpty {
             print("[CodexTelemetry] Scanning \(scanFiles.count) telemetry sources")
         } else {
@@ -91,8 +107,18 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         var lastActivity = Date.distantPast
         var events: [UsageEvent] = []
 
+        // Session rollouts are append-only and mostly cold, so parsing them on
+        // every refresh was the dominant cost of a scan. Cache per file and
+        // only pay for the ones that changed. Bounded to a few multiples of the
+        // primary scan so the store stays small; backfill's historical files
+        // are read once and would never be looked up again.
+        TelemetryParseCache.shared.prune(
+            provider: Self.parseCacheProvider,
+            keepingNewest: maxSessionTelemetryFiles * 3
+        )
+
         for telemetryInfo in scanFiles {
-            let records = (try? readTelemetryRecords(from: telemetryInfo.url)) ?? []
+            let records = cachedTelemetryRecords(for: telemetryInfo)
             guard !records.isEmpty else { continue }
 
             for record in records {
@@ -135,6 +161,9 @@ public struct CodexTelemetryProviderClient: ProviderClient {
                 }
             }
         }
+
+        // No-op unless this scan actually parsed something new.
+        TelemetryParseCache.shared.persist()
 
         // Previous behavior threw `notConfigured` whenever the lookback window
         // contained no recent activity, which made Codex flicker off the
@@ -219,8 +248,12 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             )
         }
 
-        let hasSQLite = existing.contains { $0.url.lastPathComponent == "logs_2.sqlite" }
-        let sessionFiles = hasSQLite ? Array(sessionTelemetryURLs(in: root).prefix(2)) : sessionTelemetryURLs(in: root)
+        // Session JSONL used to collapse to `prefix(2)` whenever logs_2.sqlite
+        // was present, on the assumption SQLite already covered recent
+        // activity. It doesn't: the SQLite path emits activity markers with
+        // `tokenCount: 0`, so deferring to it meant Codex tokens were read from
+        // two files on a day that spans hundreds.
+        let sessionFiles = sessionTelemetryURLs(in: root)
 
         return (existing + sessionFiles).sorted { lhs, rhs in
             lhs.modificationDate > rhs.modificationDate
@@ -318,13 +351,21 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         let today = calendar.startOfDay(for: now)
 
         // Days already covered by the persisted snapshot — those don't
-        // need re-scanning.
+        // need re-scanning. Coverage means TOKENS, not merely events: the
+        // SQLite path contributes activity markers carrying `tokenCount: 0`,
+        // so counting any event as coverage let a zero-token marker mark a day
+        // as done and permanently suppress the backfill that would have found
+        // that day's actual usage.
         let datesWithEvents: Set<Date> = {
             guard let previous = QuotaSnapshotStore.shared.loadSnapshots()
                 .first(where: { $0.providerID == .codexTelemetry }) else {
                 return []
             }
-            return Set(previous.events.map { calendar.startOfDay(for: $0.timestamp) })
+            return Set(
+                previous.events
+                    .filter { ($0.tokens ?? 0) > 0 }
+                    .map { calendar.startOfDay(for: $0.timestamp) }
+            )
         }()
 
         // Walk the 30-day window newest-first, collecting session files
@@ -371,6 +412,36 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         return collected
     }
 
+    /// Cache-aware wrapper around `readTelemetryRecords`. Only session JSONL is
+    /// cached: `logs_2.sqlite` and the rolling text logs change on virtually
+    /// every refresh, so caching those would only churn the store.
+    private func cachedTelemetryRecords(for info: CodexTelemetryFileInfo) -> [CodexTelemetryRecord] {
+        guard isSessionTelemetryURL(info.url) else {
+            return (try? readTelemetryRecords(from: info.url)) ?? []
+        }
+
+        if let payload = TelemetryParseCache.shared.payload(
+            provider: Self.parseCacheProvider,
+            path: info.url.path,
+            modifiedAt: info.modificationDate,
+            size: info.fileSize
+        ), let cached = try? JSONDecoder().decode([CodexTelemetryRecord].self, from: payload) {
+            return cached
+        }
+
+        let records = (try? readTelemetryRecords(from: info.url)) ?? []
+        if let payload = try? JSONEncoder().encode(records) {
+            TelemetryParseCache.shared.store(
+                provider: Self.parseCacheProvider,
+                path: info.url.path,
+                modifiedAt: info.modificationDate,
+                size: info.fileSize,
+                payload: payload
+            )
+        }
+        return records
+    }
+
     private func readTelemetryRecords(from url: URL) throws -> [CodexTelemetryRecord] {
         if url.lastPathComponent == "logs_2.sqlite" {
             return try readSQLiteTelemetryRecords(from: url)
@@ -382,10 +453,13 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         }
 
         var records: [CodexTelemetryRecord] = []
+        // Per-file running total, so token_count events can be reduced to
+        // per-turn deltas. Nil until the first one is seen.
+        var previousCumulative: Double?
         for line in text.split(whereSeparator: \.isNewline) {
             guard let lineData = line.data(using: .utf8) else { continue }
             guard let json = try? JSONSerialization.jsonObject(with: lineData) else { continue }
-            if let record = parseRecord(from: json) {
+            if let record = parseRecord(from: json, previousCumulative: &previousCumulative) {
                 records.append(record)
             }
         }
@@ -570,12 +644,16 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         return nil
     }
 
-    private func parseRecord(from json: Any) -> CodexTelemetryRecord? {
+    private func parseRecord(from json: Any, previousCumulative: inout Double?) -> CodexTelemetryRecord? {
         guard let timestamp = firstDate(in: json, keys: ["timestamp", "time", "created_at", "createdAt", "date"]) else {
             return nil
         }
 
-        if let tokenCountRecord = parseSessionTokenCountRecord(from: json, timestamp: timestamp) {
+        if let tokenCountRecord = parseSessionTokenCountRecord(
+            from: json,
+            timestamp: timestamp,
+            previousCumulative: &previousCumulative
+        ) {
             return tokenCountRecord
         }
 
@@ -619,7 +697,23 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         )
     }
 
-    private func parseSessionTokenCountRecord(from json: Any, timestamp: Date) -> CodexTelemetryRecord? {
+    /// Codex reports `total_token_usage` as a CUMULATIVE session running total
+    /// and `last_token_usage` as that turn's delta. Two things follow.
+    ///
+    /// Around 16% of token_count events re-emit an unchanged cumulative total,
+    /// so taking every `last_token_usage` at face value counts those turns
+    /// twice; and a forked session opens carrying its parent's cumulative
+    /// baseline, so its first event's total is not its own spend. Tracking the
+    /// advance between consecutive events settles both — no advance means a
+    /// repeat, while the first event of a fork is still measured by its own
+    /// delta. It also removes the need for the old
+    /// `?? total_token_usage` fallback, which billed a whole session's running
+    /// total as though it were a single turn.
+    private func parseSessionTokenCountRecord(
+        from json: Any,
+        timestamp: Date,
+        previousCumulative: inout Double?
+    ) -> CodexTelemetryRecord? {
         guard let dict = json as? [String: Any],
               let payload = dict["payload"] as? [String: Any],
               let payloadType = payload["type"] as? String,
@@ -628,9 +722,22 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         }
 
         let info = payload["info"] as? [String: Any]
-        let usage = (info?["last_token_usage"] as? [String: Any])
-            ?? (info?["total_token_usage"] as? [String: Any])
-        let tokens = usage.map(tokenTotal(from:)) ?? 0
+        let cumulative = (info?["total_token_usage"] as? [String: Any]).map(tokenTotal(from:)) ?? 0
+        let advance = previousCumulative.map { cumulative - $0 }
+        if cumulative > 0 { previousCumulative = cumulative }
+
+        let tokens: Double
+        if let usage = info?["last_token_usage"] as? [String: Any] {
+            // A repeat restates a turn already counted.
+            if let advance, advance <= 0, cumulative > 0 { return nil }
+            tokens = tokenTotal(from: usage)
+        } else if let advance, advance > 0 {
+            // No per-turn breakdown: the advance is this turn's spend.
+            tokens = advance
+        } else {
+            return nil
+        }
+
         let conversationID = firstString(
             in: json,
             keys: ["thread_id", "threadId", "conversation_id", "conversationId", "session_id", "sessionId"]
@@ -649,18 +756,41 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         )
     }
 
+    /// Bounds how many events per 2h bucket reach the persisted snapshot,
+    /// without losing the tokens carried by the ones that don't survive.
+    ///
+    /// The cap exists so a busy hour can't put thousands of events into the
+    /// App Group defaults. It used to `continue` past the overflow, which
+    /// silently dropped their tokens too — on an hour with hundreds of
+    /// token_count events that discarded almost all of the usage it was
+    /// supposed to be measuring. Overflow tokens are now folded into the
+    /// bucket's last retained event, so the count is bounded while the bucket
+    /// total stays exact.
     private func cappedHeatmapEvents(from events: [UsageEvent], now: Date) -> [UsageEvent] {
         let cutoff = now.addingTimeInterval(-35 * 24 * 60 * 60)
         var retained: [UsageEvent] = []
+        var indexOfLastRetained: [CodexTelemetryBucketKey: Int] = [:]
         var bucketCounts: [CodexTelemetryBucketKey: Int] = [:]
         let calendar = Calendar.current
 
         for event in events.sorted(by: { $0.timestamp > $1.timestamp }) where event.timestamp >= cutoff {
             let key = CodexTelemetryBucketKey(timestamp: event.timestamp, calendar: calendar)
             guard bucketCounts[key, default: 0] < maxSQLiteEventsPerHeatmapBucket else {
+                // Bucket is full: carry the tokens over rather than dropping them.
+                if let tokens = event.tokens, tokens > 0, let index = indexOfLastRetained[key] {
+                    let carrier = retained[index]
+                    retained[index] = UsageEvent(
+                        id: carrier.id,
+                        timestamp: carrier.timestamp,
+                        tokens: (carrier.tokens ?? 0) + tokens,
+                        model: carrier.model,
+                        type: carrier.type
+                    )
+                }
                 continue
             }
             bucketCounts[key, default: 0] += 1
+            indexOfLastRetained[key] = retained.count
             retained.append(event)
         }
 
@@ -1062,7 +1192,7 @@ private struct CodexTelemetryFileInfo {
     let fileSize: Int
 }
 
-private struct CodexTelemetryRecord {
+private struct CodexTelemetryRecord: Codable {
     let timestamp: Date
     let conversationID: String?
     let eventName: String
@@ -1072,6 +1202,20 @@ private struct CodexTelemetryRecord {
     let isToolEvent: Bool
     let isApprovalEvent: Bool
     let eventCount: Double
+
+    // Short keys: these are cached per file and a busy day runs to hundreds of
+    // thousands of records.
+    enum CodingKeys: String, CodingKey {
+        case timestamp = "t"
+        case conversationID = "c"
+        case eventName = "e"
+        case tokenCount = "k"
+        case isPrompt = "p"
+        case isResponse = "r"
+        case isToolEvent = "o"
+        case isApprovalEvent = "a"
+        case eventCount = "n"
+    }
 }
 
 private struct CodexTelemetryBucketKey: Hashable {
