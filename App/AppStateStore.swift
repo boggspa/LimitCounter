@@ -31,6 +31,18 @@ enum CloudSnapshotBackgroundRefresher {
     }
 }
 
+private struct UsageResetHistoryEntry: Codable, Hashable {
+    let providerID: ProviderID
+    let signature: String
+    let occurredAt: Date
+
+    init(alert: CloudAlertPayload) {
+        providerID = alert.providerID
+        signature = alert.signature
+        occurredAt = alert.createdAt
+    }
+}
+
 @MainActor
 final class AppStateStore: ObservableObject {
 
@@ -39,6 +51,7 @@ final class AppStateStore: ObservableObject {
     @Published private(set) var lastSyncDate: Date?
     @Published private(set) var syncErrors: [ProviderID: String] = [:]
     @Published private(set) var usageAlerts: [CloudAlertPayload] = []
+    @Published private var usageResetHistory: [UsageResetHistoryEntry] = []
     @Published var pendingDeepLinkProviderID: ProviderID?
     #if os(iOS)
     @Published var lastSeenAlertDate: Date?
@@ -59,10 +72,13 @@ final class AppStateStore: ObservableObject {
     private var cloudPublishTask: Task<Void, Never>?
     private var pendingCloudPublishSnapshots: [QuotaSnapshot]?
     private let usageAlertsKey = "usageAlerts.activePayloads"
+    private let usageResetHistoryKey = "usageAlerts.resetHistory"
     private let dismissedUsageAlertSignaturesKey = "usageAlerts.dismissedSignatures"
     private let maxUsageAlerts = 8
     private let maxDismissedUsageAlertSignatures = 300
     private let usageAlertRetention: TimeInterval = 24 * 60 * 60
+    private let usageResetHistoryRetention: TimeInterval = 7 * 24 * 60 * 60
+    private let maxUsageResetHistoryEntries = 500
     private let usageAlertEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -103,6 +119,8 @@ final class AppStateStore: ObservableObject {
         self.lastSyncDate = stored.map(\.fetchedAt).max()
         self.isHeadlessMode = UserDefaults.standard.bool(forKey: "isHeadlessMode")
         self.usageAlerts = loadStoredUsageAlerts()
+        self.usageResetHistory = loadStoredUsageResetHistory()
+        recordUsageResetHistory(usageAlerts)
     }
 
     private static var initialSnapshots: [QuotaSnapshot] {
@@ -182,6 +200,15 @@ final class AppStateStore: ObservableObject {
         return snapshots.filter { visibility.isVisible($0.providerID) }
     }
 
+    var sevenDayResetCounts: [ProviderID: Int] {
+        let cutoff = Date().addingTimeInterval(-usageResetHistoryRetention)
+        return Dictionary(
+            grouping: usageResetHistory.filter { $0.occurredAt >= cutoff },
+            by: \.providerID
+        )
+        .mapValues { $0.count }
+    }
+
     func suggestedRefreshDelay(defaultIntervalSeconds: Int) -> TimeInterval {
         let baseDelay = TimeInterval(max(15, defaultIntervalSeconds))
         let now = Date()
@@ -214,6 +241,19 @@ final class AppStateStore: ObservableObject {
             try await cloudSync.ensureViewerSubscriptions()
         } catch {
             print("[AppStateStore] CloudKit subscription setup skipped: \(error.localizedDescription)")
+        }
+
+        do {
+            let recentAlerts = try await cloudSync.fetchRecentAlerts(
+                since: Date().addingTimeInterval(-usageResetHistoryRetention),
+                limit: 200
+            )
+            ingestUsageAlerts(recentAlerts)
+            #if os(iOS)
+            lastSeenAlertDate = recentAlerts.map(\.createdAt).max()
+            #endif
+        } catch {
+            print("[AppStateStore] Reset history backfill skipped: \(error.localizedDescription)")
         }
 
         #if os(iOS)
@@ -296,6 +336,8 @@ final class AppStateStore: ObservableObject {
     }
 
     private func ingestUsageAlerts(_ alerts: [CloudAlertPayload]) {
+        recordUsageResetHistory(alerts)
+
         guard !alerts.isEmpty else {
             pruneStoredUsageAlerts()
             return
@@ -331,6 +373,8 @@ final class AppStateStore: ObservableObject {
     }
 
     private func pruneStoredUsageAlerts() {
+        recordUsageResetHistory([])
+
         let dismissed = Set(loadDismissedUsageAlertSignatures())
         let now = Date()
         let pruned = usageAlerts.filter {
@@ -362,6 +406,43 @@ final class AppStateStore: ObservableObject {
     private func saveUsageAlerts() {
         guard let data = try? usageAlertEncoder.encode(usageAlerts) else { return }
         UserDefaults.standard.set(data, forKey: usageAlertsKey)
+    }
+
+    private func loadStoredUsageResetHistory() -> [UsageResetHistoryEntry] {
+        guard let data = UserDefaults.standard.data(forKey: usageResetHistoryKey),
+              let decoded = try? usageAlertDecoder.decode([UsageResetHistoryEntry].self, from: data) else {
+            return []
+        }
+
+        let cutoff = Date().addingTimeInterval(-usageResetHistoryRetention)
+        return decoded
+            .filter { $0.occurredAt >= cutoff }
+            .sorted { $0.occurredAt > $1.occurredAt }
+    }
+
+    private func recordUsageResetHistory(_ alerts: [CloudAlertPayload]) {
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-usageResetHistoryRetention)
+        var history = usageResetHistory.filter { $0.occurredAt >= cutoff && $0.occurredAt <= now }
+        var signatures = Set(history.map(\.signature))
+
+        for alert in alerts where alert.kind.isUsageReset && alert.createdAt >= cutoff && alert.createdAt <= now {
+            guard signatures.insert(alert.signature).inserted else { continue }
+            history.append(UsageResetHistoryEntry(alert: alert))
+        }
+
+        history = Array(
+            history
+                .sorted { $0.occurredAt > $1.occurredAt }
+                .prefix(maxUsageResetHistoryEntries)
+        )
+
+        guard history != usageResetHistory else { return }
+        usageResetHistory = history
+
+        if let data = try? usageAlertEncoder.encode(history) {
+            UserDefaults.standard.set(data, forKey: usageResetHistoryKey)
+        }
     }
 
     private func loadDismissedUsageAlertSignatures() -> [String] {

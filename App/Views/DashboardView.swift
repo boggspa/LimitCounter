@@ -891,7 +891,10 @@ struct DashboardView: View {
                 emptyDashboardState
             }
         } else {
-            CompactDashboardCardView(snapshots: snapshots)
+            CompactDashboardCardView(
+                snapshots: snapshots,
+                sevenDayResetCounts: appState.sevenDayResetCounts
+            )
 
             if visibilityStore.isVisible(.heatmap) {
                 LLMActivityHeatmapView(snapshots: appState.snapshots)
@@ -1051,6 +1054,9 @@ struct DashboardView: View {
 }
 
 private struct UsageAlertToastView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var celebrationIsActive = false
+
     let alert: CloudAlertPayload
     let pendingCount: Int
     let onOpen: () -> Void
@@ -1063,9 +1069,9 @@ private struct UsageAlertToastView: View {
     private var badgeTitle: String {
         switch alert.kind {
         case .scheduledReset:
-            return "Reset"
+            return "Quota reset"
         case .unexpectedRecovery:
-            return "Early reset"
+            return "Early quota reset"
         case .threshold:
             return "Limit"
         case .error:
@@ -1143,7 +1149,131 @@ private struct UsageAlertToastView: View {
             }
         }
         .frame(maxWidth: 360, alignment: .topTrailing)
-        .shadow(color: accent.opacity(0.18), radius: 18, y: 8)
+        .overlay {
+            if alert.kind.isUsageReset {
+                ResetCelebrationEffect(
+                    accent: accent,
+                    reduceMotion: reduceMotion,
+                    isAnimated: celebrationIsActive
+                )
+            }
+        }
+        .shadow(color: accent.opacity(0.30), radius: 22, y: 8)
+        .task(id: alert.signature) {
+            let remaining = 12 - Date().timeIntervalSince(alert.createdAt)
+            guard !reduceMotion, remaining > 0 else {
+                celebrationIsActive = false
+                return
+            }
+
+            celebrationIsActive = true
+            try? await Task.sleep(for: .seconds(remaining))
+            guard !Task.isCancelled else { return }
+            celebrationIsActive = false
+        }
+    }
+}
+
+private struct ResetCelebrationEffect: View {
+    let accent: Color
+    let reduceMotion: Bool
+    let isAnimated: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: reduceMotion || !isAnimated)) { timeline in
+            let phase = reduceMotion || !isAnimated
+                ? 0.0
+                : timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 3) / 3
+
+            ResetCelebrationFrame(
+                accent: accent,
+                phase: phase,
+                reduceMotion: reduceMotion || !isAnimated
+            )
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct ResetCelebrationFrame: View {
+    let accent: Color
+    let phase: Double
+    let reduceMotion: Bool
+
+    private let sparkCount = 7
+
+    private var rainbow: AngularGradient {
+        AngularGradient(
+            colors: [accent, .cyan, .blue, .purple, .pink, .orange, .yellow, .green, accent],
+            center: .center,
+            angle: .degrees(phase * 360)
+        )
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(rainbow, lineWidth: 2)
+                    .shadow(color: accent.opacity(0.55), radius: 7)
+
+                ForEach(0..<sparkCount, id: \.self) { index in
+                    ResetOrbitingSpark(
+                        index: index,
+                        count: sparkCount,
+                        phase: phase,
+                        reduceMotion: reduceMotion,
+                        containerSize: proxy.size
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct ResetOrbitingSpark: View {
+    let index: Int
+    let count: Int
+    let phase: Double
+    let reduceMotion: Bool
+    let containerSize: CGSize
+
+    private var angle: Double {
+        (Double(index) / Double(count) + phase) * Double.pi * 2
+    }
+
+    private var pulse: Double {
+        guard !reduceMotion else { return 0.72 }
+        return 0.45 + 0.55 * ((sin(phase * Double.pi * 6 + Double(index)) + 1) / 2)
+    }
+
+    private var sparkPosition: CGPoint {
+        CGPoint(
+            x: containerSize.width / 2 + cos(angle) * max(0, containerSize.width / 2 - 7),
+            y: containerSize.height / 2 + sin(angle) * max(0, containerSize.height / 2 - 7)
+        )
+    }
+
+    var body: some View {
+        Image(systemName: index.isMultiple(of: 2) ? "sparkle" : "bolt.fill")
+            .font(.system(size: index.isMultiple(of: 2) ? 8 : 6, weight: .bold))
+            .foregroundStyle(sparkColor)
+            .shadow(color: sparkColor.opacity(0.85), radius: 4)
+            .scaleEffect(0.82 + pulse * 0.38)
+            .opacity(pulse)
+            .position(sparkPosition)
+    }
+
+    private var sparkColor: Color {
+        switch index % 6 {
+        case 0: return .cyan
+        case 1: return .blue
+        case 2: return .purple
+        case 3: return .pink
+        case 4: return .orange
+        default: return .green
+        }
     }
 }
 
@@ -1475,6 +1605,7 @@ extension SettingsWindowManager: NSWindowDelegate {
 /// rolling "in 2h 44m" phrasing would re-flow as numbers wobble.
 struct CompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
+    let sevenDayResetCounts: [ProviderID: Int]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1494,6 +1625,7 @@ struct CompactDashboardCardView: View {
     private func providerBlock(_ snapshot: QuotaSnapshot) -> some View {
         let accent = Color(hex: snapshot.providerID.accentColorHex)
         let windows = snapshot.summaryWindows
+        let resetCount = sevenDayResetCounts[snapshot.providerID, default: 0]
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -1521,6 +1653,14 @@ struct CompactDashboardCardView: View {
                 }
 
                 Spacer(minLength: 4)
+
+                Text(resetCount == 1 ? "1 reset · 7d" : "\(resetCount) resets · 7d")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(resetCount > 0 ? accent : Color.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .accessibilityLabel("\(resetCount) quota resets in the last 7 days")
             }
             .padding(.bottom, 1)
 
