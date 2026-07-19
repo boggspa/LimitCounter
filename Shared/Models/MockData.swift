@@ -46,15 +46,6 @@ public enum MockData {
             planName: "Plus",
             windows: [
                 QuotaWindow(
-                    label: "Session",
-                    windowKind: .session,
-                    used: 0,
-                    total: 100,
-                    resetDate: Date().addingTimeInterval(2 * 3600 + 22 * 60),
-                    unit: "%",
-                    subtitle: "Interactive session budget"
-                ),
-                QuotaWindow(
                     label: "Weekly",
                     windowKind: .weekly,
                     used: 90,
@@ -62,6 +53,15 @@ public enum MockData {
                     resetDate: Date().addingTimeInterval(3 * 3600 + 8 * 60),
                     unit: "%",
                     subtitle: "Rolling weekly allowance"
+                ),
+                QuotaWindow(
+                    label: "GPT-5.3-Codex-Spark Weekly",
+                    windowKind: .weekly,
+                    used: 18,
+                    total: 100,
+                    resetDate: Date().addingTimeInterval(2 * 3600 + 22 * 60),
+                    unit: "%",
+                    subtitle: "7-day usage limit"
                 )
             ],
             signals: [

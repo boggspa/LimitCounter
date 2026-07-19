@@ -68,21 +68,10 @@ public struct CodexUsageClient: Sendable {
         var additionalWindows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
 
-        if let primary = payload.primaryWindow {
+        if let weekly = aggregateWeeklyWindow(in: payload) {
             aggregateWindows.append(
                 quotaWindow(
-                    from: primary,
-                    label: "Session",
-                    windowKind: .session,
-                    subtitle: "5-hour rolling window"
-                )
-            )
-        }
-
-        if let secondary = payload.secondaryWindow {
-            aggregateWindows.append(
-                quotaWindow(
-                    from: secondary,
+                    from: weekly,
                     label: "Weekly",
                     windowKind: .weekly,
                     subtitle: "7-day rolling window"
@@ -94,27 +83,17 @@ public struct CodexUsageClient: Sendable {
             guard let rateLimit = additionalLimit.rateLimit else { continue }
             let name = additionalLimit.displayName
 
-            if let primary = rateLimit.primaryWindow {
+            if isCodexSparkLimit(name), let weekly = weeklyWindow(in: rateLimit) {
                 additionalWindows.append(
                     quotaWindow(
-                        from: primary,
-                        label: "\(name) 5h",
-                        windowKind: .session,
-                        subtitle: "5-hour usage limit"
-                    )
-                )
-            }
-
-            if let secondary = rateLimit.secondaryWindow {
-                additionalWindows.append(
-                    quotaWindow(
-                        from: secondary,
+                        from: weekly,
                         label: "\(name) Weekly",
                         windowKind: .weekly,
                         subtitle: "7-day usage limit"
                     )
                 )
             }
+
         }
 
         if let balance = payload.credits?.balance {
@@ -132,10 +111,7 @@ public struct CodexUsageClient: Sendable {
             providerID: .codex,
             displayName: "Codex",
             planName: chatGPTPlanName(from: payload.planType),
-            windows: reconciledCodexWindows(
-                aggregateWindows: aggregateWindows,
-                additionalWindows: additionalWindows
-            ),
+            windows: aggregateWindows + additionalWindows,
             balances: balances,
             fetchState: .success,
             fetchedAt: now
@@ -163,55 +139,21 @@ public struct CodexUsageClient: Sendable {
         )
     }
 
-    private func reconciledCodexWindows(
-        aggregateWindows: [QuotaWindow],
-        additionalWindows: [QuotaWindow]
-    ) -> [QuotaWindow] {
-        let activeAggregateWindows = aggregateWindows.filter {
-            !isStaleAggregateWindow($0, comparedTo: additionalWindows)
-        }
-        return activeAggregateWindows + additionalWindows
+    private func isCodexSparkLimit(_ name: String) -> Bool {
+        let normalizedName = name.lowercased().filter { $0.isLetter || $0.isNumber }
+        return normalizedName.contains("53codexspark")
     }
 
-    private func isStaleAggregateWindow(
-        _ aggregateWindow: QuotaWindow,
-        comparedTo additionalWindows: [QuotaWindow]
-    ) -> Bool {
-        guard let aggregateTotal = aggregateWindow.total,
-              aggregateTotal > 0,
-              let aggregateResetDate = aggregateWindow.resetDate,
-              usageFraction(for: aggregateWindow) >= 0.98 else {
-            return false
-        }
-
-        let resetShiftThreshold = staleAggregateResetShiftThreshold(for: aggregateWindow)
-
-        return additionalWindows.contains { additionalWindow in
-            guard additionalWindow.windowKind == aggregateWindow.windowKind,
-                  let additionalTotal = additionalWindow.total,
-                  additionalTotal > 0,
-                  let additionalResetDate = additionalWindow.resetDate,
-                  abs(additionalTotal - aggregateTotal) <= max(0.01, aggregateTotal * 0.05),
-                  usageFraction(for: additionalWindow) <= 0.20 else {
-                return false
-            }
-
-            return additionalResetDate.timeIntervalSince(aggregateResetDate) >= resetShiftThreshold
-        }
+    private func aggregateWeeklyWindow(in payload: CodexUsagePayload) -> CodexWindow? {
+        [payload.primaryWindow, payload.secondaryWindow]
+            .compactMap { $0 }
+            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
     }
 
-    private func usageFraction(for window: QuotaWindow) -> Double {
-        guard let total = window.total, total > 0 else { return 0 }
-        return min(max(window.used / total, 0), 1)
-    }
-
-    private func staleAggregateResetShiftThreshold(for window: QuotaWindow) -> TimeInterval {
-        guard let totalHours = window.total, totalHours > 0 else {
-            return 30 * 60
-        }
-
-        let duration = totalHours * 3_600
-        return min(max(duration * 0.05, 30 * 60), 12 * 60 * 60)
+    private func weeklyWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
+        [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+            .compactMap { $0 }
+            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
     }
 
     private func chatGPTPlanName(from planType: String?) -> String {

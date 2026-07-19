@@ -34,13 +34,19 @@ final class CodexUsageClientTests: XCTestCase {
               },
               "additional_rate_limits": [
                 {
-                  "limit_name": "GPT-5.5",
+                  "limit_name": "GPT-5.3-Codex-Spark",
                   "rate_limit": {
                     "primary_window": {
                       "used_percent": 10,
                       "limit_window_seconds": 18000,
                       "reset_after_seconds": 1800,
                       "reset_at": 1893459600
+                    },
+                    "secondary_window": {
+                      "used_percent": 80,
+                      "limit_window_seconds": 604800,
+                      "reset_after_seconds": 7200,
+                      "reset_at": 1893542400
                     }
                   }
                 }
@@ -61,20 +67,21 @@ final class CodexUsageClientTests: XCTestCase {
         XCTAssertEqual(snapshot.displayName, "Codex")
         XCTAssertEqual(snapshot.planName, "Pro")
         XCTAssertEqual(snapshot.fetchState, .success)
-        XCTAssertEqual(snapshot.windows.count, 3)
-        XCTAssertEqual(snapshot.windows[0].label, "Session")
-        XCTAssertEqual(snapshot.windows[0].windowKind, .session)
-        XCTAssertEqual(snapshot.windows[0].used, 2.1, accuracy: 0.0001)
-        XCTAssertEqual(try XCTUnwrap(snapshot.windows[0].total), 5, accuracy: 0.0001)
-        XCTAssertEqual(snapshot.windows[0].percentageUsed, 42)
-        XCTAssertEqual(snapshot.windows[0].resetDate, Date(timeIntervalSince1970: 1_893_456_000))
-        XCTAssertEqual(snapshot.windows[1].label, "Weekly")
-        XCTAssertEqual(snapshot.windows[2].label, "GPT-5.5 5h")
+        XCTAssertEqual(snapshot.windows.count, 2)
+        XCTAssertEqual(snapshot.windows[0].label, "Weekly")
+        XCTAssertEqual(snapshot.windows[0].windowKind, .weekly)
+        XCTAssertEqual(snapshot.windows[0].percentageUsed, 20)
+        XCTAssertEqual(snapshot.windows[1].label, "GPT-5.3-Codex-Spark Weekly")
+        XCTAssertEqual(snapshot.windows[1].windowKind, .weekly)
+        XCTAssertEqual(snapshot.windows[1].used, 134.4, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.windows[1].total), 168, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.windows[1].percentageUsed, 80)
+        XCTAssertEqual(snapshot.windows[1].resetDate, Date(timeIntervalSince1970: 1_893_542_400))
         XCTAssertEqual(snapshot.balances.first?.label, "Credits Remaining")
         XCTAssertEqual(snapshot.balances.first?.amount, 12.5)
     }
 
-    func testSuppressesStaleAggregateWindowWhenNamedLimitHasReset() async throws {
+    func testIncludesNamedWeeklyWindowForSpark() async throws {
         MockURLProtocol.requestHandler = { request in
             let data = Data("""
             {
@@ -88,7 +95,7 @@ final class CodexUsageClientTests: XCTestCase {
               },
               "additional_rate_limits": [
                 {
-                  "limit_name": "GPT-5.5",
+                  "limit_name": "GPT-5.3-Codex-Spark",
                   "rate_limit": {
                     "secondary_window": {
                       "used_percent": 0,
@@ -111,18 +118,63 @@ final class CodexUsageClientTests: XCTestCase {
         let snapshot = try await client.fetchSnapshot(credential: credential)
         let labels = snapshot.windows.map(\.label)
 
-        XCTAssertFalse(labels.contains("Weekly"))
-        XCTAssertEqual(labels, ["GPT-5.5 Weekly"])
-        XCTAssertEqual(snapshot.windows.first?.percentageUsed, 0)
+        XCTAssertEqual(labels, ["Weekly", "GPT-5.3-Codex-Spark Weekly"])
+        XCTAssertEqual(snapshot.windows.map(\.percentageUsed), [100, 0])
     }
 
-    func testKeepsSaturatedAggregateWindowWithoutFreshNamedReset() async throws {
+    func testRecognizesWeeklyAggregateWhenReturnedAsPrimary() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let data = Data("""
+            {
+              "plan_type": "pro",
+              "rate_limit": {
+                "primary_window": {
+                  "used_percent": 33,
+                  "limit_window_seconds": 604800,
+                  "reset_after_seconds": 580000,
+                  "reset_at": 1784492408
+                }
+              },
+              "additional_rate_limits": [
+                {
+                  "limit_name": "GPT-5.3-Codex-Spark",
+                  "metered_feature": "codex_bengalfox",
+                  "rate_limit": {
+                    "primary_window": {
+                      "used_percent": 6,
+                      "limit_window_seconds": 604800,
+                      "reset_after_seconds": 580000,
+                      "reset_at": 1784493835
+                    }
+                  }
+                }
+              ]
+            }
+            """.utf8)
+
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let client = CodexUsageClient(session: makeMockSession(), endpointURL: URL(string: "https://example.test/usage")!)
+        let credential = try CodexUsageCredential(accessToken: "access-token", accountID: "account-id")
+
+        let snapshot = try await client.fetchSnapshot(credential: credential)
+
+        XCTAssertEqual(snapshot.windows.map(\.label), ["Weekly", "GPT-5.3-Codex-Spark Weekly"])
+        XCTAssertEqual(snapshot.windows.map(\.percentageUsed), [33, 6])
+        XCTAssertEqual(snapshot.windows[0].windowKind, .weekly)
+        XCTAssertEqual(snapshot.windows[1].windowKind, .weekly)
+        XCTAssertEqual(try XCTUnwrap(snapshot.windows[0].total), 168, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.windows[1].total), 168, accuracy: 0.0001)
+    }
+
+    func testIgnoresOtherNamedFiveHourLimits() async throws {
         MockURLProtocol.requestHandler = { request in
             let data = Data("""
             {
               "rate_limit": {
                 "secondary_window": {
-                  "used_percent": 100,
+                  "used_percent": 35,
                   "limit_window_seconds": 604800,
                   "reset_after_seconds": 172800,
                   "reset_at": 1893628800
@@ -132,9 +184,9 @@ final class CodexUsageClientTests: XCTestCase {
                 {
                   "limit_name": "GPT-5.5",
                   "rate_limit": {
-                    "secondary_window": {
+                    "primary_window": {
                       "used_percent": 80,
-                      "limit_window_seconds": 604800,
+                      "limit_window_seconds": 18000,
                       "reset_after_seconds": 176400,
                       "reset_at": 1893632400
                     }
@@ -153,7 +205,7 @@ final class CodexUsageClientTests: XCTestCase {
         let snapshot = try await client.fetchSnapshot(credential: credential)
         let labels = snapshot.windows.map(\.label)
 
-        XCTAssertEqual(labels, ["Weekly", "GPT-5.5 Weekly"])
+        XCTAssertEqual(labels, ["Weekly"])
     }
 
     func testDecodesStringCreditBalance() async throws {
