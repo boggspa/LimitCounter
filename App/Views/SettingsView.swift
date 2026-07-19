@@ -1003,19 +1003,29 @@ struct ProviderCredentialView: View {
                 }
 
                 // Import from file button (all providers)
-                Section("Import from File") {
+                Section(providerID == .kimi ? "Import Kimi CLI Folder" : "Import from File") {
                     Button(action: importFromFile) {
                         HStack {
                             Image(systemName: "folder.badge.person.crop")
-                            Text(providerID == .grok ? "Select Grok folder..." : "Select credential file...")
+                            Text(
+                                providerID == .grok
+                                    ? "Select Grok folder..."
+                                    : providerID == .kimi
+                                        ? "Select ~/.kimi-code..."
+                                        : "Select credential file..."
+                            )
                             Spacer()
                         }
                     }
                     .foregroundStyle(accent)
 
-                    Text(providerID == .grok
-                         ? "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
-                         : "Import credentials from a JSON or text file you exported from the provider.")
+                    Text(
+                        providerID == .grok
+                            ? "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
+                            : providerID == .kimi
+                                ? "Select the folder in the macOS picker so Limit Counter receives persistent read/write access for Kimi's rotating OAuth session."
+                                : "Import credentials from a JSON or text file you exported from the provider."
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1162,7 +1172,7 @@ struct ProviderCredentialView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .kimi {
-                        Text("Paste a Kimi Code Console API key above, or import the `~/.kimi` folder for the CLI OAuth file. The app reads the current access token only while it is valid; if Kimi CLI refreshes it, the folder bookmark lets the app pick up the new token.")
+                        Text("Paste a Kimi Code Console API key above, or import `~/.kimi-code` for the current CLI OAuth session and local activity. Limit Counter renews and safely persists Kimi's rotating OAuth token; an old `~/.kimi` grant must be replaced through the folder picker.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1310,6 +1320,10 @@ struct ProviderCredentialView: View {
                 case .success(let credential):
                     self.applyImportedCredential(credential)
                 case .failure(let error):
+                    if let importError = error as? CredentialImportService.ImportError,
+                       case .userCancelled = importError {
+                        return
+                    }
                     if let importError = error as? CredentialImportService.ImportError {
                         self.importError = importError.errorDescription
                     } else {
@@ -1326,6 +1340,13 @@ struct ProviderCredentialView: View {
     }
 
     private func importDetectedCredential(_ detected: CredentialImportService.DetectedCredential) {
+        if detected.providerID == .kimi {
+            // Auto-detection can suggest the path, but only NSOpenPanel can
+            // issue a persistent read/write sandbox grant for this folder.
+            importFromFile()
+            return
+        }
+
         do {
             let credential = try CredentialImportService.importFromURL(detected.fileURL, for: detected.providerID)
             applyImportedCredential(credential)

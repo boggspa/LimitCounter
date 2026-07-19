@@ -94,7 +94,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .windsurf: return "#2D5AB2" // Deep Windsurf Blue
         case .cursor:   return "#EAB308" // Gold
         case .gemini:   return "#4285F4" // Google Blue
-        case .kimi:     return "#6B8E23" // Kimi Olive
+        case .kimi:     return "#1CA4FC" // Kimi Blue
         case .grok:     return "#C7CCD4" // Grok Silver — monochrome to match xAI's black/white brand. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
         case .heatmap:  return "#5B8AF5" // App Blue
         }

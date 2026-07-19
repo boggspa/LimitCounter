@@ -299,10 +299,10 @@ final class SyncCoordinator {
             // good card rather than blanking every meter to "Update failed".
             shouldPreserve = true
         case .kimi:
-            shouldPreserve =
-                reason.contains("Kimi CLI OAuth token is expired")
-                || reason.contains("Rate limited")
-                || reason.hasPrefix("Network error")
+            // Kimi OAuth tokens rotate every 15 minutes. Permission, network,
+            // refresh, and token-race failures must not erase the last good
+            // quota snapshot while the user repairs or retries the session.
+            shouldPreserve = true
         default:
             shouldPreserve = false
         }
@@ -530,86 +530,37 @@ private struct SnapshotSignalDetector {
     }
 
     func enrichedSnapshot(from snapshot: QuotaSnapshot, previousSnapshot: QuotaSnapshot?) -> QuotaSnapshot {
-        let correctedSnapshot = applyLockoutCorrections(current: snapshot, previous: previousSnapshot)
-
         var activeSignals = loadSignals()
-        pruneExpiredSignals(&activeSignals, now: correctedSnapshot.fetchedAt)
+        pruneExpiredSignals(&activeSignals, now: snapshot.fetchedAt)
+        discardUnreliableKimiRecoverySignals(&activeSignals, current: snapshot)
 
-        let newSignals = detectSignals(current: correctedSnapshot, previous: previousSnapshot)
-        merge(newSignals, into: &activeSignals, providerID: correctedSnapshot.providerID)
+        let newSignals = detectSignals(current: snapshot, previous: previousSnapshot)
+        merge(newSignals, into: &activeSignals, providerID: snapshot.providerID)
         saveSignals(activeSignals)
 
-        guard correctedSnapshot.fetchState.isHealthy else {
-            return correctedSnapshot.withSignals([])
+        guard snapshot.fetchState.isHealthy else {
+            return snapshot.withSignals([])
         }
 
-        let providerSignals = (activeSignals[correctedSnapshot.providerID.rawValue] ?? [])
+        let providerSignals = (activeSignals[snapshot.providerID.rawValue] ?? [])
             .sorted { $0.detectedAt > $1.detectedAt }
 
-        return correctedSnapshot.withSignals(providerSignals)
+        return snapshot.withSignals(providerSignals)
     }
 
-    /// Kimi-specific: when the rolling 5h window is exhausted, Kimi's API returns
-    /// `remaining = limit` with `resetTime` set to when the lockout ends — making
-    /// the window look like a fresh full window. Detect that pattern by comparing
-    /// against the previous snapshot and pin `used = total` so the UI shows 100%.
-    private func applyLockoutCorrections(current: QuotaSnapshot, previous: QuotaSnapshot?) -> QuotaSnapshot {
-        guard current.providerID == .kimi,
-              current.fetchState.isHealthy,
-              let previous,
-              previous.fetchState.isHealthy else {
-            return current
+    private func discardUnreliableKimiRecoverySignals(
+        _ signals: inout [String: [QuotaSignal]],
+        current: QuotaSnapshot
+    ) {
+        guard current.providerID == .kimi, current.fetchState.isHealthy else { return }
+
+        let providerKey = ProviderID.kimi.rawValue
+        let filtered = (signals[providerKey] ?? []).filter { $0.kind != .unexpectedRecovery }
+        if filtered.isEmpty {
+            signals.removeValue(forKey: providerKey)
+        } else {
+            signals[providerKey] = filtered
         }
-
-        let elapsed = current.fetchedAt.timeIntervalSince(previous.fetchedAt)
-        guard elapsed >= 0, elapsed <= 60 * 60 else {
-            return current
-        }
-
-        let previousWindows: [WindowComparisonKey: QuotaWindow] = Dictionary(
-            uniqueKeysWithValues: previous.windows.compactMap { window -> (WindowComparisonKey, QuotaWindow)? in
-                guard window.hasExplicitLimit else { return nil }
-                return (WindowComparisonKey(window: window), window)
-            }
-        )
-
-        var didCorrect = false
-        let correctedWindows = current.windows.map { window -> QuotaWindow in
-            guard window.hasExplicitLimit,
-                  let total = window.total,
-                  total > 0 else {
-                return window
-            }
-            let key = WindowComparisonKey(window: window)
-            guard let previousWindow = previousWindows[key],
-                  let previousTotal = previousWindow.total,
-                  previousTotal > 0,
-                  abs(previousTotal - total) <= max(1, previousTotal * 0.05) else {
-                return window
-            }
-            guard previousWindow.fractionUsed >= 0.70,
-                  window.fractionUsed <= 0.10 else {
-                return window
-            }
-            guard let previousResetDate = previousWindow.resetDate,
-                  previousResetDate > current.fetchedAt else {
-                return window
-            }
-
-            didCorrect = true
-            return QuotaWindow(
-                id: window.id,
-                label: window.label,
-                windowKind: window.windowKind,
-                used: total,
-                total: total,
-                resetDate: window.resetDate,
-                unit: window.unit,
-                subtitle: window.subtitle
-            )
-        }
-
-        return didCorrect ? current.withWindows(correctedWindows) : current
     }
 
     private func detectSignals(current: QuotaSnapshot, previous: QuotaSnapshot?) -> [QuotaSignal] {
@@ -642,7 +593,9 @@ private struct SnapshotSignalDetector {
             ) {
                 return [signal]
             }
-            if let signal = unexpectedRecoverySignal(
+            // Kimi overloads a full `remaining` value to represent an active
+            // lockout, so only its scheduled reset transition is trustworthy.
+            if current.providerID != .kimi, let signal = unexpectedRecoverySignal(
                 currentWindow: currentWindow,
                 previousWindow: previousWindow,
                 currentDate: current.fetchedAt,
