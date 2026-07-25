@@ -572,7 +572,10 @@ private struct SnapshotSignalDetector {
         }
 
         let elapsed = current.fetchedAt.timeIntervalSince(previous.fetchedAt)
-        guard elapsed >= minimumObservationGap else {
+        guard elapsed > 0 else {
+            return []
+        }
+        if current.providerID != .openai, elapsed < minimumObservationGap {
             return []
         }
 
@@ -599,7 +602,8 @@ private struct SnapshotSignalDetector {
                 currentWindow: currentWindow,
                 previousWindow: previousWindow,
                 currentDate: current.fetchedAt,
-                previousDate: previous.fetchedAt
+                previousDate: previous.fetchedAt,
+                allowResetWindowRestart: current.providerID == .openai
             ) {
                 return [signal]
             }
@@ -637,20 +641,25 @@ private struct SnapshotSignalDetector {
             return nil
         }
 
-        guard previousWindow.fractionUsed >= 0.40 else {
+        let previousFraction = recordedFractionUsed(previousWindow)
+        let currentFraction = recordedFractionUsed(currentWindow)
+
+        guard previousFraction >= 0.40 else {
             return nil
         }
 
-        guard currentWindow.fractionUsed <= 0.10 else {
+        guard currentFraction <= 0.10 else {
             return nil
         }
 
+        let previousPercentage = percentageUsed(previousFraction)
+        let currentPercentage = percentageUsed(currentFraction)
         let message: String
         if let newReset = currentWindow.resetDate {
             let resetIn = durationDescription(newReset.timeIntervalSince(currentDate))
-            message = "Quota refreshed from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)%. Next reset in \(resetIn)."
+            message = "Quota refreshed from \(previousPercentage)% to \(currentPercentage)%. Next reset in \(resetIn)."
         } else {
-            message = "Quota refreshed from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)%."
+            message = "Quota refreshed from \(previousPercentage)% to \(currentPercentage)%."
         }
 
         return QuotaSignal(
@@ -668,7 +677,8 @@ private struct SnapshotSignalDetector {
         currentWindow: QuotaWindow,
         previousWindow: QuotaWindow,
         currentDate: Date,
-        previousDate: Date
+        previousDate: Date,
+        allowResetWindowRestart: Bool
     ) -> QuotaSignal? {
         guard currentWindow.hasExplicitLimit,
               previousWindow.hasExplicitLimit,
@@ -700,20 +710,32 @@ private struct SnapshotSignalDetector {
             return nil
         }
 
-        let fractionDrop = previousWindow.fractionUsed - currentWindow.fractionUsed
-        let resetToZeroEarly = currentWindow.fractionUsed <= 0.01
+        let previousFraction = recordedFractionUsed(previousWindow)
+        let currentFraction = recordedFractionUsed(currentWindow)
+        let fractionDrop = previousFraction - currentFraction
+        let resetToZeroEarly = currentFraction <= 0.01
             && currentWindow.used <= max(1, currentTotal * 0.01)
-            && previousWindow.fractionUsed >= 0.08
+            && previousFraction >= 0.08
             && fractionDrop >= 0.08
-        let strongRecovery = currentWindow.fractionUsed <= 0.20
+        let strongRecovery = currentFraction <= 0.20
             || fractionDrop >= strongRecoveryFloor
             || currentWindow.used <= previousWindow.used * 0.4
 
-        let strongDropRecovery = previousWindow.fractionUsed >= 0.50
+        let strongDropRecovery = previousFraction >= 0.50
             && fractionDrop >= minimumFractionDrop
             && strongRecovery
 
-        guard resetToZeroEarly || strongDropRecovery else {
+        let resetWindowRestarted: Bool
+        if allowResetWindowRestart,
+           let currentResetDate = currentWindow.resetDate {
+            resetWindowRestarted = currentFraction <= 0.10
+                && currentResetDate.timeIntervalSince(previousResetDate) >= minimumEarlyLead
+                && currentResetDate > currentDate
+        } else {
+            resetWindowRestarted = false
+        }
+
+        guard resetToZeroEarly || strongDropRecovery || resetWindowRestarted else {
             return nil
         }
 
@@ -725,18 +747,24 @@ private struct SnapshotSignalDetector {
         let confidence = signalConfidence(
             fractionDrop: fractionDrop,
             elapsedShare: elapsedShare,
-            currentWindow: currentWindow
+            currentFraction: currentFraction,
+            resetWindowRestarted: resetWindowRestarted
         )
 
-        let recoveryTitle: String = resetToZeroEarly
-            ? "Usage window reset early"
-            : currentWindow.fractionUsed <= 0.10
+        let recoveryTitle: String
+        var message: String
+        if resetWindowRestarted {
+            recoveryTitle = "Usage window reset early"
+            message = "\(currentWindow.label) reset window restarted at \(percentageUsed(currentFraction))% used about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        } else if resetToZeroEarly {
+            recoveryTitle = "Usage window reset early"
+            message = "\(currentWindow.label) reset from \(percentageUsed(previousFraction))% to 0% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        } else {
+            recoveryTitle = currentFraction <= 0.10
                 ? "Usage window appears refreshed early"
                 : "Unexpected quota recovery detected"
-
-        var message = resetToZeroEarly
-            ? "\(currentWindow.label) reset from \(previousWindow.percentageUsed)% to 0% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
-            : "\(currentWindow.label) fell from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+            message = "\(currentWindow.label) fell from \(percentageUsed(previousFraction))% to \(percentageUsed(currentFraction))% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        }
 
         if let currentResetDate = currentWindow.resetDate {
             let resetShift = currentResetDate.timeIntervalSince(previousResetDate)
@@ -763,13 +791,27 @@ private struct SnapshotSignalDetector {
     private func signalConfidence(
         fractionDrop: Double,
         elapsedShare: Double,
-        currentWindow: QuotaWindow
+        currentFraction: Double,
+        resetWindowRestarted: Bool
     ) -> Double {
+        if resetWindowRestarted {
+            return 0.95
+        }
+
         let recoveryScore = min(max(fractionDrop / 0.75, 0), 1)
         let earlinessScore = min(max(1 - elapsedShare, 0), 1)
-        let freshnessScore = currentWindow.fractionUsed <= 0.10 ? 1.0 : 0.7
+        let freshnessScore = currentFraction <= 0.10 ? 1.0 : 0.7
 
         return min(0.95, max(0.55, 0.30 + recoveryScore * 0.35 + earlinessScore * 0.25 + freshnessScore * 0.10))
+    }
+
+    private func recordedFractionUsed(_ window: QuotaWindow) -> Double {
+        guard let total = window.total, total > 0 else { return 0 }
+        return min(max(window.used / total, 0), 1)
+    }
+
+    private func percentageUsed(_ fraction: Double) -> Int {
+        Int((min(max(fraction, 0), 1) * 100).rounded())
     }
 
     private func durationDescription(_ interval: TimeInterval) -> String {

@@ -9,7 +9,7 @@ public struct CodexSnapshotSignalDetector {
     private let strongRecoveryFloor: Double
 
     public init(
-        minimumObservationGap: TimeInterval = 5 * 60,
+        minimumObservationGap: TimeInterval = 0,
         minimumRemainingWindow: TimeInterval = 30 * 60,
         minimumEarlyLead: TimeInterval = 20 * 60,
         maximumElapsedShare: Double = 0.5,
@@ -40,7 +40,7 @@ public struct CodexSnapshotSignalDetector {
         }
 
         let elapsed = current.fetchedAt.timeIntervalSince(previous.fetchedAt)
-        guard elapsed >= minimumObservationGap else {
+        guard elapsed > 0, elapsed >= minimumObservationGap else {
             return []
         }
 
@@ -99,20 +99,31 @@ public struct CodexSnapshotSignalDetector {
             return nil
         }
 
-        let fractionDrop = previousWindow.fractionUsed - currentWindow.fractionUsed
-        let resetToZeroEarly = currentWindow.fractionUsed <= 0.01
+        let previousFraction = recordedFractionUsed(previousWindow)
+        let currentFraction = recordedFractionUsed(currentWindow)
+        let fractionDrop = previousFraction - currentFraction
+        let resetToZeroEarly = currentFraction <= 0.01
             && currentWindow.used <= max(1, currentTotal * 0.01)
-            && previousWindow.fractionUsed >= 0.08
+            && previousFraction >= 0.08
             && fractionDrop >= 0.08
-        let strongRecovery = currentWindow.fractionUsed <= 0.20
+        let strongRecovery = currentFraction <= 0.20
             || fractionDrop >= strongRecoveryFloor
             || currentWindow.used <= previousWindow.used * 0.4
 
-        let strongDropRecovery = previousWindow.fractionUsed >= 0.50
+        let strongDropRecovery = previousFraction >= 0.50
             && fractionDrop >= minimumFractionDrop
             && strongRecovery
 
-        guard resetToZeroEarly || strongDropRecovery else {
+        let resetWindowRestarted: Bool
+        if let currentResetDate = currentWindow.resetDate {
+            resetWindowRestarted = currentFraction <= 0.10
+                && currentResetDate.timeIntervalSince(previousResetDate) >= minimumEarlyLead
+                && currentResetDate > currentDate
+        } else {
+            resetWindowRestarted = false
+        }
+
+        guard resetToZeroEarly || strongDropRecovery || resetWindowRestarted else {
             return nil
         }
 
@@ -124,16 +135,23 @@ public struct CodexSnapshotSignalDetector {
         let confidence = signalConfidence(
             fractionDrop: fractionDrop,
             elapsedShare: elapsedShare,
-            currentWindow: currentWindow
+            currentFraction: currentFraction,
+            resetWindowRestarted: resetWindowRestarted
         )
-        let recoveryTitle = resetToZeroEarly
-            ? "Usage window reset early"
-            : currentWindow.fractionUsed <= 0.10
+        let recoveryTitle: String
+        let message: String
+        if resetWindowRestarted {
+            recoveryTitle = "Usage window reset early"
+            message = "\(currentWindow.label) reset window restarted at \(percentageUsed(currentFraction))% used about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        } else if resetToZeroEarly {
+            recoveryTitle = "Usage window reset early"
+            message = "\(currentWindow.label) reset from \(percentageUsed(previousFraction))% to 0% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        } else {
+            recoveryTitle = currentFraction <= 0.10
                 ? "Usage window appears refreshed early"
                 : "Unexpected quota recovery detected"
-        let message = resetToZeroEarly
-            ? "\(currentWindow.label) reset from \(previousWindow.percentageUsed)% to 0% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
-            : "\(currentWindow.label) fell from \(previousWindow.percentageUsed)% to \(currentWindow.percentageUsed)% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+            message = "\(currentWindow.label) fell from \(percentageUsed(previousFraction))% to \(percentageUsed(currentFraction))% about \(durationDescription(earlyLead)) earlier than the prior reset estimate."
+        }
 
         return QuotaSignal(
             kind: .unexpectedRecovery,
@@ -149,13 +167,27 @@ public struct CodexSnapshotSignalDetector {
     private func signalConfidence(
         fractionDrop: Double,
         elapsedShare: Double,
-        currentWindow: QuotaWindow
+        currentFraction: Double,
+        resetWindowRestarted: Bool
     ) -> Double {
+        if resetWindowRestarted {
+            return 0.95
+        }
+
         let recoveryScore = min(max(fractionDrop / 0.75, 0), 1)
         let earlinessScore = min(max(1 - elapsedShare, 0), 1)
-        let freshnessScore = currentWindow.fractionUsed <= 0.10 ? 1.0 : 0.7
+        let freshnessScore = currentFraction <= 0.10 ? 1.0 : 0.7
 
         return min(0.95, max(0.55, 0.30 + recoveryScore * 0.35 + earlinessScore * 0.25 + freshnessScore * 0.10))
+    }
+
+    private func recordedFractionUsed(_ window: QuotaWindow) -> Double {
+        guard let total = window.total, total > 0 else { return 0 }
+        return min(max(window.used / total, 0), 1)
+    }
+
+    private func percentageUsed(_ fraction: Double) -> Int {
+        Int((min(max(fraction, 0), 1) * 100).rounded())
     }
 
     private func durationDescription(_ interval: TimeInterval) -> String {

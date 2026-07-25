@@ -132,7 +132,7 @@ final class CodexUsageClientTests: XCTestCase {
                   "used_percent": 33,
                   "limit_window_seconds": 604800,
                   "reset_after_seconds": 580000,
-                  "reset_at": 1784492408
+                  "reset_at": 1893456000
                 }
               },
               "additional_rate_limits": [
@@ -144,7 +144,7 @@ final class CodexUsageClientTests: XCTestCase {
                       "used_percent": 6,
                       "limit_window_seconds": 604800,
                       "reset_after_seconds": 580000,
-                      "reset_at": 1784493835
+                      "reset_at": 1893459600
                     }
                   }
                 }
