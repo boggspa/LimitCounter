@@ -4437,13 +4437,20 @@ enum KimiUsageNormalizer {
         switch rawLevel.uppercased() {
         case "LEVEL_FREE":
             return "Adagio"
-        case "LEVEL_BASIC":
+        case "LEVEL_BEGINNER", "BEGINNER",
+             "LEVEL_BASIC", "BASIC",
+             "LEVEL_MODERATO", "MODERATO":
             return "Moderato"
-        case "LEVEL_PRO":
+        case "LEVEL_INTERMEDIATE", "INTERMEDIATE",
+             "LEVEL_PRO", "PRO",
+             "LEVEL_ALLEGRETTO", "ALLEGRETTO":
             return "Allegretto"
-        case "LEVEL_MAX":
+        case "LEVEL_ADVANCED", "ADVANCED",
+             "LEVEL_MAX", "MAX",
+             "LEVEL_ALLEGRO", "ALLEGRO":
             return "Allegro"
-        case "LEVEL_ULTRA":
+        case "LEVEL_ULTRA", "ULTRA",
+             "LEVEL_VIVACE", "VIVACE":
             return "Vivace"
         default:
             return prettyRawName(rawLevel, droppingPrefix: "LEVEL_")

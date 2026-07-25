@@ -33,6 +33,7 @@ func expectNil<T>(_ value: T?, _ message: String) throws {
 enum KimiUsageTestRunner {
     static func main() async throws {
         try testParsesWeeklyAndFiveHourStringQuota()
+        try testMapsCurrentAndLegacyMembershipLevels()
         try testParsesMissingOptionalFieldsAndUnknownMembership()
         try testParsesExhaustedWeeklyAndUnusedFiveHourQuota()
         try testImportsPlainTextAPIKey()
@@ -108,6 +109,39 @@ enum KimiUsageTestRunner {
         try expectEqual(snapshot.stats.first?.label, "Parallel Limit", "parallel stat label")
         try expectEqual(snapshot.stats.first?.value, 2, "parallel stat value")
         try expectEqual(snapshot.balances.first?.amount, 1580, "total quota balance")
+    }
+
+    private static func testMapsCurrentAndLegacyMembershipLevels() throws {
+        let expectedNames: [(String, String)] = [
+            ("LEVEL_BEGINNER", "Moderato"),
+            ("LEVEL_BASIC", "Moderato"),
+            ("LEVEL_MODERATO", "Moderato"),
+            ("LEVEL_INTERMEDIATE", "Allegretto"),
+            ("LEVEL_PRO", "Allegretto"),
+            ("LEVEL_ALLEGRETTO", "Allegretto"),
+            ("LEVEL_ADVANCED", "Allegro"),
+            ("LEVEL_MAX", "Allegro"),
+            ("LEVEL_ALLEGRO", "Allegro"),
+            ("LEVEL_ULTRA", "Vivace"),
+            ("LEVEL_VIVACE", "Vivace")
+        ]
+
+        for (level, expectedName) in expectedNames {
+            let payload: [String: Any] = [
+                "user": [
+                    "membership": [
+                        "level": level
+                    ]
+                ],
+                "usage": [
+                    "limit": 100,
+                    "remaining": 100
+                ]
+            ]
+
+            let snapshot = try KimiUsageNormalizer.snapshot(from: payload)
+            try expectEqual(snapshot.planName, expectedName, "\(level) plan name")
+        }
     }
 
     private static func testParsesMissingOptionalFieldsAndUnknownMembership() throws {
