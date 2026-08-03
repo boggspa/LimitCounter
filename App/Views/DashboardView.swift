@@ -29,7 +29,7 @@ struct DashboardView: View {
                 usageAlertToastHost
             }
             .refreshable {
-                await appState.refresh()
+                await appState.refresh(userInitiated: true)
             }
             .task(id: dashboardRefreshIntervalSeconds) {
                 await appState.refresh()
@@ -180,7 +180,7 @@ struct DashboardView: View {
                     accent: ProGlassTheme.accent,
                     isActive: appState.isSyncing
                 ) {
-                    Task { await appState.refresh() }
+                    Task { await appState.refresh(userInitiated: true) }
                 }
             }
 
@@ -373,7 +373,7 @@ struct DashboardView: View {
     private var bottomControlDock: some View {
         HStack(spacing: 12) {
             dockButton(systemImage: appState.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise", title: "Refresh") {
-                Task { await appState.refresh() }
+                Task { await appState.refresh(userInitiated: true) }
             }
             .disabled(appState.isSyncing)
 
@@ -972,7 +972,7 @@ struct DashboardView: View {
             controlPillButton(
                 accessibilityLabel: appState.isSyncing ? "Refreshing dashboard" : "Refresh dashboard"
             ) {
-                Task { await appState.refresh() }
+                Task { await appState.refresh(userInitiated: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .foregroundStyle(.white)
@@ -1670,14 +1670,22 @@ struct CompactDashboardCardView: View {
                     .foregroundStyle(.tertiary)
             } else {
                 ForEach(windows) { window in
-                    compactMeterRow(window: window, accent: accent)
+                    compactMeterRow(
+                        window: window,
+                        accent: accent,
+                        providerID: snapshot.providerID
+                    )
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func compactMeterRow(window: QuotaWindow, accent: Color) -> some View {
+    private func compactMeterRow(
+        window: QuotaWindow,
+        accent: Color,
+        providerID: ProviderID
+    ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(window.label)
@@ -1694,7 +1702,7 @@ struct CompactDashboardCardView: View {
                         .lineLimit(1)
                 }
 
-                Text(percentageText(for: window))
+                Text(percentageText(for: window, providerID: providerID))
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(usageColor(for: window.fractionUsed, accentColor: accent))
                     .lineLimit(1)
@@ -1713,7 +1721,10 @@ struct CompactDashboardCardView: View {
         }
     }
 
-    private func percentageText(for window: QuotaWindow) -> String {
+    private func percentageText(for window: QuotaWindow, providerID: ProviderID) -> String {
+        if window.isCurrencyMetric {
+            return window.leadingValueText(for: providerID)
+        }
         if window.hasExplicitLimit {
             return "\(window.percentageUsed)%"
         }

@@ -35,7 +35,7 @@ final class SyncCoordinator {
     // MARK: - Sync
 
     /// Fetches all registered providers in display order.
-    func syncAll() async {
+    func syncAll(userInitiated: Bool = false) async {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
@@ -53,7 +53,8 @@ final class SyncCoordinator {
                         let outcome = await self.syncOutcome(
                             providerID: providerID,
                             client: client,
-                            previousSnapshot: previousSnapshots[providerID]
+                            previousSnapshot: previousSnapshots[providerID],
+                            userInitiated: userInitiated
                         )
                         return (providerID, outcome)
                     }
@@ -102,12 +103,12 @@ final class SyncCoordinator {
     }
 
     /// Fetches a single provider.
-    func sync(providerID: ProviderID) async {
+    func sync(providerID: ProviderID, userInitiated: Bool = true) async {
         print("[SyncCoordinator] Starting sync for \(providerID.rawValue)")
 
         // Handle Codex/OpenAI coalescence special case
         if providerID == .openai || providerID == .codexTelemetry {
-            await syncAll() // Simpler to re-sync both to ensure events are merged correctly
+            await syncAll(userInitiated: userInitiated) // Simpler to re-sync both to ensure events are merged correctly
             return
         }
 
@@ -119,7 +120,8 @@ final class SyncCoordinator {
         let outcome = await syncOutcome(
             providerID: providerID,
             client: client,
-            previousSnapshot: store.snapshot(for: providerID)
+            previousSnapshot: store.snapshot(for: providerID),
+            userInitiated: userInitiated
         )
         applySyncOutcome(outcome)
         lastSyncDate = Date()
@@ -133,7 +135,8 @@ final class SyncCoordinator {
     private func syncOutcome(
         providerID: ProviderID,
         client: any ProviderClient,
-        previousSnapshot: QuotaSnapshot?
+        previousSnapshot: QuotaSnapshot?,
+        userInitiated: Bool
     ) async -> ProviderSyncOutcome {
         let credential = keychain.credential(for: providerID)
         print("[SyncCoordinator] Credential for \(providerID.rawValue): \(credential != nil ? "present" : "nil")")
@@ -150,6 +153,9 @@ final class SyncCoordinator {
             || client is CursorProviderClient
             || client is GeminiProviderClient
             || client is GrokProviderClient
+            || client is AntigravityProviderClient
+            || client is MistralProviderClient
+            || client is CerebrasProviderClient
         guard credential != nil || client is MockProviderClient || canAutoDiscover else {
             print("[SyncCoordinator] No credentials for \(providerID.rawValue), skipping")
             if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
@@ -182,7 +188,8 @@ final class SyncCoordinator {
             let snapshot = try await fetchSnapshotWithTimeout(
                 providerID: providerID,
                 client: client,
-                credentials: credential
+                credentials: credential,
+                userInitiated: userInitiated
             )
             print("[SyncCoordinator] Got snapshot for \(providerID.rawValue): \(snapshot.windows.count) windows")
             let historyPreservedSnapshot = snapshotPreservingCodexTelemetryHistory(
@@ -303,6 +310,10 @@ final class SyncCoordinator {
             // refresh, and token-race failures must not erase the last good
             // quota snapshot while the user repairs or retries the session.
             shouldPreserve = true
+        case .antigravity, .mistral, .deepseek, .cerebras:
+            // Local probes, imported reports, and billing APIs can all miss a
+            // refresh transiently. Keep the last truthful reading visible.
+            shouldPreserve = true
         default:
             shouldPreserve = false
         }
@@ -316,7 +327,8 @@ final class SyncCoordinator {
     private func fetchSnapshotWithTimeout(
         providerID: ProviderID,
         client: any ProviderClient,
-        credentials: ProviderCredential?
+        credentials: ProviderCredential?,
+        userInitiated: Bool
     ) async throws -> QuotaSnapshot {
         let timeout = providerTimeout(for: providerID)
 
@@ -324,7 +336,15 @@ final class SyncCoordinator {
             let state = TimeoutRaceState(continuation)
             let fetchTask = Task {
                 do {
-                    let snapshot = try await client.fetchSnapshot(credentials: credentials)
+                    let snapshot: QuotaSnapshot
+                    if let interactiveClient = client as? any UserInitiatedProviderClient {
+                        snapshot = try await interactiveClient.fetchSnapshot(
+                            credentials: credentials,
+                            userInitiated: userInitiated
+                        )
+                    } else {
+                        snapshot = try await client.fetchSnapshot(credentials: credentials)
+                    }
                     _ = state.resume(with: .success(snapshot))
                 } catch {
                     _ = state.resume(with: .failure(error))
@@ -353,7 +373,10 @@ final class SyncCoordinator {
             return 30
         case .claude, .chatgpt, .gemini:
             return 15
-        case .openai, .openaiAPI, .windsurf, .cursor, .kimi, .grok:
+        case .openai, .openaiAPI, .windsurf, .cursor, .kimi, .grok,
+             .mistral, .deepseek, .cerebras:
+            return 20
+        case .antigravity:
             return 20
         case .heatmap:
             return 5

@@ -30,6 +30,7 @@ enum CursorCredentialTestRunner {
         try testImportsCursorStateDirectory()
         try testImportsCursorStateFile()
         try await testCursorProviderReadsDirectoryState()
+        try await testCursorProviderNormalizesProPlusPlan()
         print("Cursor credential tests passed")
     }
 
@@ -77,7 +78,27 @@ enum CursorCredentialTestRunner {
         try cursorExpectEqual(snapshot.events.count, 1, "local daily activity events")
     }
 
-    private static func createCursorStateDatabase(at url: URL) throws {
+    private static func testCursorProviderNormalizesProPlusPlan() async throws {
+        let directory = try temporaryDirectory()
+        let stateDB = directory.appendingPathComponent("state.vscdb")
+        try createCursorStateDatabase(at: stateDB, membershipType: "pro_plus")
+
+        let credential = ProviderCredential(
+            customEndpoint: directory.path,
+            extraFields: [
+                "cursorAuthMode": "localState"
+            ]
+        )
+
+        let snapshot = try await CursorProviderClient().fetchSnapshot(credentials: credential)
+
+        try cursorExpectEqual(snapshot.planName, "Pro +", "Pro Plus membership plan")
+    }
+
+    private static func createCursorStateDatabase(
+        at url: URL,
+        membershipType: String = "pro"
+    ) throws {
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else {
             throw CursorTestFailure.failed("could not create sqlite database")
@@ -88,7 +109,7 @@ enum CursorCredentialTestRunner {
 
         try exec("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);", db: db)
         try insert(key: "cursorAuth/cachedEmail", value: "cursor@example.com", db: db)
-        try insert(key: "cursorAuth/cachedMembershipType", value: "pro", db: db)
+        try insert(key: "cursorAuth/cachedMembershipType", value: membershipType, db: db)
         try insert(
             key: "aiCodeTracking.dailyStats.\(trackedDate)",
             value: """

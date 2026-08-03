@@ -34,13 +34,25 @@ public struct ProviderBrandIconView: View {
                     .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
             }
 
-            icon
-                .resizable()
-                .renderingMode(iconUsesOriginalColors ? .original : .template)
-                .scaledToFit()
-                .padding(iconUsesOriginalColors ? 0 : size * 0.18)
-                .foregroundStyle(iconUsesOriginalColors ? .primary : accentColor)
-                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            if usesLeadingBrandMark {
+                icon
+                    .resizable()
+                    .renderingMode(.original)
+                    .frame(
+                        width: leadingBrandMarkHeight * leadingBrandImageAspectRatio,
+                        height: leadingBrandMarkHeight
+                    )
+                    .frame(width: size, height: size, alignment: .leading)
+                    .clipped()
+            } else {
+                icon
+                    .resizable()
+                    .renderingMode(iconUsesOriginalColors ? .original : .template)
+                    .scaledToFit()
+                    .padding(iconUsesOriginalColors ? 0 : size * 0.18)
+                    .foregroundStyle(iconUsesOriginalColors ? .primary : accentColor)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            }
         }
         .frame(width: size, height: size)
     }
@@ -51,6 +63,18 @@ public struct ProviderBrandIconView: View {
         #endif
         if bundledLogoImage != nil { return true }
         return false
+    }
+
+    private var usesLeadingBrandMark: Bool {
+        providerID == .deepseek || providerID == .cerebras
+    }
+
+    private var leadingBrandMarkHeight: CGFloat {
+        providerID == .deepseek ? size * 0.74 : size
+    }
+
+    private var leadingBrandImageAspectRatio: CGFloat {
+        providerID == .deepseek ? 1_024 / 217 : 2_403 / 1_058
     }
 
     private var icon: Image {
@@ -800,7 +824,7 @@ public struct QuotaWindowRow: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.primary)
                 Spacer()
-                Text(window.leadingValueText)
+                Text(window.leadingValueText(for: providerID))
                     .font(.headline.weight(.bold))
                     .foregroundStyle(usageColor(for: window.fractionUsed, accentColor: accentColor))
             }
@@ -1069,7 +1093,7 @@ public struct QuotaCardSmallView: View {
                         .minimumScaleFactor(0.75)
                 }
 
-                Text(window.leadingValueText)
+                Text(window.leadingValueText(for: snapshot.providerID))
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(usageColor(for: window.fractionUsed, accentColor: accent))
                     .lineLimit(1)

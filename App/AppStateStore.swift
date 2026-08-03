@@ -110,6 +110,10 @@ final class AppStateStore: ObservableObject {
         coordinator.register(GeminiProviderClient())
         coordinator.register(KimiProviderClient())
         coordinator.register(GrokProviderClient())
+        coordinator.register(AntigravityProviderClient())
+        coordinator.register(MistralProviderClient())
+        coordinator.register(DeepSeekProviderClient())
+        coordinator.register(CerebrasProviderClient())
         #endif
 
         self.syncCoordinator = coordinator
@@ -265,13 +269,13 @@ final class AppStateStore: ObservableObject {
         #endif
     }
 
-    func refresh() async {
+    func refresh(userInitiated: Bool = false) async {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
 
         #if os(macOS)
-        await syncCoordinator.syncAll()
+        await syncCoordinator.syncAll(userInitiated: userInitiated)
         let loaded = store.loadSnapshots()
         snapshots = loaded.isEmpty ? Self.initialSnapshots : loaded
         lastSyncDate = syncCoordinator.lastSyncDate

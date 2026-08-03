@@ -38,6 +38,8 @@
 		EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */; };
 		F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */; };
 		F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */; };
+		FA1100010000000000000001 /* AntigravityProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200010000000000000001 /* AntigravityProviderClient.swift */; };
+		FA1100020000000000000002 /* SpendProviderClients.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000002 /* SpendProviderClients.swift */; };
 		F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
 /* End PBXBuildFile section */
 
@@ -88,6 +90,8 @@
 		A42BC5382F9140180096DECB /* Limit Counter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Limit Counter.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderDetailView.swift; path = App/Views/ProviderDetailView.swift; sourceTree = SOURCE_ROOT; };
 		AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderClient.swift; path = App/Providers/ProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		FA1200010000000000000001 /* AntigravityProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AntigravityProviderClient.swift; path = App/Providers/AntigravityProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		FA1200020000000000000002 /* SpendProviderClients.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SpendProviderClients.swift; path = App/Providers/SpendProviderClients.swift; sourceTree = SOURCE_ROOT; };
 		B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GlassChrome.swift; path = Shared/Views/GlassChrome.swift; sourceTree = SOURCE_ROOT; };
 		B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AppStateStore.swift; path = App/AppStateStore.swift; sourceTree = SOURCE_ROOT; };
 		C7D74721EA3E8C99B51CF09D /* MockData.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MockData.swift; path = Shared/Models/MockData.swift; sourceTree = SOURCE_ROOT; };
@@ -188,6 +192,8 @@
 				8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */,
 				AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */,
 				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
+				FA1200010000000000000001 /* AntigravityProviderClient.swift */,
+				FA1200020000000000000002 /* SpendProviderClients.swift */,
 			);
 			path = Providers;
 			sourceTree = "<group>";
@@ -404,6 +410,8 @@
 				DDD693B6BE87A2E553B057AA /* SyncCoordinator.swift in Sources */,
 				F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */,
 				F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */,
+				FA1100010000000000000001 /* AntigravityProviderClient.swift in Sources */,
+				FA1100020000000000000002 /* SpendProviderClients.swift in Sources */,
 				D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */,
 				A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */,
 				25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */,

@@ -5,22 +5,23 @@ import SQLite3
 import Darwin
 #endif
 
-// MARK: - AGBench Unified Telemetry Source
+// MARK: - TaskWraith Unified Telemetry Source
 
-/// Reads AGBench's unified usage telemetry (`usage.json`) and emits
+/// Reads TaskWraith's unified usage telemetry (`usage.json`) and emits
 /// per-provider `UsageEvent` records.
 ///
 /// TaskWraith maintains a JSON array at
-/// `~/Library/Application Support/agbench/usage.json` that records every
+/// `~/Library/Application Support/taskwraith/usage.json` that records every
 /// chat/run across providers — Kimi, Gemini, Codex, Claude — in a clean
 /// structured form. This is a richer signal than per-provider local
-/// scanners for users who drive activity through AGBench, since one
+/// scanners for users who drive activity through TaskWraith, since one
 /// file aggregates everything.
 enum AGBenchUsageReader {
     private static let usageFileRelativePath = "usage.json"
+    private static let maximumUsageFileBytes = 32 * 1_024 * 1_024
 
     /// Returns recent `UsageEvent`s drawn from `usage.json` for the
-    /// given provider key. Provider keys match AGBench's internal naming
+    /// given provider key. Provider keys match TaskWraith's internal naming
     /// (`"kimi"`, `"gemini"`, `"codex"`, `"claude"`), not our
     /// `ProviderID.rawValue`.
     ///
@@ -39,7 +40,12 @@ enum AGBenchUsageReader {
             return []
         }
 
-        guard let data = try? Data(contentsOf: fileURL) else {
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+              values.isRegularFile == true,
+              let fileSize = values.fileSize,
+              fileSize >= 0,
+              fileSize <= maximumUsageFileBytes,
+              let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
             print("[AGBenchReader] Read failed for \(fileURL.path) (sandbox / permissions?)")
             return []
         }
@@ -87,7 +93,7 @@ enum AGBenchUsageReader {
 
     /// Resolves the user-bookmarked root URL into the actual
     /// `usage.json` path. Accepts either:
-    ///   - A bookmark on the AGBench app-support directory (we append
+    ///   - A bookmark on the TaskWraith app-support directory (we append
     ///     `usage.json`).
     ///   - A bookmark directly on `usage.json`.
     private static func resolveUsageFileURL(rootURL: URL) -> URL {
@@ -118,7 +124,8 @@ enum AGBenchUsageReader {
 }
 
 /// Persists a single user-granted security-scoped bookmark to the
-/// AGBench data directory. Stored in `UserDefaults` under a fixed key
+/// TaskWraith data directory. Stored in `UserDefaults` under the legacy fixed
+/// key so existing grants continue to work
 /// rather than the per-provider `ProviderCredential` keychain because
 /// the same bookmark is consumed by multiple providers (Kimi, Codex,
 /// Gemini, Claude).
@@ -127,6 +134,21 @@ enum AGBenchBookmarkStore {
 
     static var hasBookmark: Bool {
         UserDefaults.standard.data(forKey: defaultsKey) != nil
+    }
+
+    static var suggestedDataDirectory: URL {
+        #if os(macOS)
+        let applicationSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+        let taskWraith = applicationSupport.appendingPathComponent("taskwraith", isDirectory: true)
+        if FileManager.default.fileExists(atPath: taskWraith.path) {
+            return taskWraith
+        }
+        return applicationSupport.appendingPathComponent("agbench", isDirectory: true)
+        #else
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        #endif
     }
 
     @discardableResult
@@ -1527,6 +1549,16 @@ public protocol ProviderClient {
     func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot
 }
 
+/// Providers whose collection action has side effects, such as launching an
+/// authenticated CLI session, receive the refresh origin explicitly. Normal
+/// dashboard timers must use the cache-only path.
+public protocol UserInitiatedProviderClient: ProviderClient {
+    func fetchSnapshot(
+        credentials: ProviderCredential?,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot
+}
+
 // MARK: - Heatmap event preservation
 
 /// Content-based key used to dedupe `UsageEvent`s across fetches.
@@ -2716,6 +2748,30 @@ public enum CredentialImportService {
             ))
         }
 
+        let antigravityRoot = home
+            .appendingPathComponent(".gemini", isDirectory: true)
+            .appendingPathComponent("antigravity-cli", isDirectory: true)
+        if FileManager.default.fileExists(
+            atPath: antigravityRoot.appendingPathComponent("antigravity-oauth-token").path
+        ) {
+            detected.append(DetectedCredential(
+                providerID: .antigravity,
+                fileURL: antigravityRoot,
+                description: "Antigravity CLI session"
+            ))
+        }
+
+        let mistralRoot = home.appendingPathComponent(".vibe", isDirectory: true)
+        if FileManager.default.fileExists(
+            atPath: mistralRoot.appendingPathComponent("logs/session", isDirectory: true).path
+        ) {
+            detected.append(DetectedCredential(
+                providerID: .mistral,
+                fileURL: mistralRoot,
+                description: "Mistral Vibe usage metadata"
+            ))
+        }
+
         return detected
     }
 
@@ -2724,6 +2780,8 @@ public enum CredentialImportService {
     /// Import credentials from a user-selected file URL
     public static func importFromURL(_ url: URL, for providerID: ProviderID) throws -> ImportedCredential {
         guard url.isFileURL else { throw ImportError.fileNotFound }
+        let selectedIsDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory)
+            ?? url.hasDirectoryPath
 
         if providerID == .codexTelemetry {
             let selectedURL = url
@@ -2864,6 +2922,63 @@ public enum CredentialImportService {
                     "grokSource": "directory"
                 ],
                 bookmarkData: makeSecurityScopedReadWriteBookmarkData(for: selectedRoot)
+            )
+        }
+
+        if providerID == .antigravity {
+            let rootURL = antigravityRootURL(fromSelectedURL: url)
+            guard FileManager.default.fileExists(
+                atPath: rootURL.appendingPathComponent("antigravity-oauth-token").path
+            ) else {
+                throw ImportError.missingRequiredField("antigravity-oauth-token")
+            }
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: rootURL.path,
+                extraFields: ["antigravitySource": "officialCLIData"],
+                bookmarkData: makeSecurityScopedBookmarkData(for: rootURL)
+            )
+        }
+
+        if providerID == .mistral, selectedIsDirectory {
+            let sessionsURL: URL
+            switch url.lastPathComponent {
+            case "session":
+                sessionsURL = url
+            case "logs":
+                sessionsURL = url.appendingPathComponent("session", isDirectory: true)
+            default:
+                sessionsURL = url.appendingPathComponent("logs/session", isDirectory: true)
+            }
+            guard FileManager.default.fileExists(atPath: sessionsURL.path) else {
+                throw ImportError.missingRequiredField("logs/session")
+            }
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: url.path,
+                extraFields: ["mistralSource": "vibeMetadata"],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
+            )
+        }
+
+        if providerID == .cerebras {
+            let isCSV = url.pathExtension.lowercased() == "csv"
+            let hasCSV = selectedIsDirectory && ((try? FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ))?.contains(where: { $0.pathExtension.lowercased() == "csv" }) == true)
+            guard isCSV || hasCSV else {
+                throw ImportError.missingRequiredField("Cerebras Analytics CSV")
+            }
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: url.path,
+                extraFields: ["cerebrasSource": isCSV ? "analyticsCSV" : "analyticsFolder"],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
             )
         }
 
@@ -3056,7 +3171,25 @@ public enum CredentialImportService {
             )
         case .kimi:
             return try parseKimiJSON(json, sourceURL: sourceURL)
-        case .grok, .heatmap:
+        case .mistral:
+            guard let token = json["admin_api_key"] as? String
+                ?? json["api_key"] as? String
+                ?? json["access_token"] as? String else {
+                throw ImportError.missingRequiredField("admin_api_key")
+            }
+            return ImportedCredential(
+                accessToken: token,
+                accountIdentifier: nil,
+                extraFields: ["mistralSource": "adminAPI"]
+            )
+        case .deepseek:
+            guard let token = json["api_key"] as? String
+                ?? json["access_token"] as? String
+                ?? json["token"] as? String else {
+                throw ImportError.missingRequiredField("api_key")
+            }
+            return ImportedCredential(accessToken: token, accountIdentifier: nil)
+        case .grok, .antigravity, .cerebras, .heatmap:
             throw ImportError.unsupportedProvider
         }
     }
@@ -3329,6 +3462,16 @@ public enum CredentialImportService {
                 && fileManager.isExecutableFile(atPath: candidate.path)
         }
     }
+
+    private static func antigravityRootURL(fromSelectedURL url: URL) -> URL {
+        if url.lastPathComponent == "antigravity-oauth-token" {
+            return url.deletingLastPathComponent()
+        }
+        if url.lastPathComponent == ".gemini" {
+            return url.appendingPathComponent("antigravity-cli", isDirectory: true)
+        }
+        return url
+    }
 }
 
 // MARK: - macOS File Picker Extension
@@ -3353,19 +3496,36 @@ public extension CredentialImportService {
                     return "Select Cursor's globalStorage folder or state.vscdb for local metadata. Use the web session import for live usage."
                 case .grok:
                     return "Select your ~/.grok folder so Limit Counter can run /usage locally."
+                case .antigravity:
+                    return "Select ~/.gemini/antigravity-cli. Limit Counter reads the official CLI session and requests only Gemini quota summary after an explicit refresh."
+                case .mistral:
+                    return "Select ~/.vibe so Limit Counter can read Vibe session usage metadata."
+                case .cerebras:
+                    return "Select a Cerebras Analytics CSV or a folder containing exported CSV reports."
                 default:
                     return "Select credential file for \(providerID.displayName)"
                 }
             }()
             panel.prompt = "Import"
-            panel.allowedContentTypes = providerID == .kimi
-                ? [UTType.folder]
-                : providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .grok
-                    ? [UTType.folder, UTType.json, UTType.plainText, UTType.data]
-                    : [UTType.json, UTType.plainText, UTType.data]
+            if providerID == .kimi || providerID == .mistral || providerID == .antigravity {
+                panel.allowedContentTypes = [.folder]
+            } else if providerID == .cerebras {
+                panel.allowedContentTypes = [.folder, .commaSeparatedText, .plainText, .data]
+            } else if providerID == .codexTelemetry || providerID == .claude
+                        || providerID == .chatgpt || providerID == .cursor
+                        || providerID == .gemini || providerID == .grok {
+                panel.allowedContentTypes = [.folder, .json, .plainText, .data]
+            } else {
+                panel.allowedContentTypes = [.json, .plainText, .data]
+            }
             panel.allowsMultipleSelection = false
-            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude || providerID == .chatgpt || providerID == .cursor || providerID == .gemini || providerID == .kimi || providerID == .grok
+            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude
+                || providerID == .chatgpt || providerID == .cursor || providerID == .gemini
+                || providerID == .kimi || providerID == .grok || providerID == .antigravity
+                || providerID == .mistral || providerID == .cerebras
             panel.canChooseFiles = providerID != .kimi
+                && providerID != .mistral
+                && providerID != .antigravity
 
             // Suggest starting directory based on provider
             let home = FileManager.default.homeDirectoryForCurrentUser
@@ -3398,6 +3558,16 @@ public extension CredentialImportService {
                 panel.directoryURL = currentRoot
             case .grok:
                 panel.directoryURL = home.appendingPathComponent(".grok")
+            case .antigravity:
+                panel.directoryURL = home.appendingPathComponent(".gemini", isDirectory: true)
+                panel.prompt = "Grant Access"
+            case .mistral:
+                panel.directoryURL = home.appendingPathComponent(".vibe")
+                panel.prompt = "Grant Access"
+            case .deepseek:
+                panel.directoryURL = home
+            case .cerebras:
+                panel.directoryURL = home.appendingPathComponent("Downloads")
             case .heatmap:
                 break
             }
@@ -3406,6 +3576,16 @@ public extension CredentialImportService {
                 guard result == .OK, let url = panel.url else {
                     completion(.failure(ImportError.userCancelled))
                     return
+                }
+
+                // Start the Powerbox grant before validating the selection.
+                // Sandboxed file metadata checks can otherwise fail even though
+                // the user selected the folder explicitly.
+                let didStartAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didStartAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
                 }
 
                 do {
@@ -6355,10 +6535,14 @@ public struct CursorProviderClient: ProviderClient {
         if authNote == nil,
            let membershipType = localState.membershipType,
            !membershipType.isEmpty {
+            let membershipPlanName = cursorPlanName(
+                from: membershipType,
+                localMembershipType: nil
+            )
             signals.append(
                 QuotaSignal(
                     kind: .unexpectedRecovery,
-                    title: "Membership cached as \(membershipType.capitalized)",
+                    title: "Membership cached as \(membershipPlanName)",
                     message: "Cursor's local state reports the cached membership tier as `\(membershipType)`.",
                     severity: .info,
                     detectedAt: now
@@ -6416,6 +6600,8 @@ public struct CursorProviderClient: ProviderClient {
         switch rawValue.lowercased() {
         case "pro":
             return "Pro"
+        case "pro_plus", "pro plus", "pro-plus", "pro+":
+            return "Pro +"
         case "free":
             return "Free"
         case "business":
@@ -7073,6 +7259,28 @@ struct ClaudeOAuthUsageResponse: Decodable {
     }
 }
 
+struct ClaudeOAuthProfileResponse: Decodable {
+    struct Organization: Decodable {
+        let rateLimitTier: String?
+        let organizationType: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rateLimitTier = "rate_limit_tier"
+            case organizationType = "organization_type"
+        }
+    }
+
+    let organization: Organization?
+
+    var planInfo: ClaudePlanInfo? {
+        ClaudePlanResolver.resolve(
+            subscriptionType: nil,
+            rateLimitTier: organization?.rateLimitTier,
+            organizationType: organization?.organizationType
+        )
+    }
+}
+
 // MARK: - Claude Provider Client
 
 /// In-memory cache for the Anthropic OAuth usage endpoint.
@@ -7215,17 +7423,71 @@ private actor ClaudeLocalEventScanCoordinator {
 
 // MARK: - Claude OAuth Token Management
 
-/// Resolved Claude subscription tier, derived from the keychain payload.
-/// Used both to label the card header and to gate per-model meters that
-/// only Max plans receive (e.g. weekly Fable utilization).
-private nonisolated struct ClaudePlanInfo {
+/// Resolved Claude subscription tier, preferably derived from the live OAuth
+/// profile and backed by the mirrored keychain metadata when profile lookup
+/// is unavailable.
+nonisolated struct ClaudePlanInfo: Equatable {
     /// Human-readable label for the card subtitle (e.g. "Pro", "Max x20").
     let displayName: String
     /// True for any flavour of Max plan — gates Max-only supplemental meters.
     let isMax: Bool
 }
 
-/// One-shot diagnostic — prints the plan info we resolved from the keychain
+nonisolated enum ClaudePlanResolver {
+    static func resolve(
+        subscriptionType: String?,
+        rateLimitTier: String?,
+        organizationType: String? = nil
+    ) -> ClaudePlanInfo? {
+        let subscription = normalized(subscriptionType)
+        let tier = normalized(rateLimitTier)
+        let organization = normalized(organizationType)
+        let combined = [subscription, tier, organization]
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        guard !combined.isEmpty else { return nil }
+
+        if combined.contains("max") {
+            if combined.contains("20") {
+                return ClaudePlanInfo(displayName: "Max x20", isMax: true)
+            }
+            if combined.contains("5") {
+                return ClaudePlanInfo(displayName: "Max x5", isMax: true)
+            }
+            return ClaudePlanInfo(displayName: "Max", isMax: true)
+        }
+
+        if combined.contains("pro") {
+            return ClaudePlanInfo(displayName: "Pro", isMax: false)
+        }
+
+        if combined.contains("team") {
+            return ClaudePlanInfo(displayName: "Team", isMax: false)
+        }
+
+        if combined.contains("enterprise") {
+            return ClaudePlanInfo(displayName: "Enterprise", isMax: false)
+        }
+
+        guard let fallback = subscription ?? organization ?? tier else {
+            return nil
+        }
+        let displayName = fallback
+            .replacingOccurrences(of: "claude_", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+        return ClaudePlanInfo(displayName: displayName, isMax: false)
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
+/// One-shot diagnostic — prints the resolved plan info
 /// alongside live Fable / Sonnet / Opus usage fields from the
 /// /api/oauth/usage response, so we can confirm on any build whether the
 /// model-specific meter gate sees what we expect. Fires at most once per
@@ -7275,43 +7537,10 @@ private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> Cla
     }
     let raw = creds.rawOAuthDict
 
-    let subscription = (raw["subscriptionType"] as? String)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased() ?? ""
-    let rateLimitTier = (raw["rateLimitTier"] as? String)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased() ?? ""
-
-    if subscription.isEmpty { return nil }
-
-    if subscription.contains("max") {
-        // rateLimitTier values seen in the wild: "max_5x", "max_20x".
-        // Be tolerant — search both fields for the numeric multiplier.
-        let multiplierSource = rateLimitTier.isEmpty ? subscription : rateLimitTier
-        if multiplierSource.contains("20") {
-            return ClaudePlanInfo(displayName: "Max x20", isMax: true)
-        }
-        if multiplierSource.contains("5") {
-            return ClaudePlanInfo(displayName: "Max x5", isMax: true)
-        }
-        return ClaudePlanInfo(displayName: "Max", isMax: true)
-    }
-
-    if subscription.contains("pro") {
-        return ClaudePlanInfo(displayName: "Pro", isMax: false)
-    }
-
-    if subscription.contains("team") {
-        return ClaudePlanInfo(displayName: "Team", isMax: false)
-    }
-
-    if subscription.contains("enterprise") {
-        return ClaudePlanInfo(displayName: "Enterprise", isMax: false)
-    }
-
-    // Unknown subscription type — surface it as-is, capitalized, rather
-    // than silently labelling it "Claude Code".
-    return ClaudePlanInfo(displayName: subscription.capitalized, isMax: false)
+    return ClaudePlanResolver.resolve(
+        subscriptionType: raw["subscriptionType"] as? String,
+        rateLimitTier: raw["rateLimitTier"] as? String
+    )
 }
 
 /// Holds the parsed payload of Claude Code's keychain entry. We carry the raw
@@ -8076,6 +8305,8 @@ public struct ClaudeProviderClient: ProviderClient {
         token: String,
         allowKeychainPlanLookup: Bool
     ) async throws -> QuotaSnapshot {
+        async let livePlanLookup = fetchOAuthPlanInfo(token: token)
+
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             throw ProviderFetchError.networkError(underlying: URLError(.badURL))
         }
@@ -8119,7 +8350,9 @@ public struct ClaudeProviderClient: ProviderClient {
             throw ProviderFetchError.parsingError("OAuth decode failed: \(error.localizedDescription)")
         }
 
-        let plan = resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
+        let livePlan = await livePlanLookup
+        let plan = livePlan
+            ?? resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
 
         let fableWeeklyWindow = usage.fableWeeklyWindow
 
@@ -8221,6 +8454,30 @@ public struct ClaudeProviderClient: ProviderClient {
             fetchState: .success,
             fetchedAt: Date()
         )
+    }
+
+    private func fetchOAuthPlanInfo(token: String) async -> ClaudePlanInfo? {
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else {
+            return nil
+        }
+
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                print("[ClaudeProvider] OAuth profile unavailable; retaining credential plan metadata")
+                return nil
+            }
+
+            let profile = try JSONDecoder().decode(ClaudeOAuthProfileResponse.self, from: data)
+            return profile.planInfo
+        } catch {
+            print("[ClaudeProvider] OAuth profile lookup failed; retaining credential plan metadata")
+            return nil
+        }
     }
 }
 

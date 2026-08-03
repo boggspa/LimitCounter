@@ -184,6 +184,31 @@ private func testClaudeOpusWindowUsesSameRule() throws {
     try expectEqual(window?.resetDate, reset, "Opus reset")
 }
 
+private func testClaudeProfileResolvesLiveMax20Plan() throws {
+    let payload = """
+    {
+      "organization": {
+        "organization_type": "claude_max",
+        "rate_limit_tier": "default_claude_max_20x"
+      }
+    }
+    """
+
+    let profile = try JSONDecoder().decode(ClaudeOAuthProfileResponse.self, from: Data(payload.utf8))
+
+    try expectEqual(profile.planInfo?.displayName, "Max x20", "live profile plan")
+    try expectEqual(profile.planInfo?.isMax, true, "live profile Max gate")
+}
+
+private func testClaudePlanResolverRetainsCredentialFallback() throws {
+    let plan = ClaudePlanResolver.resolve(
+        subscriptionType: "max",
+        rateLimitTier: "default_claude_max_5x"
+    )
+
+    try expectEqual(plan?.displayName, "Max x5", "credential fallback plan")
+}
+
 private func testClaudeOAuthCacheFreshReadsDoNotSlideTTL() throws {
     let cache = ClaudeOAuthResponseCache(freshTTL: 10, staleTTL: 60, diskMaxAge: 60)
     let now = makeDate("2026-05-16T00:00:00Z")
@@ -334,6 +359,8 @@ private enum ClaudeUsageTestRunner {
         try testClaudeFableWindowFromWeeklyScopedLimit()
         try testClaudeUsageResponseBuildsFableFromLimits()
         try testClaudeOpusWindowUsesSameRule()
+        try testClaudeProfileResolvesLiveMax20Plan()
+        try testClaudePlanResolverRetainsCredentialFallback()
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
         try testClaudeCodeKeychainFallbackIsOptIn()
         try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()

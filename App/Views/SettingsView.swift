@@ -708,8 +708,8 @@ private struct AGBenchDataSourceRow: View {
                     Text("TaskWraith")
                         .font(.system(size: 14, weight: .semibold))
                     Text(hasBookmark
-                         ? "Connected - usage.json is being read for Kimi, Codex, Gemini, Claude, and Grok."
-                         : "Not configured. Grant access to surface TaskWraith runs on the heatmap.")
+                         ? "Connected - usage.json enriches activity and optional API spend estimates."
+                         : "Not configured. Grant access for optional activity and spend-estimate enrichment.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -740,7 +740,7 @@ private struct AGBenchDataSourceRow: View {
                     .foregroundStyle(.red)
             }
 
-            Text("Pick the folder at: ~/Library/Application Support/agbench")
+            Text("Pick the folder at: ~/Library/Application Support/taskwraith")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
@@ -758,8 +758,7 @@ private struct AGBenchDataSourceRow: View {
         panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         // Default to the typical location so the user only has to click "Grant".
-        let defaultURL = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support/agbench")
+        let defaultURL = AGBenchBookmarkStore.suggestedDataDirectory
         if FileManager.default.fileExists(atPath: defaultURL.path) {
             panel.directoryURL = defaultURL
         }
@@ -863,6 +862,8 @@ private struct ProviderSettingsRow: View {
                         .foregroundStyle(accent)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Configure \(providerID.displayName)")
+                .accessibilityIdentifier("configure-\(providerID.rawValue)")
 
                 Toggle(isOn: isVisible) {
                     Text("Shown on Dashboard")
@@ -884,6 +885,13 @@ private struct ProviderSettingsRow: View {
             }
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityAction {
+            onConfigure()
+        }
+        .accessibilityAction(named: Text("Configure \(providerID.displayName)")) {
+            onConfigure()
+        }
     }
 }
 
@@ -905,6 +913,7 @@ struct ProviderCredentialView: View {
     @State private var codexTelemetryEndpoint = ""
     @State private var codexTelemetryHasCredential = false
     @State private var codexTelemetrySaved = false
+    @State private var loadedBillingAnchorSignature = ""
 
     private var accent: Color { Color(hex: providerID.accentColorHex) }
     private var providerDetectedCredentials: [CredentialImportService.DetectedCredential] {
@@ -913,6 +922,64 @@ struct ProviderCredentialView: View {
     private var codexTelemetryDetectedCredentials: [CredentialImportService.DetectedCredential] {
         guard providerID == .openai else { return [] }
         return detectedCredentials.filter { $0.providerID == .codexTelemetry }
+    }
+
+    private var usesLocalPathAsPrimaryCredential: Bool {
+        switch providerID {
+        case .codexTelemetry, .chatgpt, .gemini, .grok, .antigravity, .cerebras:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var importSectionTitle: String {
+        switch providerID {
+        case .kimi:
+            return "Import Kimi CLI Folder"
+        case .antigravity:
+            return "Grant Antigravity CLI Session Access"
+        case .mistral:
+            return "Grant Vibe Metadata Access"
+        case .cerebras:
+            return "Import Analytics Report"
+        default:
+            return "Import from File"
+        }
+    }
+
+    private var importButtonTitle: String {
+        switch providerID {
+        case .grok:
+            return "Select Grok folder..."
+        case .kimi:
+            return "Select ~/.kimi-code..."
+        case .antigravity:
+            return "Select Antigravity data folder..."
+        case .mistral:
+            return "Select ~/.vibe..."
+        case .cerebras:
+            return "Select Cerebras CSV..."
+        default:
+            return "Select credential file..."
+        }
+    }
+
+    private var importHelpText: String {
+        switch providerID {
+        case .grok:
+            return "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
+        case .kimi:
+            return "Select the folder in the macOS picker so Limit Counter receives persistent read/write access for Kimi's rotating OAuth session."
+        case .antigravity:
+            return "Grant read-only access to `~/.gemini/antigravity-cli`. Limit Counter requests only the Gemini quota summary after an explicit refresh."
+        case .mistral:
+            return "Grant access to `~/.vibe`. Limit Counter reads session `meta.json` usage totals only, never message content."
+        case .cerebras:
+            return "Import a report downloaded from Cerebras Console Analytics. The latest CSV in a selected folder is used."
+        default:
+            return "Import credentials from a JSON or text file you exported from the provider."
+        }
     }
 
     private var selectedGeminiLimitPreset: GeminiLimitPreset {
@@ -1003,29 +1070,17 @@ struct ProviderCredentialView: View {
                 }
 
                 // Import from file button (all providers)
-                Section(providerID == .kimi ? "Import Kimi CLI Folder" : "Import from File") {
+                Section(importSectionTitle) {
                     Button(action: importFromFile) {
                         HStack {
                             Image(systemName: "folder.badge.person.crop")
-                            Text(
-                                providerID == .grok
-                                    ? "Select Grok folder..."
-                                    : providerID == .kimi
-                                        ? "Select ~/.kimi-code..."
-                                        : "Select credential file..."
-                            )
+                            Text(importButtonTitle)
                             Spacer()
                         }
                     }
                     .foregroundStyle(accent)
 
-                    Text(
-                        providerID == .grok
-                            ? "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
-                            : providerID == .kimi
-                                ? "Select the folder in the macOS picker so Limit Counter receives persistent read/write access for Kimi's rotating OAuth session."
-                                : "Import credentials from a JSON or text file you exported from the provider."
-                    )
+                    Text(importHelpText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1081,7 +1136,7 @@ struct ProviderCredentialView: View {
                         #if os(iOS)
                             .textInputAutocapitalization(.never)
                         #endif
-                    } else if providerID == .codexTelemetry || providerID == .chatgpt || providerID == .gemini || providerID == .grok {
+                    } else if usesLocalPathAsPrimaryCredential {
                         TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
                             .autocorrectionDisabled()
                         #if os(iOS)
@@ -1113,6 +1168,10 @@ struct ProviderCredentialView: View {
                 }
                 .padding(.horizontal, 12)
                 .listRowBackground(Color.white.opacity(0.04))
+
+                if providerID == .mistral || providerID == .deepseek || providerID == .cerebras {
+                    billingAnchorSection
+                }
 
                 Section("Advanced") {
                     if providerID == .claude {
@@ -1168,6 +1227,26 @@ struct ProviderCredentialView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .grok {
                         Text("Use the import button to grant access to `~/.grok`. Limit Counter runs the local `grok` CLI with `/usage`, parses the weekly quota screen, and keeps TaskWraith data optional for activity enrichment.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .antigravity {
+                        Text("After granting access, use the dashboard refresh button to read the official CLI session and request Gemini 5-hour and weekly quota. Background refreshes reuse the last reading and never send model prompts.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .mistral {
+                        TextField("Vibe data folder", text: $customEndpoint)
+                            .autocorrectionDisabled()
+                        #if os(iOS)
+                            .textInputAutocapitalization(.never)
+                        #endif
+                        Text(providerID.securityNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .cerebras {
+                        Text(providerID.securityNote)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1238,6 +1317,96 @@ struct ProviderCredentialView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(importError ?? "Could not import credentials from file.")
+        }
+    }
+
+    @ViewBuilder
+    private var billingAnchorSection: some View {
+        Section("Billing Anchor") {
+            if providerID == .mistral {
+                TextField(
+                    "Console spend to date",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualSpent)
+                )
+                TextField(
+                    "Currency (USD, GBP, EUR)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "USD")
+                )
+                TextField(
+                    "Billing reset (ISO date, optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualResetAt)
+                )
+                TextField(
+                    "Plan name (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
+                )
+                Text("Monthly allowance is the optional field above. New local Vibe cost is added after the anchor; EUR and GBP deltas use the same advisory FX conversion as TaskWraith.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if providerID == .deepseek {
+                TextField(
+                    "Total topped up",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualTopUpTotal)
+                )
+                Text("Limit Counter subtracts the official live remaining balance from this cumulative top-up total to derive the credit-used meter. Update it whenever you add more credit.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                TextField(
+                    "Current balance",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrentBalance)
+                )
+                TextField(
+                    "Currency (USD, GBP, EUR)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "USD")
+                )
+                TextField(
+                    "Plan name (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
+                )
+                Text("Purchased credits are the optional field above. This manual balance is kept distinct from CSV-reported cost and TaskWraith price estimates.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12)
+        .listRowBackground(Color.white.opacity(0.04))
+    }
+
+    private func extraFieldBinding(_ key: String, defaultValue: String = "") -> Binding<String> {
+        Binding(
+            get: { storedExtraFields[key] ?? defaultValue },
+            set: { value in
+                if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    storedExtraFields.removeValue(forKey: key)
+                } else {
+                    storedExtraFields[key] = value
+                }
+            }
+        )
+    }
+
+    private var billingAnchorSignature: String {
+        switch providerID {
+        case .mistral:
+            return [
+                storedExtraFields[SpendProviderCredentialField.manualSpent] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualCurrency] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualResetAt] ?? ""
+            ].joined(separator: "|")
+        case .cerebras:
+            return [
+                storedExtraFields[SpendProviderCredentialField.manualCurrentBalance] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualCurrency] ?? "",
+                accountIdentifier
+            ].joined(separator: "|")
+        case .deepseek:
+            return storedExtraFields[SpendProviderCredentialField.manualTopUpTotal] ?? ""
+        default:
+            return ""
         }
     }
 
@@ -1340,9 +1509,10 @@ struct ProviderCredentialView: View {
     }
 
     private func importDetectedCredential(_ detected: CredentialImportService.DetectedCredential) {
-        if detected.providerID == .kimi {
+        if detected.providerID == .kimi || detected.providerID == .antigravity
+            || detected.providerID == .mistral || detected.providerID == .cerebras {
             // Auto-detection can suggest the path, but only NSOpenPanel can
-            // issue a persistent read/write sandbox grant for this folder.
+            // issue a persistent sandbox grant for this folder.
             importFromFile()
             return
         }
@@ -1406,6 +1576,7 @@ struct ProviderCredentialView: View {
         }
 
         loadCodexTelemetryCredential()
+        loadedBillingAnchorSignature = billingAnchorSignature
         codexTelemetrySaved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { codexTelemetrySaved = false }
     }
@@ -1464,6 +1635,7 @@ struct ProviderCredentialView: View {
         }
 
         loadCodexTelemetryCredential()
+        loadedBillingAnchorSignature = billingAnchorSignature
     }
 
     private func restoredWindsurfEndpoint(from credential: ProviderCredential) -> String? {
@@ -1501,8 +1673,13 @@ struct ProviderCredentialView: View {
 
         // For local providers, create a security-scoped bookmark if a path is provided
         var extraFields = storedExtraFields
+        if billingAnchorSignature != loadedBillingAnchorSignature {
+            extraFields[SpendProviderCredentialField.anchorUpdatedAt] = ISO8601DateFormatter().string(from: Date())
+        }
         if let path = resolvedCustomEndpoint,
-           providerID == .gemini || providerID == .claude || providerID == .codexTelemetry || providerID == .chatgpt || providerID == .windsurf || providerID == .grok {
+           providerID == .gemini || providerID == .claude || providerID == .codexTelemetry
+                || providerID == .chatgpt || providerID == .windsurf || providerID == .grok
+                || providerID == .antigravity || providerID == .mistral || providerID == .cerebras {
             let url = URL(fileURLWithPath: path)
             if url.isFileURL {
                 #if os(macOS)
@@ -1530,6 +1707,7 @@ struct ProviderCredentialView: View {
 
         KeychainService.shared.save(credential, for: providerID)
         storedExtraFields = extraFields
+        loadedBillingAnchorSignature = billingAnchorSignature
         cursorSessionImported = providerID == .cursor && (
             storedExtraFields["cursorAuthMode"] == "cookie"
             || (storedExtraFields["cursorCookieHeader"]?.isEmpty == false)
@@ -1538,7 +1716,11 @@ struct ProviderCredentialView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { isSaved = false }
     }
 
-    private func saveCredentialWithExtraFields(_ extraFields: [String: String]) {
+    private func saveCredentialWithExtraFields(_ suppliedExtraFields: [String: String]) {
+        var extraFields = suppliedExtraFields
+        if billingAnchorSignature != loadedBillingAnchorSignature {
+            extraFields[SpendProviderCredentialField.anchorUpdatedAt] = ISO8601DateFormatter().string(from: Date())
+        }
         let resolvedCustomEndpoint = providerID == .claude
             ? (accessToken.isEmpty ? nil : accessToken)
             : (customEndpoint.isEmpty ? nil : customEndpoint)
@@ -1555,6 +1737,7 @@ struct ProviderCredentialView: View {
 
         KeychainService.shared.save(credential, for: providerID)
         storedExtraFields = extraFields
+        loadedBillingAnchorSignature = billingAnchorSignature
         cursorSessionImported = providerID == .cursor && (
             extraFields["cursorAuthMode"] == "cookie"
             || (extraFields["cursorCookieHeader"]?.isEmpty == false)
@@ -1569,11 +1752,16 @@ struct ProviderCredentialView: View {
             return
         }
 
-        accessToken = credential.accessToken ?? ""
-        accountIdentifier = credential.accountIdentifier ?? ""
-        customEndpoint = credential.customEndpoint ?? ""
+        let preservesExistingFields = providerID == .antigravity || providerID == .mistral
+            || providerID == .deepseek || providerID == .cerebras
+        accessToken = credential.accessToken ?? (preservesExistingFields ? accessToken : "")
+        accountIdentifier = credential.accountIdentifier ?? (preservesExistingFields ? accountIdentifier : "")
+        customEndpoint = credential.customEndpoint ?? (preservesExistingFields ? customEndpoint : "")
 
-        var extraFields = credential.extraFields ?? [:]
+        var extraFields = preservesExistingFields ? storedExtraFields : [:]
+        for (key, value) in credential.extraFields ?? [:] {
+            extraFields[key] = value
+        }
         if providerID == .gemini,
            let preservedPreset = storedExtraFields[GeminiLimitPreset.storageKey] {
             extraFields[GeminiLimitPreset.storageKey] = preservedPreset
@@ -1635,6 +1823,7 @@ struct ProviderCredentialView: View {
         customEndpoint = ""
         cursorSessionImported = false
         storedExtraFields = [:]
+        loadedBillingAnchorSignature = ""
     }
 }
 

@@ -19,6 +19,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case gemini
     case kimi
     case grok
+    case antigravity
+    case mistral
+    case deepseek
+    case cerebras
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -45,6 +49,11 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:   return "Gemini"
         case .kimi:     return "Kimi Code"
         case .grok:     return "Grok"
+        case .antigravity:
+            return "Antigravity"
+        case .mistral:  return "Mistral"
+        case .deepseek: return "DeepSeek"
+        case .cerebras: return "Cerebras"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -59,7 +68,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .claude, .windsurf, .cursor, .gemini, .kimi, .grok, .heatmap:
+        case .claude, .windsurf, .cursor, .gemini, .kimi, .grok,
+             .antigravity, .mistral, .deepseek, .cerebras, .heatmap:
             return displayName
         }
     }
@@ -78,6 +88,11 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:   return "sparkles"
         case .kimi:     return "moon.stars.fill"
         case .grok:     return "bolt.fill"
+        case .antigravity:
+            return "a.circle.fill"
+        case .mistral:  return "m.square.fill"
+        case .deepseek: return "d.circle.fill"
+        case .cerebras: return "c.circle.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -96,6 +111,11 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:   return "#4285F4" // Google Blue
         case .kimi:     return "#1CA4FC" // Kimi Blue
         case .grok:     return "#C7CCD4" // Grok Silver — monochrome to match xAI's black/white brand. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
+        case .antigravity:
+            return "#308713"
+        case .mistral:  return "#D44404"
+        case .deepseek: return "#4E6AEE"
+        case .cerebras: return "#BB584A"
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -119,9 +139,17 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:
             return "ProviderGeminiLogo"
         case .kimi:
-            return ""
+            return "ProviderKimiLogo"
         case .grok:
             return "ProviderGrokLogo"
+        case .antigravity:
+            return "ProviderAntigravityLogo"
+        case .mistral:
+            return "ProviderMistralLogo"
+        case .deepseek:
+            return "ProviderDeepSeekLogo"
+        case .cerebras:
+            return "ProviderCerebrasLogo"
         case .heatmap:
             return ""
         }
@@ -131,7 +159,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .chatgpt, .codexTelemetry:
             return .prototype
-        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi, .grok:
+        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi,
+             .grok, .antigravity, .mistral, .deepseek, .cerebras:
             return .session
         case .heatmap:
             return .session
@@ -160,6 +189,14 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Kimi Code API or CLI session"
         case .grok:
             return "Grok CLI weekly quota"
+        case .antigravity:
+            return "Antigravity CLI Gemini quota"
+        case .mistral:
+            return "Mistral Vibe usage and allowance"
+        case .deepseek:
+            return "DeepSeek API credit balance and top-ups"
+        case .cerebras:
+            return "Cerebras usage import"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -187,6 +224,14 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Uses a Kimi Code Console API key or an explicitly imported Kimi CLI OAuth file to read weekly and rolling 5-hour quota."
         case .grok:
             return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
+        case .antigravity:
+            return "Reads an explicitly granted Antigravity CLI session and requests the official Gemini 5-hour and weekly quota summary after an explicit refresh."
+        case .mistral:
+            return "Reads only Vibe session metadata under `~/.vibe` for local token cost. A manual billing anchor or Enterprise Admin API key can add the monthly allowance."
+        case .deepseek:
+            return "Uses the official DeepSeek balance API for current credits. An optional cumulative top-up total derives a credit-used meter, while observed balance decreases remain a separate monthly estimate."
+        case .cerebras:
+            return "Imports an official Cerebras Analytics CSV or a manual balance anchor. Optional local telemetry is displayed as an API-price estimate."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -214,6 +259,14 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Kimi Code API key"
         case .grok:
             return "Grok CLI data folder"
+        case .antigravity:
+            return "Antigravity CLI data folder"
+        case .mistral:
+            return "Mistral Admin API key (optional)"
+        case .deepseek:
+            return "DeepSeek API key"
+        case .cerebras:
+            return "Cerebras Analytics CSV or data folder"
         case .heatmap:
             return ""
         }
@@ -223,8 +276,13 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .claude:
             return "OAuth token (optional)"
-        case .chatgpt, .gemini, .kimi, .grok, .codexTelemetry, .heatmap:
+        case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
+             .codexTelemetry, .heatmap:
             return nil
+        case .mistral:
+            return "Monthly allowance (optional)"
+        case .cerebras:
+            return "Purchased credits (optional)"
         case .openaiAPI:
             return "Project ID"
         case .openai:
@@ -258,6 +316,14 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Use only a Kimi Code Console API key you intentionally enter, or a Kimi CLI OAuth file you explicitly import."
         case .grok:
             return "Runs only the local Grok CLI `/usage` command against the `~/.grok` folder you grant. No prompts are sent and no xAI credentials are extracted."
+        case .antigravity:
+            return "Reads only the official CLI OAuth session file from the folder you grant, then requests quota summary after a user refresh. It does not send model prompts or read browser data."
+        case .mistral:
+            return "Reads only Vibe `meta.json` usage fields from a folder you grant. Admin keys and manual billing anchors are stored in Keychain."
+        case .deepseek:
+            return "Uses only the DeepSeek API key you enter to request the documented balance endpoint."
+        case .cerebras:
+            return "Reads only the Cerebras CSV or folder you explicitly select. It does not inspect browser sessions or private web APIs."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -329,15 +395,20 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.anysphere.cursor", applicationNames: ["Cursor.app"])
             ]
         case .kimi:
-            return [
-                AppIconCandidate(bundleIdentifier: "com.moonshot.kimichat", applicationNames: ["Kimi.app"])
-            ]
+            // Kimi 3.x ships a textured app icon whose fine detail aliases into
+            // a corrupted-looking block at dashboard sizes. Use the bundled,
+            // small-size official mark instead.
+            return []
         case .grok:
             return [
                 AppIconCandidate(bundleIdentifier: "ai.x.grok", applicationNames: ["Grok.app"]),
                 AppIconCandidate(bundleIdentifier: "com.x.grok", applicationNames: ["Grok.app"])
             ]
-        case .gemini, .codexTelemetry, .heatmap:
+        case .antigravity:
+            return [
+                AppIconCandidate(bundleIdentifier: "com.google.antigravity", applicationNames: ["Antigravity.app"])
+            ]
+        case .gemini, .mistral, .deepseek, .cerebras, .codexTelemetry, .heatmap:
             return []
         }
     }
@@ -461,34 +532,62 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
             return "requests"
         case "usd", "$":
             return "$"
+        case "gbp", "£":
+            return "£"
+        case "eur", "€":
+            return "€"
         default:
             return unit
         }
     }
 
+    public var isCurrencyMetric: Bool {
+        let normalized = unit.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ["$", "£", "€"].contains(normalized) { return true }
+        return Locale.commonISOCurrencyCodes.contains(normalized.uppercased())
+    }
+
     public var measurementSummary: String {
         if let resetDate, resetDate < Date() {
             if let total {
+                if isCurrencyMetric {
+                    return "\(formattedMetricValue(0, unit: unit)) of \(formattedMetricValue(total, unit: unit))"
+                }
                 return "0 / \(total.compactString) \(displayUnit)"
             }
             return formattedMetricValue(0, unit: unit)
         }
 
-        let usedText = used.compactString
         if let total {
-            return "\(usedText) / \(total.compactString) \(displayUnit)"
+            if isCurrencyMetric {
+                return "\(formattedMetricValue(used, unit: unit)) of \(formattedMetricValue(total, unit: unit))"
+            }
+            return "\(used.compactString) / \(total.compactString) \(displayUnit)"
+        }
+        if let subtitle = subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !subtitle.isEmpty {
+            return subtitle
         }
         return formattedMetricValue(used, unit: unit)
     }
 
     public var leadingValueText: String {
         if let resetDate, resetDate < Date() {
+            if isCurrencyMetric { return formattedMetricValue(0, unit: unit) }
             return hasExplicitLimit ? "0%" : formattedMetricValue(0, unit: unit)
         }
+        if isCurrencyMetric { return formattedMetricValue(used, unit: unit) }
         return hasExplicitLimit ? "\(percentageUsed)%" : formattedMetricValue(used, unit: unit)
     }
 
-    public init(
+    public func leadingValueText(for providerID: ProviderID?) -> String {
+        guard providerID == .mistral, isCurrencyMetric else { return leadingValueText }
+        if let resetDate, resetDate < Date() {
+            return formattedMetricValue(0, unit: unit)
+        }
+        return formattedMetricValue(used, unit: unit, maximumFractionDigits: 4)
+    }
+
+    public nonisolated init(
         id: UUID = UUID(),
         label: String,
         windowKind: QuotaWindowKind,
@@ -721,6 +820,7 @@ public enum UsageAnalyticsSource: String, Codable, Hashable {
     case officialAPI
     case localEstimate
     case localTelemetry
+    case manualAnchor
 }
 
 public struct UsageAnalyticsBucket: Codable, Identifiable, Equatable, Hashable {
@@ -1284,6 +1384,14 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             return "Membership Metadata"
         }
 
+        if providerID == .mistral {
+            return "Spend & Local Usage"
+        }
+
+        if providerID == .deepseek || providerID == .cerebras {
+            return "Local Spend Estimate"
+        }
+
         return "Periodic Usage"
     }
 
@@ -1292,6 +1400,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         if providerID == .openai { return "Credits / Balance" }
         if providerID == .openaiAPI { return "API Costs" }
         if providerID == .kimi { return "Membership Quota" }
+        if providerID == .deepseek || providerID == .cerebras { return "Credit Balance" }
         return "Extra Balance / Credits"
     }
 
@@ -1522,7 +1631,11 @@ public extension Double {
     }
 }
 
-public func formattedMetricValue(_ value: Double, unit: String) -> String {
+public func formattedMetricValue(
+    _ value: Double,
+    unit: String,
+    maximumFractionDigits: Int = 2
+) -> String {
     let unitLower = unit.lowercased()
     switch unitLower {
     case "tokens", "tok":
@@ -1530,7 +1643,11 @@ public func formattedMetricValue(_ value: Double, unit: String) -> String {
     case "requests", "req":
         return "\(value.compactString) reqs"
     case "usd", "$":
-        return "$\(String(format: "%.2f", value))"
+        return "$\(adaptiveCurrencyNumber(value, maximumFractionDigits: maximumFractionDigits))"
+    case "gbp", "£":
+        return "£\(adaptiveCurrencyNumber(value, maximumFractionDigits: maximumFractionDigits))"
+    case "eur", "€":
+        return "€\(adaptiveCurrencyNumber(value, maximumFractionDigits: maximumFractionDigits))"
     case "msg", "msgs":
         return "\(value.compactString) msgs"
     case "hrs":
@@ -1540,6 +1657,32 @@ public func formattedMetricValue(_ value: Double, unit: String) -> String {
     case "":
         return value.compactString
     default:
+        if Locale.commonISOCurrencyCodes.contains(unit.uppercased()) {
+            return "\(adaptiveCurrencyNumber(value, maximumFractionDigits: maximumFractionDigits)) \(unit.uppercased())"
+        }
         return "\(value.compactString) \(unit)"
     }
+}
+
+private func adaptiveCurrencyNumber(
+    _ value: Double,
+    maximumFractionDigits: Int
+) -> String {
+    let maximumDigits = min(max(maximumFractionDigits, 2), 6)
+    guard maximumDigits > 2 else { return String(format: "%.2f", value) }
+
+    let tolerance = 0.5 * pow(10, -Double(maximumDigits))
+    let roundedToCents = (value * 100).rounded() / 100
+    guard abs(value - roundedToCents) >= tolerance else {
+        return String(format: "%.2f", value)
+    }
+
+    for digits in 3...maximumDigits {
+        let scale = pow(10, Double(digits))
+        let rounded = (value * scale).rounded() / scale
+        if abs(value - rounded) < tolerance {
+            return String(format: "%.*f", digits, value)
+        }
+    }
+    return String(format: "%.*f", maximumDigits, value)
 }

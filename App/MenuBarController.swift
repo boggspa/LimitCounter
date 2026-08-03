@@ -259,7 +259,7 @@ private struct MenuBarPopoverView: View {
     private var footerActions: some View {
         HStack(spacing: 8) {
             Button {
-                Task { await appState.refresh() }
+                Task { await appState.refresh(userInitiated: true) }
             } label: {
                 Label("Refresh", systemImage: appState.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
             }

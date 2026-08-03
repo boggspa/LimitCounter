@@ -597,7 +597,11 @@ public final class ProviderCardOrderStore: ObservableObject {
         .cursor,
         .gemini,
         .kimi,
-        .grok
+        .antigravity,
+        .grok,
+        .mistral,
+        .deepseek,
+        .cerebras
     ]
 }
 
