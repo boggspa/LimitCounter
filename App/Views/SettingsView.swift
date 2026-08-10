@@ -926,7 +926,7 @@ struct ProviderCredentialView: View {
 
     private var usesLocalPathAsPrimaryCredential: Bool {
         switch providerID {
-        case .codexTelemetry, .chatgpt, .gemini, .grok, .antigravity, .cerebras:
+        case .codexTelemetry, .chatgpt, .gemini, .grok, .antigravity, .cerebras, .meta:
             return true
         default:
             return false
@@ -941,6 +941,8 @@ struct ProviderCredentialView: View {
             return "Grant Antigravity CLI Session Access"
         case .mistral:
             return "Grant Vibe Metadata Access"
+        case .meta:
+            return "Grant Muse Data Access"
         case .cerebras:
             return "Import Analytics Report"
         default:
@@ -958,6 +960,8 @@ struct ProviderCredentialView: View {
             return "Select Antigravity data folder..."
         case .mistral:
             return "Select ~/.vibe..."
+        case .meta:
+            return "Select ~/.local/share/muse..."
         case .cerebras:
             return "Select Cerebras CSV..."
         default:
@@ -972,9 +976,11 @@ struct ProviderCredentialView: View {
         case .kimi:
             return "Select the folder in the macOS picker so Limit Counter receives persistent read/write access for Kimi's rotating OAuth session."
         case .antigravity:
-            return "Grant read-only access to `~/.gemini/antigravity-cli`. Limit Counter requests only the Gemini quota summary after an explicit refresh."
+            return "Grant read-only access to `~/.gemini/antigravity-cli`. Limit Counter requests the Gemini quota summary on a 4→7→16→3→21 minute loop (or immediately on manual refresh)."
         case .mistral:
-            return "Grant access to `~/.vibe`. Limit Counter reads session `meta.json` usage totals only, never message content."
+            return "Grant access to `~/.vibe`. Limit Counter estimates Vibe spend TaskWraith-style from `meta.json` plus character lengths in `messages.jsonl` (content is not stored)."
+        case .meta:
+            return "Grant access to `~/.local/share/muse`. Limit Counter projects spend from Muse `session.jsonl` tokens × catalog rates. Meta has no balance API."
         case .cerebras:
             return "Import a report downloaded from Cerebras Console Analytics. The latest CSV in a selected folder is used."
         default:
@@ -1169,7 +1175,8 @@ struct ProviderCredentialView: View {
                 .padding(.horizontal, 12)
                 .listRowBackground(Color.white.opacity(0.04))
 
-                if providerID == .mistral || providerID == .deepseek || providerID == .cerebras {
+                if providerID == .mistral || providerID == .deepseek || providerID == .cerebras
+                    || providerID == .meta {
                     billingAnchorSection
                 }
 
@@ -1231,7 +1238,7 @@ struct ProviderCredentialView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .antigravity {
-                        Text("After granting access, use the dashboard refresh button to read the official CLI session and request Gemini 5-hour and weekly quota. Background refreshes reuse the last reading and never send model prompts.")
+                        Text("After granting access, Limit Counter reads the official CLI session and requests Gemini 5-hour and weekly quota on a looping cadence: 4m → 7m → 16m → 3m → 21m. Manual refresh always fetches immediately. Background refreshes never send model prompts.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1241,6 +1248,11 @@ struct ProviderCredentialView: View {
                         #if os(iOS)
                             .textInputAutocapitalization(.never)
                         #endif
+                        Text(providerID.securityNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .meta {
                         Text(providerID.securityNote)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -1325,7 +1337,7 @@ struct ProviderCredentialView: View {
         Section("Billing Anchor") {
             if providerID == .mistral {
                 TextField(
-                    "Console spend to date",
+                    "Vibe spend to date",
                     text: extraFieldBinding(SpendProviderCredentialField.manualSpent)
                 )
                 TextField(
@@ -1340,7 +1352,40 @@ struct ProviderCredentialView: View {
                     "Plan name (optional)",
                     text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
                 )
-                Text("Monthly allowance is the optional field above. New local Vibe cost is added after the anchor; EUR and GBP deltas use the same advisory FX conversion as TaskWraith.")
+                Text("The optional budget above is the Vibe Code budget, not Mistral's shared Included monthly usage bar. Leave spend blank for automatic TaskWraith-style local estimates, or enter a current Vibe reading; estimated local cost is added only after that reading.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if providerID == .meta {
+                TextField(
+                    "Meta console spend to date",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualSpent)
+                )
+                TextField(
+                    "Preload credit",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualTopUpTotal)
+                )
+                TextField(
+                    "Remaining balance",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrentBalance)
+                )
+                TextField(
+                    "Payment threshold (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualPaymentThreshold)
+                )
+                TextField(
+                    "Currency (USD, GBP, EUR)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "USD")
+                )
+                TextField(
+                    "Billing reset (ISO date, optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualResetAt)
+                )
+                TextField(
+                    "Plan name (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
+                )
+                Text("Console spend is optional. If unset, Limit Counter uses threshold−remaining when both are set, otherwise Muse-only from £0/$0. GBP/EUR remaining auto-decrements using Muse USD×FX. Enter the console Spend reading for best Mistral-style parity. Payment threshold is the £15 / $15 auto-pay ceiling; preload minus remaining is credit used.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1405,6 +1450,12 @@ struct ProviderCredentialView: View {
             ].joined(separator: "|")
         case .deepseek:
             return storedExtraFields[SpendProviderCredentialField.manualTopUpTotal] ?? ""
+        case .meta:
+            return [
+                storedExtraFields[SpendProviderCredentialField.manualSpent] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualCurrency] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualResetAt] ?? ""
+            ].joined(separator: "|")
         default:
             return ""
         }
@@ -1510,7 +1561,8 @@ struct ProviderCredentialView: View {
 
     private func importDetectedCredential(_ detected: CredentialImportService.DetectedCredential) {
         if detected.providerID == .kimi || detected.providerID == .antigravity
-            || detected.providerID == .mistral || detected.providerID == .cerebras {
+            || detected.providerID == .mistral || detected.providerID == .cerebras
+            || detected.providerID == .meta {
             // Auto-detection can suggest the path, but only NSOpenPanel can
             // issue a persistent sandbox grant for this folder.
             importFromFile()
@@ -1679,7 +1731,8 @@ struct ProviderCredentialView: View {
         if let path = resolvedCustomEndpoint,
            providerID == .gemini || providerID == .claude || providerID == .codexTelemetry
                 || providerID == .chatgpt || providerID == .windsurf || providerID == .grok
-                || providerID == .antigravity || providerID == .mistral || providerID == .cerebras {
+                || providerID == .antigravity || providerID == .mistral || providerID == .cerebras
+                || providerID == .meta {
             let url = URL(fileURLWithPath: path)
             if url.isFileURL {
                 #if os(macOS)
@@ -1753,7 +1806,7 @@ struct ProviderCredentialView: View {
         }
 
         let preservesExistingFields = providerID == .antigravity || providerID == .mistral
-            || providerID == .deepseek || providerID == .cerebras
+            || providerID == .deepseek || providerID == .cerebras || providerID == .meta
         accessToken = credential.accessToken ?? (preservesExistingFields ? accessToken : "")
         accountIdentifier = credential.accountIdentifier ?? (preservesExistingFields ? accountIdentifier : "")
         customEndpoint = credential.customEndpoint ?? (preservesExistingFields ? customEndpoint : "")

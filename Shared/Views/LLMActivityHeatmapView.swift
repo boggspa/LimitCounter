@@ -207,6 +207,7 @@ public struct LLMActivityHeatmapView: View {
         if model.contains("cursor") { return .cursor }
         if model.contains("windsurf") { return .windsurf }
         if model.contains("grok") { return .grok }
+        if model.contains("muse") || model.hasPrefix("meta") { return .meta }
         return nil
     }
 

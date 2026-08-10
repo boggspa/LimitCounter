@@ -1549,9 +1549,9 @@ public protocol ProviderClient {
     func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot
 }
 
-/// Providers whose collection action has side effects, such as launching an
-/// authenticated CLI session, receive the refresh origin explicitly. Normal
-/// dashboard timers must use the cache-only path.
+/// Providers that distinguish manual vs timer-driven refreshes. Callers pass
+/// `userInitiated` so the client can apply its own cadence (for example
+/// Antigravity's looping quota poll) while still serving cache between polls.
 public protocol UserInitiatedProviderClient: ProviderClient {
     func fetchSnapshot(
         credentials: ProviderCredential?,
@@ -2768,7 +2768,21 @@ public enum CredentialImportService {
             detected.append(DetectedCredential(
                 providerID: .mistral,
                 fileURL: mistralRoot,
-                description: "Mistral Vibe usage metadata"
+                description: "Mistral Vibe usage estimates"
+            ))
+        }
+
+        let museRoot = home
+            .appendingPathComponent(".local", isDirectory: true)
+            .appendingPathComponent("share", isDirectory: true)
+            .appendingPathComponent("muse", isDirectory: true)
+        if FileManager.default.fileExists(
+            atPath: museRoot.appendingPathComponent("sessions", isDirectory: true).path
+        ) {
+            detected.append(DetectedCredential(
+                providerID: .meta,
+                fileURL: museRoot,
+                description: "Meta Muse session usage"
             ))
         }
 
@@ -2959,6 +2973,34 @@ public enum CredentialImportService {
                 accountIdentifier: nil,
                 customEndpoint: url.path,
                 extraFields: ["mistralSource": "vibeMetadata"],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
+            )
+        }
+
+        if providerID == .meta, selectedIsDirectory {
+            let museRoot: URL
+            switch url.lastPathComponent {
+            case "sessions":
+                museRoot = url.deletingLastPathComponent()
+            case "muse":
+                museRoot = url
+            default:
+                museRoot = url
+            }
+            let sessionsURL = url.lastPathComponent == "sessions"
+                ? url
+                : museRoot.appendingPathComponent("sessions", isDirectory: true)
+            guard FileManager.default.fileExists(atPath: sessionsURL.path) else {
+                throw ImportError.missingRequiredField("sessions")
+            }
+            // Bookmark the Powerbox-selected URL (often `sessions`), not only the parent
+            // muse root — sandbox grants apply to the selection. customEndpoint stays
+            // museRoot.path for display / normalized data-home resolution.
+            return ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: museRoot.path,
+                extraFields: ["metaSource": "museDataHome"],
                 bookmarkData: makeSecurityScopedBookmarkData(for: url)
             )
         }
@@ -3189,7 +3231,7 @@ public enum CredentialImportService {
                 throw ImportError.missingRequiredField("api_key")
             }
             return ImportedCredential(accessToken: token, accountIdentifier: nil)
-        case .grok, .antigravity, .cerebras, .heatmap:
+        case .grok, .antigravity, .cerebras, .meta, .heatmap:
             throw ImportError.unsupportedProvider
         }
     }
@@ -3497,9 +3539,11 @@ public extension CredentialImportService {
                 case .grok:
                     return "Select your ~/.grok folder so Limit Counter can run /usage locally."
                 case .antigravity:
-                    return "Select ~/.gemini/antigravity-cli. Limit Counter reads the official CLI session and requests only Gemini quota summary after an explicit refresh."
+                    return "Select ~/.gemini/antigravity-cli. Limit Counter reads the official CLI session and requests Gemini quota summary on a 4→7→16→3→21 minute loop (manual refresh is immediate)."
                 case .mistral:
-                    return "Select ~/.vibe so Limit Counter can read Vibe session usage metadata."
+                    return "Select ~/.vibe so Limit Counter can estimate Vibe spend from session metadata and message lengths."
+                case .meta:
+                    return "Select ~/.local/share/muse so Limit Counter can project Muse session spend."
                 case .cerebras:
                     return "Select a Cerebras Analytics CSV or a folder containing exported CSV reports."
                 default:
@@ -3507,7 +3551,8 @@ public extension CredentialImportService {
                 }
             }()
             panel.prompt = "Import"
-            if providerID == .kimi || providerID == .mistral || providerID == .antigravity {
+            if providerID == .kimi || providerID == .mistral || providerID == .antigravity
+                || providerID == .meta {
                 panel.allowedContentTypes = [.folder]
             } else if providerID == .cerebras {
                 panel.allowedContentTypes = [.folder, .commaSeparatedText, .plainText, .data]
@@ -3522,10 +3567,11 @@ public extension CredentialImportService {
             panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude
                 || providerID == .chatgpt || providerID == .cursor || providerID == .gemini
                 || providerID == .kimi || providerID == .grok || providerID == .antigravity
-                || providerID == .mistral || providerID == .cerebras
+                || providerID == .mistral || providerID == .cerebras || providerID == .meta
             panel.canChooseFiles = providerID != .kimi
                 && providerID != .mistral
                 && providerID != .antigravity
+                && providerID != .meta
 
             // Suggest starting directory based on provider
             let home = FileManager.default.homeDirectoryForCurrentUser
@@ -3563,6 +3609,19 @@ public extension CredentialImportService {
                 panel.prompt = "Grant Access"
             case .mistral:
                 panel.directoryURL = home.appendingPathComponent(".vibe")
+                panel.prompt = "Grant Access"
+            case .meta:
+                // Prefer the real user home over a sandboxed container home so the
+                // panel opens on ~/.local/share/muse when that path exists.
+                let homePath = NSHomeDirectory()
+                let realHome: String
+                if let range = homePath.range(of: "/Library/Containers/") {
+                    realHome = String(homePath[..<range.lowerBound])
+                } else {
+                    realHome = homePath
+                }
+                panel.directoryURL = URL(fileURLWithPath: realHome, isDirectory: true)
+                    .appendingPathComponent(".local/share/muse", isDirectory: true)
                 panel.prompt = "Grant Access"
             case .deepseek:
                 panel.directoryURL = home

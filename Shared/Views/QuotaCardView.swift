@@ -66,7 +66,7 @@ public struct ProviderBrandIconView: View {
     }
 
     private var usesLeadingBrandMark: Bool {
-        providerID == .deepseek || providerID == .cerebras
+        providerID == .deepseek || providerID == .cerebras || providerID == .meta
     }
 
     private var leadingBrandMarkHeight: CGFloat {
@@ -74,7 +74,14 @@ public struct ProviderBrandIconView: View {
     }
 
     private var leadingBrandImageAspectRatio: CGFloat {
-        providerID == .deepseek ? 1_024 / 217 : 2_403 / 1_058
+        switch providerID {
+        case .deepseek:
+            return 1_024 / 217
+        case .meta:
+            return 512 / 128
+        default:
+            return 2_403 / 1_058
+        }
     }
 
     private var icon: Image {

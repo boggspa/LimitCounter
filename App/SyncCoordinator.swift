@@ -156,6 +156,7 @@ final class SyncCoordinator {
             || client is AntigravityProviderClient
             || client is MistralProviderClient
             || client is CerebrasProviderClient
+            || client is MetaProviderClient
         guard credential != nil || client is MockProviderClient || canAutoDiscover else {
             print("[SyncCoordinator] No credentials for \(providerID.rawValue), skipping")
             if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
@@ -310,7 +311,7 @@ final class SyncCoordinator {
             // refresh, and token-race failures must not erase the last good
             // quota snapshot while the user repairs or retries the session.
             shouldPreserve = true
-        case .antigravity, .mistral, .deepseek, .cerebras:
+        case .antigravity, .mistral, .deepseek, .cerebras, .meta:
             // Local probes, imported reports, and billing APIs can all miss a
             // refresh transiently. Keep the last truthful reading visible.
             shouldPreserve = true
@@ -374,7 +375,7 @@ final class SyncCoordinator {
         case .claude, .chatgpt, .gemini:
             return 15
         case .openai, .openaiAPI, .windsurf, .cursor, .kimi, .grok,
-             .mistral, .deepseek, .cerebras:
+             .mistral, .deepseek, .cerebras, .meta:
             return 20
         case .antigravity:
             return 20

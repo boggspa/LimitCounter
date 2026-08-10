@@ -1057,6 +1057,7 @@ private struct ActivityHeatmapGrid: View {
         if model.contains("kimi") { return .kimi }
         if model.contains("cursor") { return .cursor }
         if model.contains("windsurf") { return .windsurf }
+        if model.contains("muse") || model.hasPrefix("meta") { return .meta }
         return nil
     }
 

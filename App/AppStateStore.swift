@@ -114,6 +114,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(MistralProviderClient())
         coordinator.register(DeepSeekProviderClient())
         coordinator.register(CerebrasProviderClient())
+        coordinator.register(MetaProviderClient())
         #endif
 
         self.syncCoordinator = coordinator

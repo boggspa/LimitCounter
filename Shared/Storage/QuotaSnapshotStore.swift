@@ -601,7 +601,8 @@ public final class ProviderCardOrderStore: ObservableObject {
         .grok,
         .mistral,
         .deepseek,
-        .cerebras
+        .cerebras,
+        .meta
     ]
 }
 
