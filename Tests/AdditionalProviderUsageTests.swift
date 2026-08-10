@@ -145,7 +145,97 @@ private func testAntigravityImportAcceptsOfficialCLIDataFolder() throws {
     }
 }
 
-private func testMistralReadsOnlySessionMetadataTotals() throws {
+private func testAntigravityRefreshCadenceLoopsFourSevenSixteenThreeTwentyOne() throws {
+    try expectEqual(AntigravityRefreshCadence.intervalsMinutes, [4, 7, 16, 3, 21], "Antigravity cadence minutes")
+    try expectClose(AntigravityRefreshCadence.interval(at: 0), 4 * 60, "Antigravity step 1")
+    try expectClose(AntigravityRefreshCadence.interval(at: 1), 7 * 60, "Antigravity step 2")
+    try expectClose(AntigravityRefreshCadence.interval(at: 2), 16 * 60, "Antigravity step 3")
+    try expectClose(AntigravityRefreshCadence.interval(at: 3), 3 * 60, "Antigravity step 4")
+    try expectClose(AntigravityRefreshCadence.interval(at: 4), 21 * 60, "Antigravity step 5")
+    try expectEqual(AntigravityRefreshCadence.nextIndex(after: 4), 0, "Antigravity cadence loops")
+
+    let start = date("2026-08-10T12:00:00Z")
+    try expect(
+        AntigravityRefreshCadence.isDue(
+            now: start,
+            cadenceIndex: 0,
+            fetchedAt: nil,
+            lastAttemptAt: nil
+        ),
+        "Antigravity first autonomous refresh is due immediately"
+    )
+    try expect(
+        !AntigravityRefreshCadence.isDue(
+            now: start.addingTimeInterval(3 * 60),
+            cadenceIndex: 0,
+            fetchedAt: start,
+            lastAttemptAt: start
+        ),
+        "Antigravity step 1 waits the full 4 minutes"
+    )
+    try expect(
+        AntigravityRefreshCadence.isDue(
+            now: start.addingTimeInterval(4 * 60),
+            cadenceIndex: 0,
+            fetchedAt: start,
+            lastAttemptAt: start
+        ),
+        "Antigravity step 1 becomes due at 4 minutes"
+    )
+    try expect(
+        !AntigravityRefreshCadence.isDue(
+            now: start.addingTimeInterval(15 * 60),
+            cadenceIndex: 2,
+            fetchedAt: start,
+            lastAttemptAt: start
+        ),
+        "Antigravity step 3 still waits until 16 minutes"
+    )
+    try expect(
+        AntigravityRefreshCadence.isDue(
+            now: start.addingTimeInterval(16 * 60),
+            cadenceIndex: 2,
+            fetchedAt: start,
+            lastAttemptAt: start
+        ),
+        "Antigravity step 3 becomes due at 16 minutes"
+    )
+}
+
+private func testMistralCatalogueRatesAndCharsEstimate() throws {
+    try expectClose(MistralModelRate.lookup("mistral-medium-3.5").inputUsdPerMillion, 1.5, "medium input")
+    try expectClose(MistralModelRate.lookup("mistral-medium-3.5").outputUsdPerMillion, 7.5, "medium output")
+    try expectClose(MistralModelRate.lookup("devstral-small").inputUsdPerMillion, 0.1, "devstral input")
+    try expectClose(MistralModelRate.lookup("devstral-small").outputUsdPerMillion, 0.3, "devstral output")
+    try expectClose(MistralModelRate.lookup("mistral-vibe-cli-latest").inputUsdPerMillion, 1.5, "vibe-cli alias")
+    try expectClose(MistralModelRate.lookup("devstral-small-latest").inputUsdPerMillion, 0.1, "devstral-latest alias")
+    try expectClose(MistralModelRate.lookup("mistral-large").inputUsdPerMillion, 1.5, "unknown → medium")
+    try expectClose(MistralModelRate.lookup(nil).outputUsdPerMillion, 7.5, "nil → medium")
+
+    try expectEqual(MistralTokenEstimate.estimateTokensFromChars(0), 0, "zero chars")
+    try expectEqual(MistralTokenEstimate.estimateTokensFromChars(1), 1, "1 char")
+    try expectEqual(MistralTokenEstimate.estimateTokensFromChars(4), 1, "4 chars")
+    try expectEqual(MistralTokenEstimate.estimateTokensFromChars(5), 2, "5 chars")
+    try expectEqual(MistralTokenEstimate.estimateTokensFromChars(40_000), 10_000, "AGBench prompt chars")
+
+    let medium = MistralTokenEstimate.estimateUsage(
+        model: "mistral-medium-3.5",
+        promptChars: 40_000,
+        responseChars: 20_000
+    )
+    try expectEqual(medium.inputTokens, 10_000, "medium input tokens")
+    try expectEqual(medium.outputTokens, 5_000, "medium output tokens")
+    try expectClose(medium.costUSD, 0.0525, "medium chars cost")
+
+    let cheap = MistralTokenEstimate.estimateUsage(
+        model: "devstral-small",
+        promptChars: 40_000,
+        responseChars: 20_000
+    )
+    try expectClose(cheap.costUSD, 0.0025, "devstral chars cost")
+}
+
+private func testMistralLocalCostUsesTaskWraithEstimateDoctrine() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("limit-counter-mistral-tests-\(UUID().uuidString)", isDirectory: true)
     let session = root.appendingPathComponent("logs/session/example", isDirectory: true)
@@ -159,9 +249,9 @@ private func testMistralReadsOnlySessionMetadataTotals() throws {
       "stats": {
         "session_prompt_tokens": 30773,
         "session_completion_tokens": 1023,
-        "input_price_per_million": 1.5,
-        "output_price_per_million": 7.5,
-        "session_cost": 0.053832
+        "input_price_per_million": 0.01,
+        "output_price_per_million": 0.01,
+        "session_cost": 9.99
       }
     }
     """
@@ -171,7 +261,9 @@ private func testMistralReadsOnlySessionMetadataTotals() throws {
         rootURL: root,
         now: date("2026-08-01T12:00:00Z")
     ) ?? { throw AdditionalProviderTestError.failure("Mistral metadata did not parse") }()
-    try expectClose(summary.currentMonthCostUSD, 0.053832, "Mistral current-month cost")
+    // No messages.jsonl → catalogue × session tokens (unknown model → medium).
+    // session_cost 9.99 and meta $/M 0.01 must be ignored.
+    try expectClose(summary.currentMonthCostUSD, 0.053832, "Mistral catalogue fallback cost")
     try expectClose(summary.last30DaysCostUSD, 0.053832, "Mistral 30-day cost")
     try expectClose(summary.inputTokens, 30_773, "Mistral input tokens")
     try expectClose(summary.outputTokens, 1_023, "Mistral output tokens")
@@ -185,7 +277,12 @@ private func testMistralReadsOnlySessionMetadataTotals() throws {
         0,
         "Mistral cost before anchor excluded"
     )
-    try expectEqual(summary.analyticsBuckets.first?.source, .localTelemetry, "Mistral source provenance")
+    try expectEqual(summary.analyticsBuckets.first?.source, .localEstimate, "Mistral estimate provenance")
+    try expectEqual(
+        summary.analyticsBuckets.first?.note,
+        "Catalogue × Vibe session tokens",
+        "Mistral fallback note"
+    )
     let timestampFormatter = ISO8601DateFormatter()
     timestampFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     try expectEqual(
@@ -193,6 +290,66 @@ private func testMistralReadsOnlySessionMetadataTotals() throws {
         timestampFormatter.date(from: "2026-08-01T02:15:18.173565+00:00"),
         "Mistral fractional timestamp"
     )
+}
+
+private func testMistralJsonlUniquePayloadCharsEstimate() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-mistral-jsonl-\(UUID().uuidString)", isDirectory: true)
+    let session = root.appendingPathComponent("logs/session/example", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+
+    // 4 input chars (user) → 1 token @ $1.50
+    // 8 output chars (assistant) → 2 tokens @ $7.50
+    // cost = 1/1e6*1.5 + 2/1e6*7.5 = 0.0000165
+    let payload = """
+    {
+      "start_time": "2026-08-01T02:14:53.745363+00:00",
+      "end_time": "2026-08-01T02:15:18.173565+00:00",
+      "config": { "active_model": "mistral-medium-3.5" },
+      "system_prompt": { "role": "system", "content": "SYS!" },
+      "stats": {
+        "session_prompt_tokens": 999999,
+        "session_completion_tokens": 999999,
+        "session_cost": 9.99
+      }
+    }
+    """
+    try Data(payload.utf8).write(to: session.appendingPathComponent("meta.json"))
+    let jsonl = """
+    {"role":"user","content":"USER"}
+    {"role":"assistant","content":"ASSISTOK"}
+    """
+    try Data(jsonl.utf8).write(to: session.appendingPathComponent("messages.jsonl"))
+
+    let summary = try MistralVibeUsageReader.read(
+        rootURL: root,
+        now: date("2026-08-01T12:00:00Z")
+    ) ?? { throw AdditionalProviderTestError.failure("Mistral jsonl estimate did not parse") }()
+    try expectClose(summary.currentMonthCostUSD, 0.0000165, "Mistral unique payload cost")
+    try expectClose(summary.inputTokens, 1, "Mistral estimated input tokens")
+    try expectClose(summary.outputTokens, 2, "Mistral estimated output tokens")
+    try expectEqual(
+        summary.analyticsBuckets.first?.note,
+        "TaskWraith-style chars÷4 × catalogue",
+        "Mistral jsonl estimate note"
+    )
+}
+
+private func testMistralAdminMeterPrefersVibeSpend() throws {
+    let withVibe = """
+    {
+      "currency": "EUR",
+      "usage": {
+        "chat": { "cost": 1.20 },
+        "vibe_usage": { "amount": 0.35 }
+      }
+    }
+    """
+    let parsed = try MistralAdminUsageParser.parse(data: Data(withVibe.utf8))
+        ?? { throw AdditionalProviderTestError.failure("Mistral Admin payload did not parse") }()
+    let adminSpend = parsed.vibeSpend ?? (parsed.totalSpendIsComplete ? parsed.totalSpend : nil)
+    try expectClose(adminSpend ?? -1, 0.35, "Admin meter must prefer vibe_usage over totalSpend")
 }
 
 private func testMistralAdminUsageParserKeepsOfficialCurrency() throws {
@@ -225,6 +382,49 @@ private func testMistralAdminUsageParserMarksOpaqueSharedPoolPartial() throws {
     try expect(!result.totalSpendIsComplete, "Opaque Mistral categories must not become a shared-pool total")
     try expectClose(result.vibeSpend ?? -1, 14, "Mistral direct Vibe usage")
     try expectEqual(result.currency, "billing units", "Missing Mistral currency must not be guessed as USD")
+}
+
+private func testMistralVibeBudgetMigratesLegacySharedPool() throws {
+    let migrated = MistralVibeBudgetResolver.effectiveAllowance(
+        rawAllowance: 25.5,
+        currency: "EUR",
+        planName: "Pro",
+        configuredBudgetUSD: nil
+    )
+    try expectClose(migrated ?? -1, 255, "Mistral Pro Vibe budget migration")
+    try expect(
+        MistralVibeBudgetResolver.shouldDiscardLegacyAnchor(
+            rawAllowance: 25.5,
+            rawSpent: 1.44,
+            currency: "EUR",
+            planName: "Pro"
+        ),
+        "Legacy shared-pool spend must not be added to the Vibe meter"
+    )
+    try expect(
+        !MistralVibeBudgetResolver.shouldDiscardLegacyAnchor(
+            rawAllowance: 25.5,
+            rawSpent: 36.81,
+            currency: "EUR",
+            planName: "Pro"
+        ),
+        "A larger manual Vibe reading must remain authoritative"
+    )
+    try expectClose(
+        MistralVibeBudgetResolver.effectiveAllowance(
+            rawAllowance: 255,
+            currency: "EUR",
+            planName: "Pro",
+            configuredBudgetUSD: nil
+        ) ?? -1,
+        255,
+        "Current Vibe budget must not be migrated again"
+    )
+    try expectClose(
+        MistralVibeBudgetResolver.amountInCurrency(10, currency: "EUR") ?? -1,
+        9.2,
+        "Automatic local Vibe spend currency conversion"
+    )
 }
 
 private func testMistralManualAnchorAccumulatesAcrossMonthAndScanGaps() throws {
@@ -420,6 +620,401 @@ private func testTaskWraithPricingIsProviderScopedAndEstimated() throws {
     try expectEqual(summary.analyticsBuckets.first?.source, .localEstimate, "TaskWraith estimate provenance")
 }
 
+private func museSparkRate() -> MuseModelRate {
+    MuseModelRate.sparkDefault
+}
+
+private func testMuseCostEstimatorMatchesSparkSessionTotals() throws {
+    let rate = museSparkRate()
+    // 16009 * 1.25e-6 + 130 * 4.25e-6 ≈ 0.02056 (catalog Spark rates)
+    let plain = MuseCostEstimator.estimateUSD(
+        input: 16_009,
+        output: 130,
+        cacheRead: 0,
+        rate: rate
+    )
+    try expectClose(Double(plain), 0.02056375, "Muse Spark session cost without cache")
+
+    // Live-session style: omitted / zero cacheCreation must match plain MuseUsage.ts cost.
+    let liveSessionOmitted = MuseCostEstimator.estimateUSD(
+        input: 16_009,
+        output: 130,
+        cacheRead: 0,
+        rate: rate
+    )
+    let liveSessionZero = MuseCostEstimator.estimateUSD(
+        input: 16_009,
+        output: 130,
+        cacheRead: 0,
+        cacheCreation: 0,
+        rate: rate
+    )
+    try expectClose(Double(liveSessionOmitted), Double(plain), "Omitted cacheCreation matches live session cost")
+    try expectClose(Double(liveSessionZero), Double(plain), "Zero cacheCreation matches live session cost")
+
+    let withCache = MuseCostEstimator.estimateUSD(
+        input: 16_009,
+        output: 130,
+        cacheRead: 1_000,
+        rate: rate
+    )
+    // Billable input excludes cache-read: (15009*1.25 + 1000*0.15 + 130*4.25) / 1e6
+    try expectClose(Double(withCache), 0.01946375, "Muse billable input excludes cache-read tokens")
+    try expect(Double(withCache) < Double(plain), "Cache-read pricing must reduce cost vs full input rate")
+
+    // TaskWraith journal path: cacheCreation billed at input rate on top of plain cost.
+    let withCreation = MuseCostEstimator.estimateUSD(
+        input: 16_009,
+        output: 130,
+        cacheRead: 0,
+        cacheCreation: 2_000,
+        rate: rate
+    )
+    try expectClose(Double(withCreation), Double(plain) + 0.0025, "cacheCreation 2000 @ Spark adds 0.0025")
+}
+
+private func testMuseSessionUsageReducerCountsProviderAttributionOnce() throws {
+    let attribution = """
+    {"schema_version":1,"id":"attr-1","stream":{"kind":"session","id":"sess-1"},"sequence":33,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"usage-1","usage_family":"provider","quantity":{"unit":"tokens","reported":true,"input_tokens":16009,"output_tokens":130,"cached_tokens":0,"reasoning_tokens":40}}}}}
+    """
+    let completed = """
+    {"schema_version":1,"id":"done-1","stream":{"kind":"session","id":"sess-1"},"sequence":34,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_completed","usage":{"input_tokens":16009,"output_tokens":130,"cached_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":40},"duration_ms":1745,"model":"muse-spark-1.2"}}}
+    """
+    let duplicateAttribution = """
+    {"schema_version":1,"id":"attr-1-dup","stream":{"kind":"session","id":"sess-1"},"sequence":35,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"usage-1","usage_family":"provider","quantity":{"unit":"tokens","reported":true,"input_tokens":16009,"output_tokens":130,"cached_tokens":0}}}}}
+    """
+    let toolFamily = """
+    {"schema_version":1,"id":"tool-1","stream":{"kind":"session","id":"sess-1"},"sequence":36,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"usage-tool","usage_family":"tool","quantity":{"unit":"tokens","reported":true,"input_tokens":999,"output_tokens":9}}}}}
+    """
+    let unreported = """
+    {"schema_version":1,"id":"est-1","stream":{"kind":"session","id":"sess-1"},"sequence":37,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"usage-est","usage_family":"provider","quantity":{"unit":"tokens","reported":false,"input_tokens":888,"output_tokens":8}}}}}
+    """
+
+    var reducer = MuseSessionUsageReducer(museSessionId: "sess-1", logPath: "/tmp/session.jsonl")
+    reducer.ingestLine(attribution)
+    reducer.ingestLine(completed)
+    let snap = reducer.snapshot(rate: museSparkRate())
+    try expectClose(Double(snap.inputTokens), 16_009, "Muse attribution input tokens")
+    try expectClose(Double(snap.outputTokens), 130, "Muse attribution output tokens")
+    try expectClose(Double(snap.totalTokens), 16_139, "Muse total excludes reasoning")
+    try expect(snap.model == "muse-spark-1.2", "Muse model from model_completed")
+    try expectClose(snap.estimatedCostUSD ?? -1, 0.02056375, "Muse snapshot cost once")
+
+    reducer.ingestLine(duplicateAttribution)
+    reducer.ingestLine(toolFamily)
+    reducer.ingestLine(unreported)
+    let afterNoise = reducer.snapshot(rate: museSparkRate())
+    try expectClose(Double(afterNoise.inputTokens), 16_009, "Duplicate usage_id and ignored families must not double count")
+    try expectClose(Double(afterNoise.outputTokens), 130, "Ignored attribution must not add output")
+    try expectClose(afterNoise.estimatedCostUSD ?? -1, 0.02056375, "Cost stays single-counted")
+}
+
+private func testMetaCreditUsedAndDefaultMonthlyReset() throws {
+    let creditUsed = try DeepSeekTopUpMeter.creditUsed(totalTopUp: 15, currentBalance: 14.95)
+        ?? { throw AdditionalProviderTestError.failure("Meta preload credit used was not derived") }()
+    try expectClose(creditUsed, 0.05, "Meta preload 15 remaining 14.95 → credit used")
+
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+    let midMonth = calendar.date(from: DateComponents(year: 2026, month: 8, day: 10, hour: 15))!
+    let reset = MetaBillingReset.nextResetDate(from: midMonth, calendar: calendar)
+    let parts = calendar.dateComponents([.year, .month, .day], from: reset)
+    try expectEqual(parts.year, 2026, "Meta reset year")
+    try expectEqual(parts.month, 9, "Meta reset lands on next month")
+    try expectEqual(parts.day, 1, "Meta reset lands on day 1")
+}
+
+private func testMetaRemainingWatermarkAdvancesAndResetsOnMonth() throws {
+    let suiteName = "limit-counter-meta-watermark-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let august = date("2026-08-10T12:00:00Z")
+    let september = date("2026-09-02T12:00:00Z")
+
+    let baseline = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.02,
+        currency: "USD",
+        signature: "sig-a",
+        now: august,
+        defaults: defaults
+    )
+    try expectClose(baseline.effectiveRemaining, 15, "Meta remaining baseline leaves anchor intact")
+    try expectClose(baseline.localDecrementUSD, 0, "Meta remaining baseline decrement is zero")
+
+    let advanced = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.05,
+        currency: "USD",
+        signature: "sig-a",
+        now: august,
+        defaults: defaults
+    )
+    try expectClose(advanced.effectiveRemaining, 14.97, "Meta remaining advances with observed spend")
+    try expectClose(advanced.localDecrementUSD, 0.03, "Meta remaining decrement tracks observed delta")
+
+    let regression = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.04,
+        currency: "USD",
+        signature: "sig-a",
+        now: august,
+        defaults: defaults
+    )
+    try expectClose(regression.effectiveRemaining, 14.97, "Meta remaining must not rise when observed regresses")
+    try expectClose(regression.localDecrementUSD, 0.03, "Meta remaining decrement never decreases")
+
+    let nextMonth = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.01,
+        currency: "USD",
+        signature: "sig-a",
+        now: september,
+        defaults: defaults
+    )
+    // Previous accumulated 0.03 + new-month MTD 0.01 = 0.04 (like Mistral month rollover).
+    try expectClose(nextMonth.effectiveRemaining, 14.96, "Meta remaining month rollover preserves accumulated drain")
+    try expectClose(nextMonth.localDecrementUSD, 0.04, "Meta remaining month rollover adds new-month MTD")
+
+    let afterMonthAdvance = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.08,
+        currency: "USD",
+        signature: "sig-a",
+        now: september,
+        defaults: defaults
+    )
+    try expectClose(afterMonthAdvance.effectiveRemaining, 14.89, "Meta remaining re-accumulates in new month")
+    try expectClose(afterMonthAdvance.localDecrementUSD, 0.11, "Meta remaining new-month decrement continues from preserved baseline")
+
+    let missingScan = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: nil,
+        currency: "USD",
+        signature: "sig-a",
+        now: september,
+        defaults: defaults
+    )
+    try expectClose(missingScan.effectiveRemaining, 14.89, "Meta remaining missing scan preserves accumulated decrement")
+    try expectClose(missingScan.localDecrementUSD, 0.11, "Meta remaining missing scan keeps local decrement")
+
+    let rebased = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 12,
+        currentObservedMonthUSD: 0.50,
+        currency: "USD",
+        signature: "sig-b",
+        now: september,
+        defaults: defaults
+    )
+    try expectClose(rebased.effectiveRemaining, 12, "Meta remaining signature change rebases to new anchor")
+    try expectClose(rebased.localDecrementUSD, 0, "Meta remaining signature change clears decrement")
+
+    let unknownCurrency = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 10,
+        currentObservedMonthUSD: 2,
+        currency: "JPY",
+        signature: "sig-jpy",
+        now: september,
+        defaults: defaults
+    )
+    try expectClose(unknownCurrency.effectiveRemaining, 10, "Meta remaining unknown currency skips auto-decrement")
+    try expectClose(unknownCurrency.localDecrementUSD, 0, "Meta remaining unknown currency decrement is zero")
+}
+
+private func testMetaRemainingWatermarkConvertsGBP() throws {
+    let suiteName = "limit-counter-meta-gbp-remaining-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-10T12:00:00Z")
+    let baseline = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.02,
+        currency: "GBP",
+        signature: "gbp-remaining",
+        now: now,
+        defaults: defaults
+    )
+    try expectClose(baseline.effectiveRemaining, 15, "Meta GBP remaining baseline leaves anchor intact")
+    try expectClose(baseline.localDecrementUSD, 0, "Meta GBP remaining baseline decrement is zero")
+
+    let advanced = MetaRemainingWatermarkStore.adjustment(
+        anchoredRemaining: 15,
+        currentObservedMonthUSD: 0.12,
+        currency: "GBP",
+        signature: "gbp-remaining",
+        now: now,
+        defaults: defaults
+    )
+    // USD observed delta 0.10 × 0.79 = 0.079 GBP → remaining 15 → 14.921
+    try expectClose(advanced.localDecrementUSD, 0.079, "Meta GBP remaining converts USD delta via FX")
+    try expectClose(advanced.effectiveRemaining, 14.921, "Meta GBP remaining decrements in billing currency")
+}
+
+private func testMetaSpendWatermarkAccumulatesLikeMistral() throws {
+    let suiteName = "limit-counter-meta-spend-watermark-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let july = date("2026-07-31T12:00:00Z")
+    let august = date("2026-08-01T12:00:00Z")
+
+    try expectClose(
+        MetaSpendWatermarkStore.amountInCurrency(1, currency: "GBP") ?? -1,
+        0.79,
+        "Meta spend GBP conversion"
+    )
+    try expectClose(
+        MetaSpendWatermarkStore.amountInCurrency(1, currency: "EUR") ?? -1,
+        0.92,
+        "Meta spend EUR conversion"
+    )
+    try expectClose(
+        MetaSpendWatermarkStore.amountInCurrency(1, currency: "USD") ?? -1,
+        1,
+        "Meta spend USD conversion"
+    )
+
+    let initial = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: 0.02,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        initialLocalIncrementUSD: 0.02,
+        now: july,
+        defaults: defaults
+    )
+    try expectClose(initial.spend, 0.05 + 0.02 * 0.79, "Meta spend converts console anchor plus local USD")
+    try expectClose(initial.localIncrement, 0.02 * 0.79, "Meta spend GBP increment from recovered local")
+
+    let advanced = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: 0.05,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        now: july,
+        defaults: defaults
+    )
+    // Accumulated 0.02 + delta 0.03 = 0.05 USD × 0.79
+    try expectClose(advanced.spend, 0.05 + 0.05 * 0.79, "Meta spend advances with local Muse USD")
+    try expectClose(advanced.localIncrement, 0.05 * 0.79, "Meta spend GBP increment grows")
+
+    let regression = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: 0.04,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        now: july,
+        defaults: defaults
+    )
+    try expectClose(regression.spend, 0.05 + 0.05 * 0.79, "Meta spend never shrinks on partial scan")
+    try expectClose(regression.localIncrement, 0.05 * 0.79, "Meta spend increment never decreases")
+
+    let recovered = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: 0.05,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        now: july,
+        defaults: defaults
+    )
+    try expectClose(recovered.spend, 0.05 + 0.05 * 0.79, "Meta spend recovered scan must not double count")
+
+    let nextMonth = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: 0.01,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        now: august,
+        defaults: defaults
+    )
+    // Previous accumulated 0.05 + new-month MTD 0.01 = 0.06 USD × 0.79
+    try expectClose(nextMonth.spend, 0.05 + 0.06 * 0.79, "Meta spend month rollover preserves + adds")
+    try expectClose(nextMonth.localIncrement, 0.06 * 0.79, "Meta spend month rollover local increment")
+
+    let missingScan = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0.05,
+        currentLocalSpendUSD: nil,
+        currency: "GBP",
+        signature: "meta-anchor-a",
+        now: august,
+        defaults: defaults
+    )
+    try expectClose(missingScan.spend, 0.05 + 0.06 * 0.79, "Meta spend missing scan preserves accumulated")
+}
+
+private func testMetaSpendWatermarkWithZeroAnchorAccumulatesLocal() throws {
+    let suiteName = "limit-counter-meta-zero-anchor-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-10T12:00:00Z")
+    let seeded = MetaSpendWatermarkStore.adjustment(
+        anchoredSpend: 0,
+        currentLocalSpendUSD: 0.05,
+        currency: "GBP",
+        signature: "zero-anchor",
+        initialLocalIncrementUSD: 0.05,
+        now: now,
+        defaults: defaults
+    )
+    try expectClose(seeded.spend, 0.05 * 0.79, "Meta zero-anchor spend converts local USD to GBP")
+    try expectClose(seeded.localIncrement, 0.05 * 0.79, "Meta zero-anchor local increment in GBP")
+}
+
+private func testTaskWraithMusePricingUsesMuseCostEstimator() throws {
+    let now = date("2026-08-10T12:00:00Z")
+    let timestamp = now.timeIntervalSince1970 * 1_000
+    let payload = """
+    [
+      {
+        "provider": "muse",
+        "model": "muse-spark-1.2",
+        "timestamp": \(timestamp),
+        "inputTokens": 16009,
+        "outputTokens": 130,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0
+      },
+      {
+        "provider": "muse",
+        "model": "muse-spark-1.2",
+        "timestamp": \(timestamp),
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 2000
+      },
+      {
+        "provider": "pi",
+        "model": "deepseek/deepseek-v4-flash",
+        "timestamp": \(timestamp),
+        "inputTokens": 1000000,
+        "outputTokens": 0
+      }
+    ]
+    """
+    let summary = try TaskWraithSpendReader.parse(
+        data: Data(payload.utf8),
+        provider: .meta,
+        now: now
+    ) ?? { throw AdditionalProviderTestError.failure("TaskWraith Muse spend did not parse") }()
+    // Plain Spark session (0.02056375) + cacheCreation 2000 @ 1.25/1e6 (= 0.0025)
+    try expectClose(
+        summary.currentMonthCostUSD,
+        0.02306375,
+        "Meta TaskWraith prices Muse rows including cacheCreation at input rate"
+    )
+    try expectEqual(summary.analyticsBuckets.count, 1, "Meta TaskWraith ignores non-muse providers")
+    try expectEqual(summary.analyticsBuckets.first?.source, .localEstimate, "Muse TaskWraith estimate provenance")
+    try expectEqual(summary.analyticsBuckets.first?.model, "muse-spark-1.2", "Muse TaskWraith model")
+}
+
 private func testCerebrasCSVHandlesQuotedNumbersAndCurrency() throws {
     let payload = """
     Date (UTC),Model,Cost (USD),Input Tokens,Output Tokens,Requests,Currency
@@ -481,12 +1076,25 @@ private enum AdditionalProviderUsageTestRunner {
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
         try testAntigravityParsesOfficialOAuthEnvelope()
         try testAntigravityImportAcceptsOfficialCLIDataFolder()
-        try testMistralReadsOnlySessionMetadataTotals()
+        try testAntigravityRefreshCadenceLoopsFourSevenSixteenThreeTwentyOne()
+        try testMistralCatalogueRatesAndCharsEstimate()
+        try testMistralLocalCostUsesTaskWraithEstimateDoctrine()
+        try testMistralJsonlUniquePayloadCharsEstimate()
+        try testMistralAdminMeterPrefersVibeSpend()
         try testMistralAdminUsageParserKeepsOfficialCurrency()
         try testMistralAdminUsageParserMarksOpaqueSharedPoolPartial()
+        try testMistralVibeBudgetMigratesLegacySharedPool()
         try testMistralManualAnchorAccumulatesAcrossMonthAndScanGaps()
         try testDeepSeekBalanceAndObservedSpendSemantics()
         try testTaskWraithPricingIsProviderScopedAndEstimated()
+        try testMuseCostEstimatorMatchesSparkSessionTotals()
+        try testMuseSessionUsageReducerCountsProviderAttributionOnce()
+        try testMetaCreditUsedAndDefaultMonthlyReset()
+        try testMetaRemainingWatermarkAdvancesAndResetsOnMonth()
+        try testMetaRemainingWatermarkConvertsGBP()
+        try testMetaSpendWatermarkAccumulatesLikeMistral()
+        try testMetaSpendWatermarkWithZeroAnchorAccumulatesLocal()
+        try testTaskWraithMusePricingUsesMuseCostEstimator()
         try testCerebrasCSVHandlesQuotedNumbersAndCurrency()
         try testCurrencyFormatting()
         print("Additional provider usage tests passed")
