@@ -7,6 +7,7 @@ enum SpendProviderCredentialField {
     static let manualResetAt = "manualResetAt"
     static let manualCurrentBalance = "manualCurrentBalance"
     static let manualTopUpTotal = "manualTopUpTotal"
+    static let manualPaymentThreshold = "manualPaymentThreshold"
     static let manualPlanName = "manualPlanName"
     static let anchorUpdatedAt = "anchorUpdatedAt"
 }
@@ -104,6 +105,212 @@ struct MistralLocalUsageSummary {
     }
 }
 
+/// TaskWraith / AGBench Mistral catalogue rates (Vibe CLI DEFAULT_MODELS).
+struct MistralModelRate: Equatable {
+    let inputUsdPerMillion: Double
+    let outputUsdPerMillion: Double
+
+    static let medium = MistralModelRate(inputUsdPerMillion: 1.5, outputUsdPerMillion: 7.5)
+    static let devstralSmall = MistralModelRate(inputUsdPerMillion: 0.1, outputUsdPerMillion: 0.3)
+
+    /// Pricing lookup: aliases first, then exact seat ids, else fail-safe **medium**.
+    static func lookup(_ model: String?) -> MistralModelRate {
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !trimmed.isEmpty, !trimmed.contains("/") else { return .medium }
+        switch trimmed {
+        case "devstral-small", "devstral-small-latest":
+            return .devstralSmall
+        case "mistral-medium-3.5", "mistral-vibe-cli-latest":
+            return .medium
+        default:
+            return .medium
+        }
+    }
+
+    func estimateUSD(inputTokens: Int, outputTokens: Int) -> Double {
+        Double(max(inputTokens, 0)) / 1_000_000 * inputUsdPerMillion
+            + Double(max(outputTokens, 0)) / 1_000_000 * outputUsdPerMillion
+    }
+}
+
+enum MistralTokenEstimate {
+    static let approxCharsPerToken = 4
+
+    /// Matches TaskWraith `estimateTokensFromChars` / Vibe `approx_token_count`.
+    static func estimateTokensFromChars(_ charCount: Int) -> Int {
+        guard charCount > 0 else { return 0 }
+        return Int(ceil(Double(charCount) / Double(approxCharsPerToken)))
+    }
+
+    static func estimateUsage(
+        model: String?,
+        promptChars: Int,
+        responseChars: Int,
+        extraOutputChars: Int = 0
+    ) -> (inputTokens: Int, outputTokens: Int, totalTokens: Int, costUSD: Double) {
+        let rate = MistralModelRate.lookup(model)
+        let inputTokens = estimateTokensFromChars(promptChars)
+        let outputTokens = estimateTokensFromChars(responseChars + max(extraOutputChars, 0))
+        return (
+            inputTokens,
+            outputTokens,
+            inputTokens + outputTokens,
+            rate.estimateUSD(inputTokens: inputTokens, outputTokens: outputTokens)
+        )
+    }
+}
+
+/// Offline TaskWraith doctrine: unique message payload chars÷4 × catalogue rates.
+///
+/// Live TaskWraith cannot see ACP usage, so it projects `ceil(chars/4)` over the
+/// host prompt + assistant/tool stream (not Vibe system/tools config). After the
+/// fact, replaying every growing API context turn overcounts (~7× vs TW). Counting
+/// each unique `messages.jsonl` payload char once empirically tracks TW's cycle
+/// local spend. `session_cost` is ignored — it bills cumulative API prompt tokens
+/// at full input price (including cache).
+enum MistralSessionCostEstimator {
+    struct Estimate {
+        let inputTokens: Double
+        let outputTokens: Double
+        let costUSD: Double
+        let source: UsageAnalyticsSource
+        let note: String
+    }
+
+    private static let jsonlMaximumBytes = 2 * 1_048_576
+
+    static func estimate(
+        activeModel: String?,
+        sessionPromptTokens: Double?,
+        sessionCompletionTokens: Double?,
+        sessionDirectory: URL
+    ) -> Estimate {
+        let rate = MistralModelRate.lookup(activeModel)
+        let jsonlURL = sessionDirectory.appendingPathComponent("messages.jsonl", isDirectory: false)
+        if let chars = uniqueMessageCharCounts(jsonlURL: jsonlURL) {
+            let inputTokens = MistralTokenEstimate.estimateTokensFromChars(chars.input)
+            let outputTokens = MistralTokenEstimate.estimateTokensFromChars(chars.output)
+            return Estimate(
+                inputTokens: Double(inputTokens),
+                outputTokens: Double(outputTokens),
+                costUSD: rate.estimateUSD(inputTokens: inputTokens, outputTokens: outputTokens),
+                source: .localEstimate,
+                note: "TaskWraith-style chars÷4 × catalogue"
+            )
+        }
+
+        // Fallback when messages.jsonl is missing/too large: reprice vendor tokens
+        // with the catalogue (never trust opaque session_cost / meta $/M).
+        let input = Int(max(sessionPromptTokens ?? 0, 0))
+        let output = Int(max(sessionCompletionTokens ?? 0, 0))
+        return Estimate(
+            inputTokens: Double(input),
+            outputTokens: Double(output),
+            costUSD: rate.estimateUSD(inputTokens: input, outputTokens: output),
+            source: .localEstimate,
+            note: "Catalogue × Vibe session tokens"
+        )
+    }
+
+    /// UTF-16 code unit counts (JS `.length` / TaskWraith doctrine). Content is never retained.
+    /// System prompt / tools_available are excluded — live TW meters host prompt + stream only.
+    private static func uniqueMessageCharCounts(
+        jsonlURL: URL
+    ) -> (input: Int, output: Int)? {
+        let values = try? jsonlURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard values?.isRegularFile == true,
+              let fileSize = values?.fileSize,
+              fileSize >= 0,
+              fileSize <= jsonlMaximumBytes else { return nil }
+
+        var inputChars = 0
+        var outputChars = 0
+
+        guard let handle = try? FileHandle(forReadingFrom: jsonlURL) else { return nil }
+        defer { try? handle.close() }
+
+        var buffer = Data()
+        let chunkSize = 256 * 1_024
+        var parsedAnyLine = false
+        while true {
+            let chunk = handle.readData(ofLength: chunkSize)
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<newline)
+                buffer.removeSubrange(buffer.startIndex...newline)
+                guard !lineData.isEmpty,
+                      let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      let role = (object["role"] as? String)?.lowercased() else { continue }
+                parsedAnyLine = true
+                accumulate(role: role, object: object, inputChars: &inputChars, outputChars: &outputChars)
+            }
+            if buffer.count > jsonlMaximumBytes { return nil }
+        }
+        if !buffer.isEmpty,
+           let object = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any],
+           let role = (object["role"] as? String)?.lowercased() {
+            parsedAnyLine = true
+            accumulate(role: role, object: object, inputChars: &inputChars, outputChars: &outputChars)
+        }
+
+        guard parsedAnyLine || inputChars > 0 || outputChars > 0 else { return nil }
+        return (inputChars, outputChars)
+    }
+
+    private static func accumulate(
+        role: String,
+        object: [String: Any],
+        inputChars: inout Int,
+        outputChars: inout Int
+    ) {
+        switch role {
+        case "assistant":
+            outputChars += utf16Count(object["content"])
+            outputChars += utf16Count(object["reasoning_content"])
+            outputChars += toolCallChars(object["tool_calls"])
+        case "tool":
+            inputChars += toolResultChars(object)
+        default:
+            // user / system / unknown → input lane
+            inputChars += utf16Count(object["content"])
+        }
+    }
+
+    private static func utf16Count(_ value: Any?) -> Int {
+        guard let value else { return 0 }
+        if let string = value as? String { return string.utf16.count }
+        if let number = value as? NSNumber { return "\(number)".utf16.count }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value),
+           let text = String(data: data, encoding: .utf8) {
+            return text.utf16.count
+        }
+        return 0
+    }
+
+    private static func toolCallChars(_ value: Any?) -> Int {
+        guard let calls = value as? [Any] else { return utf16Count(value) }
+        var total = 0
+        for call in calls {
+            guard let object = call as? [String: Any] else {
+                total += utf16Count(call)
+                continue
+            }
+            let function = object["function"] as? [String: Any]
+            total += utf16Count(function?["name"] ?? object["name"])
+            total += utf16Count(function?["arguments"] ?? object["arguments"] ?? object["input"])
+        }
+        return total
+    }
+
+    private static func toolResultChars(_ object: [String: Any]) -> Int {
+        let content = utf16Count(object["content"])
+        if content > 0 { return content }
+        return utf16Count(object["tool_result"] ?? object["output"])
+    }
+}
+
 enum MistralVibeUsageReader {
     private struct SessionMeta: Decodable {
         struct Stats: Decodable {
@@ -153,7 +360,11 @@ enum MistralVibeUsageReader {
         var outputTokens = 0.0
         var costUSD = 0.0
         var requests = 0.0
+        var note = "TaskWraith-style chars÷4 × catalogue"
     }
+
+    /// Bump when local cost doctrine changes so watermarked manual anchors rebase.
+    static let estimateDoctrineVersion = "tw-est-v1"
 
     static func read(rootURL: URL, now: Date = Date()) -> MistralLocalUsageSummary? {
         let sessionsURL = normalizedSessionsURL(rootURL)
@@ -202,13 +413,18 @@ enum MistralVibeUsageReader {
                 ?? now
             guard timestamp >= cutoff else { continue }
 
-            let input = max(stats.sessionPromptTokens ?? 0, 0)
-            let output = max(stats.sessionCompletionTokens ?? 0, 0)
-            let derivedCost = input / 1_000_000 * max(stats.inputPricePerMillion ?? 0, 0)
-                + output / 1_000_000 * max(stats.outputPricePerMillion ?? 0, 0)
-            let cost = max(stats.sessionCost ?? derivedCost, 0)
-            let model = meta.config?.activeModel?.trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty ?? "Mistral Vibe"
+            let activeModel = meta.config?.activeModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+            let estimate = MistralSessionCostEstimator.estimate(
+                activeModel: activeModel,
+                sessionPromptTokens: stats.sessionPromptTokens,
+                sessionCompletionTokens: stats.sessionCompletionTokens,
+                sessionDirectory: candidate.url.deletingLastPathComponent()
+            )
+            let input = estimate.inputTokens
+            let output = estimate.outputTokens
+            let cost = max(estimate.costUSD, 0)
+            let model = activeModel ?? "Mistral Vibe"
             let day = utcCalendar.startOfDay(for: timestamp)
             let key = DailyKey(start: day, model: model)
             var value = daily[key] ?? DailyValue()
@@ -216,6 +432,7 @@ enum MistralVibeUsageReader {
             value.outputTokens += output
             value.costUSD += cost
             value.requests += 1
+            value.note = estimate.note
             daily[key] = value
             costObservations.append(.init(timestamp: timestamp, costUSD: cost))
             events.append(
@@ -243,8 +460,8 @@ enum MistralVibeUsageReader {
                 outputTokens: value.outputTokens,
                 requests: value.requests,
                 costUSD: value.costUSD,
-                source: .localTelemetry,
-                note: "Vibe meta.json"
+                source: .localEstimate,
+                note: value.note
             )
         }.sorted { $0.startDate > $1.startDate }
 
@@ -387,6 +604,114 @@ private struct MistralAdminUsageClient {
             return MistralAdminUsageParser.parse(data: data)
         } catch {
             return nil
+        }
+    }
+}
+
+/// Resolves the subscription pool that Vibe Code actually consumes.
+///
+/// Mistral's subscription page now exposes the shared "Included monthly usage"
+/// pool and a separate Vibe Code budget. Older Limit Counter credentials stored
+/// the shared Pro allowance (EUR 25.50) as the Mistral meter's ceiling. Keep the
+/// migration narrow: only the known legacy Pro/Team figure is rewritten, while
+/// any other user-entered allowance remains authoritative.
+enum MistralVibeBudgetResolver {
+    private static let unitsPerUSD: [String: Double] = [
+        "USD": 1,
+        "EUR": 0.92,
+        "GBP": 0.79
+    ]
+
+    private static let legacySharedPoolUSD = 27.8
+    private static let legacySharedPoolEUR = 25.5
+    private static let legacyTolerance = 0.05
+
+    static func effectiveAllowance(
+        rawAllowance: Double?,
+        currency: String,
+        planName: String?,
+        configuredBudgetUSD: Double?
+    ) -> Double? {
+        if isLegacySharedPoolAllowance(rawAllowance, currency: currency, planName: planName) {
+            return defaultAllowance(currency: currency, planName: planName, configuredBudgetUSD: configuredBudgetUSD)
+        }
+        if let rawAllowance, rawAllowance > 0 { return rawAllowance }
+        return defaultAllowance(currency: currency, planName: planName, configuredBudgetUSD: configuredBudgetUSD)
+    }
+
+    /// The old anchor's spend belongs to the shared pool, not the new Vibe bar.
+    /// Keep a larger manual value because it is likely a fresh Vibe-console
+    /// reading entered after the budget split.
+    static func shouldDiscardLegacyAnchor(
+        rawAllowance: Double?,
+        rawSpent: Double?,
+        currency: String,
+        planName: String?
+    ) -> Bool {
+        guard isLegacySharedPoolAllowance(rawAllowance, currency: currency, planName: planName) else {
+            return false
+        }
+        guard let rawSpent else { return true }
+        return rawSpent <= legacySharedPoolAllowance(currency: currency) + legacyTolerance
+    }
+
+    static func convert(_ amount: Double, from sourceCurrency: String, to targetCurrency: String) -> Double? {
+        guard let sourceRate = unitsPerUSD[sourceCurrency.uppercased()],
+              let targetRate = unitsPerUSD[targetCurrency.uppercased()] else {
+            return nil
+        }
+        return amount / sourceRate * targetRate
+    }
+
+    static func amountInCurrency(_ usd: Double, currency: String) -> Double? {
+        guard let rate = unitsPerUSD[currency.uppercased()] else { return nil }
+        return usd * rate
+    }
+
+    private static func defaultAllowance(
+        currency: String,
+        planName: String?,
+        configuredBudgetUSD: Double?
+    ) -> Double? {
+        if let configuredBudgetUSD, configuredBudgetUSD > 0,
+           let configured = amountInCurrency(configuredBudgetUSD, currency: currency) {
+            return configured
+        }
+
+        let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let isProOrTeam = normalizedPlan.contains("pro") || normalizedPlan.contains("team")
+        let isFree = normalizedPlan.contains("free")
+        let usdBudget = isProOrTeam ? 278.0 : 9.25
+
+        switch currency.uppercased() {
+        case "EUR":
+            return isProOrTeam ? 255 : (isFree || normalizedPlan.isEmpty ? 8.5 : usdBudget * 0.92)
+        case "USD":
+            return usdBudget
+        case "GBP":
+            return amountInCurrency(usdBudget, currency: "GBP")
+        default:
+            return nil
+        }
+    }
+
+    private static func isLegacySharedPoolAllowance(
+        _ rawAllowance: Double?,
+        currency: String,
+        planName: String?
+    ) -> Bool {
+        guard let rawAllowance, rawAllowance > 0 else { return false }
+        let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard normalizedPlan.contains("pro") || normalizedPlan.contains("team") else { return false }
+        let expected = legacySharedPoolAllowance(currency: currency)
+        return abs(rawAllowance - expected) <= max(legacyTolerance, expected * 0.01)
+    }
+
+    private static func legacySharedPoolAllowance(currency: String) -> Double {
+        switch currency.uppercased() {
+        case "EUR": return legacySharedPoolEUR
+        case "USD": return legacySharedPoolUSD
+        default: return legacySharedPoolUSD * (unitsPerUSD[currency.uppercased()] ?? 1)
         }
     }
 }
@@ -556,45 +881,71 @@ public struct MistralProviderClient: ProviderClient {
             nil
         }
 
-        let manualAllowance = positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
+        let rawManualAllowance = positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
             ?? positiveDouble(credentials?.normalizedAccountIdentifier)
-        let manualSpend = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
+        let rawManualSpend = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
         let manualCurrency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
         let manualReset = ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
         let budgetUSD = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .mistral)
+        let planName = fields[SpendProviderCredentialField.manualPlanName]
+        let manualAllowance = MistralVibeBudgetResolver.effectiveAllowance(
+            rawAllowance: rawManualAllowance,
+            currency: manualCurrency,
+            planName: planName,
+            configuredBudgetUSD: budgetUSD
+        )
+        let discardedLegacyAnchor = MistralVibeBudgetResolver.shouldDiscardLegacyAnchor(
+            rawAllowance: rawManualAllowance,
+            rawSpent: rawManualSpend,
+            currency: manualCurrency,
+            planName: planName
+        )
+        let manualSpend = discardedLegacyAnchor ? nil : rawManualSpend
         var windows: [QuotaWindow] = []
         var stats: [QuotaStat] = []
         var signals: [QuotaSignal] = []
 
-        if let admin, admin.totalSpendIsComplete {
-            let total = admin.currency == "USD" ? (manualAllowance ?? budgetUSD) : manualAllowance
-            windows.append(
-                QuotaWindow(
-                    label: "This billing period",
-                    windowKind: .monthly,
-                    used: admin.totalSpend,
-                    total: total,
-                    resetDate: admin.periodEnd,
-                    unit: admin.currency,
-                    subtitle: "Official Mistral Admin API"
+        if let admin {
+            let adminSpend = admin.vibeSpend ?? (admin.totalSpendIsComplete ? admin.totalSpend : nil)
+            let adminAllowance = manualAllowance.flatMap {
+                MistralVibeBudgetResolver.convert($0, from: manualCurrency, to: admin.currency)
+            } ?? (admin.currency == "USD" ? budgetUSD : nil)
+            if let adminSpend {
+                let isVibeSpecific = admin.vibeSpend != nil
+                windows.append(
+                    QuotaWindow(
+                        label: isVibeSpecific ? "Vibe Code this billing period" : "Mistral usage this billing period",
+                        windowKind: .monthly,
+                        used: adminSpend,
+                        total: adminAllowance,
+                        resetDate: admin.periodEnd,
+                        unit: admin.currency,
+                        subtitle: isVibeSpecific
+                            ? "Official Mistral Admin API Vibe usage"
+                            : "Official Mistral Admin API total; Vibe breakdown unavailable"
+                    )
                 )
-            )
-        } else if let manualSpend {
+            }
+        }
+
+        if windows.isEmpty, let manualSpend {
             if let manualReset, manualReset <= now {
                 signals.append(
                     QuotaSignal(
                         kind: .scheduledReset,
                         title: "Billing anchor expired",
-                        message: "Update the Mistral console reading for the new billing cycle.",
+                        message: "Update the Mistral Vibe Code reading for the new billing cycle.",
                         severity: .info,
                         confidence: 1,
-                        windowLabel: "This billing period",
+                        windowLabel: "Vibe Code this billing period",
                         detectedAt: now
                     )
                 )
             } else {
-                let signature = fields[SpendProviderCredentialField.anchorUpdatedAt]
-                    ?? "\(manualSpend)|\(manualAllowance ?? 0)|\(manualReset?.timeIntervalSince1970 ?? 0)"
+                let baseSignature = fields[SpendProviderCredentialField.anchorUpdatedAt]
+                    ?? "\(manualSpend)|\(rawManualAllowance ?? 0)|\(manualReset?.timeIntervalSince1970 ?? 0)"
+                // Doctrine version forces a watermark rebase when local cost math changes.
+                let signature = "\(MistralVibeUsageReader.estimateDoctrineVersion)|\(baseSignature)"
                 let anchorUpdatedAt = ProviderDateParser.parse(
                     fields[SpendProviderCredentialField.anchorUpdatedAt]
                 )
@@ -610,28 +961,18 @@ public struct MistralProviderClient: ProviderClient {
                 )
                 windows.append(
                     QuotaWindow(
-                        label: "This billing period",
+                        label: "Vibe Code this billing period",
                         windowKind: .monthly,
                         used: adjustment.spend,
                         total: manualAllowance,
                         resetDate: manualReset,
                         unit: manualCurrency,
                         subtitle: adjustment.localIncrement > 0
-                            ? "Manual console anchor plus tracked local Vibe spend"
-                            : "Manual console anchor"
+                            ? "Manual Vibe reading plus TaskWraith-style local estimate"
+                            : "Manual Vibe reading"
                     )
                 )
             }
-        } else if let admin, let vibeSpend = admin.vibeSpend {
-            windows.append(
-                QuotaWindow(
-                    label: "Vibe this billing period",
-                    windowKind: .monthly,
-                    used: vibeSpend,
-                    unit: admin.currency,
-                    subtitle: "Official Mistral Admin API; shared-pool total unavailable"
-                )
-            )
         }
 
         if let admin, let vibeSpend = admin.vibeSpend {
@@ -647,21 +988,33 @@ public struct MistralProviderClient: ProviderClient {
 
         if let local {
             if windows.isEmpty {
+                let localCurrency = manualCurrency
+                let localSpend = MistralVibeBudgetResolver.amountInCurrency(
+                    local.currentMonthCostUSD,
+                    currency: localCurrency
+                ) ?? local.currentMonthCostUSD
                 windows.append(
                     QuotaWindow(
-                        label: "Local Vibe this month",
+                        label: "Vibe Code this billing period",
                         windowKind: .monthly,
-                        used: local.currentMonthCostUSD,
-                        total: budgetUSD,
-                        unit: "USD",
-                        subtitle: "Exact local Vibe meta.json cost"
+                        used: localSpend,
+                        total: manualAllowance,
+                        unit: localCurrency,
+                        subtitle: discardedLegacyAnchor
+                            ? "TaskWraith-style local estimate; legacy shared-pool anchor ignored"
+                            : "TaskWraith-style local estimate"
                     )
                 )
             }
             stats.append(contentsOf: [
-                QuotaStat(label: "Local 30D cost", value: local.last30DaysCostUSD, unit: "USD", subtitle: "First-party Vibe metadata"),
-                QuotaStat(label: "Input tokens", value: local.inputTokens, unit: "tokens"),
-                QuotaStat(label: "Output tokens", value: local.outputTokens, unit: "tokens")
+                QuotaStat(
+                    label: "Local 30D cost",
+                    value: local.last30DaysCostUSD,
+                    unit: "USD",
+                    subtitle: "TaskWraith-style chars÷4 × catalogue"
+                ),
+                QuotaStat(label: "Input tokens", value: local.inputTokens, unit: "tokens", subtitle: "Estimated"),
+                QuotaStat(label: "Output tokens", value: local.outputTokens, unit: "tokens", subtitle: "Estimated")
             ])
         }
 
@@ -669,7 +1022,7 @@ public struct MistralProviderClient: ProviderClient {
         return QuotaSnapshot(
             providerID: .mistral,
             displayName: ProviderID.mistral.snapshotDisplayName,
-            planName: fields[SpendProviderCredentialField.manualPlanName] ?? (admin == nil ? "Vibe" : "Admin API"),
+            planName: planName ?? (admin == nil ? "Vibe" : "Admin API"),
             windows: windows,
             stats: stats,
             signals: signals,
@@ -819,10 +1172,11 @@ enum TaskWraithSpendReader {
         let outputTokens: Double?
         let cacheReadInputTokens: Double?
         let cacheCreationInputTokens: Double?
+        let usageKind: String?
 
         enum CodingKeys: String, CodingKey {
             case provider, model, timestamp, inputTokens, outputTokens
-            case cacheReadInputTokens, cacheCreationInputTokens
+            case cacheReadInputTokens, cacheCreationInputTokens, usageKind
         }
     }
 
@@ -858,41 +1212,78 @@ enum TaskWraithSpendReader {
     }
 
     static func parse(data: Data, provider: ProviderID, now: Date = Date()) -> TaskWraithSpendSummary? {
-        guard provider == .deepseek || provider == .cerebras,
+        guard provider == .deepseek || provider == .cerebras || provider == .meta,
               let records = try? JSONDecoder().decode([Record].self, from: data) else { return nil }
 
         let cutoff = now.addingTimeInterval(-35 * 86_400)
         var daily: [DailyKey: DailyValue] = [:]
         var events: [UsageEvent] = []
+        let isMeta = provider == .meta
         for record in records {
-            guard record.provider?.lowercased() == "pi",
-                  let model = record.model?.lowercased(),
-                  model.hasPrefix(provider == .deepseek ? "deepseek/" : "cerebras/"),
-                  let timestampMs = record.timestamp else { continue }
-            let timestamp = Date(timeIntervalSince1970: timestampMs / 1_000)
-            guard timestamp >= cutoff, let rate = rate(for: model) else { continue }
-            let input = max(record.inputTokens ?? 0, 0)
-            let output = max(record.outputTokens ?? 0, 0)
-            let cached = max(record.cacheReadInputTokens ?? 0, 0)
-            let cacheCreation = max(record.cacheCreationInputTokens ?? 0, 0)
-            let cost = (input + cacheCreation) / 1_000_000 * rate.input
-                + output / 1_000_000 * rate.output
-                + cached / 1_000_000 * rate.cachedInput
-            let date = utcCalendar.startOfDay(for: timestamp)
+            let timestampMs = record.timestamp
+            let timestamp: Date
+            let model: String
+            let input: Double
+            let output: Double
+            let cached: Double
+            let cacheCreation: Double
+            let cost: Double
+
+            if isMeta {
+                guard record.provider?.lowercased() == "muse",
+                      let timestampMs else { continue }
+                if record.usageKind?.lowercased() == "reset_hint" { continue }
+                timestamp = Date(timeIntervalSince1970: timestampMs / 1_000)
+                guard timestamp >= cutoff else { continue }
+                model = record.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                    ?? "muse-spark-1.2"
+                input = max(record.inputTokens ?? 0, 0)
+                output = max(record.outputTokens ?? 0, 0)
+                cached = max(record.cacheReadInputTokens ?? 0, 0)
+                cacheCreation = max(record.cacheCreationInputTokens ?? 0, 0)
+                let home = museDefaultDataHomeURL()
+                let rate = MuseModelCatalogRateLoader.load(from: home, modelId: model)
+                    ?? MuseModelRate.defaultRate(for: model)
+                cost = MuseCostEstimator.estimateUSD(
+                    input: input,
+                    output: output,
+                    cacheRead: cached,
+                    cacheCreation: cacheCreation,
+                    rate: rate
+                )
+            } else {
+                guard record.provider?.lowercased() == "pi",
+                      let lowered = record.model?.lowercased(),
+                      lowered.hasPrefix(provider == .deepseek ? "deepseek/" : "cerebras/"),
+                      let timestampMs,
+                      let rate = rate(for: lowered) else { continue }
+                timestamp = Date(timeIntervalSince1970: timestampMs / 1_000)
+                guard timestamp >= cutoff else { continue }
+                model = lowered
+                input = max(record.inputTokens ?? 0, 0)
+                output = max(record.outputTokens ?? 0, 0)
+                cached = max(record.cacheReadInputTokens ?? 0, 0)
+                cacheCreation = max(record.cacheCreationInputTokens ?? 0, 0)
+                cost = (input + cacheCreation) / 1_000_000 * rate.input
+                    + output / 1_000_000 * rate.output
+                    + cached / 1_000_000 * rate.cachedInput
+            }
+
+            let dayCalendar = isMeta ? Calendar.current : utcCalendar
+            let date = dayCalendar.startOfDay(for: timestamp)
             let key = DailyKey(date: date, model: model)
             var value = daily[key] ?? DailyValue()
-            value.input += input + cacheCreation
+            value.input += isMeta ? input : input + cacheCreation
             value.output += output
             value.cached += cached
             value.requests += 1
             value.cost += cost
             daily[key] = value
+            let tokenTotal = input + output + cached + (isMeta ? 0 : cacheCreation)
             events.append(
                 UsageEvent(
                     timestamp: timestamp,
-                    tokens: input + output + cached + cacheCreation > 0
-                        ? input + output + cached + cacheCreation
-                        : nil,
+                    tokens: tokenTotal > 0 ? tokenTotal : nil,
                     model: model,
                     type: .telemetry
                 )
@@ -900,10 +1291,14 @@ enum TaskWraithSpendReader {
         }
 
         guard !daily.isEmpty else { return nil }
+        let bucketCalendar = isMeta ? Calendar.current : utcCalendar
+        let note = isMeta
+            ? "Muse session tokens × catalog rates"
+            : "TaskWraith tokens priced with vendor rates checked 2026-08-01"
         let buckets = daily.map { key, value in
             UsageAnalyticsBucket(
                 startDate: key.date,
-                endDate: utcCalendar.date(byAdding: .day, value: 1, to: key.date)
+                endDate: bucketCalendar.date(byAdding: .day, value: 1, to: key.date)
                     ?? key.date.addingTimeInterval(86_400),
                 model: key.model,
                 inputTokens: value.input,
@@ -912,12 +1307,14 @@ enum TaskWraithSpendReader {
                 requests: value.requests,
                 costUSD: value.cost,
                 source: .localEstimate,
-                note: "TaskWraith tokens priced with vendor rates checked 2026-08-01"
+                note: note
             )
         }.sorted { $0.startDate > $1.startDate }
-        let monthStart = utcCalendar.date(
-            from: utcCalendar.dateComponents([.year, .month], from: now)
-        ) ?? utcCalendar.startOfDay(for: now)
+        // Meta soft $15 budget matches TaskWraith: local calendar month, not UTC.
+        let monthCalendar = isMeta ? Calendar.current : utcCalendar
+        let monthStart = monthCalendar.date(
+            from: monthCalendar.dateComponents([.year, .month], from: now)
+        ) ?? monthCalendar.startOfDay(for: now)
         return TaskWraithSpendSummary(
             currentMonthCostUSD: buckets
                 .filter { $0.startDate >= monthStart }
@@ -1354,6 +1751,1179 @@ public struct CerebrasProviderClient: ProviderClient {
         }
         return periodStart >= monthStart && periodEnd < nextMonth
     }
+}
+
+// MARK: - Meta / Muse local metering
+
+struct MuseModelRate: Equatable {
+    let inputUsdPerMillion: Double
+    let outputUsdPerMillion: Double
+    let cachedUsdPerMillion: Double
+    let currency: String
+
+    static let sparkDefault = MuseModelRate(
+        inputUsdPerMillion: 1.25,
+        outputUsdPerMillion: 4.25,
+        cachedUsdPerMillion: 0.15,
+        currency: "USD"
+    )
+
+    /// Baked-in rates for muse-spark-1.2 / muse-default / any muse-* id.
+    static func defaultRate(for modelId: String?) -> MuseModelRate {
+        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if id.isEmpty || id.hasPrefix("muse-") || id == "muse-default" || id == "muse-spark-1.2" {
+            return .sparkDefault
+        }
+        return .sparkDefault
+    }
+}
+
+enum MuseCostEstimator {
+    /// Muse billable formula matching MuseUsage.ts session.jsonl metering:
+    /// cache-read is priced at the cached rate and subtracted from billable input
+    /// when cache-read is known.
+    ///
+    /// `cacheCreation` is for TaskWraith journaled Muse rows
+    /// (`estimateUsageRecordCostUsd` / RemoteModelUsageProjection). When > 0 it adds
+    /// `cacheCreation/1e6 * rate.inputUsdPerMillion` on top of the Muse session formula.
+    /// Live Muse session metering should pass 0 (MuseUsage.ts does not price cache write).
+    static func estimateUSD(
+        input: Double,
+        output: Double,
+        cacheRead: Double,
+        cacheCreation: Double = 0,
+        rate: MuseModelRate
+    ) -> Double {
+        let inputTokens = nonNegative(input)
+        let outputTokens = nonNegative(output)
+        let cacheReadTokens = nonNegative(cacheRead)
+        let cacheCreationTokens = nonNegative(cacheCreation)
+        let billableInput = cacheReadTokens > 0
+            ? max(0, inputTokens - cacheReadTokens)
+            : inputTokens
+        var usd = billableInput / 1_000_000 * rate.inputUsdPerMillion
+            + cacheReadTokens / 1_000_000 * rate.cachedUsdPerMillion
+            + outputTokens / 1_000_000 * rate.outputUsdPerMillion
+        if cacheCreationTokens > 0 {
+            usd += cacheCreationTokens / 1_000_000 * rate.inputUsdPerMillion
+        }
+        return usd.isFinite ? usd : 0
+    }
+
+    private static func nonNegative(_ value: Double) -> Double {
+        value.isFinite && value > 0 ? value : 0
+    }
+}
+
+enum MuseModelCatalogRateLoader {
+    static func load(from dataHomeURL: URL, modelId: String) -> MuseModelRate? {
+        let id = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return nil }
+        let root = normalizedMuseDataHomeURL(dataHomeURL)
+        let catalogDir = root.appendingPathComponent("model-catalog", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: catalogDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        for fileURL in entries where fileURL.pathExtension.lowercased() == "json" {
+            guard let data = boundedFileData(at: fileURL, maximumBytes: 4 * 1_024 * 1_024),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = json["rows"] as? [Any] else { continue }
+            for row in rows {
+                guard let record = row as? [String: Any] else { continue }
+                let mid = stringValue(record["model_id"])
+                    ?? stringValue(record["id"])
+                    ?? stringValue(record["model"])
+                guard mid == id, let rate = parseCost(record["cost"]) else { continue }
+                return rate
+            }
+        }
+        return nil
+    }
+
+    static func parseCost(_ cost: Any?) -> MuseModelRate? {
+        guard let record = cost as? [String: Any] else { return nil }
+        guard let input = finiteNumber(record["input"]),
+              let output = finiteNumber(record["output"]),
+              let cached = finiteNumber(record["cached"]),
+              input >= 0, output >= 0, cached >= 0 else { return nil }
+        let currency = stringValue(record["currency"])?.uppercased() ?? "USD"
+        return MuseModelRate(
+            inputUsdPerMillion: input,
+            outputUsdPerMillion: output,
+            cachedUsdPerMillion: cached,
+            currency: currency
+        )
+    }
+
+    private static func finiteNumber(_ value: Any?) -> Double? {
+        switch value {
+        case let number as Double:
+            return number.isFinite ? number : nil
+        case let number as Int:
+            return Double(number)
+        case let number as NSNumber:
+            let double = number.doubleValue
+            return double.isFinite ? double : nil
+        case let text as String:
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let double = Double(trimmed), double.isFinite else { return nil }
+            return double
+        default:
+            return nil
+        }
+    }
+
+    private static func stringValue(_ value: Any?) -> String? {
+        guard let text = value as? String else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct MuseMeterSnapshot: Equatable {
+    var museSessionId: String
+    var model: String?
+    var inputTokens: Double
+    var outputTokens: Double
+    var cacheReadInputTokens: Double
+    var cacheCreationInputTokens: Double
+    var reasoningTokens: Double
+    var totalTokens: Double
+    var durationMs: Double
+    var estimatedCostUSD: Double?
+    var usageIds: [String]
+    var latestRecordedAt: Date?
+}
+
+struct MuseSessionUsageReducer {
+    private struct RunAccum {
+        var inputTokens = 0.0
+        var outputTokens = 0.0
+        var cachedTokens = 0.0
+        var reasoningTokens = 0.0
+        var cacheReadTokens = 0.0
+        var cacheWriteTokens = 0.0
+        var durationMs = 0.0
+        var model: String?
+        var usageIds: [String] = []
+        var hasCompletedCache = false
+    }
+
+    let museSessionId: String
+    let logPath: String
+    private var seenEnvelopeKeys = Set<String>()
+    private var seenUsageKeys = Set<String>()
+    private var byRunId: [String: RunAccum] = [:]
+    private(set) var latestRecordedAt: Date?
+
+    init(museSessionId: String, logPath: String) {
+        self.museSessionId = museSessionId
+        self.logPath = logPath
+    }
+
+    mutating func ingestLine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        ingestEnvelope(object)
+    }
+
+    mutating func ingestEnvelope(_ envelope: [String: Any]) {
+        let stream = envelope["stream"] as? [String: Any]
+        let streamId = stringValue(stream?["id"]) ?? ""
+        let sequence = finiteNumber(envelope["sequence"]).map { String(Int($0)) } ?? "0"
+        let envelopeId = stringValue(envelope["id"])
+        let dedupeKey = envelopeId ?? "\(streamId):\(sequence)"
+        if seenEnvelopeKeys.contains(dedupeKey) { return }
+        seenEnvelopeKeys.insert(dedupeKey)
+
+        if let recorded = museRecordedAtDate(envelope["recorded_at"]) {
+            if let previous = latestRecordedAt {
+                latestRecordedAt = max(previous, recorded)
+            } else {
+                latestRecordedAt = recorded
+            }
+        }
+
+        guard stringValue(envelope["payload_type"]) == "runtime.session",
+              let payload = envelope["payload"] as? [String: Any],
+              let event = payload["event"] as? [String: Any] else { return }
+
+        let kind = stringValue(event["kind"])
+        let runId = stringValue(payload["run_id"]) ?? "unknown"
+
+        if kind == "goal_usage_attribution" {
+            guard let record = event["record"] as? [String: Any],
+                  stringValue(record["usage_family"]) == "provider",
+                  let quantity = record["quantity"] as? [String: Any],
+                  boolValue(quantity["reported"]) == true else { return }
+            let usageId = stringValue(record["usage_id"]) ?? dedupeKey
+            let usageKey = "\(logPath)::\(usageId)"
+            if seenUsageKeys.contains(usageKey) { return }
+            seenUsageKeys.insert(usageKey)
+
+            var row = byRunId[runId] ?? RunAccum()
+            row.inputTokens += nonNegative(finiteNumber(quantity["input_tokens"]))
+            row.outputTokens += nonNegative(finiteNumber(quantity["output_tokens"]))
+            row.cachedTokens += nonNegative(finiteNumber(quantity["cached_tokens"]))
+            row.reasoningTokens += nonNegative(finiteNumber(quantity["reasoning_tokens"]))
+            row.usageIds.append(usageId)
+            byRunId[runId] = row
+            return
+        }
+
+        if kind == "model_completed" {
+            var row = byRunId[runId] ?? RunAccum()
+            if let usage = event["usage"] as? [String: Any] {
+                // Enrich only — tokens already counted from goal_usage_attribution.
+                row.cacheReadTokens += nonNegative(finiteNumber(usage["cache_read_tokens"]))
+                row.cacheWriteTokens += nonNegative(finiteNumber(usage["cache_write_tokens"]))
+                row.hasCompletedCache = true
+                if row.reasoningTokens <= 0 {
+                    row.reasoningTokens = nonNegative(finiteNumber(usage["reasoning_tokens"]))
+                }
+            }
+            row.durationMs += nonNegative(finiteNumber(event["duration_ms"]))
+            if let model = stringValue(event["model"]) {
+                row.model = model
+            }
+            byRunId[runId] = row
+        }
+    }
+
+    func snapshot(rate: MuseModelRate? = nil) -> MuseMeterSnapshot {
+        var inputTokens = 0.0
+        var outputTokens = 0.0
+        var cacheReadInputTokens = 0.0
+        var cacheCreationInputTokens = 0.0
+        var reasoningTokens = 0.0
+        var durationMs = 0.0
+        var model: String?
+        var usageIds: [String] = []
+        var anyCompletedCache = false
+        var cachedTokensFallback = 0.0
+
+        for row in byRunId.values {
+            inputTokens += row.inputTokens
+            outputTokens += row.outputTokens
+            reasoningTokens += row.reasoningTokens
+            durationMs += row.durationMs
+            usageIds.append(contentsOf: row.usageIds)
+            if let rowModel = row.model { model = rowModel }
+            if row.hasCompletedCache {
+                anyCompletedCache = true
+                cacheReadInputTokens += row.cacheReadTokens
+                cacheCreationInputTokens += row.cacheWriteTokens
+            } else {
+                cachedTokensFallback += row.cachedTokens
+            }
+        }
+        if !anyCompletedCache, cachedTokensFallback > 0 {
+            cacheReadInputTokens = cachedTokensFallback
+        }
+
+        let hasReported = !usageIds.isEmpty
+        let estimatedCostUSD: Double? = {
+            guard hasReported, let rate else { return nil }
+            // Live Muse session metering: cacheCreation stays 0 (MuseUsage.ts).
+            return MuseCostEstimator.estimateUSD(
+                input: inputTokens,
+                output: outputTokens,
+                cacheRead: cacheReadInputTokens,
+                cacheCreation: 0,
+                rate: rate
+            )
+        }()
+
+        return MuseMeterSnapshot(
+            museSessionId: museSessionId,
+            model: model,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheReadInputTokens: cacheReadInputTokens,
+            cacheCreationInputTokens: cacheCreationInputTokens,
+            reasoningTokens: reasoningTokens,
+            totalTokens: inputTokens + outputTokens,
+            durationMs: durationMs,
+            estimatedCostUSD: estimatedCostUSD,
+            usageIds: usageIds,
+            latestRecordedAt: latestRecordedAt
+        )
+    }
+
+    private func stringValue(_ value: Any?) -> String? {
+        guard let text = value as? String else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func finiteNumber(_ value: Any?) -> Double? {
+        switch value {
+        case let number as Double:
+            return number.isFinite ? number : nil
+        case let number as Int:
+            return Double(number)
+        case let number as NSNumber:
+            let double = number.doubleValue
+            return double.isFinite ? double : nil
+        case let text as String:
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let double = Double(trimmed), double.isFinite else { return nil }
+            return double
+        default:
+            return nil
+        }
+    }
+
+    private func boolValue(_ value: Any?) -> Bool? {
+        switch value {
+        case let flag as Bool:
+            return flag
+        case let number as NSNumber:
+            return number.boolValue
+        default:
+            return nil
+        }
+    }
+
+    private func nonNegative(_ value: Double?) -> Double {
+        guard let value, value.isFinite, value > 0 else { return 0 }
+        return value
+    }
+
+    /// Muse `recorded_at` is microseconds since epoch.
+    private func museRecordedAtDate(_ value: Any?) -> Date? {
+        guard let raw = finiteNumber(value), raw > 0 else { return nil }
+        return Date(timeIntervalSince1970: raw / 1_000_000)
+    }
+}
+
+struct MuseLocalUsageSummary {
+    struct CostObservation {
+        let timestamp: Date
+        let costUSD: Double
+    }
+
+    let currentMonthCostUSD: Double
+    let last30DaysCostUSD: Double
+    let inputTokens: Double
+    let outputTokens: Double
+    let cachedTokens: Double
+    let events: [UsageEvent]
+    let analyticsBuckets: [UsageAnalyticsBucket]
+    let costObservations: [CostObservation]
+    /// True when the Muse data home folder exists (even with zero sessions).
+    let dataHomeConfigured: Bool
+
+    func costUSD(since date: Date) -> Double {
+        costObservations
+            .filter { $0.timestamp > date }
+            .reduce(0) { $0 + $1.costUSD }
+    }
+}
+
+enum MuseLocalUsageReader {
+    private static let maxSessionFiles = 5_000
+    /// Full-file read / streaming prefix budget.
+    private static let maxPrefixBytes = 8 * 1_024 * 1_024
+    /// Skip session files larger than this entirely.
+    private static let maxHardSkipBytes = 32 * 1_024 * 1_024
+
+    private struct DailyKey: Hashable {
+        let date: Date
+        let model: String
+    }
+
+    private struct DailyValue {
+        var input = 0.0
+        var output = 0.0
+        var cached = 0.0
+        var requests = 0.0
+        var cost = 0.0
+    }
+
+    /// UTF-8 session.jsonl text, fully for files ≤ `maximumBytes`, otherwise the leading
+    /// `maximumBytes` with any incomplete trailing line dropped.
+    static func sessionJSONLText(at url: URL, maximumBytes: Int) -> String? {
+        if let data = boundedFileData(at: url, maximumBytes: maximumBytes),
+           let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let data = handle.readData(ofLength: maximumBytes)
+        guard !data.isEmpty else { return nil }
+        var text = String(decoding: data, as: UTF8.self)
+        // Only drop a trailing incomplete line when this is a truncated prefix read.
+        if data.count >= maximumBytes {
+            if let lastNewline = text.lastIndex(of: "\n") {
+                text = String(text[..<lastNewline])
+            } else {
+                // Prefix ended mid-line with no complete JSONL record.
+                return nil
+            }
+        }
+        return text.isEmpty ? nil : text
+    }
+
+    static func read(rootURL: URL, now: Date = Date()) -> MuseLocalUsageSummary? {
+        let dataHome = normalizedMuseDataHomeURL(rootURL)
+        let sessionsRoot = dataHome.appendingPathComponent("sessions", isDirectory: true)
+        let dataHomeConfigured = FileManager.default.fileExists(atPath: dataHome.path)
+        guard dataHomeConfigured else { return nil }
+
+        // Soft Meta / TaskWraith $15 budget resets on the local calendar month.
+        let calendar = Calendar.current
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now))
+            ?? calendar.startOfDay(for: now)
+        let thirtyDayCutoff = now.addingTimeInterval(-30 * 86_400)
+        let scanCutoff = now.addingTimeInterval(-40 * 86_400)
+
+        var candidates: [(url: URL, modified: Date)] = []
+        if FileManager.default.fileExists(atPath: sessionsRoot.path),
+           let enumerator = FileManager.default.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+           ) {
+            for case let fileURL as URL in enumerator {
+                guard fileURL.lastPathComponent == "session.jsonl" else { continue }
+                let values = try? fileURL.resourceValues(
+                    forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+                )
+                guard values?.isRegularFile == true else { continue }
+                if let size = values?.fileSize, size > maxHardSkipBytes { continue }
+                let modified = values?.contentModificationDate ?? .distantPast
+                if modified < scanCutoff { continue }
+                candidates.append((fileURL, modified))
+            }
+        }
+
+        candidates.sort { $0.modified > $1.modified }
+        var daily: [DailyKey: DailyValue] = [:]
+        var events: [UsageEvent] = []
+        var costObservations: [MuseLocalUsageSummary.CostObservation] = []
+
+        for candidate in candidates.prefix(maxSessionFiles) {
+            guard let text = sessionJSONLText(at: candidate.url, maximumBytes: maxPrefixBytes) else {
+                continue
+            }
+
+            let sessionId = candidate.url.deletingLastPathComponent().lastPathComponent
+            var reducer = MuseSessionUsageReducer(
+                museSessionId: sessionId,
+                logPath: candidate.url.path
+            )
+            for line in text.split(whereSeparator: \.isNewline) {
+                reducer.ingestLine(String(line))
+            }
+
+            let provisional = reducer.snapshot(rate: nil)
+            guard !provisional.usageIds.isEmpty else { continue }
+            let model = provisional.model ?? "muse-spark-1.2"
+            let rate = MuseModelCatalogRateLoader.load(from: dataHome, modelId: model)
+                ?? MuseModelRate.defaultRate(for: model)
+            let snap = reducer.snapshot(rate: rate)
+            let timestamp = snap.latestRecordedAt ?? candidate.modified
+            guard timestamp >= scanCutoff else { continue }
+
+            let cost = snap.estimatedCostUSD ?? 0
+            let day = calendar.startOfDay(for: timestamp)
+            let key = DailyKey(date: day, model: model)
+            var value = daily[key] ?? DailyValue()
+            value.input += snap.inputTokens
+            value.output += snap.outputTokens
+            value.cached += snap.cacheReadInputTokens
+            value.requests += 1
+            value.cost += cost
+            daily[key] = value
+            costObservations.append(.init(timestamp: timestamp, costUSD: cost))
+            let tokens = snap.totalTokens
+            events.append(
+                UsageEvent(
+                    timestamp: timestamp,
+                    tokens: tokens > 0 ? tokens : nil,
+                    model: model,
+                    type: .telemetry
+                )
+            )
+        }
+
+        let buckets = daily.map { key, value in
+            UsageAnalyticsBucket(
+                startDate: key.date,
+                endDate: calendar.date(byAdding: .day, value: 1, to: key.date)
+                    ?? key.date.addingTimeInterval(86_400),
+                model: key.model,
+                inputTokens: value.input,
+                outputTokens: value.output,
+                cachedInputTokens: value.cached,
+                requests: value.requests,
+                costUSD: value.cost,
+                source: .localEstimate,
+                note: "Muse session tokens × catalog rates"
+            )
+        }.sorted { $0.startDate > $1.startDate }
+
+        return MuseLocalUsageSummary(
+            currentMonthCostUSD: buckets
+                .filter { $0.startDate >= monthStart }
+                .compactMap(\.costUSD)
+                .reduce(0, +),
+            last30DaysCostUSD: buckets
+                .filter { $0.endDate >= thirtyDayCutoff }
+                .compactMap(\.costUSD)
+                .reduce(0, +),
+            inputTokens: buckets.reduce(0) { $0 + $1.inputTokens },
+            outputTokens: buckets.reduce(0) { $0 + $1.outputTokens },
+            cachedTokens: buckets.reduce(0) { $0 + $1.cachedInputTokens },
+            events: events.sorted { $0.timestamp > $1.timestamp },
+            analyticsBuckets: buckets,
+            costObservations: costObservations,
+            dataHomeConfigured: true
+        )
+    }
+}
+
+enum MetaBillingReset {
+    /// First instant of the next local calendar month (TaskWraith soft-budget reset).
+    static func nextResetDate(from now: Date, calendar: Calendar = .current) -> Date {
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now))
+            ?? calendar.startOfDay(for: now)
+        return calendar.date(byAdding: .month, value: 1, to: monthStart)
+            ?? now.addingTimeInterval(30 * 86_400)
+    }
+}
+
+/// Accumulates post-anchor Muse projected spend on top of a Meta console "Spend to date" reading.
+enum MetaSpendWatermarkStore {
+    struct Adjustment {
+        let spend: Double
+        let localIncrement: Double
+    }
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let signatureKey = "meta.spendWatermark.signature"
+    private static let localCostKey = "meta.spendWatermark.localCostUSD"
+    private static let localMonthKey = "meta.spendWatermark.localCostMonth"
+    private static let accumulatedCostKey = "meta.spendWatermark.accumulatedLocalCostUSD"
+    private static let hasBaselineKey = "meta.spendWatermark.hasLocalBaseline"
+
+    private static let unitsPerUSD: [String: Double] = [
+        "USD": 1,
+        "EUR": 0.92,
+        "GBP": 0.79
+    ]
+
+    /// Converts a USD amount into the user's billing currency using the same rates as spend accumulation.
+    static func amountInCurrency(_ usd: Double, currency: String) -> Double? {
+        guard let rate = unitsPerUSD[currency.uppercased()] else { return nil }
+        return usd * rate
+    }
+
+    static func adjustment(
+        anchoredSpend: Double,
+        currentLocalSpendUSD: Double?,
+        currency: String,
+        signature: String,
+        initialLocalIncrementUSD: Double = 0,
+        now: Date = Date(),
+        defaults overrideDefaults: UserDefaults? = nil
+    ) -> Adjustment {
+        guard let conversionRate = unitsPerUSD[currency.uppercased()] else {
+            return Adjustment(spend: anchoredSpend, localIncrement: 0)
+        }
+        let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        guard defaults.string(forKey: signatureKey) == signature else {
+            defaults.set(signature, forKey: signatureKey)
+            let recoveredIncrement = max(initialLocalIncrementUSD, 0)
+            defaults.set(recoveredIncrement, forKey: accumulatedCostKey)
+            if let currentLocalSpendUSD {
+                defaults.set(currentLocalSpendUSD, forKey: localCostKey)
+                defaults.set(monthKey(for: now), forKey: localMonthKey)
+                defaults.set(true, forKey: hasBaselineKey)
+            } else {
+                defaults.removeObject(forKey: localCostKey)
+                defaults.removeObject(forKey: localMonthKey)
+                defaults.set(false, forKey: hasBaselineKey)
+            }
+            return result(
+                anchoredSpend: anchoredSpend,
+                accumulatedUSD: recoveredIncrement,
+                conversionRate: conversionRate
+            )
+        }
+
+        var accumulated = defaults.double(forKey: accumulatedCostKey)
+        guard let currentLocalSpendUSD else {
+            return result(
+                anchoredSpend: anchoredSpend,
+                accumulatedUSD: accumulated,
+                conversionRate: conversionRate
+            )
+        }
+        let currentMonth = monthKey(for: now)
+        guard defaults.bool(forKey: hasBaselineKey) else {
+            if defaults.object(forKey: localCostKey) != nil {
+                let legacyBaseline = defaults.double(forKey: localCostKey)
+                accumulated += max(currentLocalSpendUSD - legacyBaseline, 0)
+                defaults.set(accumulated, forKey: accumulatedCostKey)
+            } else if initialLocalIncrementUSD > accumulated {
+                accumulated = initialLocalIncrementUSD
+                defaults.set(accumulated, forKey: accumulatedCostKey)
+            }
+            defaults.set(currentLocalSpendUSD, forKey: localCostKey)
+            defaults.set(currentMonth, forKey: localMonthKey)
+            defaults.set(true, forKey: hasBaselineKey)
+            return result(
+                anchoredSpend: anchoredSpend,
+                accumulatedUSD: accumulated,
+                conversionRate: conversionRate
+            )
+        }
+
+        let previousLocalCost = defaults.double(forKey: localCostKey)
+        let storedLocalCost: Double
+        if defaults.string(forKey: localMonthKey) == currentMonth {
+            accumulated += max(currentLocalSpendUSD - previousLocalCost, 0)
+            storedLocalCost = max(currentLocalSpendUSD, previousLocalCost)
+        } else {
+            // The local month-to-date counter restarted. Preserve previously
+            // accumulated post-anchor spend and begin with the new month.
+            accumulated += currentLocalSpendUSD
+            storedLocalCost = currentLocalSpendUSD
+        }
+        defaults.set(storedLocalCost, forKey: localCostKey)
+        defaults.set(currentMonth, forKey: localMonthKey)
+        defaults.set(accumulated, forKey: accumulatedCostKey)
+        return result(
+            anchoredSpend: anchoredSpend,
+            accumulatedUSD: accumulated,
+            conversionRate: conversionRate
+        )
+    }
+
+    static func adjustedSpend(
+        anchoredSpend: Double,
+        currentLocalSpendUSD: Double?,
+        currency: String,
+        signature: String,
+        initialLocalIncrementUSD: Double = 0,
+        now: Date = Date(),
+        defaults overrideDefaults: UserDefaults? = nil
+    ) -> Double {
+        adjustment(
+            anchoredSpend: anchoredSpend,
+            currentLocalSpendUSD: currentLocalSpendUSD,
+            currency: currency,
+            signature: signature,
+            initialLocalIncrementUSD: initialLocalIncrementUSD,
+            now: now,
+            defaults: overrideDefaults
+        ).spend
+    }
+
+    private static func result(
+        anchoredSpend: Double,
+        accumulatedUSD: Double,
+        conversionRate: Double
+    ) -> Adjustment {
+        let localIncrement = max(accumulatedUSD, 0) * conversionRate
+        return Adjustment(
+            spend: anchoredSpend + localIncrement,
+            localIncrement: localIncrement
+        )
+    }
+
+    /// Soft Meta budget resets on the local calendar month.
+    private static func monthKey(for date: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.year, .month], from: date)
+        return String(format: "%04d-%02d", parts.year ?? 0, parts.month ?? 0)
+    }
+}
+
+/// Auto-decrements a manual Meta remaining-balance anchor by post-anchor Muse observed spend.
+enum MetaRemainingWatermarkStore {
+    struct Adjustment {
+        let effectiveRemaining: Double
+        /// Amount subtracted from remaining in billing currency (USD/EUR/GBP) due to local Muse spend since the anchor.
+        let localDecrementUSD: Double
+    }
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let signatureKey = "meta.remainingWatermark.signature"
+    private static let observedKey = "meta.remainingWatermark.observedMonthUSD"
+    private static let monthKeyName = "meta.remainingWatermark.localMonth"
+    private static let accumulatedKey = "meta.remainingWatermark.accumulatedDecrementUSD"
+
+    /// Same FX table as `MetaSpendWatermarkStore` (USD=1, EUR=0.92, GBP=0.79).
+    private static let unitsPerUSD: [String: Double] = [
+        "USD": 1,
+        "EUR": 0.92,
+        "GBP": 0.79
+    ]
+
+    static func adjustment(
+        anchoredRemaining: Double,
+        currentObservedMonthUSD: Double?,
+        currency: String,
+        signature: String,
+        now: Date = Date(),
+        defaults overrideDefaults: UserDefaults? = nil
+    ) -> Adjustment {
+        // Unknown billing currency: keep the console remaining as-is (no auto-decrement).
+        guard let conversionRate = unitsPerUSD[currency.uppercased()] else {
+            return Adjustment(effectiveRemaining: max(0, anchoredRemaining), localDecrementUSD: 0)
+        }
+        let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        guard defaults.string(forKey: signatureKey) == signature else {
+            defaults.set(signature, forKey: signatureKey)
+            defaults.set(0.0, forKey: accumulatedKey)
+            if let currentObservedMonthUSD {
+                defaults.set(currentObservedMonthUSD, forKey: observedKey)
+                defaults.set(monthKey(for: now), forKey: monthKeyName)
+            } else {
+                defaults.removeObject(forKey: observedKey)
+                defaults.removeObject(forKey: monthKeyName)
+            }
+            return result(
+                anchoredRemaining: anchoredRemaining,
+                accumulatedUSD: 0,
+                conversionRate: conversionRate
+            )
+        }
+
+        var accumulated = max(defaults.double(forKey: accumulatedKey), 0)
+        guard let currentObservedMonthUSD else {
+            return result(
+                anchoredRemaining: anchoredRemaining,
+                accumulatedUSD: accumulated,
+                conversionRate: conversionRate
+            )
+        }
+
+        let currentMonth = monthKey(for: now)
+        guard defaults.string(forKey: monthKeyName) == currentMonth else {
+            // Local month-to-date restarted. Preserve previously accumulated drain and
+            // treat the new month's observed MTD as a fresh increment from zero.
+            accumulated += max(currentObservedMonthUSD, 0)
+            defaults.set(accumulated, forKey: accumulatedKey)
+            defaults.set(currentObservedMonthUSD, forKey: observedKey)
+            defaults.set(currentMonth, forKey: monthKeyName)
+            return result(
+                anchoredRemaining: anchoredRemaining,
+                accumulatedUSD: accumulated,
+                conversionRate: conversionRate
+            )
+        }
+
+        if defaults.object(forKey: observedKey) == nil {
+            defaults.set(currentObservedMonthUSD, forKey: observedKey)
+            return result(
+                anchoredRemaining: anchoredRemaining,
+                accumulatedUSD: accumulated,
+                conversionRate: conversionRate
+            )
+        }
+
+        let previousObserved = defaults.double(forKey: observedKey)
+        accumulated += max(currentObservedMonthUSD - previousObserved, 0)
+        let storedObserved = max(currentObservedMonthUSD, previousObserved)
+        defaults.set(storedObserved, forKey: observedKey)
+        defaults.set(currentMonth, forKey: monthKeyName)
+        defaults.set(accumulated, forKey: accumulatedKey)
+        return result(
+            anchoredRemaining: anchoredRemaining,
+            accumulatedUSD: accumulated,
+            conversionRate: conversionRate
+        )
+    }
+
+    private static func result(
+        anchoredRemaining: Double,
+        accumulatedUSD: Double,
+        conversionRate: Double
+    ) -> Adjustment {
+        // Accumulated Muse deltas stay in USD; convert to billing currency for display.
+        let localDecrementInCurrency = max(accumulatedUSD, 0) * conversionRate
+        return Adjustment(
+            effectiveRemaining: max(0, anchoredRemaining - localDecrementInCurrency),
+            localDecrementUSD: localDecrementInCurrency
+        )
+    }
+
+    private static func monthKey(for date: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.year, .month], from: date)
+        return String(format: "%04d-%02d", parts.year ?? 0, parts.month ?? 0)
+    }
+}
+
+public struct MetaProviderClient: ProviderClient {
+    public let providerID: ProviderID = .meta
+
+    public init() {}
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        let now = Date()
+        let fields = credentials?.extraFields ?? [:]
+        let access = resolveMuseAccess(credentials: credentials)
+        defer { access?.stop() }
+
+        let local = access.flatMap { MuseLocalUsageReader.read(rootURL: $0.url, now: now) }
+        let taskWraith = TaskWraithSpendReader.read(provider: .meta, now: now)
+
+        let preload = positiveDouble(fields[SpendProviderCredentialField.manualTopUpTotal])
+            ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
+        let remaining = nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
+        let threshold = positiveDouble(fields[SpendProviderCredentialField.manualPaymentThreshold])
+        let manualSpent = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
+        let currency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
+        let manualResetAt = ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
+        let resetAt = manualResetAt ?? MetaBillingReset.nextResetDate(from: now)
+        let softBudget = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .meta) ?? 15.0
+        let convertedSoftBudget = MetaSpendWatermarkStore.amountInCurrency(softBudget, currency: currency)
+        let planName = fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).nilIfEmpty ?? "API Credits"
+
+        let observedMonth = observedMonthCostUSD(local: local, taskWraith: taskWraith)
+        let remainingAdjustment: MetaRemainingWatermarkStore.Adjustment? = remaining.map { anchored in
+            // Include currency + doctrine so GBP/EUR FX enablement rebases stale USD-only state.
+            let signature = [
+                "fx-v1",
+                currency,
+                fields[SpendProviderCredentialField.manualTopUpTotal]
+                    ?? fields[SpendProviderCredentialField.manualAllowance]
+                    ?? "",
+                fields[SpendProviderCredentialField.manualCurrentBalance] ?? ""
+            ].joined(separator: "|")
+            return MetaRemainingWatermarkStore.adjustment(
+                anchoredRemaining: anchored,
+                currentObservedMonthUSD: observedMonth,
+                currency: currency,
+                signature: signature,
+                now: now
+            )
+        }
+        let displayRemaining = remainingAdjustment?.effectiveRemaining
+        let remainingLocalDecrement = remainingAdjustment?.localDecrementUSD ?? 0
+        let remainingDrivenSubtitle = remainingLocalDecrement > 0
+            ? "Manual remaining minus tracked Muse spend since anchor"
+            : nil
+
+        let impliedSpendFromBalance: Double? = {
+            guard let threshold, let remaining else { return nil }
+            return max(0, threshold - remaining)
+        }()
+        let spendAnchor = manualSpent ?? impliedSpendFromBalance
+
+        var windows: [QuotaWindow] = []
+        var balances: [QuotaBalance] = []
+        var signals: [QuotaSignal] = []
+        var spendPeriodUsesThreshold = false
+
+        // Always drive a cumulative spend window when we have a console spend
+        // reading, a payment threshold to accumulate toward, or Muse observations.
+        let shouldDriveSpendWindow = manualSpent != nil
+            || threshold != nil
+            || local != nil
+            || observedMonth != nil
+        if shouldDriveSpendWindow {
+            if let manualResetAt, manualResetAt <= now {
+                signals.append(
+                    QuotaSignal(
+                        kind: .scheduledReset,
+                        title: "Billing anchor expired",
+                        message: "Update the Meta console Spend reading for the new billing cycle.",
+                        severity: .info,
+                        confidence: 1,
+                        windowLabel: "Spend this billing period",
+                        detectedAt: now
+                    )
+                )
+            }
+
+            let anchoredSpend = spendAnchor ?? 0
+            let signature: String = {
+                if let anchorUpdatedAt = fields[SpendProviderCredentialField.anchorUpdatedAt],
+                   !anchorUpdatedAt.isEmpty {
+                    return anchorUpdatedAt
+                }
+                var parts = ["\(manualSpent ?? -1)", "\(threshold ?? -1)"]
+                // Include remaining only when it contributes to implied spend.
+                if manualSpent == nil, impliedSpendFromBalance != nil {
+                    parts.append("\(remaining ?? -1)")
+                }
+                parts.append(currency)
+                parts.append("\(manualResetAt?.timeIntervalSince1970 ?? 0)")
+                return parts.joined(separator: "|")
+            }()
+            let anchorUpdatedAt = ProviderDateParser.parse(
+                fields[SpendProviderCredentialField.anchorUpdatedAt]
+            )
+            let currentLocalSpendUSD = observedMonth ?? local?.currentMonthCostUSD
+            let initialLocalIncrementUSD: Double = {
+                if let anchorUpdatedAt {
+                    return local?.costUSD(since: anchorUpdatedAt) ?? 0
+                }
+                // Muse-only / zero-anchor: seed with current MTD so the first card
+                // isn't stuck at zero until the next scan delta.
+                if spendAnchor == nil {
+                    return currentLocalSpendUSD ?? 0
+                }
+                return 0
+            }()
+            let adjustment = MetaSpendWatermarkStore.adjustment(
+                anchoredSpend: anchoredSpend,
+                currentLocalSpendUSD: currentLocalSpendUSD,
+                currency: currency,
+                signature: signature,
+                initialLocalIncrementUSD: initialLocalIncrementUSD,
+                now: now
+            )
+            let spendTotal = threshold ?? convertedSoftBudget ?? preload
+            spendPeriodUsesThreshold = threshold != nil && spendTotal == threshold
+            let spendSubtitle: String = {
+                if adjustment.localIncrement > 0 {
+                    if manualSpent != nil {
+                        return "Meta console reading plus tracked Muse spend"
+                    }
+                    if impliedSpendFromBalance != nil {
+                        return "Threshold minus remaining, plus tracked Muse spend"
+                    }
+                    return "Tracked Muse spend since billing period start"
+                }
+                if manualSpent != nil {
+                    return "Meta console reading"
+                }
+                if impliedSpendFromBalance != nil {
+                    return "Threshold minus remaining balance"
+                }
+                return "Muse projected spend"
+            }()
+            windows.append(
+                QuotaWindow(
+                    label: "Spend this billing period",
+                    windowKind: .monthly,
+                    used: adjustment.spend,
+                    total: spendTotal,
+                    resetDate: resetAt,
+                    unit: currency,
+                    subtitle: spendSubtitle
+                )
+            )
+        }
+
+        if let preload, let displayRemaining,
+           let creditUsed = DeepSeekTopUpMeter.creditUsed(
+            totalTopUp: preload,
+            currentBalance: displayRemaining
+           ) {
+            windows.append(
+                QuotaWindow(
+                    label: "Credit used",
+                    windowKind: .custom,
+                    used: creditUsed,
+                    total: preload,
+                    unit: currency,
+                    subtitle: remainingLocalDecrement > 0
+                        ? "Preload minus remaining, auto-advanced by Muse spend"
+                        : "Configured preload minus remaining Meta balance"
+                )
+            )
+        }
+
+        // Prefer an Observed card whenever the Muse data home is readable (even at $0).
+        // Kept as a USD Muse projection secondary meter (not converted to billing currency).
+        if local != nil {
+            windows.append(
+                QuotaWindow(
+                    label: "Observed this month",
+                    windowKind: .monthly,
+                    used: observedMonth ?? 0,
+                    total: softBudget,
+                    resetDate: resetAt,
+                    unit: "USD",
+                    subtitle: "Muse projected spend from session tokens × catalog rates — not a Meta invoice"
+                )
+            )
+        }
+
+        // Skip a separate Payment threshold window when the spend window already
+        // uses the threshold as its total (avoids mislabeling USD Muse as GBP).
+        if let threshold, !spendPeriodUsesThreshold {
+            windows.append(
+                QuotaWindow(
+                    label: "Payment threshold",
+                    windowKind: .custom,
+                    used: observedMonth ?? local?.currentMonthCostUSD ?? taskWraith?.currentMonthCostUSD ?? 0,
+                    total: threshold,
+                    unit: currency,
+                    subtitle: "Advisory vs Meta auto-charge threshold"
+                )
+            )
+        }
+
+        if local == nil, let estimated = taskWraith?.currentMonthCostUSD, estimated > 0 {
+            windows.append(
+                QuotaWindow(
+                    label: "TaskWraith estimate",
+                    windowKind: .monthly,
+                    used: estimated,
+                    total: softBudget,
+                    resetDate: resetAt,
+                    unit: "USD",
+                    subtitle: "Muse session tokens × catalog rates"
+                )
+            )
+        }
+
+        if let preload {
+            balances.append(
+                QuotaBalance(label: "Preload credit", amount: preload, unit: currency, subtitle: "Manual billing anchor")
+            )
+        }
+        if let displayRemaining {
+            balances.append(
+                QuotaBalance(
+                    label: "Remaining balance",
+                    amount: displayRemaining,
+                    unit: currency,
+                    subtitle: remainingDrivenSubtitle ?? "Manual billing anchor"
+                )
+            )
+        }
+        if let threshold {
+            balances.append(
+                QuotaBalance(label: "Payment threshold", amount: threshold, unit: currency, subtitle: "Manual billing anchor")
+            )
+        }
+
+        var stats: [QuotaStat] = []
+        if let local {
+            stats.append(
+                QuotaStat(
+                    label: "Local 30D cost",
+                    value: local.last30DaysCostUSD,
+                    unit: "USD",
+                    subtitle: "Muse session projection"
+                )
+            )
+            if local.inputTokens > 0 {
+                stats.append(
+                    QuotaStat(label: "Input tokens", value: local.inputTokens, unit: "tokens", subtitle: "Muse sessions")
+                )
+            }
+            if local.outputTokens > 0 {
+                stats.append(
+                    QuotaStat(label: "Output tokens", value: local.outputTokens, unit: "tokens", subtitle: "Muse sessions")
+                )
+            }
+        }
+        if let taskWraith {
+            stats.append(
+                QuotaStat(
+                    label: "TaskWraith 35D estimate",
+                    value: taskWraith.last35DaysCostUSD,
+                    unit: "USD",
+                    subtitle: "Not vendor billing"
+                )
+            )
+        }
+
+        let hasAnchors = preload != nil || remaining != nil || threshold != nil || manualSpent != nil
+        guard !windows.isEmpty || local != nil || hasAnchors || taskWraith != nil else {
+            throw ProviderFetchError.notConfigured
+        }
+
+        return QuotaSnapshot(
+            providerID: .meta,
+            displayName: ProviderID.meta.snapshotDisplayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: local?.events ?? taskWraith?.events ?? [],
+            analyticsBuckets: local?.analyticsBuckets.isEmpty == false
+                ? (local?.analyticsBuckets ?? [])
+                : (taskWraith?.analyticsBuckets ?? []),
+            fetchState: .success
+        )
+    }
+
+    private func observedMonthCostUSD(
+        local: MuseLocalUsageSummary?,
+        taskWraith: TaskWraithSpendSummary?
+    ) -> Double? {
+        switch (local?.currentMonthCostUSD, taskWraith?.currentMonthCostUSD) {
+        case let (local?, tw?):
+            return max(local, tw)
+        case let (local?, nil):
+            return local
+        case let (nil, tw?):
+            return tw
+        default:
+            return nil
+        }
+    }
+
+    /// Prefer security-scoped bookmark, then customEndpoint, then ~/.local/share/muse.
+    private func resolveMuseAccess(credentials: ProviderCredential?) -> SecurityScopedCredentialAccess? {
+        if let access = SecurityScopedCredentialAccess.resolve(
+            credentials: credentials,
+            fallbackURL: nil
+        ) {
+            return access
+        }
+        let fallback = museDefaultDataHomeURL()
+        let sessionsURL = fallback.appendingPathComponent("sessions", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: sessionsURL.path) else { return nil }
+        return SecurityScopedCredentialAccess(url: fallback, stop: {})
+    }
+}
+
+/// Default Muse data home (`~/.local/share/muse`), unwrapping macOS container home paths.
+private func museDefaultDataHomeURL() -> URL {
+    let homePath = NSHomeDirectory()
+    let realHome: String
+    if let range = homePath.range(of: "/Library/Containers/") {
+        realHome = String(homePath[..<range.lowerBound])
+    } else {
+        realHome = homePath
+    }
+    return URL(fileURLWithPath: realHome, isDirectory: true)
+        .appendingPathComponent(".local/share/muse", isDirectory: true)
+}
+
+private func normalizedMuseDataHomeURL(_ selectedURL: URL) -> URL {
+    var url = selectedURL.standardizedFileURL
+    if url.lastPathComponent == "session.jsonl" {
+        url = url.deletingLastPathComponent()
+    }
+    if url.path.contains("/sessions/") || url.lastPathComponent == "sessions" {
+        while url.lastPathComponent != "sessions", url.pathComponents.count > 1 {
+            url = url.deletingLastPathComponent()
+        }
+        if url.lastPathComponent == "sessions" {
+            return url.deletingLastPathComponent()
+        }
+    }
+    if url.lastPathComponent == "muse" {
+        return url
+    }
+    let fm = FileManager.default
+    if fm.fileExists(atPath: url.appendingPathComponent("sessions", isDirectory: true).path)
+        || fm.fileExists(atPath: url.appendingPathComponent("model-catalog", isDirectory: true).path) {
+        return url
+    }
+    return url.appendingPathComponent("muse", isDirectory: true)
 }
 
 private func normalizedCurrency(_ value: String?) -> String {

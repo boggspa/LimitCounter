@@ -23,6 +23,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case mistral
     case deepseek
     case cerebras
+    case meta
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -54,6 +55,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mistral:  return "Mistral"
         case .deepseek: return "DeepSeek"
         case .cerebras: return "Cerebras"
+        case .meta:     return "Meta API"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -69,7 +71,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Codex Telemetry"
         case .claude, .windsurf, .cursor, .gemini, .kimi, .grok,
-             .antigravity, .mistral, .deepseek, .cerebras, .heatmap:
+             .antigravity, .mistral, .deepseek, .cerebras, .meta, .heatmap:
             return displayName
         }
     }
@@ -93,6 +95,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mistral:  return "m.square.fill"
         case .deepseek: return "d.circle.fill"
         case .cerebras: return "c.circle.fill"
+        case .meta:     return "infinity"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -116,6 +119,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mistral:  return "#D44404"
         case .deepseek: return "#4E6AEE"
         case .cerebras: return "#BB584A"
+        case .meta:     return "#0082FB" // Meta Blue
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -150,6 +154,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderDeepSeekLogo"
         case .cerebras:
             return "ProviderCerebrasLogo"
+        case .meta:
+            return "ProviderMetaLogo"
         case .heatmap:
             return ""
         }
@@ -160,7 +166,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt, .codexTelemetry:
             return .prototype
         case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi,
-             .grok, .antigravity, .mistral, .deepseek, .cerebras:
+             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta:
             return .session
         case .heatmap:
             return .session
@@ -197,6 +203,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "DeepSeek API credit balance and top-ups"
         case .cerebras:
             return "Cerebras usage import"
+        case .meta:
+            return "Meta API credits and Muse spend"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -225,13 +233,15 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .grok:
             return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
         case .antigravity:
-            return "Reads an explicitly granted Antigravity CLI session and requests the official Gemini 5-hour and weekly quota summary after an explicit refresh."
+            return "Reads an explicitly granted Antigravity CLI session and requests the official Gemini 5-hour and weekly quota summary on a looping cadence (4m → 7m → 16m → 3m → 21m), or immediately on manual refresh."
         case .mistral:
-            return "Reads only Vibe session metadata under `~/.vibe` for local token cost. A manual billing anchor or Enterprise Admin API key can add the monthly allowance."
+            return "Estimates Vibe spend under `~/.vibe` TaskWraith-style (unique payload chars÷4 × catalogue rates). The Vibe Code budget can be entered manually, or supplied by an Enterprise Admin API key."
         case .deepseek:
             return "Uses the official DeepSeek balance API for current credits. An optional cumulative top-up total derives a credit-used meter, while observed balance decreases remain a separate monthly estimate."
         case .cerebras:
             return "Imports an official Cerebras Analytics CSV or a manual balance anchor. Optional local telemetry is displayed as an API-price estimate."
+        case .meta:
+            return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Optional Meta console Spend reading anchors a billing-period meter that accumulates Muse spend after that reading; preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -267,6 +277,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "DeepSeek API key"
         case .cerebras:
             return "Cerebras Analytics CSV or data folder"
+        case .meta:
+            return "Muse data folder"
         case .heatmap:
             return ""
         }
@@ -277,10 +289,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .claude:
             return "OAuth token (optional)"
         case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
-             .codexTelemetry, .heatmap:
+             .codexTelemetry, .meta, .heatmap:
             return nil
         case .mistral:
-            return "Monthly allowance (optional)"
+            return "Vibe Code budget (optional)"
         case .cerebras:
             return "Purchased credits (optional)"
         case .openaiAPI:
@@ -317,13 +329,15 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .grok:
             return "Runs only the local Grok CLI `/usage` command against the `~/.grok` folder you grant. No prompts are sent and no xAI credentials are extracted."
         case .antigravity:
-            return "Reads only the official CLI OAuth session file from the folder you grant, then requests quota summary after a user refresh. It does not send model prompts or read browser data."
+            return "Reads only the official CLI OAuth session file from the folder you grant, then requests quota summary on a 4→7→16→3→21 minute loop (or immediately on manual refresh). It does not send model prompts or read browser data."
         case .mistral:
-            return "Reads only Vibe `meta.json` usage fields from a folder you grant. Admin keys and manual billing anchors are stored in Keychain."
+            return "Reads Vibe `meta.json` and estimates character lengths from `messages.jsonl` (content is not stored) from a folder you grant. Admin keys and manual billing anchors are stored in Keychain."
         case .deepseek:
             return "Uses only the DeepSeek API key you enter to request the documented balance endpoint."
         case .cerebras:
             return "Reads only the Cerebras CSV or folder you explicitly select. It does not inspect browser sessions or private web APIs."
+        case .meta:
+            return "Reads only Muse `session.jsonl` usage fields from a folder you grant. Manual billing anchors are stored in Keychain. Meta has no documented balance API; spend is projected locally."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -408,7 +422,7 @@ public extension ProviderID {
             return [
                 AppIconCandidate(bundleIdentifier: "com.google.antigravity", applicationNames: ["Antigravity.app"])
             ]
-        case .gemini, .mistral, .deepseek, .cerebras, .codexTelemetry, .heatmap:
+        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .heatmap:
             return []
         }
     }
@@ -1388,7 +1402,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             return "Spend & Local Usage"
         }
 
-        if providerID == .deepseek || providerID == .cerebras {
+        if providerID == .deepseek || providerID == .cerebras || providerID == .meta {
             return "Local Spend Estimate"
         }
 
@@ -1400,7 +1414,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         if providerID == .openai { return "Credits / Balance" }
         if providerID == .openaiAPI { return "API Costs" }
         if providerID == .kimi { return "Membership Quota" }
-        if providerID == .deepseek || providerID == .cerebras { return "Credit Balance" }
+        if providerID == .deepseek || providerID == .cerebras || providerID == .meta { return "Credit Balance" }
         return "Extra Balance / Credits"
     }
 
