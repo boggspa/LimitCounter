@@ -116,24 +116,63 @@ nonisolated enum AntigravityQuotaSummaryParser {
     }
 }
 
+/// Autonomous Antigravity quota refresh cadence (minutes): 4 → 7 → 16 → 3 → 21 → loop.
+enum AntigravityRefreshCadence {
+    static let intervalsMinutes: [Int] = [4, 7, 16, 3, 21]
+
+    static var intervals: [TimeInterval] {
+        intervalsMinutes.map { TimeInterval($0 * 60) }
+    }
+
+    static func interval(at index: Int) -> TimeInterval {
+        let steps = intervals
+        guard !steps.isEmpty else { return 4 * 60 }
+        let normalized = ((index % steps.count) + steps.count) % steps.count
+        return steps[normalized]
+    }
+
+    static func nextIndex(after index: Int) -> Int {
+        let count = max(intervals.count, 1)
+        return (index + 1) % count
+    }
+
+    /// Whether an autonomous refresh is due given the current cadence step.
+    static func isDue(
+        now: Date,
+        cadenceIndex: Int,
+        fetchedAt: Date?,
+        lastAttemptAt: Date?
+    ) -> Bool {
+        let required = interval(at: cadenceIndex)
+        guard let reference = fetchedAt ?? lastAttemptAt else { return true }
+        return now.timeIntervalSince(reference) >= required
+    }
+}
+
 private actor AntigravityUsageCache {
     static let shared = AntigravityUsageCache()
 
     private var observation: AntigravityUsageObservation?
     private var fetchedAt: Date?
     private var lastAttemptAt: Date?
-    private let minimumInterval: TimeInterval = 5 * 60
+    private var cadenceIndex = 0
 
     func cachedObservation() -> AntigravityUsageObservation? {
         observation
     }
 
-    func beginFetch(now: Date = Date()) -> Bool {
-        if let lastAttemptAt, now.timeIntervalSince(lastAttemptAt) < minimumInterval {
-            return false
-        }
-        if let fetchedAt, now.timeIntervalSince(fetchedAt) < minimumInterval {
-            return false
+    /// Manual refreshes always proceed. Autonomous refreshes follow the
+    /// 4→7→16→3→21 minute cadence loop.
+    func beginFetch(userInitiated: Bool, now: Date = Date()) -> Bool {
+        if !userInitiated {
+            guard AntigravityRefreshCadence.isDue(
+                now: now,
+                cadenceIndex: cadenceIndex,
+                fetchedAt: fetchedAt,
+                lastAttemptAt: lastAttemptAt
+            ) else {
+                return false
+            }
         }
         lastAttemptAt = now
         return true
@@ -142,6 +181,7 @@ private actor AntigravityUsageCache {
     func store(_ value: AntigravityUsageObservation, at date: Date = Date()) {
         observation = value
         fetchedAt = date
+        cadenceIndex = AntigravityRefreshCadence.nextIndex(after: cadenceIndex)
     }
 }
 
@@ -178,8 +218,7 @@ public struct AntigravityProviderClient: UserInitiatedProviderClient {
         var observation = await AntigravityUsageCache.shared.cachedObservation()
         var fetchError: Error?
 
-        if userInitiated,
-           await AntigravityUsageCache.shared.beginFetch() {
+        if await AntigravityUsageCache.shared.beginFetch(userInitiated: userInitiated) {
             guard let access = AntigravitySessionAccess.resolve(credentials: credentials) else {
                 throw ProviderFetchError.notConfigured
             }
