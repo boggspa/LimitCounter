@@ -62,6 +62,7 @@ nonisolated enum AntigravityQuotaSummaryParser {
 
     private struct Bucket: Decodable {
         let bucketId: String
+        let displayName: String?
         let remainingFraction: Double
         let resetTime: String?
     }
@@ -73,17 +74,99 @@ nonisolated enum AntigravityQuotaSummaryParser {
         let response = try JSONDecoder().decode(Response.self, from: data)
         let buckets = response.groups.flatMap(\.buckets)
 
-        guard let fiveHour = buckets.first(where: { $0.bucketId == "gemini-5h" }),
-              let weekly = buckets.first(where: { $0.bucketId == "gemini-weekly" }),
-              let fiveHourWindow = makeWindow(from: fiveHour, label: "Gemini 5H", kind: .session),
-              let weeklyWindow = makeWindow(from: weekly, label: "Gemini Weekly", kind: .weekly) else {
+        let trackedBuckets = buckets.compactMap(AntigravityBucketCandidate.init)
+
+        guard trackedBuckets.contains(where: { $0.family == .gemini && $0.windowKind == .session }),
+              trackedBuckets.contains(where: { $0.family == .gemini && $0.windowKind == .weekly }) else {
             return nil
         }
 
+        let hasDedicatedClaudeOrGPTBuckets = trackedBuckets.contains {
+            $0.family == .claude || $0.family == .gpt
+        }
+        let activeCandidates = trackedBuckets.filter {
+            $0.family != .combined3P || !hasDedicatedClaudeOrGPTBuckets
+        }
+
+        let windows = activeCandidates.compactMap { candidate in
+            makeWindow(
+                from: candidate.bucket,
+                label: candidate.label,
+                kind: candidate.windowKind
+            ).map { candidate.windowOrdered($0) }
+        }
+        .sorted { lhs, rhs in
+            if lhs.order != rhs.order { return lhs.order < rhs.order }
+            return lhs.window.label < rhs.window.label
+        }
+        .map(\.window)
+
+        let ordered = windows
+        guard ordered.count >= 2 else { return nil }
+
         return AntigravityUsageObservation(
             planName: planName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
-            windows: [fiveHourWindow, weeklyWindow]
+            windows: ordered
         )
+    }
+
+    private struct AntigravityBucketCandidate {
+        enum Family {
+            case gemini
+            case claude
+            case gpt
+            case combined3P
+        }
+
+        let bucket: Bucket
+        let label: String
+        let family: Family
+        let windowKind: QuotaWindowKind
+        let familyOrder: Int
+        let windowOrder: Int
+
+        init?(bucket: Bucket) {
+            let normalized = bucket.bucketId.lowercased()
+            guard let delimiter = normalized.firstIndex(of: "-") else { return nil }
+            let family = String(normalized[..<delimiter])
+            let window = String(normalized[normalized.index(after: delimiter)...])
+            let isFiveHour = window == "5h"
+            let isWeekly = window == "weekly"
+            guard isFiveHour || isWeekly else { return nil }
+
+            let windowKind: QuotaWindowKind = isFiveHour ? .session : .weekly
+            let windowOrder = isFiveHour ? 0 : 1
+
+            let (familyType, familyOrder, familyLabel): (Family, Int, String)
+            switch family {
+            case "gemini":
+                (familyType, familyOrder, familyLabel) = (.gemini, 0, "Gemini")
+            case "claude":
+                (familyType, familyOrder, familyLabel) = (.claude, 1, "Claude")
+            case "gpt":
+                (familyType, familyOrder, familyLabel) = (.gpt, 2, "GPT")
+            case "3p":
+                (familyType, familyOrder, familyLabel) = (.combined3P, 3, "Claude/GPT")
+            default:
+                return nil
+            }
+
+            self.bucket = bucket
+            self.label = "\(familyLabel) \(isFiveHour ? "5H" : "Weekly")"
+            self.family = familyType
+            self.windowKind = windowKind
+            self.familyOrder = familyOrder
+            self.windowOrder = windowOrder
+        }
+
+        func windowOrdered(_ window: QuotaWindow) -> OrderedWindow {
+            OrderedWindow(window: window, order: familyOrder * 2 + windowOrder)
+        }
+    }
+
+    private struct OrderedWindow {
+        let window: QuotaWindow
+        let order: Int
     }
 
     private static func makeWindow(

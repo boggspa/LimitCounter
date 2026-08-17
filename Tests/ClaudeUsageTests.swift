@@ -27,6 +27,13 @@ private func makeDate(_ value: String) -> Date {
     ISO8601DateFormatter().date(from: value)!
 }
 
+private func isolatedDefaults() -> (defaults: UserDefaults, suiteName: String) {
+    let suiteName = "ClaudeUsageTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    return (defaults, suiteName)
+}
+
 private func utcCalendar() -> Calendar {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -210,7 +217,16 @@ private func testClaudePlanResolverRetainsCredentialFallback() throws {
 }
 
 private func testClaudeOAuthCacheFreshReadsDoNotSlideTTL() throws {
-    let cache = ClaudeOAuthResponseCache(freshTTL: 10, staleTTL: 60, diskMaxAge: 60)
+    let storage = isolatedDefaults()
+    defer { storage.defaults.removePersistentDomain(forName: storage.suiteName) }
+
+    let cache = ClaudeOAuthResponseCache(
+        freshTTL: 10,
+        staleTTL: 60,
+        diskMaxAge: 60,
+        defaults: storage.defaults,
+        legacySnapshotLoader: { nil }
+    )
     let now = makeDate("2026-05-16T00:00:00Z")
     let snapshot = QuotaSnapshot(
         providerID: .claude,
@@ -238,6 +254,116 @@ private func testClaudeOAuthCacheFreshReadsDoNotSlideTTL() throws {
         cache.fresh(now: now.addingTimeInterval(11)) == nil,
         "cache read should not extend TTL"
     )
+}
+
+private func testClaudeOAuthCacheRejectsTranscriptSnapshots() throws {
+    let storage = isolatedDefaults()
+    defer { storage.defaults.removePersistentDomain(forName: storage.suiteName) }
+
+    let now = makeDate("2026-08-16T00:00:00Z")
+    let localSnapshot = QuotaSnapshot(
+        providerID: .claude,
+        displayName: "Claude Code",
+        windows: [
+            QuotaWindow(
+                label: "Session",
+                windowKind: .session,
+                used: 91_214_868,
+                unit: "tok",
+                subtitle: "Local Claude Code transcript"
+            ),
+            QuotaWindow(
+                label: "Weekly",
+                windowKind: .weekly,
+                used: 2_306_975_133,
+                unit: "tok",
+                subtitle: "Aggregated local Claude Code usage"
+            )
+        ],
+        fetchedAt: now
+    )
+    let cache = ClaudeOAuthResponseCache(
+        freshTTL: 10,
+        staleTTL: 60,
+        diskMaxAge: 60,
+        defaults: storage.defaults,
+        legacySnapshotLoader: { localSnapshot }
+    )
+
+    cache.store(localSnapshot, now: now)
+
+    try expect(
+        !ClaudeOAuthResponseCache.isOAuthQuotaSnapshot(localSnapshot),
+        "local transcript totals must not be classified as OAuth quota"
+    )
+    try expect(cache.fresh(now: now) == nil, "local transcript totals must not enter memory cache")
+    try expect(
+        cache.staleFallback(now: now.addingTimeInterval(1)) == nil,
+        "local transcript totals must not enter disk fallback"
+    )
+}
+
+private func testClaudeOAuthCachePersistsQuotaOnlyAcrossInstances() throws {
+    let storage = isolatedDefaults()
+    defer { storage.defaults.removePersistentDomain(forName: storage.suiteName) }
+
+    let now = makeDate("2026-08-16T00:00:00Z")
+    let event = UsageEvent(
+        timestamp: now.addingTimeInterval(-300),
+        tokens: 42,
+        model: "Claude",
+        type: .bucket
+    )
+    let oauthSnapshot = QuotaSnapshot(
+        providerID: .claude,
+        displayName: "Claude Code",
+        planName: "Max x20",
+        windows: [
+            QuotaWindow(
+                label: "Session",
+                windowKind: .session,
+                used: 6,
+                total: 100,
+                resetDate: now.addingTimeInterval(3_600),
+                unit: "%"
+            ),
+            QuotaWindow(
+                label: "Weekly",
+                windowKind: .weekly,
+                used: 80,
+                total: 100,
+                resetDate: now.addingTimeInterval(2 * 24 * 60 * 60),
+                unit: "%"
+            )
+        ],
+        events: [event],
+        fetchedAt: now
+    )
+    let firstCache = ClaudeOAuthResponseCache(
+        freshTTL: 10,
+        staleTTL: 60,
+        diskMaxAge: 120,
+        defaults: storage.defaults,
+        legacySnapshotLoader: { nil }
+    )
+    firstCache.store(oauthSnapshot, now: now)
+
+    let relaunchedCache = ClaudeOAuthResponseCache(
+        freshTTL: 10,
+        staleTTL: 60,
+        diskMaxAge: 120,
+        defaults: storage.defaults,
+        legacySnapshotLoader: { nil }
+    )
+    let restored = relaunchedCache.staleFallback(now: now.addingTimeInterval(30))
+
+    try expect(
+        ClaudeOAuthResponseCache.isOAuthQuotaSnapshot(oauthSnapshot),
+        "percentage windows with explicit limits should be classified as OAuth quota"
+    )
+    try expectEqual(restored?.planName, "Max x20", "persisted OAuth plan")
+    try expectEqual(restored?.windows, oauthSnapshot.windows, "persisted OAuth windows")
+    try expectEqual(restored?.events.count, 0, "dedicated OAuth persistence should strip local events")
 }
 
 private func testClaudeCodeKeychainFallbackIsOptIn() throws {
@@ -362,6 +488,8 @@ private enum ClaudeUsageTestRunner {
         try testClaudeProfileResolvesLiveMax20Plan()
         try testClaudePlanResolverRetainsCredentialFallback()
         try testClaudeOAuthCacheFreshReadsDoNotSlideTTL()
+        try testClaudeOAuthCacheRejectsTranscriptSnapshots()
+        try testClaudeOAuthCachePersistsQuotaOnlyAcrossInstances()
         try testClaudeCodeKeychainFallbackIsOptIn()
         try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()
         try testClaudeJSONLReaderBoundsOversizedTranscriptsToTail()

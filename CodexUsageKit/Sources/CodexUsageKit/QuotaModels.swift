@@ -40,7 +40,7 @@ public struct QuotaPace: Codable, Equatable, Hashable, Sendable {
     public let state: QuotaPaceState
 
     public var shouldSurface: Bool {
-        state != .onTrack
+        true
     }
 
     public var compactStatusText: String {
@@ -103,10 +103,8 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable, Sendable 
         let remaining = resetDate.timeIntervalSince(date)
         let elapsed = min(max(duration - remaining, 0), duration)
         let expectedFraction = min(max(elapsed / duration, 0), 1)
-        guard expectedFraction >= 0.03, expectedFraction < 0.985 else { return nil }
 
         let actualFraction = min(max(used / total, 0), 1)
-        guard actualFraction < 1 else { return nil }
 
         let delta = actualFraction - expectedFraction
         let tolerance = 0.02

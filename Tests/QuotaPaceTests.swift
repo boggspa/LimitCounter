@@ -90,7 +90,7 @@ private func testDailyOnTrackIsSuppressed() throws {
 
     let pace = window.pace(providerID: .windsurf, at: now)
     try expectEqual(pace?.state, .onTrack, "daily on-track state")
-    try expect(pace?.shouldSurface == false, "daily on-track should not surface")
+    try expect(pace?.shouldSurface == true, "daily on-track should surface")
 }
 
 private func testWeeklyAheadWhenUnderGuide() throws {

@@ -976,7 +976,7 @@ struct ProviderCredentialView: View {
         case .kimi:
             return "Select the folder in the macOS picker so Limit Counter receives persistent read/write access for Kimi's rotating OAuth session."
         case .antigravity:
-            return "Grant read-only access to `~/.gemini/antigravity-cli`. Limit Counter requests the Gemini quota summary on a 4→7→16→3→21 minute loop (or immediately on manual refresh)."
+            return "Grant read-only access to `~/.gemini/antigravity-cli`. Limit Counter requests the Antigravity quota summary on a 4→7→16→3→21 minute loop (or immediately on manual refresh)."
         case .mistral:
             return "Grant access to `~/.vibe`. Limit Counter estimates Vibe spend TaskWraith-style from `meta.json` plus character lengths in `messages.jsonl` (content is not stored)."
         case .meta:
@@ -1238,7 +1238,7 @@ struct ProviderCredentialView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .antigravity {
-                        Text("After granting access, Limit Counter reads the official CLI session and requests Gemini 5-hour and weekly quota on a looping cadence: 4m → 7m → 16m → 3m → 21m. Manual refresh always fetches immediately. Background refreshes never send model prompts.")
+                        Text("After granting access, Limit Counter reads the official CLI session and requests Antigravity 5-hour and 7-day quota windows on a looping cadence: 4m → 7m → 16m → 3m → 21m. Manual refresh always fetches immediately. Background refreshes never send model prompts.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

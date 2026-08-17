@@ -30,7 +30,7 @@ private func date(_ value: String) -> Date {
     ISO8601DateFormatter().date(from: value)!
 }
 
-private func testAntigravityParsesOfficialGeminiBucketsOnly() throws {
+private func testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets() throws {
     let payload = """
     {
       "groups": [
@@ -72,15 +72,112 @@ private func testAntigravityParsesOfficialGeminiBucketsOnly() throws {
 
     let parsed = try observed ?? { throw AdditionalProviderTestError.failure("Antigravity summary did not parse") }()
     try expectEqual(parsed.planName, "Google AI Pro", "Antigravity plan")
-    try expectEqual(parsed.windows.count, 2, "Gemini window count")
-    let weekly = try parsed.windows.first(where: { $0.windowKind == .weekly })
-        ?? { throw AdditionalProviderTestError.failure("Missing weekly window") }()
-    let fiveHour = try parsed.windows.first(where: { $0.windowKind == .session })
-        ?? { throw AdditionalProviderTestError.failure("Missing five-hour window") }()
+    try expectEqual(parsed.windows.count, 3, "Gemini + Claude/GPT window count")
+    let weekly = try parsed.windows.first(where: { $0.label == "Gemini Weekly" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Gemini weekly window") }()
+    let fiveHour = try parsed.windows.first(where: { $0.label == "Gemini 5H" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Gemini five-hour window") }()
+    let p3Weekly = try parsed.windows.first(where: { $0.label == "Claude/GPT Weekly" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Claude/GPT weekly window") }()
+    
     try expectClose(weekly.used, 58, "weekly remaining must invert to used")
     try expectClose(fiveHour.used, 0, "available five-hour quota must be unused")
     try expectEqual(weekly.resetDate, date("2026-08-05T07:44:00Z"), "Antigravity reset timestamp")
-    try expect(!parsed.windows.contains(where: { $0.used == 95 }), "Claude/GPT pool leaked into Gemini")
+    try expectClose(p3Weekly.used, 95, "3p-weekly remaining must invert to used")
+    let windowLabels = parsed.windows.map(\.label)
+    try expectEqual(
+        windowLabels,
+        ["Gemini 5H", "Gemini Weekly", "Claude/GPT Weekly"],
+        "Gemini windows stay adjacent to the 3P bucket"
+    )
+}
+
+private func testAntigravityParsesSeparatedClaudeAndGPTBuckets() throws {
+    let payload = """
+    {
+      "groups": [
+        {
+          "displayName": "Gemini Models",
+          "buckets": [
+            {
+              "bucketId": "gemini-weekly",
+              "displayName": "Weekly Limit",
+              "remainingFraction": 0.42,
+              "resetTime": "2026-08-05T07:44:00Z"
+            },
+            {
+              "bucketId": "gemini-5h",
+              "displayName": "Five Hour Limit",
+              "remainingFraction": 1.0,
+              "resetTime": "2026-08-01T16:00:00Z"
+            }
+          ]
+        },
+        {
+          "displayName": "Claude and GPT models",
+          "buckets": [
+            {
+              "bucketId": "claude-5h",
+              "displayName": "Five Hour Limit",
+              "remainingFraction": 0.6,
+              "resetTime": "2026-08-01T22:00:00Z"
+            },
+            {
+              "bucketId": "claude-weekly",
+              "displayName": "Weekly Limit",
+              "remainingFraction": 0.3,
+              "resetTime": "2026-08-05T07:44:00Z"
+            },
+            {
+              "bucketId": "gpt-5h",
+              "displayName": "Five Hour Limit",
+              "remainingFraction": 0.7,
+              "resetTime": "2026-08-01T22:00:00Z"
+            },
+            {
+              "bucketId": "gpt-weekly",
+              "displayName": "Weekly Limit",
+              "remainingFraction": 0.85,
+              "resetTime": "2026-08-06T07:44:00Z"
+            }
+          ]
+        }
+      ]
+    }
+    """
+    let observed = try AntigravityQuotaSummaryParser.parse(
+        Data(payload.utf8),
+        planName: "Google AI Pro"
+    )
+    let parsed = try observed ?? { throw AdditionalProviderTestError.failure("Antigravity summary did not parse") }()
+
+    let labels = parsed.windows.map(\.label)
+    try expectEqual(
+        labels,
+        [
+            "Gemini 5H",
+            "Gemini Weekly",
+            "Claude 5H",
+            "Claude Weekly",
+            "GPT 5H",
+            "GPT Weekly"
+        ],
+        "Gemini and Claude/GPT windows should stay adjacent by family"
+    )
+
+    let claude5h = try parsed.windows.first(where: { $0.label == "Claude 5H" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Claude 5H window") }()
+    let claudeWeekly = try parsed.windows.first(where: { $0.label == "Claude Weekly" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Claude Weekly window") }()
+    let gpt5h = try parsed.windows.first(where: { $0.label == "GPT 5H" })
+        ?? { throw AdditionalProviderTestError.failure("Missing GPT 5H window") }()
+    let gptWeekly = try parsed.windows.first(where: { $0.label == "GPT Weekly" })
+        ?? { throw AdditionalProviderTestError.failure("Missing GPT Weekly window") }()
+
+    try expectClose(claude5h.used, 40, "Claude 5h remaining should invert")
+    try expectClose(claudeWeekly.used, 70, "Claude weekly remaining should invert")
+    try expectClose(gpt5h.used, 30, "GPT 5h remaining should invert")
+    try expectClose(gptWeekly.used, 15, "GPT weekly remaining should invert")
 }
 
 private func testAntigravityFailsClosedWithoutBothGeminiBuckets() throws {
@@ -1072,7 +1169,8 @@ private func testCurrencyFormatting() throws {
 @main
 private enum AdditionalProviderUsageTestRunner {
     static func main() throws {
-        try testAntigravityParsesOfficialGeminiBucketsOnly()
+        try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
+        try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
         try testAntigravityParsesOfficialOAuthEnvelope()
         try testAntigravityImportAcceptsOfficialCLIDataFolder()

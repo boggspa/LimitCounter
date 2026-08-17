@@ -196,7 +196,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .grok:
             return "Grok CLI weekly quota"
         case .antigravity:
-            return "Antigravity CLI Gemini quota"
+            return "Antigravity CLI quota"
         case .mistral:
             return "Mistral Vibe usage and allowance"
         case .deepseek:
@@ -233,7 +233,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .grok:
             return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
         case .antigravity:
-            return "Reads an explicitly granted Antigravity CLI session and requests the official Gemini 5-hour and weekly quota summary on a looping cadence (4m → 7m → 16m → 3m → 21m), or immediately on manual refresh."
+            return "Reads an explicitly granted Antigravity CLI session and requests the official 5-hour and 7-day quota summary on a looping cadence (4m → 7m → 16m → 3m → 21m), or immediately on manual refresh."
         case .mistral:
             return "Estimates Vibe spend under `~/.vibe` TaskWraith-style (unique payload chars÷4 × catalogue rates). The Vibe Code budget can be entered manually, or supplied by an Enterprise Admin API key."
         case .deepseek:
@@ -490,7 +490,7 @@ public struct QuotaPace: Codable, Equatable, Hashable {
     public let state: QuotaPaceState
 
     public var shouldSurface: Bool {
-        state != .onTrack
+        true
     }
 
     public var compactStatusText: String {
@@ -503,7 +503,7 @@ public struct QuotaPace: Codable, Equatable, Hashable {
         case .ahead:
             return "#22C55E"
         case .onTrack:
-            return "#94A3B8"
+            return "#3B82F6"
         case .behind:
             return "#F97316"
         }
@@ -630,10 +630,7 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
         let elapsed = min(max(duration - remaining, 0), duration)
         let expectedFraction = min(max(elapsed / duration, 0), 1)
 
-        guard expectedFraction >= 0.03, expectedFraction < 0.985 else { return nil }
-
         let actualFraction = min(max(used / total, 0), 1)
-        guard actualFraction < 1 else { return nil }
 
         let delta = actualFraction - expectedFraction
         let tolerance = 0.02

@@ -3539,7 +3539,7 @@ public extension CredentialImportService {
                 case .grok:
                     return "Select your ~/.grok folder so Limit Counter can run /usage locally."
                 case .antigravity:
-                    return "Select ~/.gemini/antigravity-cli. Limit Counter reads the official CLI session and requests Gemini quota summary on a 4→7→16→3→21 minute loop (manual refresh is immediate)."
+                    return "Select ~/.gemini/antigravity-cli. Limit Counter reads the official CLI session and requests Antigravity quota summary on a 4→7→16→3→21 minute loop (manual refresh is immediate)."
                 case .mistral:
                     return "Select ~/.vibe so Limit Counter can estimate Vibe spend from session metadata and message lengths."
                 case .meta:
@@ -7342,15 +7342,22 @@ struct ClaudeOAuthProfileResponse: Decodable {
 
 // MARK: - Claude Provider Client
 
-/// In-memory cache for the Anthropic OAuth usage endpoint.
+/// Source-aware cache for the Anthropic OAuth usage endpoint.
 /// The endpoint is aggressively rate-limited (HTTP 429 after only a couple of
 /// requests per minute), so we serve a recent successful response if the
 /// dashboard refreshes faster than `freshTTL`, and we fall back to the most
-/// recent successful response for `staleTTL` whenever the live call fails
-/// transiently (rate-limit, network blip) — that way the card keeps showing
-/// real meters instead of flipping to "Update failed".
+/// recent successful response whenever the live call fails transiently.
+///
+/// OAuth quota and local transcript snapshots intentionally share the Claude
+/// provider ID, so the general snapshot store cannot identify their source.
+/// This cache persists quota-only snapshots under its own key and validates
+/// every candidate before use. That prevents transcript token totals from
+/// contaminating the last-known-good quota path.
 final class ClaudeOAuthResponseCache: @unchecked Sendable {
     static let shared = ClaudeOAuthResponseCache()
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let defaultPersistenceKey = "claude.oauthQuotaSnapshot.v1"
 
     /// Serve cached snapshot without touching the network if newer than this.
     private let freshTTL: TimeInterval
@@ -7363,6 +7370,9 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
     /// something is genuinely broken for the user (expired creds, deleted
     /// keychain entry, etc.).
     private let diskMaxAge: TimeInterval
+    private let defaults: UserDefaults
+    private let persistenceKey: String
+    private let legacySnapshotLoader: () -> QuotaSnapshot?
 
     private let lock = NSLock()
     private var stored: (snapshot: QuotaSnapshot, fetchedAt: Date)?
@@ -7370,11 +7380,22 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
     init(
         freshTTL: TimeInterval = 120,                  // 2 min
         staleTTL: TimeInterval = 4 * 60 * 60,          // 4 hours
-        diskMaxAge: TimeInterval = 24 * 60 * 60        // 24 hours
+        diskMaxAge: TimeInterval = 24 * 60 * 60,       // 24 hours
+        defaults: UserDefaults? = nil,
+        persistenceKey: String = ClaudeOAuthResponseCache.defaultPersistenceKey,
+        legacySnapshotLoader: @escaping () -> QuotaSnapshot? = {
+            QuotaSnapshotStore.shared.loadSnapshots()
+                .first { $0.providerID == .claude && $0.fetchState == .success }
+        }
     ) {
         self.freshTTL = freshTTL
         self.staleTTL = staleTTL
         self.diskMaxAge = diskMaxAge
+        self.defaults = defaults
+            ?? UserDefaults(suiteName: Self.appGroupID)
+            ?? .standard
+        self.persistenceKey = persistenceKey
+        self.legacySnapshotLoader = legacySnapshotLoader
     }
 
     func fresh(now: Date = Date()) -> QuotaSnapshot? {
@@ -7388,9 +7409,9 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
     /// Last-known-good snapshot to serve when the live fetch fails for a
     /// transient reason. Layered fallback:
     ///   1. In-memory: most recent successful response from this process.
-    ///   2. Disk: previously-stored snapshot from `QuotaSnapshotStore`,
-    ///      letting us recover across app launches without showing
-    ///      "Update failed" before we ever get one good fetch.
+    ///   2. Disk: dedicated OAuth quota snapshot, stripped of bulky events.
+    ///   3. Legacy disk: a validated OAuth snapshot from QuotaSnapshotStore,
+    ///      used only to migrate installs that predate the dedicated cache.
     func staleFallback(now: Date = Date()) -> QuotaSnapshot? {
         lock.lock()
         if let stored, now.timeIntervalSince(stored.fetchedAt) < staleTTL {
@@ -7400,22 +7421,72 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
         }
         lock.unlock()
 
-        // Disk fallback: find the Claude snapshot in the shared store.
-        // The snapshot itself carries the original fetchedAt, so the
-        // card's "Updated X ago" line stays truthful — the user can see
-        // how stale the data is and decide for themselves.
-        let disk = QuotaSnapshotStore.shared.loadSnapshots()
-            .first { $0.providerID == .claude && $0.fetchState == .success }
+        if let disk = loadPersistedSnapshot(),
+           now.timeIntervalSince(disk.fetchedAt) < diskMaxAge {
+            return disk
+        }
 
-        guard let disk, now.timeIntervalSince(disk.fetchedAt) < diskMaxAge else {
+        guard let legacy = legacySnapshotLoader(),
+              Self.isOAuthQuotaSnapshot(legacy),
+              now.timeIntervalSince(legacy.fetchedAt) < diskMaxAge else {
             return nil
         }
-        return disk
+
+        persist(Self.quotaOnlySnapshot(from: legacy))
+        return legacy
     }
 
     func store(_ snapshot: QuotaSnapshot, now: Date = Date()) {
-        lock.lock(); defer { lock.unlock() }
+        guard Self.isOAuthQuotaSnapshot(snapshot) else { return }
+
+        lock.lock()
         stored = (snapshot, now)
+        lock.unlock()
+
+        persist(Self.quotaOnlySnapshot(from: snapshot))
+    }
+
+    static func isOAuthQuotaSnapshot(_ snapshot: QuotaSnapshot) -> Bool {
+        snapshot.providerID == .claude
+            && snapshot.fetchState == .success
+            && snapshot.windows.contains { window in
+                window.hasExplicitLimit
+                    && window.unit.trimmingCharacters(in: .whitespacesAndNewlines) == "%"
+            }
+    }
+
+    private func loadPersistedSnapshot() -> QuotaSnapshot? {
+        guard let data = defaults.data(forKey: persistenceKey) else { return nil }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let snapshot = try? decoder.decode(QuotaSnapshot.self, from: data),
+              Self.isOAuthQuotaSnapshot(snapshot) else {
+            defaults.removeObject(forKey: persistenceKey)
+            return nil
+        }
+        return snapshot
+    }
+
+    private func persist(_ snapshot: QuotaSnapshot) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(snapshot) else { return }
+        defaults.set(data, forKey: persistenceKey)
+    }
+
+    private static func quotaOnlySnapshot(from snapshot: QuotaSnapshot) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: snapshot.windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
     }
 }
 
@@ -7603,8 +7674,9 @@ private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> Cla
 }
 
 /// Holds the parsed payload of Claude Code's keychain entry. We carry the raw
-/// `claudeAiOauth` dictionary alongside the typed fields so we can write back
-/// without losing unknown keys (subscriptionType, rateLimitTier, scopes, etc.).
+/// `claudeAiOauth` dictionary alongside the typed fields so the access-token
+/// mirror can retain non-secret metadata (subscriptionType, rateLimitTier,
+/// scopes, etc.).
 private nonisolated struct ClaudeOAuthCredentials {
     let accessToken: String
     let refreshToken: String?
@@ -7685,13 +7757,17 @@ private nonisolated enum ClaudeKeychainStore {
     /// read.
     ///
     /// Once we've successfully read the CLI entry once (one prompt),
-    /// we copy the credentials into our own mirror so steady-state
-    /// reads never touch the CLI's entry again. The token refresh
-    /// path (`performRefresh`) keeps the mirror's refresh_token
-    /// rotating; as long as that refresh_token stays valid we can
-    /// keep minting fresh access tokens without ever re-prompting.
+    /// we copy its access token and plan metadata into our own mirror
+    /// so steady-state reads do not touch the CLI's entry. Claude Code
+    /// remains the sole owner of refresh-token rotation; Limit Counter
+    /// re-reads the CLI entry through the explicit recovery path.
     static func readBest(allowClaudeCodeFallback: Bool) -> (ClaudeOAuthCredentials, source: String)? {
         if let backup = readBackup() {
+            // Migrate mirrors created by older builds, which retained Claude
+            // Code's rotating refresh token. `write` strips it from backups.
+            if backup.refreshToken != nil {
+                _ = write(backup, service: backupService)
+            }
             return (backup, backupService)
         }
 
@@ -7712,11 +7788,9 @@ private nonisolated enum ClaudeKeychainStore {
         return nil
     }
 
-    /// Escape hatch for when the mirror's refresh_token is rejected
-    /// (rotating refresh tokens — Anthropic does this occasionally).
-    /// Called by the refresh path to grab a fresh token from the CLI's
-    /// entry. This DOES potentially prompt, but it's the recovery path
-    /// — not the steady-state path.
+    /// Escape hatch for when the mirrored access token is rejected or near
+    /// expiry. This can prompt, but it is only used by the explicit recovery
+    /// path rather than during steady-state reads.
     static func readClaudeCodeAsFallback() -> ClaudeOAuthCredentials? {
         guard let cc = readClaudeCode() else { return nil }
         _ = write(cc, service: backupService)
@@ -7753,10 +7827,14 @@ private nonisolated enum ClaudeKeychainStore {
     /// Writes the credentials back to the named service. Returns true on success.
     @discardableResult
     static func write(_ creds: ClaudeOAuthCredentials, service: String) -> Bool {
-        // Re-serialize: preserve unknown keys, override the three we manage.
+        // Re-serialize: preserve unknown keys and override the access-token
+        // metadata we mirror. Never retain Claude Code's rotating refresh
+        // token in Limit Counter's backup keychain item.
         var oauthDict = creds.rawOAuthDict
         oauthDict["accessToken"] = creds.accessToken
-        if let refreshToken = creds.refreshToken {
+        if service == backupService {
+            oauthDict.removeValue(forKey: "refreshToken")
+        } else if let refreshToken = creds.refreshToken {
             oauthDict["refreshToken"] = refreshToken
         }
         if let ms = creds.expiresAtMillis {
@@ -7793,26 +7871,20 @@ private nonisolated enum ClaudeKeychainStore {
     }
 }
 
-/// Coalesces concurrent calls and refreshes Anthropic OAuth tokens when the
-/// access token in the keychain is near expiry. Falls back gracefully on
-/// network or keychain failure — callers will simply receive `nil` and the
-/// provider will fall back to local JSONL parsing.
+/// Resolves Anthropic OAuth access tokens without participating in Claude
+/// Code's rotating refresh-token lineage. Claude Code is the sole refresh
+/// client; Limit Counter only mirrors its current access token when the user
+/// explicitly enables keychain recovery.
 private actor ClaudeOAuthTokenManager {
     static let shared = ClaudeOAuthTokenManager()
 
-    /// Refresh `buffer` seconds before the stored expiry so we never make a
-    /// request with a token that flips invalid mid-flight.
+    /// Re-read Claude Code's current credential this far ahead of expiry when
+    /// the user explicitly enabled keychain recovery.
     private let refreshBuffer: TimeInterval = 5 * 60     // 5 min
 
-    /// Hard guard: never re-attempt a failed refresh more often than this.
-    private let minRetryInterval: TimeInterval = 60
-
-    private var inflight: Task<String?, Never>?
-    private var lastFailureAt: Date?
-
-    /// Returns a usable mirrored access token, refreshing it transparently if needed.
-    /// Reads Claude Code's own keychain item only when explicitly allowed.
-    func currentAccessTokenFromKeychain(allowClaudeCodeFallback: Bool) async -> String? {
+    /// Returns the mirrored access token and, when permitted, replaces a
+    /// near-expiry mirror with Claude Code's current access token.
+    func currentAccessTokenFromKeychain(allowClaudeCodeFallback: Bool) -> String? {
         guard let (creds, source) = ClaudeKeychainStore.readBest(
             allowClaudeCodeFallback: allowClaudeCodeFallback
         ) else {
@@ -7823,37 +7895,16 @@ private actor ClaudeOAuthTokenManager {
             return creds.accessToken
         }
 
-        // Don't hammer the refresh endpoint after a recent failure.
-        if let lastFailureAt, Date().timeIntervalSince(lastFailureAt) < minRetryInterval {
-            print("[ClaudeOAuth] Refresh backoff active — returning current token")
-            return creds.accessToken
+        if allowClaudeCodeFallback, source != ClaudeKeychainStore.claudeCodeService,
+           let current = recoverFromClaudeCodeKeychain(
+               rejectedToken: nil,
+               reason: "mirrored access token near expiry"
+           ) {
+            return current
         }
 
-        if let inflight {
-            return await inflight.value
-        }
-
-        print("[ClaudeOAuth] Access token near expiry (source: \(source)) — refreshing")
-        let task = Task { [creds] in
-            await Self.performRefresh(creds: creds)
-        }
-        inflight = task
-        var result = await task.value
-        inflight = nil
-
-        if result == nil, allowClaudeCodeFallback, source != ClaudeKeychainStore.claudeCodeService {
-            result = await recoverFromClaudeCodeKeychain(
-                rejectedToken: creds.accessToken,
-                reason: "refresh failed"
-            )
-        }
-
-        if result == nil {
-            lastFailureAt = Date()
-        } else {
-            lastFailureAt = nil
-        }
-        return result
+        print("[ClaudeOAuth] Access token near expiry (source: \(source)); Claude Code owns token refresh")
+        return creds.accessToken
     }
 
     /// Recovery path for when our mirrored OAuth token was invalidated or
@@ -7863,12 +7914,12 @@ private actor ClaudeOAuthTokenManager {
         rejectedToken: String?,
         reason: String,
         allowClaudeCodeFallback: Bool
-    ) async -> String? {
+    ) -> String? {
         guard allowClaudeCodeFallback else {
             return nil
         }
 
-        return await recoverFromClaudeCodeKeychain(
+        return recoverFromClaudeCodeKeychain(
             rejectedToken: rejectedToken,
             reason: reason
         )
@@ -7877,7 +7928,7 @@ private actor ClaudeOAuthTokenManager {
     private func recoverFromClaudeCodeKeychain(
         rejectedToken: String?,
         reason: String
-    ) async -> String? {
+    ) -> String? {
         guard let fallback = ClaudeKeychainStore.readClaudeCodeAsFallback() else {
             return nil
         }
@@ -7887,89 +7938,7 @@ private actor ClaudeOAuthTokenManager {
         }
 
         print("[ClaudeOAuth] \(reason) — retrying with current Claude Code keychain token")
-        if fallback.needsRefresh(buffer: refreshBuffer) {
-            return await Self.performRefresh(creds: fallback)
-        }
         return fallback.accessToken
-    }
-
-    /// POSTs the refresh request, persists the new tokens to our keychain
-    /// mirror, returns the new access token (or nil on failure).
-    private static func performRefresh(creds: ClaudeOAuthCredentials) async -> String? {
-        guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else {
-            print("[ClaudeOAuth] No refresh_token available — cannot refresh")
-            return nil
-        }
-
-        // Values verified against the shipped Claude Code CLI binary.
-        let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-        let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
-
-        let scopeString = creds.scopes.isEmpty
-            ? "user:inference user:profile"
-            : creds.scopes.joined(separator: " ")
-
-        let body: [String: Any] = [
-            "grant_type":   "refresh_token",
-            "refresh_token": refreshToken,
-            "client_id":    clientID,
-            "scope":        scopeString
-        ]
-
-        var request = URLRequest(url: tokenURL, timeoutInterval: 20)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            print("[ClaudeOAuth] Refresh network error: \(error.localizedDescription)")
-            return nil
-        }
-
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            let bodyStr = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
-            print("[ClaudeOAuth] Refresh HTTP \(status): \(bodyStr)")
-            return nil
-        }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let newAccessToken = json["access_token"] as? String,
-              !newAccessToken.isEmpty else {
-            print("[ClaudeOAuth] Refresh response missing access_token")
-            return nil
-        }
-
-        let expiresInSec = (json["expires_in"] as? NSNumber)?.doubleValue
-        // Rotating refresh tokens: prefer the new one if the server returns it.
-        let newRefreshToken = (json["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            ?? creds.refreshToken
-
-        let newExpiresAtMillis: Double? = expiresInSec.map {
-            (Date().timeIntervalSince1970 + $0) * 1000
-        }
-
-        let refreshed = ClaudeOAuthCredentials(
-            accessToken: newAccessToken,
-            refreshToken: newRefreshToken,
-            expiresAtMillis: newExpiresAtMillis,
-            scopes: creds.scopes,
-            rawOAuthDict: creds.rawOAuthDict
-        )
-
-        // Keep Limit Counter's mirror fresh without mutating Claude Code's
-        // own keychain item. Claude Code manages its entry independently,
-        // and rewriting it from a background refresh can trigger repeat
-        // macOS password prompts.
-        let wroteBackup = ClaudeKeychainStore.write(refreshed, service: ClaudeKeychainStore.backupService)
-        print("[ClaudeOAuth] Refresh OK. Wrote Backup=\(wroteBackup)")
-
-        return newAccessToken
     }
 }
 
@@ -8017,13 +7986,11 @@ public struct ClaudeProviderClient: ProviderClient {
             }
             print("[ClaudeProvider] OAuth token found — fetching live quota")
             do {
-                let merged = try await fetchOAuthSnapshotAndMerge(
+                return try await fetchOAuthSnapshotAndMerge(
                     token: token,
                     credentials: credentials,
                     allowKeychainPlanLookup: tokenAllowsKeychainPlanLookup
                 )
-                ClaudeOAuthResponseCache.shared.store(merged)
-                return merged
             } catch let error as ProviderFetchError {
                 var effectiveError = error
                 if tokenAllowsKeychainRecovery,
@@ -8034,13 +8001,11 @@ public struct ClaudeProviderClient: ProviderClient {
                     allowClaudeCodeFallback: claudeCodeKeychainFallbackEnabled
                    ) {
                     do {
-                        let recovered = try await fetchOAuthSnapshotAndMerge(
+                        return try await fetchOAuthSnapshotAndMerge(
                             token: recoveredToken,
                             credentials: credentials,
                             allowKeychainPlanLookup: true
                         )
-                        ClaudeOAuthResponseCache.shared.store(recovered)
-                        return recovered
                     } catch let retryError as ProviderFetchError {
                         print("[ClaudeProvider] Claude Code keychain recovery retry failed (\(retryError.localizedDescription))")
                         effectiveError = retryError
@@ -8066,6 +8031,13 @@ public struct ClaudeProviderClient: ProviderClient {
             }
         }
 
+        if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
+            print("[ClaudeProvider] OAuth token unavailable — serving last successful OAuth snapshot to preserve meters")
+            let events = await eventsForOAuthEnrichment(credentials: credentials)
+            let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
+            return mergeEvents(into: stale, events: events + agbenchEvents)
+        }
+
         // Fall back to local JSONL transcript parsing.
         let localSnapshot = try await loadLocalSnapshot(credentials: credentials, qos: .userInitiated)
         // Inject AGBench events here too so the local fallback path is
@@ -8084,6 +8056,15 @@ public struct ClaudeProviderClient: ProviderClient {
             token: token,
             allowKeychainPlanLookup: allowKeychainPlanLookup
         )
+        // Seed the source-aware fallback immediately. Local transcript scans
+        // can be slow on large histories and must never make a successful
+        // quota response disappear if the coordinator timeout wins the race.
+        let immediatelyCached = mergeEvents(
+            into: oauthSnapshot,
+            events: previousClaudeEvents()
+        )
+        ClaudeOAuthResponseCache.shared.store(immediatelyCached)
+
         // Augment OAuth quota meters with locally-captured 2-hour buckets so
         // the activity heatmap still shows Claude usage even when the OAuth
         // path has no per-event data.
@@ -8091,7 +8072,9 @@ public struct ClaudeProviderClient: ProviderClient {
         // Plus AGBench's unified usage.json for any Claude runs driven
         // through TaskWraith. No-op without the bookmark.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
-        return mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
+        let merged = mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
+        ClaudeOAuthResponseCache.shared.store(merged)
+        return merged
     }
 
     private func loadLocalSnapshot(
@@ -8162,19 +8145,13 @@ public struct ClaudeProviderClient: ProviderClient {
     }
 
     private func eventsForOAuthEnrichment(credentials: ProviderCredential?) async -> [UsageEvent] {
-        // 12s ceiling, sitting just under SyncCoordinator's 15s outer
-        // per-provider timeout. The previous 4s budget was too tight and
-        // silently discarded fresh buckets on every refresh; bumping past
-        // 15s would let the outer timeout fire first and turn the whole
-        // fetch into a "refresh miss". 12s gives accounts with many
-        // active projects room to scan fully, while keeping enough slack
-        // before the outer guard. If a scan still doesn't complete in
-        // time, `loadLocalEventsWithinTimeout` lets it finish in the
-        // background and persists its events for the NEXT fetch via
-        // `persistLateClaudeScan`.
+        // Keep local enrichment comfortably inside SyncCoordinator's 15s
+        // provider timeout. Long scans continue in the background and persist
+        // their buckets for the next refresh, so quota availability never
+        // depends on transcript size.
         if let localEvents = await loadLocalEventsWithinTimeout(
             credentials: credentials,
-            timeoutSeconds: 12
+            timeoutSeconds: 4
         ), !localEvents.isEmpty {
             return localEvents
         }
@@ -8340,7 +8317,8 @@ public struct ClaudeProviderClient: ProviderClient {
 
     /// Plain-text token file fallback used in headless / CI setups where
     /// `claude auth login --claudeai` is impractical. Keychain-based lookup
-    /// (with auto-refresh) is handled by `ClaudeOAuthTokenManager`.
+    /// and read-only Claude Code recovery are handled by
+    /// `ClaudeOAuthTokenManager`.
     private static func autoDetectedOAuthTokenFile() -> String? {
         let homePath = NSHomeDirectory()
         let realHome: String
@@ -8364,8 +8342,6 @@ public struct ClaudeProviderClient: ProviderClient {
         token: String,
         allowKeychainPlanLookup: Bool
     ) async throws -> QuotaSnapshot {
-        async let livePlanLookup = fetchOAuthPlanInfo(token: token)
-
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             throw ProviderFetchError.networkError(underlying: URLError(.badURL))
         }
@@ -8409,9 +8385,16 @@ public struct ClaudeProviderClient: ProviderClient {
             throw ProviderFetchError.parsingError("OAuth decode failed: \(error.localizedDescription)")
         }
 
-        let livePlan = await livePlanLookup
-        let plan = livePlan
-            ?? resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
+        // The profile endpoint shares Anthropic's tight OAuth request budget.
+        // Credential metadata is normally sufficient, so only issue the
+        // second authenticated request when no plan information exists.
+        let credentialPlan = resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
+        let plan: ClaudePlanInfo?
+        if let credentialPlan {
+            plan = credentialPlan
+        } else {
+            plan = await fetchOAuthPlanInfo(token: token)
+        }
 
         let fableWeeklyWindow = usage.fableWeeklyWindow
 
