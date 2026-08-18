@@ -213,7 +213,7 @@ private struct MenuBarPopoverView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(snapshot.displayName)
                             .font(.caption.weight(.bold))
-                        MiniMetadataLine(plan: snapshot.planName, updatedAt: snapshot.fetchedAt)
+                        MiniMetadataLine(plan: snapshot.displayPlanName, updatedAt: snapshot.fetchedAt)
                     }
 
                     Spacer()
@@ -470,7 +470,7 @@ private struct FloatingProviderPanelView: View {
                 if let snapshot {
                     FloatingPanelHeader(
                         title: snapshot.displayName,
-                        subtitle: [snapshot.planName, "Updated \(snapshot.fetchedAt.relativeString)"].compactMap { $0 }.joined(separator: " - "),
+                        subtitle: [snapshot.displayPlanName, "Updated \(snapshot.fetchedAt.relativeString)"].compactMap { $0 }.joined(separator: " - "),
                         providerID: snapshot.providerID
                     )
 

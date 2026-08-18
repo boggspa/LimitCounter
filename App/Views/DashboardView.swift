@@ -1015,6 +1015,22 @@ struct DashboardView: View {
                     .foregroundStyle(layoutModeStore.mode == .compact ? ProGlassTheme.accent : .white)
             }
 
+            #if os(iOS)
+            Rectangle()
+                .fill(Color.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+                .padding(.vertical, 6)
+
+            controlPillButton(
+                accessibilityLabel: "Take screenshot of quota card"
+            ) {
+                takeQuotaCardScreenshot()
+            } label: {
+                Image(systemName: "camera.fill")
+                    .foregroundStyle(.white)
+            }
+            #endif
+
             #if os(macOS)
             Rectangle()
                 .fill(Color.white.opacity(0.12))
@@ -1051,6 +1067,30 @@ struct DashboardView: View {
         .buttonStyle(.plain)
         .accessibilityLabel(accessibilityLabel)
     }
+
+    #if os(iOS)
+    @MainActor private func takeQuotaCardScreenshot() {
+        // Create a sample quota card view for screenshot
+        // Using the first available snapshot or a mock one
+        let sampleSnapshot = appState.snapshots.first ?? MockData.claudeSnapshot
+        let quotaCard = QuotaCardView(snapshot: sampleSnapshot)
+            .frame(width: 320) // Fixed width for consistent screenshot
+            .environmentObject(appState)
+
+        // Convert SwiftUI view to UIImage
+        let hostingController = UIHostingController(rootView: quotaCard)
+        hostingController.view.frame = CGRect(x: 0, y: 0, width: 320, height: 200)
+        hostingController.view.layoutIfNeeded()
+
+        let renderer = UIGraphicsImageRenderer(size: hostingController.view.bounds.size)
+        let image = renderer.image { ctx in
+            hostingController.view.drawHierarchy(in: hostingController.view.bounds, afterScreenUpdates: true)
+        }
+
+        // Save to photo library
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+    }
+    #endif
 }
 
 private struct UsageAlertToastView: View {
@@ -1636,7 +1676,7 @@ struct CompactDashboardCardView: View {
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(.primary)
 
-                if let plan = snapshot.planName, !plan.isEmpty, plan != snapshot.displayName {
+                if let plan = snapshot.displayPlanName, !plan.isEmpty, plan != snapshot.displayName {
                     Text(plan)
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)

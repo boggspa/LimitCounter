@@ -105,7 +105,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(ChatGPTLocalProviderClient())
         coordinator.register(CodexTelemetryProviderClient())
         coordinator.register(ClaudeProviderClient())
-        coordinator.register(WindsurfProviderClient())
+        coordinator.register(DevinProviderClient())
         coordinator.register(CursorProviderClient())
         coordinator.register(GeminiProviderClient())
         coordinator.register(KimiProviderClient())
@@ -115,6 +115,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(DeepSeekProviderClient())
         coordinator.register(CerebrasProviderClient())
         coordinator.register(MetaProviderClient())
+        coordinator.register(OllamaProviderClient())
         #endif
 
         self.syncCoordinator = coordinator
@@ -169,8 +170,8 @@ final class AppStateStore: ObservableObject {
                 fetchState: .notConfigured
             ),
             QuotaSnapshot(
-                providerID: .windsurf,
-                displayName: ProviderID.windsurf.snapshotDisplayName,
+                providerID: .devin,
+                displayName: ProviderID.devin.snapshotDisplayName,
                 planName: nil,
                 windows: [],
                 fetchState: .notConfigured

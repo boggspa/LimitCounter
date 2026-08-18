@@ -593,7 +593,7 @@ public final class ProviderCardOrderStore: ObservableObject {
         .openaiAPI,
         .claude,
         .chatgpt,
-        .windsurf,
+        .devin,
         .cursor,
         .gemini,
         .kimi,
@@ -602,7 +602,8 @@ public final class ProviderCardOrderStore: ObservableObject {
         .mistral,
         .deepseek,
         .cerebras,
-        .meta
+        .meta,
+        .ollama
     ]
 }
 

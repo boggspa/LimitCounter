@@ -14,7 +14,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case openaiAPI
     case chatgpt
     case codexTelemetry
-    case windsurf
+    case devin
     case cursor
     case gemini
     case kimi
@@ -24,6 +24,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case deepseek
     case cerebras
     case meta
+    case ollama
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -45,7 +46,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt:  return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .windsurf: return "Windsurf"
+        case .devin: return "Devin"
         case .cursor:   return "Cursor"
         case .gemini:   return "Gemini"
         case .kimi:     return "Kimi Code"
@@ -56,6 +57,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .deepseek: return "DeepSeek"
         case .cerebras: return "Cerebras"
         case .meta:     return "Meta API"
+        case .ollama:   return "Ollama"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -70,8 +72,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .claude, .windsurf, .cursor, .gemini, .kimi, .grok,
-             .antigravity, .mistral, .deepseek, .cerebras, .meta, .heatmap:
+        case .claude, .devin, .cursor, .gemini, .kimi, .grok,
+             .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .heatmap:
             return displayName
         }
     }
@@ -85,7 +87,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt:  return "bubble.left.and.bubble.right.fill"
         case .codexTelemetry:
             return "cpu.fill"
-        case .windsurf: return "wave.3.right"
+        case .devin: return "wave.3.right"
         case .cursor:   return "cursorarrow.rays"
         case .gemini:   return "sparkles"
         case .kimi:     return "moon.stars.fill"
@@ -96,6 +98,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .deepseek: return "d.circle.fill"
         case .cerebras: return "c.circle.fill"
         case .meta:     return "infinity"
+        case .ollama:   return "circle.grid.2x2.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -109,7 +112,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt:  return "#10B981" // Emerald/OpenAI Green
         case .codexTelemetry:
             return "#4D4DFF" // Electric Indigo — same hue family as the previous #6366F1 (~240°) but saturation maxed to 100% (was 84%) for stronger contrast against Gemini's Google Blue #4285F4
-        case .windsurf: return "#2D5AB2" // Deep Windsurf Blue
+        case .devin: return "#2D5AB2" // Deep Devin Blue
         case .cursor:   return "#EAB308" // Gold
         case .gemini:   return "#4285F4" // Google Blue
         case .kimi:     return "#1CA4FC" // Kimi Blue
@@ -120,6 +123,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .deepseek: return "#4E6AEE"
         case .cerebras: return "#BB584A"
         case .meta:     return "#0082FB" // Meta Blue
+        case .ollama:   return "#F3F4F6" // Ollama White/Silver
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -136,8 +140,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderChatGPTLogo"
         case .codexTelemetry:
             return "ProviderCodexLogo"
-        case .windsurf:
-            return "ProviderWindsurfLogo"
+        case .devin:
+            return "ProviderDevinLogo"
         case .cursor:
             return "ProviderCursorLogo"
         case .gemini:
@@ -156,6 +160,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderCerebrasLogo"
         case .meta:
             return "ProviderMetaLogo"
+        case .ollama:
+            return "ProviderOllamaLogo"
         case .heatmap:
             return ""
         }
@@ -165,8 +171,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .chatgpt, .codexTelemetry:
             return .prototype
-        case .claude, .openai, .openaiAPI, .windsurf, .cursor, .gemini, .kimi,
-             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta:
+        case .claude, .openai, .openaiAPI, .devin, .cursor, .gemini, .kimi,
+             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama:
             return .session
         case .heatmap:
             return .session
@@ -185,8 +191,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT local desktop cache"
         case .codexTelemetry:
             return "Codex local telemetry folder"
-        case .windsurf:
-            return "Windsurf local quota cache"
+        case .devin:
+            return "Devin local quota cache"
         case .cursor:
             return "Cursor web session and local state"
         case .gemini:
@@ -205,6 +211,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Cerebras usage import"
         case .meta:
             return "Meta API credits and Muse spend"
+        case .ollama:
+            return "Ollama Cloud session"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -222,8 +230,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Reads the local ChatGPT macOS app cache and turns recent conversation activity into local usage-style snapshots."
         case .codexTelemetry:
             return "Reads the local Codex store you point it at and turns event counts and token totals into snapshots."
-        case .windsurf:
-            return "Reads the local Windsurf quota cache or a user-provided export and normalizes the quota windows."
+        case .devin:
+            return "Reads the local Devin quota cache or a user-provided export and normalizes the quota windows."
         case .cursor:
             return "Uses a Cursor web session or dashboard token for live usage, and can read local Cursor state for cached account metadata."
         case .gemini:
@@ -242,6 +250,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Imports an official Cerebras Analytics CSV or a manual balance anchor. Optional local telemetry is displayed as an API-price estimate."
         case .meta:
             return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Optional Meta console Spend reading anchors a billing-period meter that accumulates Muse spend after that reading; preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
+        case .ollama:
+            return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters from ollama.com/settings."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -259,8 +269,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT app data folder"
         case .codexTelemetry:
             return "Codex telemetry folder"
-        case .windsurf:
-            return "Windsurf access token"
+        case .devin:
+            return "Devin access token"
         case .cursor:
             return "Cursor web session cookie or dashboard token"
         case .gemini:
@@ -279,6 +289,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Cerebras Analytics CSV or data folder"
         case .meta:
             return "Muse data folder"
+        case .ollama:
+            return "Session Cookie (__Secure-session)"
         case .heatmap:
             return ""
         }
@@ -289,7 +301,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .claude:
             return "OAuth token (optional)"
         case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
-             .codexTelemetry, .meta, .heatmap:
+             .codexTelemetry, .meta, .ollama, .heatmap:
             return nil
         case .mistral:
             return "Vibe Code budget (optional)"
@@ -299,7 +311,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Project ID"
         case .openai:
             return "ChatGPT account ID"
-        case .windsurf:
+        case .devin:
             return "Team ID (optional)"
         case .cursor:
             return "Team slug or org ID"
@@ -320,7 +332,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Use only Claude Code logs, OAuth tokens, or keychain access you intentionally provide."
         case .cursor:
             return "Use only a Cursor web credential you intentionally import. Local Cursor state is read only for cached metadata."
-        case .windsurf:
+        case .devin:
             return "Use only credentials the user intentionally enters or exports."
         case .gemini:
             return "Use only local Gemini CLI log folders or history you intentionally point the app at."
@@ -338,6 +350,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Reads only the Cerebras CSV or folder you explicitly select. It does not inspect browser sessions or private web APIs."
         case .meta:
             return "Reads only Muse `session.jsonl` usage fields from a folder you grant. Manual billing anchors are stored in Keychain. Meta has no documented balance API; spend is projected locally."
+        case .ollama:
+            return "Stores your Ollama `__Secure-session` cookie securely in macOS Keychain. Used only to read your usage meters from ollama.com/settings."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -398,10 +412,10 @@ public extension ProviderID {
             return [
                 AppIconCandidate(bundleIdentifier: "com.openai.chat", applicationNames: ["ChatGPT.app"])
             ]
-        case .windsurf:
+        case .devin:
             return [
-                AppIconCandidate(bundleIdentifier: "com.codeium.windsurf", applicationNames: ["Windsurf.app"]),
-                AppIconCandidate(bundleIdentifier: "com.windsurf", applicationNames: ["Windsurf.app"])
+                AppIconCandidate(bundleIdentifier: "com.cognition.devin", applicationNames: ["Devin.app"]),
+                AppIconCandidate(bundleIdentifier: "com.cognition.devin", applicationNames: ["Devin.app"])
             ]
         case .cursor:
             return [
@@ -421,6 +435,11 @@ public extension ProviderID {
         case .antigravity:
             return [
                 AppIconCandidate(bundleIdentifier: "com.google.antigravity", applicationNames: ["Antigravity.app"])
+            ]
+        case .ollama:
+            return [
+                AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),
+                AppIconCandidate(bundleIdentifier: "ai.ollama.ollama", applicationNames: ["Ollama.app"])
             ]
         case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .heatmap:
             return []
@@ -1356,6 +1375,17 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let fetchState: ProviderFetchState
     public let fetchedAt: Date
 
+    public var displayPlanName: String? {
+        guard let name = planName, !name.isEmpty else { return nil }
+        
+        let parts = name.components(separatedBy: " / ")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.lowercased() != "free" }
+        
+        let cleaned = parts.joined(separator: " / ")
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
     public var statsSectionTitle: String? {
         if stats.isEmpty { return nil }
 
@@ -1375,7 +1405,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             return "Local Activity"
         }
 
-        if providerID == .windsurf {
+        if providerID == .devin {
             return "Plan & Workspace Metadata"
         }
 
@@ -1401,6 +1431,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
 
         if providerID == .deepseek || providerID == .cerebras || providerID == .meta {
             return "Local Spend Estimate"
+        }
+
+        if providerID == .ollama {
+            return "Usage & Cloud Quota"
         }
 
         return "Periodic Usage"

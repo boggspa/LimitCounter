@@ -1613,7 +1613,7 @@ private nonisolated struct UsageEventContentKey: Hashable {
 /// by modification date (typically a 30-day window), so the moment a
 /// project goes untouched its events disappear from subsequent
 /// snapshots even though they'd still fall within the heatmap's
-/// display window. Windsurf reads only a single `lastSessionDate`
+/// display window. Devin reads only a single `lastSessionDate`
 /// pseudo-event that gets overwritten on the next session boundary —
 /// same problem, different cause.
 ///
@@ -2701,13 +2701,13 @@ public enum CredentialImportService {
             ))
         }
 
-        // Windsurf: Check for state.vscdb which contains cached quota and auth state
-        let windsurfStateDBPath = home.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb")
-        if FileManager.default.fileExists(atPath: windsurfStateDBPath.path) {
+        // Devin: Check for state.vscdb which contains cached quota and auth state
+        let devinStateDBPath = home.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb")
+        if FileManager.default.fileExists(atPath: devinStateDBPath.path) {
             detected.append(DetectedCredential(
-                providerID: .windsurf,
-                fileURL: windsurfStateDBPath,
-                description: "Windsurf local state"
+                providerID: .devin,
+                fileURL: devinStateDBPath,
+                description: "Devin local state"
             ))
         }
 
@@ -2843,7 +2843,7 @@ public enum CredentialImportService {
             )
         }
 
-        // Special handling for SQLite databases (Windsurf and Cursor)
+        // Special handling for SQLite databases (Devin and Cursor)
         if url.lastPathComponent == "state.vscdb" {
             print("[CredentialImportService] Reading SQLite database immediately: \(url.path)")
 
@@ -2864,13 +2864,13 @@ public enum CredentialImportService {
                 )
             }
 
-            if providerID == .windsurf {
+            if providerID == .devin {
                 // Bookmark the FILE itself, not the parent directory.
                 // NSOpenPanel grants security-scoped access only to the user-selected URL;
                 // bookmarking the parent directory produces an invalid bookmark that fails
                 // to resolve on the next launch, forcing the user to re-import every time.
                 let bookmarkData = makeSecurityScopedBookmarkData(for: url)
-                let authStatus = readWindsurfAuthStatus(from: url)
+                let authStatus = readDevinAuthStatus(from: url)
 
                 return ImportedCredential(
                     accessToken: authStatus?.apiKey,
@@ -3055,52 +3055,63 @@ public enum CredentialImportService {
 
     // MARK: - SQLite Helpers
 
-    private struct WindsurfAuthState {
+    private struct DevinAuthState {
         let apiKey: String?
         let accountIdentifier: String?
         let extraFields: [String: String]?
     }
 
-    private static func readWindsurfAuthStatus(from url: URL) -> WindsurfAuthState? {
+    private static func readDevinAuthStatus(from url: URL) -> DevinAuthState? {
         guard FileManager.default.isReadableFile(atPath: url.path) else {
-            print("[CredentialImportService] Windsurf state.vscdb not readable at path: \(url.path)")
+            print("[CredentialImportService] Devin state.vscdb not readable at path: \(url.path)")
             return nil
         }
 
         guard let db = openSQLiteSnapshotDatabase(at: url) else {
-            print("[CredentialImportService] Failed to open Windsurf state.vscdb")
+            print("[CredentialImportService] Failed to open Devin state.vscdb")
             return nil
         }
         defer { sqlite3_close(db) }
 
         guard let rawValue = readSQLiteValue(
             from: db,
-            query: "SELECT value FROM ItemTable WHERE key = 'windsurfAuthStatus' LIMIT 1;"
+            query: """
+            SELECT value FROM ItemTable 
+            WHERE key IN ('devinAuthStatus', 'windsurfAuthStatus', 'codeiumAuthStatus', 'authStatus')
+            OR key LIKE '%AuthStatus%'
+            ORDER BY CASE 
+                WHEN key LIKE 'devin%' THEN 1 
+                WHEN key LIKE 'windsurf%' THEN 2 
+                WHEN key LIKE 'codeium%' THEN 3 
+                ELSE 4 
+            END 
+            LIMIT 1;
+            """
         ),
         let data = rawValue.data(using: .utf8),
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            print("[CredentialImportService] No Windsurf auth status found in database")
+            print("[CredentialImportService] No Devin auth status found in database")
             return nil
         }
 
         let apiKey = json["apiKey"] as? String
             ?? json["api_key"] as? String
             ?? json["access_token"] as? String
-        let accountIdentifier = inferredWindsurfAccountIdentifier(from: json)
+        let accountIdentifier = inferredDevinAccountIdentifier(from: json)
 
         var extraFields: [String: String] = [:]
         if let userStatus = json["userStatusProtoBinaryBase64"] as? String, !userStatus.isEmpty {
-            extraFields["windsurfUserStatusProtoBinaryBase64"] = userStatus
+            extraFields["devinUserStatusProtoBinaryBase64"] = userStatus
         }
 
-        return WindsurfAuthState(
+        return DevinAuthState(
             apiKey: apiKey,
             accountIdentifier: accountIdentifier,
             extraFields: extraFields.isEmpty ? nil : extraFields
         )
     }
 
-    private static func inferredWindsurfAccountIdentifier(from json: [String: Any]) -> String? {
+    private static func inferredDevinAccountIdentifier(from json: [String: Any]) -> String? {
         guard let encoded = json["userStatusProtoBinaryBase64"] as? String,
               let data = Data(base64Encoded: encoded),
               let decoded = String(data: data, encoding: .utf8) else {
@@ -3200,8 +3211,8 @@ public enum CredentialImportService {
             return try parseClaudeJSON(json, sourceURL: sourceURL)
         case .cursor:
             return try parseCursorJSON(json)
-        case .windsurf:
-            return try parseWindsurfJSON(json, sourceURL: sourceURL)
+        case .devin:
+            return try parseDevinJSON(json, sourceURL: sourceURL)
         case .gemini:
             let selectedRoot = sourceURL.hasDirectoryPath ? sourceURL : sourceURL.deletingLastPathComponent()
             return ImportedCredential(
@@ -3231,7 +3242,7 @@ public enum CredentialImportService {
                 throw ImportError.missingRequiredField("api_key")
             }
             return ImportedCredential(accessToken: token, accountIdentifier: nil)
-        case .grok, .antigravity, .cerebras, .meta, .heatmap:
+        case .grok, .antigravity, .cerebras, .meta, .ollama, .heatmap:
             throw ImportError.unsupportedProvider
         }
     }
@@ -3331,14 +3342,14 @@ public enum CredentialImportService {
         )
     }
 
-    private static func parseWindsurfJSON(_ json: [String: Any], sourceURL: URL) throws -> ImportedCredential {
+    private static func parseDevinJSON(_ json: [String: Any], sourceURL: URL) throws -> ImportedCredential {
         // If the selected file is state.vscdb, store its path as customEndpoint
         // so the provider can read quota data directly from it
         if sourceURL.lastPathComponent == "state.vscdb" {
-            print("[CredentialImportService] Creating bookmark in parseWindsurfJSON for: \(sourceURL.path)")
+            print("[CredentialImportService] Creating bookmark in parseDevinJSON for: \(sourceURL.path)")
             let bookmarkData = makeSecurityScopedBookmarkData(for: sourceURL)
             if let bookmarkData {
-                print("[CredentialImportService] Created bookmark in parseWindsurfJSON (length: \(bookmarkData.count))")
+                print("[CredentialImportService] Created bookmark in parseDevinJSON (length: \(bookmarkData.count))")
             }
             return ImportedCredential(
                 accessToken: nil,
@@ -3589,9 +3600,9 @@ public extension CredentialImportService {
             case .cursor:
                 // Point to the directory containing state.vscdb
                 panel.directoryURL = home.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage")
-            case .windsurf:
+            case .devin:
                 // Point to the directory containing state.vscdb
-                panel.directoryURL = home.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage")
+                panel.directoryURL = home.appendingPathComponent("Library/Application Support/Devin/User/globalStorage")
             case .gemini:
                 panel.directoryURL = home.appendingPathComponent(".gemini")
             case .kimi:
@@ -3627,7 +3638,7 @@ public extension CredentialImportService {
                 panel.directoryURL = home
             case .cerebras:
                 panel.directoryURL = home.appendingPathComponent("Downloads")
-            case .heatmap:
+            case .ollama, .heatmap:
                 break
             }
 
@@ -5040,32 +5051,32 @@ private struct CodexCredits: Decodable {
     }
 }
 
-// MARK: - Windsurf Provider Client
+// MARK: - Devin Provider Client
 
-public struct WindsurfProviderClient: ProviderClient {
-    public let providerID: ProviderID = .windsurf
+public struct DevinProviderClient: ProviderClient {
+    public let providerID: ProviderID = .devin
 
     public init() {}
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
-        print("[WindsurfProvider] Reading cached plan info from local state DB...")
+        print("[DevinProvider] Reading cached plan info from local state DB...")
 
         // Check if user has configured a custom file path
         var customPath: URL?
         var bookmarkData: Data?
         if let path = credentials?.customEndpoint, !path.isEmpty {
             customPath = URL(fileURLWithPath: path)
-            print("[WindsurfProvider] Using configured file path: \(path)")
+            print("[DevinProvider] Using configured file path: \(path)")
         }
         // Check for bookmark data in extraFields
         if let bookmarkBase64 = credentials?.extraFields?["bookmarkData"],
            let data = Data(base64Encoded: bookmarkBase64) {
             bookmarkData = data
-            print("[WindsurfProvider] Found security-scoped bookmark data")
+            print("[DevinProvider] Found security-scoped bookmark data")
         }
 
         do {
-            let state = try WindsurfLocalStateReader.loadCachedPlanInfo(customPath: customPath, bookmarkData: bookmarkData)
+            let states = try DevinLocalStateReader.loadCachedPlanInfo(customPath: customPath, bookmarkData: bookmarkData)
             // Each fetch produces at most one `lastSessionDate` activity
             // marker, and the underlying SQLite value is overwritten when
             // a new session starts — so without enrichment the heatmap
@@ -5073,14 +5084,86 @@ public struct WindsurfProviderClient: ProviderClient {
             // snapshots' events lets us accumulate session markers over
             // time (content-deduped, so repeating the same lastSessionDate
             // across many fetches collapses to a single marker).
-            return enrichEventsWithHistory(makeSnapshot(from: state))
+            let multiUser = states.count > 1
+            let merged = mergeSnapshots(states, multiUser: multiUser)
+            return enrichEventsWithHistory(merged)
         } catch {
-            print("[WindsurfProvider] Failed to read cached plan info: \(error.localizedDescription)")
+            print("[DevinProvider] Failed to read cached plan info: \(error.localizedDescription)")
             throw error as? ProviderFetchError ?? .parsingError(error.localizedDescription)
         }
     }
 
-    private func makeSnapshot(from state: WindsurfStateSnapshot) -> QuotaSnapshot {
+    private func mergeSnapshots(_ states: [DevinStateSnapshot], multiUser: Bool) -> QuotaSnapshot {
+        guard let first = states.first else {
+            return QuotaSnapshot(
+                providerID: .devin,
+                displayName: "Devin",
+                planName: "Unknown",
+                windows: [],
+                stats: [],
+                balances: [],
+                signals: [],
+                events: [],
+                fetchState: .success,
+                fetchedAt: Date()
+            )
+        }
+        if states.count == 1 {
+            return makeSnapshot(from: first, userLabel: nil)
+        }
+        // Multiple accounts: merge all windows/balances/stats/signals/events
+        var allWindows: [QuotaWindow] = []
+        var allBalances: [QuotaBalance] = []
+        var allStats: [QuotaStat] = []
+        var allSignals: [QuotaSignal] = []
+        var allEvents: [UsageEvent] = []
+        var planNames: [String] = []
+        for state in states {
+            let label = Self.shortUserLabel(from: state.planInfo.accountIdentityText)
+            let snap = makeSnapshot(from: state, userLabel: label)
+            allWindows.append(contentsOf: snap.windows)
+            allBalances.append(contentsOf: snap.balances)
+            allStats.append(contentsOf: snap.stats)
+            allSignals.append(contentsOf: snap.signals)
+            allEvents.append(contentsOf: snap.events)
+            if let pName = snap.planName, !planNames.contains(pName) {
+                planNames.append(pName)
+            }
+        }
+        return QuotaSnapshot(
+            providerID: .devin,
+            displayName: "Devin",
+            planName: planNames.joined(separator: " / "),
+            windows: allWindows,
+            stats: allStats,
+            balances: allBalances,
+            signals: allSignals,
+            events: allEvents,
+            fetchState: .success,
+            fetchedAt: Date()
+        )
+    }
+
+    private static func shortUserLabel(from accountIdentityText: String?) -> String {
+        guard let text = accountIdentityText, !text.isEmpty else { return "Unknown" }
+        // Format is "email - Display Name" or "email - email"
+        let parts = text.components(separatedBy: " - ")
+        if parts.count >= 2 {
+            let name = parts[1].trimmingCharacters(in: .whitespaces)
+            // If the name is the same as the email, use the local part
+            if name.contains("@") {
+                return String(name.prefix(while: { $0 != "@" }))
+            }
+            return name
+        }
+        // Fallback: use local part of email
+        if text.contains("@") {
+            return String(text.prefix(while: { $0 != "@" }))
+        }
+        return text
+    }
+
+    private func makeSnapshot(from state: DevinStateSnapshot, userLabel: String?) -> QuotaSnapshot {
         let planInfo = state.planInfo
         let localMetadata = state.localMetadata
         let now = Date()
@@ -5089,13 +5172,23 @@ public struct WindsurfProviderClient: ProviderClient {
         var stats: [QuotaStat] = []
         var signals: [QuotaSignal] = []
 
-        if !planInfo.hideDailyQuota, let remaining = planInfo.quotaUsage?.dailyRemainingPercent {
-            let resetDate = Date(timeIntervalSince1970: TimeInterval(planInfo.quotaUsage?.dailyResetAtUnix ?? planInfo.endTimestamp / 1000))
+        var dailyUsedPercent: Double? = nil
+        var dailyResetDate: Date? = nil
+
+        if let remaining = planInfo.quotaUsage?.dailyRemainingPercent {
+            dailyUsedPercent = max(0, 100 - Double(remaining))
+            dailyResetDate = planInfo.quotaUsage?.dailyResetAtUnix.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        } else if let usage = planInfo.usage, usage.messages > 0 {
+            dailyUsedPercent = (Double(usage.usedMessages) / Double(usage.messages)) * 100
+        }
+
+        if !planInfo.hideDailyQuota, let used = dailyUsedPercent {
+            let resetDate = dailyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
             windows.append(
                 QuotaWindow(
-                    label: "Daily Quota",
+                    label: userLabel.map { "Daily quota (\($0))" } ?? "Daily quota usage",
                     windowKind: .session,
-                    used: max(0, 100 - Double(remaining)),
+                    used: used,
                     total: 100,
                     resetDate: resetDate,
                     unit: "%",
@@ -5104,13 +5197,23 @@ public struct WindsurfProviderClient: ProviderClient {
             )
         }
 
-        if !planInfo.hideWeeklyQuota, let remaining = planInfo.quotaUsage?.weeklyRemainingPercent {
-            let resetDate = Date(timeIntervalSince1970: TimeInterval(planInfo.quotaUsage?.weeklyResetAtUnix ?? planInfo.endTimestamp / 1000))
+        var weeklyUsedPercent: Double? = nil
+        var weeklyResetDate: Date? = nil
+
+        if let remaining = planInfo.quotaUsage?.weeklyRemainingPercent {
+            weeklyUsedPercent = max(0, 100 - Double(remaining))
+            weeklyResetDate = planInfo.quotaUsage?.weeklyResetAtUnix.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        } else if let usage = planInfo.usage, usage.flowActions > 0 {
+            weeklyUsedPercent = (Double(usage.usedFlowActions) / Double(usage.flowActions)) * 100
+        }
+
+        if !planInfo.hideWeeklyQuota, let used = weeklyUsedPercent {
+            let resetDate = weeklyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
             windows.append(
                 QuotaWindow(
-                    label: "Weekly Quota",
+                    label: userLabel.map { "Weekly quota (\($0))" } ?? "Weekly quota usage",
                     windowKind: .weekly,
-                    used: max(0, 100 - Double(remaining)),
+                    used: used,
                     total: 100,
                     resetDate: resetDate,
                     unit: "%",
@@ -5123,7 +5226,7 @@ public struct WindsurfProviderClient: ProviderClient {
             let balance = Double(overageBalanceMicros) / 1_000_000.0
             balances.append(
                 QuotaBalance(
-                    label: "Extra Balance",
+                    label: userLabel.map { "Extra usage (\($0))" } ?? "Extra usage balance",
                     amount: balance,
                     unit: "$",
                     subtitle: "Extra usage balance",
@@ -5152,7 +5255,7 @@ public struct WindsurfProviderClient: ProviderClient {
             stats.append(
                 QuotaStat(
                     label: "Messages Remaining",
-                    value: Double(usage.remainingMessages),
+                    value: Double(usage.remainingMessages ?? 0),
                     unit: "msgs",
                     subtitle: "Still available"
                 )
@@ -5176,7 +5279,7 @@ public struct WindsurfProviderClient: ProviderClient {
             stats.append(
                 QuotaStat(
                     label: "Flow Actions Remaining",
-                    value: Double(usage.remainingFlowActions),
+                    value: Double(usage.remainingFlowActions ?? 0),
                     unit: "actions",
                     subtitle: "Still available"
                 )
@@ -5200,7 +5303,7 @@ public struct WindsurfProviderClient: ProviderClient {
             stats.append(
                 QuotaStat(
                     label: "Flex Credits Remaining",
-                    value: Double(usage.remainingFlexCredits),
+                    value: Double(usage.remainingFlexCredits ?? 0),
                     unit: "credits",
                     subtitle: "Still available"
                 )
@@ -5259,7 +5362,7 @@ public struct WindsurfProviderClient: ProviderClient {
                     label: "Session Age",
                     value: daysSinceSession,
                     unit: "days",
-                    subtitle: "Since Windsurf telemetry last recorded activity"
+                    subtitle: "Since Devin telemetry last recorded activity"
                 )
             )
         }
@@ -5269,7 +5372,7 @@ public struct WindsurfProviderClient: ProviderClient {
                 QuotaSignal(
                     kind: .unexpectedRecovery,
                     title: "Billing write permissions enabled",
-                    message: "The local Windsurf cache reports billing write access is available.",
+                    message: "The local Devin cache reports billing write access is available.",
                     severity: .info,
                     detectedAt: now
                 )
@@ -5294,8 +5397,8 @@ public struct WindsurfProviderClient: ProviderClient {
         }
 
         return QuotaSnapshot(
-            providerID: .windsurf,
-            displayName: "Windsurf",
+            providerID: .devin,
+            displayName: "Devin",
             planName: planInfo.planName,
             windows: windows,
             stats: stats,
@@ -5308,70 +5411,73 @@ public struct WindsurfProviderClient: ProviderClient {
     }
 }
 
-private enum WindsurfLocalStateReader {
-    static func loadCachedPlanInfo(customPath: URL? = nil, bookmarkData: Data? = nil) throws -> WindsurfStateSnapshot {
-        print("[WindsurfLocalStateReader] Searching for state.vscdb...")
+private enum DevinLocalStateReader {
+    static func loadCachedPlanInfo(customPath: URL? = nil, bookmarkData: Data? = nil) throws -> [DevinStateSnapshot] {
+        print("[DevinLocalStateReader] Searching for state.vscdb...")
 
         // If we have bookmark data, resolve it first (this gives us sandbox access)
         if let bookmarkData = bookmarkData {
-            print("[WindsurfLocalStateReader] Resolving security-scoped bookmark...")
+            print("[DevinLocalStateReader] Resolving security-scoped bookmark...")
             do {
                 let resolvedURL = try resolveSecurityScopedURL(from: bookmarkData)
-                print("[WindsurfLocalStateReader] Resolved bookmark to: \(resolvedURL.path)")
+                print("[DevinLocalStateReader] Resolved bookmark to: \(resolvedURL.path)")
 
                 // Start accessing the security-scoped resource
                 let accessGranted = resolvedURL.startAccessingSecurityScopedResource()
                 defer {
                     if accessGranted {
                         resolvedURL.stopAccessingSecurityScopedResource()
-                        print("[WindsurfLocalStateReader] Stopped accessing security-scoped resource")
+                        print("[DevinLocalStateReader] Stopped accessing security-scoped resource")
                     }
                 }
 
                 if accessGranted {
-                    print("[WindsurfLocalStateReader] Security-scoped access granted")
+                    print("[DevinLocalStateReader] Security-scoped access granted")
                     let bookmarkLoadURL = resolvedDatabaseURL(
                         bookmarkURL: resolvedURL,
                         customPath: customPath
                     )
-                    if let state = try loadCachedPlanInfo(from: bookmarkLoadURL) {
-                        print("[WindsurfLocalStateReader] Successfully loaded from bookmark")
-                        return state
+                    let states = try loadAllCachedPlanInfos(from: bookmarkLoadURL)
+                    if !states.isEmpty {
+                        print("[DevinLocalStateReader] Successfully loaded \(states.count) account(s) from bookmark")
+                        return states
                     }
                 } else {
-                    print("[WindsurfLocalStateReader] Failed to get security-scoped access")
+                    print("[DevinLocalStateReader] Failed to get security-scoped access")
                 }
             } catch {
-                print("[WindsurfLocalStateReader] Failed to resolve bookmark: \(error)")
+                print("[DevinLocalStateReader] Failed to resolve bookmark: \(error)")
             }
         }
 
         // If user provided a custom path, try that next
         if let customPath = customPath {
-            print("[WindsurfLocalStateReader] Trying user-provided path: \(customPath.path)")
-            print("[WindsurfLocalStateReader] Exists: \(FileManager.default.fileExists(atPath: customPath.path))")
-            print("[WindsurfLocalStateReader] Readable: \(FileManager.default.isReadableFile(atPath: customPath.path))")
+            print("[DevinLocalStateReader] Trying user-provided path: \(customPath.path)")
+            print("[DevinLocalStateReader] Exists: \(FileManager.default.fileExists(atPath: customPath.path))")
+            print("[DevinLocalStateReader] Readable: \(FileManager.default.isReadableFile(atPath: customPath.path))")
 
-            if let state = try loadCachedPlanInfo(from: customPath) {
-                print("[WindsurfLocalStateReader] Successfully loaded from user-provided path")
-                return state
+            let states = try loadAllCachedPlanInfos(from: customPath)
+            if !states.isEmpty {
+                print("[DevinLocalStateReader] Successfully loaded \(states.count) account(s) from user-provided path")
+                return states
             }
-            print("[WindsurfLocalStateReader] Failed to load from user-provided path, will try auto-discovery")
+            print("[DevinLocalStateReader] Failed to load from user-provided path, will try auto-discovery")
         }
 
         // Fall back to auto-discovery (won't work in sandboxed apps, but useful for non-sandboxed builds)
         for url in possibleStateDatabaseURLs() {
-            print("[WindsurfLocalStateReader] Checking: \(url.path)")
-            print("[WindsurfLocalStateReader] Exists: \(FileManager.default.fileExists(atPath: url.path))")
-            print("[WindsurfLocalStateReader] Readable: \(FileManager.default.isReadableFile(atPath: url.path))")
+            print("[DevinLocalStateReader] Checking: \(url.path)")
+            print("[DevinLocalStateReader] Exists: \(FileManager.default.fileExists(atPath: url.path))")
+            print("[DevinLocalStateReader] Readable: \(FileManager.default.isReadableFile(atPath: url.path))")
 
-            if let state = try loadCachedPlanInfo(from: url) {
-                print("[WindsurfLocalStateReader] Successfully loaded from: \(url.path)")
-                return state
+            let states = try loadAllCachedPlanInfos(from: url)
+            if !states.isEmpty {
+                print("[DevinLocalStateReader] Successfully loaded \(states.count) account(s) from: \(url.path)")
+                return states
             }
         }
 
-        print("[WindsurfLocalStateReader] Could not find or read state.vscdb from any location")
+        print("[DevinLocalStateReader] Could not find or read state.vscdb from any location")
         throw ProviderFetchError.notConfigured
     }
 
@@ -5398,68 +5504,99 @@ private enum WindsurfLocalStateReader {
         // Primary location (real user home, not container)
         // Note: In sandboxed apps, homeDirectoryForCurrentUser returns the container path
         let realHome = URL(fileURLWithPath: NSHomeDirectory().replacingOccurrences(of: "/Library/Containers/", with: "").components(separatedBy: "/").dropLast(3).joined(separator: "/"))
-        paths.append(realHome.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb"))
-        paths.append(realHome.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb.backup"))
+        paths.append(realHome.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb"))
+        paths.append(realHome.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb.backup"))
 
         return paths
     }
 
-    private static func loadCachedPlanInfo(from url: URL) throws -> WindsurfStateSnapshot? {
+    private static func loadAllCachedPlanInfos(from url: URL) throws -> [DevinStateSnapshot] {
         guard FileManager.default.isReadableFile(atPath: url.path) else {
-            print("[WindsurfLocalStateReader] File not readable: \(url.path)")
-            return nil
+            print("[DevinLocalStateReader] File not readable: \(url.path)")
+            return []
         }
 
         var db: OpaquePointer?
         let result = sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil)
         guard result == SQLITE_OK, let db else {
-            print("[WindsurfLocalStateReader] Failed to open DB: \(result)")
+            print("[DevinLocalStateReader] Failed to open DB: \(result)")
             if let db { sqlite3_close(db) }
-            return nil
+            return []
         }
         defer { sqlite3_close(db) }
 
-        let query = "SELECT value FROM ItemTable WHERE key = 'windsurf.settings.cachedPlanInfo' LIMIT 1;"
+        // First try to get all per-user reactSettings entries (new Devin format)
+        let reactQuery = """
+        SELECT value FROM ItemTable
+        WHERE key LIKE '%reactSettings.cachedPlanInfoData:user-%'
+        ORDER BY LENGTH(value) DESC;
+        """
+        var snapshots = try decodeAllRows(db: db, query: reactQuery)
+        if !snapshots.isEmpty {
+            print("[DevinLocalStateReader] Found \(snapshots.count) reactSettings user account(s)")
+            // Load shared local metadata once
+            let localMetadata = try loadLocalMetadata(from: db)
+            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata) }
+        }
+
+        // Fallback: try legacy keys
+        let legacyQuery = """
+        SELECT value FROM ItemTable 
+        WHERE key IN ('devin.settings.cachedPlanInfo', 'windsurf.settings.cachedPlanInfo', 'codeium.settings.cachedPlanInfo', 'cachedPlanInfo')
+        OR key LIKE '%PlanInfo%' 
+        ORDER BY CASE 
+            WHEN key LIKE 'devin.%' THEN 1 
+            WHEN key LIKE 'windsurf.%' THEN 2 
+            WHEN key LIKE 'codeium.%' THEN 3 
+            ELSE 4 
+        END
+        LIMIT 1;
+        """
+        snapshots = try decodeAllRows(db: db, query: legacyQuery)
+        if !snapshots.isEmpty {
+            let localMetadata = try loadLocalMetadata(from: db)
+            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata) }
+        }
+
+        print("[DevinLocalStateReader] No plan info rows found")
+        return []
+    }
+
+    private static func decodeAllRows(db: OpaquePointer, query: String) throws -> [DevinCachedPlanInfo] {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else {
-            print("[WindsurfLocalStateReader] Failed to prepare statement")
-            return nil
+            print("[DevinLocalStateReader] Failed to prepare statement")
+            return []
         }
         defer { sqlite3_finalize(statement) }
 
-        let stepResult = sqlite3_step(statement)
-        guard stepResult == SQLITE_ROW else {
-            print("[WindsurfLocalStateReader] No row found, step result: \(stepResult)")
-            return nil
-        }
+        var results: [DevinCachedPlanInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let textPointer = sqlite3_column_text(statement, 0) else {
+                print("[DevinLocalStateReader] No text in column, skipping row")
+                continue
+            }
+            let jsonString = String(cString: textPointer)
+            print("[DevinLocalStateReader] Got JSON (first 200 chars): \(jsonString.prefix(200))")
 
-        guard let textPointer = sqlite3_column_text(statement, 0) else {
-            print("[WindsurfLocalStateReader] No text in column")
-            return nil
+            guard let data = jsonString.data(using: .utf8) else {
+                print("[DevinLocalStateReader] Failed to convert to data, skipping row")
+                continue
+            }
+            do {
+                let planInfo = try JSONDecoder().decode(DevinCachedPlanInfo.self, from: data)
+                print("[DevinLocalStateReader] Successfully decoded plan: \(planInfo.planName) (\(planInfo.accountIdentityText ?? "no identity"))")
+                results.append(planInfo)
+            } catch {
+                print("[DevinLocalStateReader] JSON decode error for row: \(error)")
+            }
         }
-
-        let jsonString = String(cString: textPointer)
-        print("[WindsurfLocalStateReader] Got JSON (first 200 chars): \(jsonString.prefix(200))")
-
-        guard let data = jsonString.data(using: .utf8) else {
-            print("[WindsurfLocalStateReader] Failed to convert to data")
-            return nil
-        }
-
-        do {
-            let planInfo = try JSONDecoder().decode(WindsurfCachedPlanInfo.self, from: data)
-            print("[WindsurfLocalStateReader] Successfully decoded plan: \(planInfo.planName)")
-            let localMetadata = try loadLocalMetadata(from: db)
-            return WindsurfStateSnapshot(planInfo: planInfo, localMetadata: localMetadata)
-        } catch {
-            print("[WindsurfLocalStateReader] JSON decode error: \(error)")
-            throw error
-        }
+        return results
     }
 
-    private static func loadLocalMetadata(from db: OpaquePointer) throws -> WindsurfLocalMetadata {
-        let spaceMetadata = try loadJSONDictionary(from: db, key: "windsurfSpace.metadata")
-        let resourceToSpace = try loadJSONObject(from: db, key: "windsurfSpace.resourceToSpace")
+    private static func loadLocalMetadata(from db: OpaquePointer) throws -> DevinLocalMetadata {
+        let spaceMetadata = try loadJSONDictionary(from: db, keys: ["devinSpace.metadata", "windsurfSpace.metadata"])
+        let resourceToSpace = try loadJSONObject(from: db, keys: ["devinSpace.resourceToSpace", "windsurfSpace.resourceToSpace"])
         let lastSessionDate = try loadDate(from: db, key: "telemetry.lastSessionDate")
 
         let latestSpaceAccessDate = spaceMetadata?.values
@@ -5467,7 +5604,7 @@ private enum WindsurfLocalStateReader {
             .map { Date(timeIntervalSince1970: $0 / 1000) }
             .max()
 
-        return WindsurfLocalMetadata(
+        return DevinLocalMetadata(
             spaceCount: spaceMetadata?.count,
             resourceLinkCount: resourceToSpace?.count,
             latestSpaceAccessDate: latestSpaceAccessDate,
@@ -5475,8 +5612,8 @@ private enum WindsurfLocalStateReader {
         )
     }
 
-    private static func loadJSONObject(from db: OpaquePointer, key: String) throws -> [String: Any]? {
-        guard let text = try loadTextValue(from: db, key: key),
+    private static func loadJSONObject(from db: OpaquePointer, keys: [String]) throws -> [String: Any]? {
+        guard let text = try loadTextValue(from: db, keys: keys),
               let data = text.data(using: .utf8),
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
@@ -5484,8 +5621,8 @@ private enum WindsurfLocalStateReader {
         return object
     }
 
-    private static func loadJSONDictionary(from db: OpaquePointer, key: String) throws -> [String: [String: Any]]? {
-        guard let object = try loadJSONObject(from: db, key: key) else {
+    private static func loadJSONDictionary(from db: OpaquePointer, keys: [String]) throws -> [String: [String: Any]]? {
+        guard let object = try loadJSONObject(from: db, keys: keys) else {
             return nil
         }
 
@@ -5499,16 +5636,36 @@ private enum WindsurfLocalStateReader {
     }
 
     private static func loadTextValue(from db: OpaquePointer, key: String) throws -> String? {
-        let query = "SELECT value FROM ItemTable WHERE key = ? LIMIT 1;"
+        return try loadTextValue(from: db, keys: [key])
+    }
+
+    private static func loadTextValue(from db: OpaquePointer, keys: [String]) throws -> String? {
+        let placeholders = keys.map { _ in "?" }.joined(separator: ", ")
+        let caseClauses = keys.enumerated().map { "WHEN key = ? THEN \($0.offset)" }.joined(separator: " ")
+        let query = "SELECT value FROM ItemTable WHERE key IN (\(placeholders)) ORDER BY CASE \(caseClauses) ELSE \(keys.count) END LIMIT 1;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else {
-            throw ProviderFetchError.parsingError("Failed to prepare Windsurf metadata query.")
+            throw ProviderFetchError.parsingError("Failed to prepare Devin metadata query.")
         }
         defer { sqlite3_finalize(statement) }
 
         let transientDestructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        _ = key.withCString { cString in
-            sqlite3_bind_text(statement, 1, cString, -1, transientDestructor)
+        var bindIndex: Int32 = 1
+        
+        // Bind for the IN clause
+        for key in keys {
+            key.withCString { cString in
+                sqlite3_bind_text(statement, bindIndex, cString, -1, transientDestructor)
+            }
+            bindIndex += 1
+        }
+        
+        // Bind for the ORDER BY CASE clause
+        for key in keys {
+            key.withCString { cString in
+                sqlite3_bind_text(statement, bindIndex, cString, -1, transientDestructor)
+            }
+            bindIndex += 1
         }
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
@@ -5549,17 +5706,18 @@ private enum WindsurfLocalStateReader {
     }
 }
 
-private struct WindsurfCachedPlanInfo: Decodable {
+private struct DevinCachedPlanInfo: Decodable {
     let planName: String
     let startTimestamp: Int
     let endTimestamp: Int
-    let usage: WindsurfUsageSummary?
-    let quotaUsage: WindsurfQuotaUsage?
+    let usage: DevinUsageSummary?
+    let quotaUsage: DevinQuotaUsage?
     let hasBillingWritePermissions: Bool?
     let gracePeriodStatus: Int?
     let teamsTier: Int?
     let hideDailyQuota: Bool
     let hideWeeklyQuota: Bool
+    let accountIdentityText: String?
 
     enum CodingKeys: String, CodingKey {
         case planName
@@ -5572,22 +5730,48 @@ private struct WindsurfCachedPlanInfo: Decodable {
         case teamsTier
         case hideDailyQuota
         case hideWeeklyQuota
+        case accountIdentityText
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        planName = (try? container.decodeIfPresent(String.self, forKey: .planName)) ?? "Unknown"
+        startTimestamp = (try? container.decodeIfPresent(Int.self, forKey: .startTimestamp)) ?? 0
+        endTimestamp = (try? container.decodeIfPresent(Int.self, forKey: .endTimestamp)) ?? 0
+        hasBillingWritePermissions = try? container.decodeIfPresent(Bool.self, forKey: .hasBillingWritePermissions)
+        gracePeriodStatus = try? container.decodeIfPresent(Int.self, forKey: .gracePeriodStatus)
+        teamsTier = try? container.decodeIfPresent(Int.self, forKey: .teamsTier)
+        accountIdentityText = try? container.decodeIfPresent(String.self, forKey: .accountIdentityText)
+        hideDailyQuota = (try? container.decodeIfPresent(Bool.self, forKey: .hideDailyQuota)) ?? false
+        hideWeeklyQuota = (try? container.decodeIfPresent(Bool.self, forKey: .hideWeeklyQuota)) ?? false
+        
+        if let qUsage = try? container.decodeIfPresent(DevinQuotaUsage.self, forKey: .quotaUsage) {
+            quotaUsage = qUsage
+        } else {
+            quotaUsage = try? DevinQuotaUsage(from: decoder)
+        }
+        
+        if let u = try? container.decodeIfPresent(DevinUsageSummary.self, forKey: .usage) {
+            usage = u
+        } else {
+            usage = try? DevinUsageSummary(from: decoder)
+        }
     }
 }
 
-private struct WindsurfStateSnapshot {
-    let planInfo: WindsurfCachedPlanInfo
-    let localMetadata: WindsurfLocalMetadata?
+private struct DevinStateSnapshot {
+    let planInfo: DevinCachedPlanInfo
+    let localMetadata: DevinLocalMetadata?
 }
 
-private struct WindsurfLocalMetadata {
+private struct DevinLocalMetadata {
     let spaceCount: Int?
     let resourceLinkCount: Int?
     let latestSpaceAccessDate: Date?
     let lastSessionDate: Date?
 }
 
-private struct WindsurfUsageSummary: Decodable {
+private struct DevinUsageSummary: Decodable {
     let duration: Int
     let messages: Int
     let flowActions: Int
@@ -5595,17 +5779,68 @@ private struct WindsurfUsageSummary: Decodable {
     let usedMessages: Int
     let usedFlowActions: Int
     let usedFlexCredits: Int
-    let remainingMessages: Int
-    let remainingFlowActions: Int
-    let remainingFlexCredits: Int
+    let remainingMessages: Int?
+    let remainingFlowActions: Int?
+    let remainingFlexCredits: Int?
 }
 
-private struct WindsurfQuotaUsage: Decodable {
+private struct DevinQuotaUsage: Decodable {
     let dailyRemainingPercent: Int?
     let weeklyRemainingPercent: Int?
     let overageBalanceMicros: Int?
     let dailyResetAtUnix: Int?
     let weeklyResetAtUnix: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case dailyRemainingPercent = "dailyRemainingPercent"
+        case weeklyRemainingPercent = "weeklyRemainingPercent"
+        case overageBalanceMicros = "overageBalanceMicros"
+        case dailyResetAtUnix = "dailyResetAtUnix"
+        case weeklyResetAtUnix = "weeklyResetAtUnix"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        
+        // Try camelCase first, fallback to snake_case equivalent manually if needed
+        // (If the JSON happens to use snake_case keys in newer builds)
+        if let val = try? container.decodeIfPresent(Int.self, forKey: .dailyRemainingPercent) { dailyRemainingPercent = val }
+        else {
+            let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+            dailyRemainingPercent = try dynamic.decodeIfPresent(Int.self, forKey: DynamicKey(stringValue: "daily_remaining_percent")!)
+        }
+        
+        if let val = try? container.decodeIfPresent(Int.self, forKey: .weeklyRemainingPercent) { weeklyRemainingPercent = val }
+        else {
+            let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+            weeklyRemainingPercent = try dynamic.decodeIfPresent(Int.self, forKey: DynamicKey(stringValue: "weekly_remaining_percent")!)
+        }
+        
+        if let val = try? container.decodeIfPresent(Int.self, forKey: .overageBalanceMicros) { overageBalanceMicros = val }
+        else {
+            let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+            overageBalanceMicros = try dynamic.decodeIfPresent(Int.self, forKey: DynamicKey(stringValue: "overage_balance_micros")!)
+        }
+        
+        if let val = try? container.decodeIfPresent(Int.self, forKey: .dailyResetAtUnix) { dailyResetAtUnix = val }
+        else {
+            let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+            dailyResetAtUnix = try dynamic.decodeIfPresent(Int.self, forKey: DynamicKey(stringValue: "daily_reset_at_unix")!)
+        }
+        
+        if let val = try? container.decodeIfPresent(Int.self, forKey: .weeklyResetAtUnix) { weeklyResetAtUnix = val }
+        else {
+            let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+            weeklyResetAtUnix = try dynamic.decodeIfPresent(Int.self, forKey: DynamicKey(stringValue: "weekly_reset_at_unix")!)
+        }
+    }
+}
+
+private struct DynamicKey: CodingKey {
+    var stringValue: String
+    init?(stringValue: String) { self.stringValue = stringValue }
+    var intValue: Int? { return nil }
+    init?(intValue: Int) { return nil }
 }
 
 private struct CursorLocalStateSnapshot {
@@ -9271,5 +9506,346 @@ private extension ProviderFetchError {
         case .notConfigured, .credentialExpired, .networkError, .parsingError, .unknown:
             return false
         }
+    }
+}
+
+// MARK: - Ollama Cloud Provider Client
+
+/// Keeps the Ollama weekly reset date stable across syncs. The settings page
+/// only exposes a coarse relative countdown ("Sessions resume in 5 days"), so
+/// recomputing `now + N days` on every sync would creep the displayed reset
+/// forward; within one limit episode the first computed date wins.
+enum OllamaWeeklyResetStore {
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let resetDateKey = "ollama.weeklyReset.date"
+    private static let sameEpisodeTolerance: TimeInterval = 1.5 * 86_400
+
+    static func stabilizedResetDate(
+        candidate: Date,
+        now: Date = Date(),
+        defaults overrideDefaults: UserDefaults? = nil
+    ) -> Date {
+        let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        if let stored = defaults.object(forKey: resetDateKey) as? Date,
+           stored > now,
+           abs(stored.timeIntervalSince(candidate)) <= sameEpisodeTolerance {
+            return stored
+        }
+        defaults.set(candidate, forKey: resetDateKey)
+        return candidate
+    }
+}
+
+public struct OllamaProviderClient: ProviderClient {
+    public let providerID: ProviderID = .ollama
+
+    public init() {}
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        guard let credentials, !credentials.isEmpty else {
+            throw ProviderFetchError.notConfigured
+        }
+
+        let rawCookie = credentials.normalizedAccessToken
+            ?? credentials.extraFields?["ollamaCookie"]
+            ?? credentials.accountIdentifier
+
+        guard let rawCookie = rawCookie?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawCookie.isEmpty else {
+            throw ProviderFetchError.notConfigured
+        }
+
+        let sessionCookie = normalizeCookie(rawCookie)
+        let customURLString = credentials.customEndpoint?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpointURL = (customURLString?.isEmpty == false ? URL(string: customURLString!) : nil)
+            ?? URL(string: "https://ollama.com/settings")!
+
+        var request = URLRequest(url: endpointURL, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw ProviderFetchError.networkError(underlying: error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ProviderFetchError.networkError(underlying: NSError(domain: "OllamaProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response from ollama.com"]))
+        }
+
+        if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 || httpResponse.url?.path.contains("/login") == true {
+            throw ProviderFetchError.credentialExpired("Ollama session cookie expired or invalid. Please update in settings.")
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw ProviderFetchError.parsingError("HTTP \(httpResponse.statusCode) from ollama.com")
+        }
+
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw ProviderFetchError.parsingError("Unable to decode Ollama response HTML")
+        }
+
+        return try parseOllamaSettingsHTML(html, fetchedAt: Date())
+    }
+
+    private func normalizeCookie(_ input: String) -> String {
+        var trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("Cookie:") {
+            trimmed = trimmed.replacingOccurrences(of: "Cookie:", with: "").trimmingCharacters(in: .whitespaces)
+        }
+        if trimmed.contains("__Secure-session=") {
+            return trimmed
+        }
+        return "__Secure-session=\(trimmed)"
+    }
+
+    private struct ExtractedMetric {
+        let percent: Double
+        let resetDate: Date?
+        let resetDescription: String?
+    }
+
+    private struct WeeklyLimitBanner {
+        let resumeDate: Date?
+    }
+
+    func parseOllamaSettingsHTML(
+        _ html: String,
+        fetchedAt: Date,
+        defaults: UserDefaults? = nil
+    ) throws -> QuotaSnapshot {
+        if html.contains("Sign in to Ollama") || (html.contains("/login") && !html.contains("Session usage") && !html.contains("Weekly usage")) {
+            throw ProviderFetchError.credentialExpired("Ollama session cookie expired or invalid. Please update in settings.")
+        }
+
+        var windows: [QuotaWindow] = []
+
+        let (sessionChunk, weeklyChunk) = extractSections(from: html)
+        // The weekly-limit banner sits between the two usage headings, so it is
+        // detected once against the whole usage region and attributed to the
+        // weekly window rather than whichever chunk it happens to land in.
+        let banner = parseWeeklyLimitBanner(in: (sessionChunk ?? "") + (weeklyChunk ?? ""), now: fetchedAt)
+
+        if let sessionChunk {
+            let cleanedChunk = banner == nil ? sessionChunk : removingWeeklyBannerPhrases(from: sessionChunk)
+            if let sessionMetric = parseMetricFromChunk(cleanedChunk, isWeekly: false, now: fetchedAt) {
+                var resetDate = sessionMetric.resetDate
+                var resetDescription = sessionMetric.resetDescription
+                if banner != nil, let candidate = resetDate, candidate.timeIntervalSince(fetchedAt) >= 86_400 {
+                    resetDate = nil
+                    resetDescription = nil
+                }
+                windows.append(
+                    QuotaWindow(
+                        label: "Session usage",
+                        windowKind: .session,
+                        used: sessionMetric.percent,
+                        total: 100,
+                        resetDate: resetDate,
+                        unit: "%",
+                        subtitle: resetDescription ?? (banner == nil ? "5-hour sliding window" : "Blocked until weekly reset")
+                    )
+                )
+            }
+        }
+
+        if let weeklyChunk {
+            let weeklyMetric = parseMetricFromChunk(weeklyChunk, isWeekly: true, now: fetchedAt)
+            if let percent = weeklyMetric?.percent ?? (banner == nil ? nil : 100) {
+                var resetDate = weeklyMetric?.resetDate
+                var subtitle = weeklyMetric?.resetDescription ?? "Weekly rolling window"
+                if let banner {
+                    resetDate = banner.resumeDate ?? resetDate
+                    subtitle = "Weekly limit reached"
+                }
+                if let candidate = resetDate {
+                    resetDate = OllamaWeeklyResetStore.stabilizedResetDate(candidate: candidate, now: fetchedAt, defaults: defaults)
+                }
+                windows.append(
+                    QuotaWindow(
+                        label: "Weekly usage",
+                        windowKind: .weekly,
+                        used: percent,
+                        total: 100,
+                        resetDate: resetDate,
+                        unit: "%",
+                        subtitle: subtitle
+                    )
+                )
+            }
+        }
+
+        guard !windows.isEmpty else {
+            if html.contains("Sign in") || html.contains("Log in") {
+                throw ProviderFetchError.credentialExpired("Ollama session cookie expired. Please update in settings.")
+            }
+            throw ProviderFetchError.parsingError("Could not find Session or Weekly usage on ollama.com/settings")
+        }
+
+        return QuotaSnapshot(
+            providerID: .ollama,
+            displayName: "Ollama",
+            planName: nil,
+            windows: windows,
+            stats: [],
+            balances: [],
+            signals: [],
+            events: [],
+            fetchState: .success,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    private func extractSections(from html: String) -> (session: String?, weekly: String?) {
+        let sessionRange = html.range(of: "Session usage", options: .caseInsensitive)
+        let weeklyRange = html.range(of: "Weekly usage", options: .caseInsensitive)
+
+        func forwardChunk(from start: String.Index) -> String {
+            var end = html.index(start, offsetBy: min(1000, html.distance(from: start, to: html.endIndex)))
+            if let modelsRange = html.range(of: "Models used", options: .caseInsensitive, range: start..<html.endIndex) {
+                end = min(end, modelsRange.lowerBound)
+            }
+            return String(html[start..<end])
+        }
+
+        var sessionChunk: String? = nil
+        var weeklyChunk: String? = nil
+
+        if let sRange = sessionRange {
+            if let wRange = weeklyRange, wRange.lowerBound > sRange.lowerBound {
+                sessionChunk = String(html[sRange.lowerBound..<wRange.lowerBound])
+            } else {
+                sessionChunk = forwardChunk(from: sRange.lowerBound)
+            }
+        }
+
+        if let wRange = weeklyRange {
+            weeklyChunk = forwardChunk(from: wRange.lowerBound)
+        }
+
+        return (sessionChunk, weeklyChunk)
+    }
+
+    private func parseWeeklyLimitBanner(in usageRegion: String, now: Date) -> WeeklyLimitBanner? {
+        var resumeDate: Date? = nil
+        var resumeIsMultiDay = false
+        if let groups = firstMatchGroups(in: usageRegion, pattern: #"[Ss]essions?\s+resume\s+in\s+([0-9]+)\s*(days?|d\b|hours?|hrs?|h\b)"#),
+           groups.count == 2,
+           let value = Double(groups[0]) {
+            let interval = value * (groups[1].lowercased().hasPrefix("d") ? 86_400 : 3_600)
+            resumeDate = now.addingTimeInterval(interval)
+            resumeIsMultiDay = interval >= 86_400
+        }
+        if usageRegion.localizedCaseInsensitiveContains("Weekly limit reached") {
+            return WeeklyLimitBanner(resumeDate: resumeDate)
+        }
+        // A "session" that resumes in a day or more is the weekly block; the
+        // real session window is a 5-hour slide.
+        return resumeIsMultiDay ? WeeklyLimitBanner(resumeDate: resumeDate) : nil
+    }
+
+    private func removingWeeklyBannerPhrases(from chunk: String) -> String {
+        var cleaned = chunk
+        for pattern in [
+            #"[Ww]eekly\s+limit\s+reached"#,
+            #"[Ss]essions?\s+resume\s+in\s+[0-9]+\s*(?:days?|d\b|hours?|hrs?|h\b)"#
+        ] {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+        return cleaned
+    }
+
+    private func parseMetricFromChunk(_ chunk: String, isWeekly: Bool, now: Date) -> ExtractedMetric? {
+        var percent: Double? = nil
+
+        if isWeekly && (chunk.localizedCaseInsensitiveContains("Limit reached") || chunk.localizedCaseInsensitiveContains("100% used")) {
+            percent = 100.0
+        } else if let ariaNow = firstMatch(in: chunk, pattern: #"aria-valuenow="([0-9]+(?:\.[0-9]+)?)""#) {
+            percent = Double(ariaNow)
+        } else if let ariaMatch = firstMatch(in: chunk, pattern: #"aria-label="[^"]*?([0-9]+(?:\.[0-9]+)?)\s*%[^"]*""#) {
+            percent = Double(ariaMatch)
+        } else if let widthStr = firstMatch(in: chunk, pattern: #"(?<![-\w])width:\s*([0-9]+(?:\.[0-9]+)?)\s*%"#) {
+            percent = Double(widthStr)
+        } else if let pctStr = firstMatch(in: chunk, pattern: #"([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#) {
+            percent = Double(pctStr)
+        } else if let pctStr = firstMatch(in: String(chunk.prefix(300)), pattern: #"(?<=[>\s])([0-9]+(?:\.[0-9]+)?)\s*%"#) {
+            // Last resort: a bare percentage, and only near the usage heading
+            // the chunk starts with — never from deep, unrelated markup.
+            percent = Double(pctStr)
+        }
+
+        guard let percent else { return nil }
+
+        var resetDate: Date? = nil
+        var resetDesc: String? = nil
+
+        if let resumeMatch = firstMatch(in: chunk, pattern: #"(?:[Ss]essions?\s+resume\s+in\s+([0-9]+)\s*(?:days?|d))"#) {
+            if let days = Double(resumeMatch) {
+                resetDate = now.addingTimeInterval(days * 86400)
+                resetDesc = "Resumes in \(Int(days))d"
+            }
+        } else if let resumeMatch = firstMatch(in: chunk, pattern: #"(?:[Ss]essions?\s+resume\s+in\s+([0-9]+)\s*(?:hours?|hrs?|h))"#) {
+            if let hours = Double(resumeMatch) {
+                resetDate = now.addingTimeInterval(hours * 3600)
+                resetDesc = "Resumes in \(Int(hours))h"
+            }
+        } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:hours?|hrs?|h))"#) {
+            if let hours = Double(resetMatch) {
+                resetDate = now.addingTimeInterval(hours * 3600)
+                resetDesc = "Resets in \(Int(hours))h"
+            }
+        } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:days?|d))"#) {
+            if let days = Double(resetMatch) {
+                resetDate = now.addingTimeInterval(days * 86400)
+                resetDesc = "Resets in \(Int(days))d"
+            }
+        }
+
+        return ExtractedMetric(
+            percent: min(max(percent, 0), 100),
+            resetDate: resetDate,
+            resetDescription: resetDesc
+        )
+    }
+
+    private func firstMatch(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: nsRange) else {
+            return nil
+        }
+        if match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: text) {
+            return String(text[range])
+        } else if let range = Range(match.range(at: 0), in: text) {
+            return String(text[range])
+        }
+        return nil
+    }
+
+    private func firstMatchGroups(in text: String, pattern: String) -> [String]? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: nsRange) else {
+            return nil
+        }
+        var groups: [String] = []
+        for index in 1..<match.numberOfRanges {
+            guard let range = Range(match.range(at: index), in: text) else { return nil }
+            groups.append(String(text[range]))
+        }
+        return groups
     }
 }

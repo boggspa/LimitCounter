@@ -88,7 +88,7 @@ private func testDailyOnTrackIsSuppressed() throws {
         resetDate: now.addingTimeInterval(12 * 60 * 60)
     )
 
-    let pace = window.pace(providerID: .windsurf, at: now)
+    let pace = window.pace(providerID: .devin, at: now)
     try expectEqual(pace?.state, .onTrack, "daily on-track state")
     try expect(pace?.shouldSurface == true, "daily on-track should surface")
 }
@@ -123,7 +123,7 @@ private func testMissingInputsAreSuppressed() throws {
         "expired reset is suppressed"
     )
     try expect(
-        quotaWindow(label: "Generic", kind: .session, used: 10, resetDate: now.addingTimeInterval(100)).pace(providerID: .windsurf, at: now) == nil,
+        quotaWindow(label: "Generic", kind: .session, used: 10, resetDate: now.addingTimeInterval(100)).pace(providerID: .devin, at: now) == nil,
         "unlabeled session duration is suppressed"
     )
 }

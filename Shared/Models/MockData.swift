@@ -229,10 +229,10 @@ public enum MockData {
         )
     }
 
-    public static var windsurfSnapshot: QuotaSnapshot {
+    public static var devinSnapshot: QuotaSnapshot {
         QuotaSnapshot(
-            providerID: .windsurf,
-            displayName: "Windsurf",
+            providerID: .devin,
+            displayName: "Devin",
             planName: "Pro",
             windows: [
                 QuotaWindow(
@@ -324,7 +324,7 @@ public enum MockData {
     }
 
     public static var allSnapshots: [QuotaSnapshot] {
-        [claudeSnapshot, codexSnapshot, openAIAPISnapshot, chatgptSnapshot, codexTelemetrySnapshot, windsurfSnapshot, cursorSnapshot, kimiSnapshot]
+        [claudeSnapshot, codexSnapshot, openAIAPISnapshot, chatgptSnapshot, codexTelemetrySnapshot, devinSnapshot, cursorSnapshot, kimiSnapshot]
     }
 
     public static var staleSnapshot: QuotaSnapshot {
@@ -350,8 +350,8 @@ public enum MockData {
 
     public static var notConfiguredSnapshot: QuotaSnapshot {
         QuotaSnapshot(
-            providerID: .windsurf,
-            displayName: "Windsurf",
+            providerID: .devin,
+            displayName: "Devin",
             planName: nil,
             windows: [],
             fetchState: .notConfigured

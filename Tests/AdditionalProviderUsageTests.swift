@@ -609,6 +609,322 @@ private func testMistralManualAnchorAccumulatesAcrossMonthAndScanGaps() throws {
     try expectClose(convertedAdvanced.spend, 5.5925, "Mistral live GBP accumulation")
 }
 
+private func testMistralWebParserReadsSubscriptionPage() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = """
+    <!DOCTYPE html>
+    <html><head><title>Admin - Mistral AI</title><style>.bar { max-width: 100%; }</style></head>
+    <body>
+    <nav><a href="/organization">Organization</a> <a href="/usage">Usage</a> <a href="/limits">Limits</a></nav>
+    <main>
+    <h1>Subscription</h1>
+    <p>CURRENT PLAN</p>
+    <h2>Pro <span>Active</span></h2>
+    <p>Full access to Vibe for all-day coding and long-running tasks.</p>
+    <h3>INCLUDED MONTHLY ALLOWANCE</h3>
+    <h4>Included API usage</h4>
+    <p>Included monthly allowance for API/Studio usage.</p>
+    <div><span>€17.43</span><span>€25.5</span></div>
+    <p>Resets in 13 days</p>
+    <h4>Included Vibe Code usage</h4>
+    <p>Included monthly allowance for Vibe Code.</p>
+    <div><span>€90.09</span><span>€255</span></div>
+    <p>Resets in 13 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    <p>API pay-as-you-go: create API keys and use the free tier.</p>
+    <h3>ESTIMATED PRICE</h3>
+    <div>Subscription €14.99</div>
+    <div>Estimated total €14.99 /month</div>
+    </main>
+    </body></html>
+    """
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Subscription page did not parse") }()
+    try expectClose(result.apiSpent ?? -1, 17.43, "api spent")
+    try expectClose(result.apiAllowance ?? -1, 25.5, "api allowance")
+    try expectClose(result.vibeSpent ?? -1, 90.09, "vibe spent")
+    try expectClose(result.vibeAllowance ?? -1, 255, "vibe allowance")
+    try expectEqual(result.currency, "EUR", "currency")
+    try expectEqual(result.planName, "Pro", "plan name")
+    let expectedReset = now.addingTimeInterval(13 * 86400)
+    let drift = result.periodEnd.map { abs($0.timeIntervalSince(expectedReset)) } ?? .infinity
+    try expect(drift < 1, "period end from resets-in-13-days")
+}
+
+private func testMistralWebParserSurvivesReactCommentAndTagSplitting() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = """
+    <body>
+    <p>CURRENT PLAN</p><h2>Pro</h2>
+    <h4>Included <!-- -->API<!-- --> usage</h4>
+    <div><span>€</span><span>17.43</span> of <span>€</span><span>25.5</span></div>
+    <p>Resets in <!-- -->13<!-- --> days</p>
+    <h4>Included <!-- -->Vibe Code<!-- --> usage</h4>
+    <div><span>€</span><span>90.09</span> of <span>€</span><span>255</span></div>
+    <p>Resets in 13 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    </body>
+    """
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Comment-split page did not parse") }()
+    try expectClose(result.apiSpent ?? -1, 17.43, "api spent across markup splits")
+    try expectClose(result.apiAllowance ?? -1, 25.5, "api allowance across markup splits")
+    try expectClose(result.vibeSpent ?? -1, 90.09, "vibe spent across markup splits")
+    try expectClose(result.vibeAllowance ?? -1, 255, "vibe allowance across markup splits")
+}
+
+private func testMistralWebParserToleratesPayAsYouGoTooltipBeforeVibeAmounts() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = """
+    <body>
+    <h4>Included API usage</h4>
+    <div>€17.43 €25.5</div>
+    <p>Resets in 13 days</p>
+    <h4>Included Vibe Code usage <button aria-describedby="tip">i</button></h4>
+    <div role="tooltip" id="tip">Once the included allowance is exhausted, enable Pay-as-you-go for Vibe Code to keep coding.</div>
+    <p>Included monthly allowance for Vibe Code.</p>
+    <div>€90.09 €255</div>
+    <p>Resets in 13 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    </body>
+    """
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Tooltip page did not parse") }()
+    try expectClose(result.vibeSpent ?? -1, 90.09, "vibe spent despite pay-as-you-go tooltip copy")
+    try expectClose(result.vibeAllowance ?? -1, 255, "vibe allowance despite pay-as-you-go tooltip copy")
+}
+
+private func testMistralWebParserHandlesLandmarksAppearingBeforeSections() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = """
+    <html><head>
+    <script>window.__i18n = {"payg":"PAY-AS-YOU-GO & SPENDING LIMIT","vibe":"Vibe Code usage","estimated":"ESTIMATED PRICE"}</script>
+    </head>
+    <body>
+    <div>Settings / Pay-as-you-go &amp; spending limit / Estimated price</div>
+    <h4>Included API usage</h4>
+    <div>€17.43 €25.5</div>
+    <p>Resets in 13 days</p>
+    <h4>Included Vibe Code usage</h4>
+    <div>€90.09 €255</div>
+    <p>Resets in 13 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    </body></html>
+    """
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Early-landmark page did not parse") }()
+    try expectClose(result.apiSpent ?? -1, 17.43, "api spent with early landmarks")
+    try expectClose(result.vibeSpent ?? -1, 90.09, "vibe spent with early landmarks")
+    try expectClose(result.vibeAllowance ?? -1, 255, "vibe allowance with early landmarks")
+}
+
+private func testMistralWebParserReadsFlightPayloadOnlyPage() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = #"""
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"></head>
+    <body><div id="root"></div>
+    <script>self.__next_f.push([1,"7:[\"$\",\"h4\",null,{\"children\":\"Included API usage\"}]\n8:[\"$\",\"span\",null,{\"children\":\"€17.43\"}]\n9:[\"$\",\"span\",null,{\"children\":\"€25.5\"}]\n10:[\"$\",\"p\",null,{\"children\":\"Resets in 13 days\"}]"])</script>
+    <script>self.__next_f.push([1,"11:[\"$\",\"h4\",null,{\"children\":\"Included Vibe Code usage\"}]\n12:[\"$\",\"span\",null,{\"children\":\"€90.09\"}]\n13:[\"$\",\"span\",null,{\"children\":\"€255\"}]\n14:[\"$\",\"p\",null,{\"children\":\"Resets in 13 days\"}]"])</script>
+    </body></html>
+    """#
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Flight-payload page did not parse") }()
+    try expectClose(result.apiSpent ?? -1, 17.43, "api spent from flight payload")
+    try expectClose(result.apiAllowance ?? -1, 25.5, "api allowance from flight payload")
+    try expectClose(result.vibeSpent ?? -1, 90.09, "vibe spent from flight payload")
+    try expectClose(result.vibeAllowance ?? -1, 255, "vibe allowance from flight payload")
+    try expectEqual(result.currency, "EUR", "flight payload currency")
+}
+
+private func testMistralWebParserRejectsSignedOutPage() throws {
+    let html = """
+    <html><body>
+    <h1>Sign in to your account</h1>
+    <form action="/login"><input name="email"/><button>Continue</button></form>
+    </body></html>
+    """
+    let result = MistralWebSubscriptionClient.parse(html: html, now: date("2026-08-18T17:00:00Z"))
+    try expect(result == nil, "signed-out page must not parse")
+}
+
+private func testMistralWebParserReturnsPartialResultWhenVibeMissing() throws {
+    let now = date("2026-08-18T17:00:00Z")
+    let html = """
+    <body>
+    <h4>Included API usage</h4>
+    <div>€17.43 €25.5</div>
+    <p>Resets in 13 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    <h3>ESTIMATED PRICE</h3>
+    <div>Subscription €14.99</div>
+    </body>
+    """
+    let result = try MistralWebSubscriptionClient.parse(html: html, now: now)
+        ?? { throw AdditionalProviderTestError.failure("API-only page did not parse") }()
+    try expectClose(result.apiSpent ?? -1, 17.43, "api spent on partial page")
+    try expect(result.vibeSpent == nil, "vibe spent must stay nil on partial page")
+}
+
+private func testMistralAssemblyKeepsVibeAnchorWhenWebParseIsPartial() throws {
+    let suiteName = "limit-counter-mistral-assembly-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-18T17:00:00Z")
+    let web = MistralWebSubscriptionResult(
+        planName: "Pro",
+        apiSpent: 17.43,
+        apiAllowance: 25.5,
+        vibeSpent: nil,
+        vibeAllowance: nil,
+        currency: "EUR",
+        periodEnd: date("2026-08-31T17:00:00Z")
+    )
+    let fields: [String: String] = [
+        SpendProviderCredentialField.manualSpent: "90.09",
+        SpendProviderCredentialField.manualAllowance: "255",
+        SpendProviderCredentialField.manualCurrency: "EUR",
+        SpendProviderCredentialField.manualResetAt: "2026-08-31T17:00:00Z",
+        SpendProviderCredentialField.anchorUpdatedAt: "2026-08-17T23:12:28Z"
+    ]
+    let assembly = MistralProviderClient.assembleMeters(
+        webResult: web,
+        admin: nil,
+        local: nil,
+        fields: fields,
+        now: now,
+        watermarkDefaults: defaults
+    )
+    try expectEqual(assembly.windows.count, 2, "partial web parse keeps both meters")
+    let api = try assembly.windows.first(where: { $0.label == "API usage" })
+        ?? { throw AdditionalProviderTestError.failure("Missing API window") }()
+    let vibe = try assembly.windows.first(where: { $0.label == "Vibe Code usage" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Vibe window after partial web parse") }()
+    try expectClose(api.used, 17.43, "api used comes from web")
+    try expectClose(vibe.used, 90.09, "vibe used comes from manual anchor")
+    try expectClose(vibe.total ?? -1, 255, "vibe allowance comes from manual anchor")
+    try expectEqual(assembly.planName, "Pro", "plan name from web result")
+}
+
+private func testMistralAssemblyPrefersFullWebResultOverAnchor() throws {
+    let suiteName = "limit-counter-mistral-assembly-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-18T17:00:00Z")
+    let webPeriodEnd = date("2026-08-31T17:00:00Z")
+    let web = MistralWebSubscriptionResult(
+        planName: "Pro",
+        apiSpent: 17.43,
+        apiAllowance: 25.5,
+        vibeSpent: 90.09,
+        vibeAllowance: 255,
+        currency: "EUR",
+        periodEnd: webPeriodEnd
+    )
+    let fields: [String: String] = [
+        SpendProviderCredentialField.manualSpent: "42",
+        SpendProviderCredentialField.manualAllowance: "255",
+        SpendProviderCredentialField.manualCurrency: "EUR",
+        SpendProviderCredentialField.manualResetAt: "2026-09-01T00:00:00Z",
+        SpendProviderCredentialField.anchorUpdatedAt: "2026-08-17T23:12:28Z"
+    ]
+    let assembly = MistralProviderClient.assembleMeters(
+        webResult: web,
+        admin: nil,
+        local: nil,
+        fields: fields,
+        now: now,
+        watermarkDefaults: defaults
+    )
+    try expectEqual(assembly.windows.count, 2, "full web parse yields exactly two meters")
+    let vibe = try assembly.windows.first(where: { $0.label == "Vibe Code usage" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Vibe window") }()
+    try expectClose(vibe.used, 90.09, "vibe used comes from web, not anchor")
+    try expectEqual(vibe.resetDate, webPeriodEnd, "vibe reset comes from web period end")
+    try expect(defaults.string(forKey: "mistral.manualAnchor.signature") == nil, "anchor watermark must not run when web vibe is present")
+}
+
+private func testMistralAssemblyKeepsAdminCombinedTotalWithoutWeb() throws {
+    let suiteName = "limit-counter-mistral-assembly-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-18T17:00:00Z")
+    let admin = MistralAdminUsageResult(
+        totalSpend: 12.5,
+        totalSpendIsComplete: true,
+        vibeSpend: nil,
+        currency: "USD",
+        periodStart: nil,
+        periodEnd: date("2026-09-01T00:00:00Z")
+    )
+    let fields: [String: String] = [
+        SpendProviderCredentialField.manualSpent: "90.09",
+        SpendProviderCredentialField.mistralApiSpent: "17.43",
+        SpendProviderCredentialField.manualCurrency: "EUR",
+        SpendProviderCredentialField.manualResetAt: "2026-09-01T00:00:00Z"
+    ]
+    let assembly = MistralProviderClient.assembleMeters(
+        webResult: nil,
+        admin: admin,
+        local: nil,
+        fields: fields,
+        now: now,
+        watermarkDefaults: defaults
+    )
+    try expectEqual(assembly.windows.count, 1, "opaque complete admin total stays a single combined meter")
+    try expectEqual(assembly.windows[0].label, "Mistral usage this billing period", "combined admin label")
+    try expectClose(assembly.windows[0].used, 12.5, "combined admin spend")
+}
+
+private func testMistralAssemblyFallsBackToLocalEstimateWithoutAnchor() throws {
+    let suiteName = "limit-counter-mistral-assembly-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let now = date("2026-08-18T17:00:00Z")
+    let web = MistralWebSubscriptionResult(
+        planName: "Pro",
+        apiSpent: 17.43,
+        apiAllowance: 25.5,
+        vibeSpent: nil,
+        vibeAllowance: nil,
+        currency: "EUR",
+        periodEnd: date("2026-08-31T17:00:00Z")
+    )
+    let local = MistralLocalUsageSummary(
+        currentMonthCostUSD: 12.34,
+        last30DaysCostUSD: 20,
+        inputTokens: 1000,
+        outputTokens: 500,
+        events: [],
+        analyticsBuckets: [],
+        costObservations: []
+    )
+    let fields: [String: String] = [
+        SpendProviderCredentialField.manualCurrency: "USD"
+    ]
+    let assembly = MistralProviderClient.assembleMeters(
+        webResult: web,
+        admin: nil,
+        local: local,
+        fields: fields,
+        now: now,
+        watermarkDefaults: defaults
+    )
+    try expectEqual(assembly.windows.count, 2, "web api plus local vibe estimate")
+    let vibe = try assembly.windows.first(where: { $0.label == "Vibe Code usage" })
+        ?? { throw AdditionalProviderTestError.failure("Missing local-estimate Vibe window") }()
+    try expectClose(vibe.used, 12.34, "vibe used from local estimate")
+    try expectEqual(vibe.subtitle, "TaskWraith-style local estimate", "local estimate subtitle")
+}
+
 private func testDeepSeekBalanceAndObservedSpendSemantics() throws {
     let payload = """
     {
@@ -1183,6 +1499,17 @@ private enum AdditionalProviderUsageTestRunner {
         try testMistralAdminUsageParserMarksOpaqueSharedPoolPartial()
         try testMistralVibeBudgetMigratesLegacySharedPool()
         try testMistralManualAnchorAccumulatesAcrossMonthAndScanGaps()
+        try testMistralWebParserReadsSubscriptionPage()
+        try testMistralWebParserSurvivesReactCommentAndTagSplitting()
+        try testMistralWebParserToleratesPayAsYouGoTooltipBeforeVibeAmounts()
+        try testMistralWebParserHandlesLandmarksAppearingBeforeSections()
+        try testMistralWebParserReadsFlightPayloadOnlyPage()
+        try testMistralWebParserRejectsSignedOutPage()
+        try testMistralWebParserReturnsPartialResultWhenVibeMissing()
+        try testMistralAssemblyKeepsVibeAnchorWhenWebParseIsPartial()
+        try testMistralAssemblyPrefersFullWebResultOverAnchor()
+        try testMistralAssemblyKeepsAdminCombinedTotalWithoutWeb()
+        try testMistralAssemblyFallsBackToLocalEstimateWithoutAnchor()
         try testDeepSeekBalanceAndObservedSpendSemantics()
         try testTaskWraithPricingIsProviderScopedAndEstimated()
         try testMuseCostEstimatorMatchesSparkSessionTotals()

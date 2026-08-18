@@ -389,7 +389,7 @@ struct RawDataDebugView: View {
                 if let snapshot {
                     InfoRow(label: "Provider", value: snapshot.providerID.rawValue)
                     InfoRow(label: "Display Name", value: snapshot.displayName)
-                    InfoRow(label: "Plan", value: snapshot.planName ?? "N/A")
+                    InfoRow(label: "Plan", value: snapshot.displayPlanName ?? "N/A")
                     InfoRow(label: "Fetch State", value: snapshot.fetchState.rawValue)
                     InfoRow(label: "Fetched At", value: formatDate(snapshot.fetchedAt))
                     InfoRow(label: "Windows", value: "\(snapshot.windows.count)")
@@ -809,9 +809,9 @@ private struct ProviderSettingsRow: View {
             return FileManager.default.fileExists(atPath: chatGPTRoot.path)
                 && !(conversations?.isEmpty ?? true)
         }
-        if providerID == .windsurf {
-            let stateDB = home.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb")
-            let backupDB = home.appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb.backup")
+        if providerID == .devin {
+            let stateDB = home.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb")
+            let backupDB = home.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb.backup")
             return FileManager.default.isReadableFile(atPath: stateDB.path)
                 || FileManager.default.isReadableFile(atPath: backupDB.path)
         }
@@ -909,6 +909,10 @@ struct ProviderCredentialView: View {
     @State private var detectedCredentials: [CredentialImportService.DetectedCredential] = []
     @State private var showCursorSessionImport = false
     @State private var cursorSessionImported = false
+    @State private var showOllamaSessionImport = false
+    @State private var ollamaSessionImported = false
+    @State private var showMistralSessionImport = false
+    @State private var mistralSessionImported = false
     @State private var storedExtraFields: [String: String] = [:]
     @State private var codexTelemetryEndpoint = ""
     @State private var codexTelemetryHasCredential = false
@@ -1136,6 +1140,66 @@ struct ProviderCredentialView: View {
                                     .foregroundStyle(.green)
                             }
                         }
+                    } else if providerID == .ollama {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into ollama.com in the embedded browser, or paste your `__Secure-session` cookie directly below:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            Button {
+                                showOllamaSessionImport = true
+                            } label: {
+                                HStack {
+                                    Image(systemName: "circle.grid.2x2.fill")
+                                    Text("Import Ollama web session...")
+                                    Spacer()
+                                }
+                            }
+                            .foregroundStyle(accent)
+
+                            if ollamaSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+
+                            SecureField(providerID.primaryCredentialLabel, text: $accessToken)
+                                .autocorrectionDisabled()
+                            #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                            #endif
+                        }
+                    } else if providerID == .mistral {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into admin.mistral.ai in the embedded browser to automatically track live API usage & Vibe Code usage quotas, or enter an Admin API key:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            Button {
+                                showMistralSessionImport = true
+                            } label: {
+                                HStack {
+                                    Image(systemName: "m.square.fill")
+                                    Text("Import Mistral web session...")
+                                    Spacer()
+                                }
+                            }
+                            .foregroundStyle(accent)
+
+                            if mistralSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+
+                            SecureField(providerID.primaryCredentialLabel, text: $accessToken)
+                                .autocorrectionDisabled()
+                            #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                            #endif
+                        }
                     } else if providerID == .claude {
                         TextField(providerID.primaryCredentialLabel, text: $accessToken)
                             .autocorrectionDisabled()
@@ -1267,6 +1331,11 @@ struct ProviderCredentialView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .ollama {
+                        Text("Paste your `__Secure-session` cookie from ollama.com (found in browser DevTools → Storage/Application → Cookies → ollama.com → `__Secure-session`). Limit Counter securely saves it to macOS Keychain and reads your 5-hour and Weekly usage meters from ollama.com/settings.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else {
                         TextField("Custom Endpoint (optional)", text: $customEndpoint)
                             .autocorrectionDisabled()
@@ -1325,6 +1394,30 @@ struct ProviderCredentialView: View {
                 }
             }
         }
+        .sheet(isPresented: $showOllamaSessionImport) {
+            OllamaSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    ollamaSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                }
+            }
+        }
+        .sheet(isPresented: $showMistralSessionImport) {
+            MistralSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    mistralSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                }
+            }
+        }
         .alert("Import Failed", isPresented: $showImportError) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -1341,8 +1434,16 @@ struct ProviderCredentialView: View {
                     text: extraFieldBinding(SpendProviderCredentialField.manualSpent)
                 )
                 TextField(
+                    "API & Studio spend to date (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.mistralApiSpent)
+                )
+                TextField(
+                    "API & Studio budget (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.mistralApiAllowance)
+                )
+                TextField(
                     "Currency (USD, GBP, EUR)",
-                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "USD")
+                    text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "EUR")
                 )
                 TextField(
                     "Billing reset (ISO date, optional)",
@@ -1352,7 +1453,7 @@ struct ProviderCredentialView: View {
                     "Plan name (optional)",
                     text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
                 )
-                Text("The optional budget above is the Vibe Code budget, not Mistral's shared Included monthly usage bar. Leave spend blank for automatic TaskWraith-style local estimates, or enter a current Vibe reading; estimated local cost is added only after that reading.")
+                Text("Enter your current web readings for Vibe Code and API & Studio. Vibe Code spend will automatically track new local ~/.vibe sessions; leave spend blank for purely automatic estimates.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1439,6 +1540,7 @@ struct ProviderCredentialView: View {
         case .mistral:
             return [
                 storedExtraFields[SpendProviderCredentialField.manualSpent] ?? "",
+                storedExtraFields[SpendProviderCredentialField.mistralApiSpent] ?? "",
                 storedExtraFields[SpendProviderCredentialField.manualCurrency] ?? "",
                 storedExtraFields[SpendProviderCredentialField.manualResetAt] ?? ""
             ].joined(separator: "|")
@@ -1662,7 +1764,7 @@ struct ProviderCredentialView: View {
             accountIdentifier = cred.accountIdentifier ?? ""
             storedExtraFields = cred.extraFields ?? [:]
 
-        if providerID == .windsurf, let restoredEndpoint = restoredWindsurfEndpoint(from: cred) {
+        if providerID == .devin, let restoredEndpoint = restoredDevinEndpoint(from: cred) {
             customEndpoint = restoredEndpoint
         } else {
             customEndpoint = cred.customEndpoint ?? ""
@@ -1672,11 +1774,21 @@ struct ProviderCredentialView: View {
                 cred.extraFields?["cursorAuthMode"] == "cookie"
                 || (cred.extraFields?["cursorCookieHeader"]?.isEmpty == false)
             )
+            ollamaSessionImported = providerID == .ollama && (
+                !(cred.accessToken ?? "").isEmpty
+                || (cred.extraFields?["ollamaCookie"]?.isEmpty == false)
+            )
+            mistralSessionImported = providerID == .mistral && (
+                cred.extraFields?["mistralCookieHeader"]?.isEmpty == false
+                || cred.extraFields?["mistralCookie"]?.isEmpty == false
+            )
         } else {
             accessToken = ""
             accountIdentifier = ""
             customEndpoint = ""
             cursorSessionImported = false
+            ollamaSessionImported = false
+            mistralSessionImported = false
             storedExtraFields = [:]
         }
         // Scan for available credential files
@@ -1690,7 +1802,7 @@ struct ProviderCredentialView: View {
         loadedBillingAnchorSignature = billingAnchorSignature
     }
 
-    private func restoredWindsurfEndpoint(from credential: ProviderCredential) -> String? {
+    private func restoredDevinEndpoint(from credential: ProviderCredential) -> String? {
         guard let bookmarkBase64 = credential.extraFields?["bookmarkData"],
               let bookmarkData = Data(base64Encoded: bookmarkBase64) else {
             return nil
@@ -1713,7 +1825,7 @@ struct ProviderCredentialView: View {
             }
             return resolvedURL.path
         } catch {
-            print("[SettingsView] Failed to restore Windsurf bookmark: \(error)")
+            print("[SettingsView] Failed to restore Devin bookmark: \(error)")
             return credential.customEndpoint
         }
     }
@@ -1730,7 +1842,7 @@ struct ProviderCredentialView: View {
         }
         if let path = resolvedCustomEndpoint,
            providerID == .gemini || providerID == .claude || providerID == .codexTelemetry
-                || providerID == .chatgpt || providerID == .windsurf || providerID == .grok
+                || providerID == .chatgpt || providerID == .devin || providerID == .grok
                 || providerID == .antigravity || providerID == .mistral || providerID == .cerebras
                 || providerID == .meta {
             let url = URL(fileURLWithPath: path)

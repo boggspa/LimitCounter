@@ -3,6 +3,8 @@ import Foundation
 enum SpendProviderCredentialField {
     static let manualSpent = "manualSpent"
     static let manualAllowance = "manualAllowance"
+    static let mistralApiSpent = "mistralApiSpent"
+    static let mistralApiAllowance = "mistralApiAllowance"
     static let manualCurrency = "manualCurrency"
     static let manualResetAt = "manualResetAt"
     static let manualCurrentBalance = "manualCurrentBalance"
@@ -639,6 +641,29 @@ enum MistralVibeBudgetResolver {
         return defaultAllowance(currency: currency, planName: planName, configuredBudgetUSD: configuredBudgetUSD)
     }
 
+    static func defaultApiAllowance(
+        rawAllowance: Double?,
+        currency: String,
+        planName: String?
+    ) -> Double? {
+        if let rawAllowance, rawAllowance > 0 { return rawAllowance }
+        let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let isProOrTeam = normalizedPlan.contains("pro") || normalizedPlan.contains("team")
+        let isFree = normalizedPlan.contains("free")
+        let usdBudget = isProOrTeam ? 27.8 : (isFree || normalizedPlan.isEmpty ? 0.0 : 5.0)
+
+        switch currency.uppercased() {
+        case "EUR":
+            return isProOrTeam ? 25.5 : (isFree || normalizedPlan.isEmpty ? 0.0 : 5.0 * 0.92)
+        case "USD":
+            return usdBudget
+        case "GBP":
+            return amountInCurrency(usdBudget, currency: "GBP")
+        default:
+            return amountInCurrency(usdBudget, currency: currency)
+        }
+    }
+
     /// The old anchor's spend belongs to the shared pool, not the new Vibe bar.
     /// Keep a larger manual value because it is likely a fresh Vibe-console
     /// reading entered after the budget split.
@@ -858,10 +883,575 @@ enum MistralAnchorWatermarkStore {
     }
 }
 
+// MARK: - Mistral Web Subscription Client
+
+public struct MistralWebSubscriptionResult: Sendable {
+    public let planName: String?
+    public let apiSpent: Double?
+    public let apiAllowance: Double?
+    public let vibeSpent: Double?
+    public let vibeAllowance: Double?
+    public let currency: String
+    public let periodEnd: Date?
+
+    public init(
+        planName: String?,
+        apiSpent: Double?,
+        apiAllowance: Double?,
+        vibeSpent: Double?,
+        vibeAllowance: Double?,
+        currency: String,
+        periodEnd: Date?
+    ) {
+        self.planName = planName
+        self.apiSpent = apiSpent
+        self.apiAllowance = apiAllowance
+        self.vibeSpent = vibeSpent
+        self.vibeAllowance = vibeAllowance
+        self.currency = currency
+        self.periodEnd = periodEnd
+    }
+}
+
+public struct MistralWebSubscriptionClient: Sendable {
+    public init() {}
+
+    public func fetch(cookieHeader: String, now: Date) async -> MistralWebSubscriptionResult? {
+        guard let url = URL(string: "https://admin.mistral.ai/subscription") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+        // Cookie-inert session: admin.mistral.ai rotates session cookies via
+        // Set-Cookie, and the shared cookie jar would override the imported
+        // Keychain header on every fetch after the first.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode),
+              let html = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return Self.parse(html: html, now: now)
+    }
+
+    // MARK: Parsing
+
+    struct MeterReading {
+        let spent: Double
+        let allowance: Double?
+        let resetDate: Date?
+        let currency: String?
+    }
+
+    /// Landmarks that end a meter block. Only searched forward from a section
+    /// occurrence, so the same words appearing elsewhere in the document
+    /// (tooltips, navigation, RSC payload duplicates) cannot clip a block that
+    /// has not started yet. Deliberately not plain "pay-as-you-go": that phrase
+    /// shows up in tooltip copy inside the meter blocks themselves.
+    private static let sectionStopLabels = [
+        "api usage",
+        "vibe code usage",
+        "pay-as-you-go & spending limit",
+        "estimated price",
+        "estimated total",
+        "current plan"
+    ]
+
+    /// Normalized meter blocks are ~200 characters; the cap bounds the scan
+    /// when no stop label follows an occurrence.
+    private static let maximumBlockLength = 800
+
+    public static func parse(html: String, now: Date) -> MistralWebSubscriptionResult? {
+        let renderedText = normalizedRenderedText(from: html)
+        if renderedText.range(of: "Sign in to your account", options: .caseInsensitive) != nil {
+            return nil
+        }
+
+        let payloadText = normalizedScriptPayloadText(from: html)
+
+        let apiReading = meterReading(labeled: "API usage", in: renderedText, now: now)
+            ?? meterReading(labeled: "API usage", in: payloadText, now: now)
+        let vibeReading = meterReading(labeled: "Vibe Code usage", in: renderedText, now: now)
+            ?? meterReading(labeled: "Vibe Code usage", in: payloadText, now: now)
+
+        guard apiReading != nil || vibeReading != nil else { return nil }
+
+        return MistralWebSubscriptionResult(
+            planName: planName(in: renderedText) ?? planName(in: payloadText),
+            apiSpent: apiReading?.spent,
+            apiAllowance: apiReading?.allowance,
+            vibeSpent: vibeReading?.spent,
+            vibeAllowance: vibeReading?.allowance,
+            currency: apiReading?.currency ?? vibeReading?.currency ?? fallbackCurrency(in: renderedText),
+            periodEnd: vibeReading?.resetDate ?? apiReading?.resetDate
+        )
+    }
+
+    /// Returns the first occurrence of `label` that is followed by at least one
+    /// currency amount before the next section landmark. Iterating occurrences
+    /// keeps duplicated strings in navigation or embedded payloads harmless.
+    static func meterReading(labeled label: String, in text: String, now: Date) -> MeterReading? {
+        guard !text.isEmpty else { return nil }
+        let normalizedLabel = label.lowercased()
+        var searchStart = text.startIndex
+        while searchStart < text.endIndex,
+              let labelRange = text.range(of: label, options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            let blockStart = labelRange.upperBound
+            var blockEnd = text.index(blockStart, offsetBy: maximumBlockLength, limitedBy: text.endIndex) ?? text.endIndex
+            for stop in sectionStopLabels where stop != normalizedLabel {
+                if let stopRange = text.range(of: stop, options: .caseInsensitive, range: blockStart..<blockEnd) {
+                    blockEnd = stopRange.lowerBound
+                }
+            }
+            let block = String(text[blockStart..<blockEnd])
+            let amounts = extractCurrencyAmounts(from: block)
+            if let spent = amounts.first {
+                return MeterReading(
+                    spent: spent,
+                    allowance: amounts.count >= 2 ? amounts[1] : nil,
+                    resetDate: extractResetDate(from: block, now: now),
+                    currency: detectedCurrency(in: block)
+                )
+            }
+            searchStart = labelRange.upperBound
+        }
+        return nil
+    }
+
+    // MARK: Text normalization
+
+    /// Text the way a browser renders it: comments removed (React SSR inserts
+    /// `<!-- -->` between text segments), scripts/styles dropped, tags
+    /// collapsed to spaces (amounts can be split across inline elements),
+    /// entities decoded, whitespace collapsed.
+    static func normalizedRenderedText(from html: String) -> String {
+        var text = replacingPattern(#"<!--[\s\S]*?-->"#, in: html, with: "")
+        text = replacingPattern(#"<script\b[^>]*>[\s\S]*?</script>"#, in: text, with: " ")
+        text = replacingPattern(#"<style\b[^>]*>[\s\S]*?</style>"#, in: text, with: " ")
+        text = replacingPattern(#"<[^>]+>"#, in: text, with: " ")
+        text = decodedHTMLEntities(text)
+        return collapsedWhitespace(text)
+    }
+
+    /// Script bodies (Next.js RSC flight payload and similar) decoded into
+    /// searchable text, for pages that do not server-render the meters.
+    static func normalizedScriptPayloadText(from html: String) -> String {
+        let bodies = capturedGroups(#"<script\b[^>]*>([\s\S]*?)</script>"#, in: html)
+        guard !bodies.isEmpty else { return "" }
+        var text = decodedJavaScriptEscapes(bodies.joined(separator: " "))
+        text = replacingPattern(#"<!--[\s\S]*?-->"#, in: text, with: "")
+        text = replacingPattern(#"<[^>]+>"#, in: text, with: " ")
+        text = decodedHTMLEntities(text)
+        return collapsedWhitespace(text)
+    }
+
+    private static func replacingPattern(_ pattern: String, in text: String, with template: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: template)
+    }
+
+    private static func capturedGroups(_ pattern: String, in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, options: [], range: range).compactMap { match in
+            guard match.numberOfRanges > 1, let captured = Range(match.range(at: 1), in: text) else { return nil }
+            return String(text[captured])
+        }
+    }
+
+    private static func replacingMatches(
+        pattern: String,
+        in text: String,
+        transform: (NSString, NSTextCheckingResult) -> String?
+    ) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length))
+        guard !matches.isEmpty else { return text }
+        var result = ""
+        var cursor = 0
+        for match in matches {
+            result += nsText.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            result += transform(nsText, match) ?? nsText.substring(with: match.range)
+            cursor = match.range.location + match.range.length
+        }
+        result += nsText.substring(from: cursor)
+        return result
+    }
+
+    private static func decodedHTMLEntities(_ text: String) -> String {
+        var result = replacingMatches(pattern: #"&#(x[0-9a-fA-F]+|[0-9]+);"#, in: text) { nsText, match in
+            let token = nsText.substring(with: match.range(at: 1))
+            let value: UInt32? = token.lowercased().hasPrefix("x")
+                ? UInt32(token.dropFirst(), radix: 16)
+                : UInt32(token)
+            guard let value, let scalar = UnicodeScalar(value) else { return nil }
+            return String(Character(scalar))
+        }
+        // &amp; decodes last so double-encoded entities stay literal text.
+        let named: [(String, String)] = [
+            ("&nbsp;", " "), ("&euro;", "€"), ("&pound;", "£"),
+            ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""),
+            ("&apos;", "'"), ("&amp;", "&")
+        ]
+        for (entity, replacement) in named {
+            result = result.replacingOccurrences(of: entity, with: replacement, options: .caseInsensitive)
+        }
+        return result
+    }
+
+    private static func decodedJavaScriptEscapes(_ text: String) -> String {
+        var result = replacingMatches(pattern: #"\\u([0-9a-fA-F]{4})"#, in: text) { nsText, match in
+            guard let value = UInt32(nsText.substring(with: match.range(at: 1)), radix: 16),
+                  let scalar = UnicodeScalar(value) else { return nil }
+            return String(Character(scalar))
+        }
+        // Backslash-backslash decodes last so it cannot manufacture new escapes.
+        let simple: [(String, String)] = [
+            ("\\\"", "\""), ("\\/", "/"), ("\\n", " "), ("\\t", " "), ("\\r", " "), ("\\\\", "\\")
+        ]
+        for (escapeSequence, replacement) in simple {
+            result = result.replacingOccurrences(of: escapeSequence, with: replacement)
+        }
+        return result
+    }
+
+    private static func collapsedWhitespace(_ text: String) -> String {
+        text.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    // MARK: Field extraction
+
+    static func extractCurrencyAmounts(from chunk: String) -> [Double] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(?:€|\$|£|EUR|USD|GBP)\s*([0-9][0-9,]*(?:\.[0-9]+)?)"#,
+            options: [.caseInsensitive]
+        ) else {
+            return []
+        }
+        let nsRange = NSRange(chunk.startIndex..<chunk.endIndex, in: chunk)
+        let matches = regex.matches(in: chunk, options: [], range: nsRange)
+        return matches.compactMap { match -> Double? in
+            guard match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: chunk) else { return nil }
+            return Double(chunk[range].replacingOccurrences(of: ",", with: ""))
+        }
+    }
+
+    /// The currency of the first symbol-plus-number match. A lone symbol is
+    /// not evidence: RSC flight payloads use `"$"` as an element marker.
+    private static func detectedCurrency(in block: String) -> String? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(€|\$|£|EUR|USD|GBP)\s*[0-9]"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        guard let match = regex.firstMatch(in: block, options: [], range: nsRange),
+              match.numberOfRanges > 1,
+              let symbolRange = Range(match.range(at: 1), in: block) else {
+            return nil
+        }
+        switch block[symbolRange].uppercased() {
+        case "€", "EUR": return "EUR"
+        case "£", "GBP": return "GBP"
+        default: return "USD"
+        }
+    }
+
+    private static func fallbackCurrency(in text: String) -> String {
+        if text.contains("€") { return "EUR" }
+        if text.contains("$") { return "USD" }
+        if text.contains("£") { return "GBP" }
+        return "EUR"
+    }
+
+    private static func planName(in text: String) -> String? {
+        if let plan = firstMatch(in: text, pattern: #"current plan\s+(pro|team|enterprise|free)\b"#) {
+            return plan.capitalized
+        }
+        if let plan = firstMatch(in: text, pattern: #"\b(pro|team|enterprise|free)\b\s+active\b"#) {
+            return plan.capitalized
+        }
+        return nil
+    }
+
+    private static func extractResetDate(from chunk: String, now: Date) -> Date? {
+        if let daysMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:days?|d))"#),
+           let days = Double(daysMatch) {
+            return now.addingTimeInterval(days * 86400)
+        }
+        if let hoursMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:hours?|hrs?|h))"#),
+           let hours = Double(hoursMatch) {
+            return now.addingTimeInterval(hours * 3600)
+        }
+        return nil
+    }
+
+    private static func firstMatch(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: nsRange) else {
+            return nil
+        }
+        if match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: text) {
+            return String(text[range])
+        }
+        return nil
+    }
+}
+
 public struct MistralProviderClient: ProviderClient {
     public let providerID: ProviderID = .mistral
 
     public init() {}
+
+    struct MeterAssembly {
+        let windows: [QuotaWindow]
+        let signals: [QuotaSignal]
+        let planName: String?
+    }
+
+    /// Builds the API and Vibe meters, choosing the best source per meter:
+    /// web subscription page, then Admin API split, then the manual anchor or
+    /// local estimate. Each meter falls back independently so a partial web
+    /// parse (one meter missing) cannot suppress the other meter's fallback.
+    static func assembleMeters(
+        webResult: MistralWebSubscriptionResult?,
+        admin: MistralAdminUsageResult?,
+        local: MistralLocalUsageSummary?,
+        fields: [String: String],
+        fallbackManualAllowance: Double? = nil,
+        budgetUSD: Double? = nil,
+        now: Date,
+        watermarkDefaults: UserDefaults? = nil
+    ) -> MeterAssembly {
+        let rawManualVibeAllowance = positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
+            ?? fallbackManualAllowance
+        let rawManualVibeSpend = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
+        let rawManualApiSpend = nonnegativeDouble(fields[SpendProviderCredentialField.mistralApiSpent])
+        let rawManualApiAllowance = positiveDouble(fields[SpendProviderCredentialField.mistralApiAllowance])
+        let manualCurrency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
+        let manualReset = ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
+        let planName = fields[SpendProviderCredentialField.manualPlanName]
+
+        let manualVibeAllowance = MistralVibeBudgetResolver.effectiveAllowance(
+            rawAllowance: rawManualVibeAllowance,
+            currency: manualCurrency,
+            planName: planName,
+            configuredBudgetUSD: budgetUSD
+        )
+        let manualApiAllowance = MistralVibeBudgetResolver.defaultApiAllowance(
+            rawAllowance: rawManualApiAllowance,
+            currency: manualCurrency,
+            planName: planName
+        )
+        let discardedLegacyAnchor = MistralVibeBudgetResolver.shouldDiscardLegacyAnchor(
+            rawAllowance: rawManualVibeAllowance,
+            rawSpent: rawManualVibeSpend,
+            currency: manualCurrency,
+            planName: planName
+        )
+        let manualVibeSpend = discardedLegacyAnchor ? nil : rawManualVibeSpend
+
+        var windows: [QuotaWindow] = []
+        var signals: [QuotaSignal] = []
+
+        // The Admin API only splits into two meters when it itemizes Vibe
+        // spend. Its opaque-but-complete total still beats manual estimates,
+        // but only when no web reading exists at all.
+        let useAdminCombinedTotal = webResult == nil
+            && admin?.vibeSpend == nil
+            && admin?.totalSpendIsComplete == true
+
+        if useAdminCombinedTotal, let admin {
+            let adminVibeAllowance = manualVibeAllowance.flatMap {
+                MistralVibeBudgetResolver.convert($0, from: manualCurrency, to: admin.currency)
+            } ?? (admin.currency == "USD" ? budgetUSD : nil)
+            windows.append(
+                QuotaWindow(
+                    label: "Mistral usage this billing period",
+                    windowKind: .monthly,
+                    used: admin.totalSpend,
+                    total: adminVibeAllowance,
+                    resetDate: admin.periodEnd ?? manualReset,
+                    unit: admin.currency,
+                    subtitle: "Official Mistral Admin API total"
+                )
+            )
+            return MeterAssembly(windows: windows, signals: signals, planName: planName)
+        }
+
+        // API meter: web page, then Admin API split, then manual anchor.
+        if let webResult, let apiSpent = webResult.apiSpent {
+            let apiAllowance = webResult.apiAllowance
+                ?? manualApiAllowance
+                ?? MistralVibeBudgetResolver.defaultApiAllowance(rawAllowance: nil, currency: webResult.currency, planName: webResult.planName ?? planName)
+            windows.append(
+                QuotaWindow(
+                    label: "API usage",
+                    windowKind: .monthly,
+                    used: apiSpent,
+                    total: apiAllowance,
+                    resetDate: webResult.periodEnd ?? manualReset,
+                    unit: webResult.currency,
+                    subtitle: "Available via the API and Studio"
+                )
+            )
+        } else if let admin, let vibeSpend = admin.vibeSpend {
+            let adminApiAllowance = manualApiAllowance.flatMap {
+                MistralVibeBudgetResolver.convert($0, from: manualCurrency, to: admin.currency)
+            } ?? MistralVibeBudgetResolver.defaultApiAllowance(rawAllowance: nil, currency: admin.currency, planName: planName)
+            windows.append(
+                QuotaWindow(
+                    label: "API usage",
+                    windowKind: .monthly,
+                    used: max(0, admin.totalSpend - vibeSpend),
+                    total: adminApiAllowance,
+                    resetDate: admin.periodEnd ?? manualReset,
+                    unit: admin.currency,
+                    subtitle: "Available via the API and Studio"
+                )
+            )
+        } else if let apiSpend = rawManualApiSpend {
+            windows.append(
+                QuotaWindow(
+                    label: "API usage",
+                    windowKind: .monthly,
+                    used: apiSpend,
+                    total: manualApiAllowance,
+                    resetDate: manualReset,
+                    unit: manualCurrency,
+                    subtitle: "Available via the API and Studio"
+                )
+            )
+        }
+
+        // Vibe meter: web page, then Admin API split, then the manual anchor
+        // advanced by the local watermark, then the pure local estimate.
+        if let webResult, let vibeSpent = webResult.vibeSpent {
+            let vibeAllowance = webResult.vibeAllowance
+                ?? manualVibeAllowance
+                ?? MistralVibeBudgetResolver.effectiveAllowance(rawAllowance: nil, currency: webResult.currency, planName: webResult.planName ?? planName, configuredBudgetUSD: budgetUSD)
+            windows.append(
+                QuotaWindow(
+                    label: "Vibe Code usage",
+                    windowKind: .monthly,
+                    used: vibeSpent,
+                    total: vibeAllowance,
+                    resetDate: webResult.periodEnd ?? manualReset,
+                    unit: webResult.currency,
+                    subtitle: "Vibe Code includes extra monthly usage"
+                )
+            )
+        } else if let admin, let vibeSpend = admin.vibeSpend {
+            let adminVibeAllowance = manualVibeAllowance.flatMap {
+                MistralVibeBudgetResolver.convert($0, from: manualCurrency, to: admin.currency)
+            } ?? (admin.currency == "USD" ? budgetUSD : nil)
+            windows.append(
+                QuotaWindow(
+                    label: "Vibe Code usage",
+                    windowKind: .monthly,
+                    used: vibeSpend,
+                    total: adminVibeAllowance,
+                    resetDate: admin.periodEnd ?? manualReset,
+                    unit: admin.currency,
+                    subtitle: "Vibe Code includes extra monthly usage"
+                )
+            )
+        } else if let manualSpend = manualVibeSpend {
+            if let manualReset, manualReset <= now {
+                signals.append(
+                    QuotaSignal(
+                        kind: .scheduledReset,
+                        title: "Billing anchor expired",
+                        message: "Update the Mistral Vibe Code reading for the new billing cycle.",
+                        severity: .info,
+                        confidence: 1,
+                        windowLabel: "Vibe Code usage",
+                        detectedAt: now
+                    )
+                )
+            } else {
+                let baseSignature = fields[SpendProviderCredentialField.anchorUpdatedAt]
+                    ?? "\(manualSpend)|\(rawManualVibeAllowance ?? 0)|\(manualReset?.timeIntervalSince1970 ?? 0)"
+                // Doctrine version forces a watermark rebase when local cost math changes.
+                let signature = "\(MistralVibeUsageReader.estimateDoctrineVersion)|\(baseSignature)"
+                let anchorUpdatedAt = ProviderDateParser.parse(
+                    fields[SpendProviderCredentialField.anchorUpdatedAt]
+                )
+                let adjustment = MistralAnchorWatermarkStore.adjustment(
+                    anchoredSpend: manualSpend,
+                    currentLocalSpendUSD: local?.currentMonthCostUSD,
+                    currency: manualCurrency,
+                    signature: signature,
+                    initialLocalIncrementUSD: anchorUpdatedAt.map {
+                        local?.costUSD(since: $0) ?? 0
+                    } ?? 0,
+                    now: now,
+                    defaults: watermarkDefaults
+                )
+                windows.append(
+                    QuotaWindow(
+                        label: "Vibe Code usage",
+                        windowKind: .monthly,
+                        used: adjustment.spend,
+                        total: manualVibeAllowance,
+                        resetDate: manualReset,
+                        unit: manualCurrency,
+                        subtitle: adjustment.localIncrement > 0
+                            ? "Manual Vibe reading plus TaskWraith-style local estimate"
+                            : "Vibe Code includes extra monthly usage"
+                    )
+                )
+            }
+        } else if let local {
+            let localCurrency = manualCurrency
+            let localSpend = MistralVibeBudgetResolver.amountInCurrency(
+                local.currentMonthCostUSD,
+                currency: localCurrency
+            ) ?? local.currentMonthCostUSD
+            windows.append(
+                QuotaWindow(
+                    label: "Vibe Code usage",
+                    windowKind: .monthly,
+                    used: localSpend,
+                    total: manualVibeAllowance,
+                    resetDate: manualReset,
+                    unit: localCurrency,
+                    subtitle: discardedLegacyAnchor
+                        ? "TaskWraith-style local estimate; legacy shared-pool anchor ignored"
+                        : "TaskWraith-style local estimate"
+                )
+            )
+        }
+
+        return MeterAssembly(
+            windows: windows,
+            signals: signals,
+            planName: webResult?.planName ?? planName
+        )
+    }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         let now = Date()
@@ -880,100 +1470,33 @@ public struct MistralProviderClient: ProviderClient {
         } else {
             nil
         }
-
-        let rawManualAllowance = positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
-            ?? positiveDouble(credentials?.normalizedAccountIdentifier)
-        let rawManualSpend = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
-        let manualCurrency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
-        let manualReset = ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
-        let budgetUSD = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .mistral)
-        let planName = fields[SpendProviderCredentialField.manualPlanName]
-        let manualAllowance = MistralVibeBudgetResolver.effectiveAllowance(
-            rawAllowance: rawManualAllowance,
-            currency: manualCurrency,
-            planName: planName,
-            configuredBudgetUSD: budgetUSD
-        )
-        let discardedLegacyAnchor = MistralVibeBudgetResolver.shouldDiscardLegacyAnchor(
-            rawAllowance: rawManualAllowance,
-            rawSpent: rawManualSpend,
-            currency: manualCurrency,
-            planName: planName
-        )
-        let manualSpend = discardedLegacyAnchor ? nil : rawManualSpend
-        var windows: [QuotaWindow] = []
-        var stats: [QuotaStat] = []
-        var signals: [QuotaSignal] = []
-
-        if let admin {
-            let adminSpend = admin.vibeSpend ?? (admin.totalSpendIsComplete ? admin.totalSpend : nil)
-            let adminAllowance = manualAllowance.flatMap {
-                MistralVibeBudgetResolver.convert($0, from: manualCurrency, to: admin.currency)
-            } ?? (admin.currency == "USD" ? budgetUSD : nil)
-            if let adminSpend {
-                let isVibeSpecific = admin.vibeSpend != nil
-                windows.append(
-                    QuotaWindow(
-                        label: isVibeSpecific ? "Vibe Code this billing period" : "Mistral usage this billing period",
-                        windowKind: .monthly,
-                        used: adminSpend,
-                        total: adminAllowance,
-                        resetDate: admin.periodEnd,
-                        unit: admin.currency,
-                        subtitle: isVibeSpecific
-                            ? "Official Mistral Admin API Vibe usage"
-                            : "Official Mistral Admin API total; Vibe breakdown unavailable"
-                    )
-                )
-            }
+        let webSessionCookie = fields["mistralCookieHeader"] ?? fields["mistralCookie"]
+        let webResult: MistralWebSubscriptionResult? = if let webSessionCookie, !webSessionCookie.isEmpty {
+            await MistralWebSubscriptionClient().fetch(cookieHeader: webSessionCookie, now: now)
+        } else {
+            nil
         }
 
-        if windows.isEmpty, let manualSpend {
-            if let manualReset, manualReset <= now {
-                signals.append(
-                    QuotaSignal(
-                        kind: .scheduledReset,
-                        title: "Billing anchor expired",
-                        message: "Update the Mistral Vibe Code reading for the new billing cycle.",
-                        severity: .info,
-                        confidence: 1,
-                        windowLabel: "Vibe Code this billing period",
-                        detectedAt: now
-                    )
-                )
+        if let webSessionCookie, !webSessionCookie.isEmpty {
+            if let webResult {
+                print("[MistralProvider] Web parse api=\(webResult.apiSpent.map { String($0) } ?? "nil") vibe=\(webResult.vibeSpent.map { String($0) } ?? "nil")")
             } else {
-                let baseSignature = fields[SpendProviderCredentialField.anchorUpdatedAt]
-                    ?? "\(manualSpend)|\(rawManualAllowance ?? 0)|\(manualReset?.timeIntervalSince1970 ?? 0)"
-                // Doctrine version forces a watermark rebase when local cost math changes.
-                let signature = "\(MistralVibeUsageReader.estimateDoctrineVersion)|\(baseSignature)"
-                let anchorUpdatedAt = ProviderDateParser.parse(
-                    fields[SpendProviderCredentialField.anchorUpdatedAt]
-                )
-                let adjustment = MistralAnchorWatermarkStore.adjustment(
-                    anchoredSpend: manualSpend,
-                    currentLocalSpendUSD: local?.currentMonthCostUSD,
-                    currency: manualCurrency,
-                    signature: signature,
-                    initialLocalIncrementUSD: anchorUpdatedAt.map {
-                        local?.costUSD(since: $0) ?? 0
-                    } ?? 0,
-                    now: now
-                )
-                windows.append(
-                    QuotaWindow(
-                        label: "Vibe Code this billing period",
-                        windowKind: .monthly,
-                        used: adjustment.spend,
-                        total: manualAllowance,
-                        resetDate: manualReset,
-                        unit: manualCurrency,
-                        subtitle: adjustment.localIncrement > 0
-                            ? "Manual Vibe reading plus TaskWraith-style local estimate"
-                            : "Manual Vibe reading"
-                    )
-                )
+                print("[MistralProvider] Web parse yielded no meters (signed out, network failure, or page layout change)")
             }
         }
+
+        let assembly = Self.assembleMeters(
+            webResult: webResult,
+            admin: admin,
+            local: local,
+            fields: fields,
+            fallbackManualAllowance: positiveDouble(credentials?.normalizedAccountIdentifier),
+            budgetUSD: ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .mistral),
+            now: now
+        )
+        let windows = assembly.windows
+        let signals = assembly.signals
+        var stats: [QuotaStat] = []
 
         if let admin, let vibeSpend = admin.vibeSpend {
             stats.append(
@@ -987,25 +1510,6 @@ public struct MistralProviderClient: ProviderClient {
         }
 
         if let local {
-            if windows.isEmpty {
-                let localCurrency = manualCurrency
-                let localSpend = MistralVibeBudgetResolver.amountInCurrency(
-                    local.currentMonthCostUSD,
-                    currency: localCurrency
-                ) ?? local.currentMonthCostUSD
-                windows.append(
-                    QuotaWindow(
-                        label: "Vibe Code this billing period",
-                        windowKind: .monthly,
-                        used: localSpend,
-                        total: manualAllowance,
-                        unit: localCurrency,
-                        subtitle: discardedLegacyAnchor
-                            ? "TaskWraith-style local estimate; legacy shared-pool anchor ignored"
-                            : "TaskWraith-style local estimate"
-                    )
-                )
-            }
             stats.append(contentsOf: [
                 QuotaStat(
                     label: "Local 30D cost",
@@ -1022,7 +1526,7 @@ public struct MistralProviderClient: ProviderClient {
         return QuotaSnapshot(
             providerID: .mistral,
             displayName: ProviderID.mistral.snapshotDisplayName,
-            planName: planName ?? (admin == nil ? "Vibe" : "Admin API"),
+            planName: assembly.planName ?? (admin == nil ? "Vibe" : "Admin API"),
             windows: windows,
             stats: stats,
             signals: signals,
@@ -1037,15 +1541,54 @@ public struct MistralProviderClient: ProviderClient {
 private struct DeepSeekBalanceResponse: Decodable {
     struct Balance: Decodable {
         let currency: String
-        let totalBalance: String
-        let grantedBalance: String
-        let toppedUpBalance: String
+        let totalBalance: Double
+        let grantedBalance: Double
+        let toppedUpBalance: Double
 
         enum CodingKeys: String, CodingKey {
             case currency
             case totalBalance = "total_balance"
             case grantedBalance = "granted_balance"
             case toppedUpBalance = "topped_up_balance"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            currency = try container.decode(String.self, forKey: .currency)
+            totalBalance = try Self.decodeAmount(container, forKey: .totalBalance)
+            grantedBalance = try Self.decodeAmount(container, forKey: .grantedBalance)
+            toppedUpBalance = try Self.decodeAmount(container, forKey: .toppedUpBalance)
+        }
+
+        private static func decodeAmount(
+            _ container: KeyedDecodingContainer<CodingKeys>,
+            forKey key: CodingKeys
+        ) throws -> Double {
+            if try container.decodeNil(forKey: key) {
+                return 0
+            }
+            if let value = try? container.decode(Double.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decode(Int.self, forKey: key) {
+                return Double(value)
+            }
+            if let value = try? container.decode(String.self, forKey: key),
+               let parsed = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return parsed
+            }
+            if let value = try? container.decode(String.self, forKey: key),
+               let parsed = Double(value.replacingOccurrences(of: ",", with: "")),
+               parsed.isFinite {
+                return parsed
+            }
+            throw DecodingError.typeMismatch(
+                Double.self,
+                .init(
+                    codingPath: container.codingPath + [key],
+                    debugDescription: "Expected numeric balance value for \(key.rawValue)"
+                )
+            )
         }
     }
 
@@ -1055,6 +1598,12 @@ private struct DeepSeekBalanceResponse: Decodable {
     enum CodingKeys: String, CodingKey {
         case isAvailable = "is_available"
         case balanceInfos = "balance_infos"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isAvailable = try container.decodeIfPresent(Bool.self, forKey: .isAvailable) ?? true
+        balanceInfos = try container.decodeIfPresent([Balance].self, forKey: .balanceInfos) ?? []
     }
 }
 
@@ -1070,25 +1619,22 @@ enum DeepSeekBalanceParser {
     static func parse(data: Data) -> DeepSeekBalanceObservation? {
         guard let decoded = try? JSONDecoder().decode(DeepSeekBalanceResponse.self, from: data),
               let selected = decoded.balanceInfos.first(where: { $0.currency.uppercased() == "USD" })
-                ?? decoded.balanceInfos.first,
-              let totalBalance = Double(selected.totalBalance),
-              let grantedBalance = Double(selected.grantedBalance),
-              let toppedUpBalance = Double(selected.toppedUpBalance) else {
+                ?? decoded.balanceInfos.first else {
             return nil
         }
         return DeepSeekBalanceObservation(
             isAvailable: decoded.isAvailable,
             currency: selected.currency.uppercased(),
-            totalBalance: totalBalance,
-            grantedBalance: grantedBalance,
-            toppedUpBalance: toppedUpBalance
+            totalBalance: selected.totalBalance,
+            grantedBalance: selected.grantedBalance,
+            toppedUpBalance: selected.toppedUpBalance
         )
     }
 }
 
 enum DeepSeekTopUpMeter {
     static func creditUsed(totalTopUp: Double?, currentBalance: Double) -> Double? {
-        guard let totalTopUp, totalTopUp > 0, currentBalance >= 0 else { return nil }
+        guard let totalTopUp, totalTopUp > 0 else { return nil }
         return min(max(totalTopUp - currentBalance, 0), totalTopUp)
     }
 }
@@ -1422,18 +1968,6 @@ public struct DeepSeekProviderClient: ProviderClient {
                 )
             )
         }
-        if observed > 0 || budget != nil {
-            windows.append(
-                QuotaWindow(
-                    label: "Observed this month",
-                    windowKind: .monthly,
-                    used: observed,
-                    total: budget,
-                    unit: currency,
-                    subtitle: "Balance decreases observed by Limit Counter"
-                )
-            )
-        }
         if observed == 0, let estimated = taskWraith?.currentMonthCostUSD, estimated > 0 {
             windows.append(
                 QuotaWindow(
@@ -1450,7 +1984,7 @@ public struct DeepSeekProviderClient: ProviderClient {
         return QuotaSnapshot(
             providerID: .deepseek,
             displayName: ProviderID.deepseek.snapshotDisplayName,
-            planName: balance.isAvailable ? "API Credits" : "Balance unavailable",
+            planName: "API Credits",
             windows: windows,
             stats: taskWraith.map {
                 [QuotaStat(label: "TaskWraith 35D estimate", value: $0.last35DaysCostUSD, unit: "USD", subtitle: "Not vendor billing")]
@@ -2735,22 +3269,6 @@ public struct MetaProviderClient: ProviderClient {
                     subtitle: remainingLocalDecrement > 0
                         ? "Preload minus remaining, auto-advanced by Muse spend"
                         : "Configured preload minus remaining Meta balance"
-                )
-            )
-        }
-
-        // Prefer an Observed card whenever the Muse data home is readable (even at $0).
-        // Kept as a USD Muse projection secondary meter (not converted to billing currency).
-        if local != nil {
-            windows.append(
-                QuotaWindow(
-                    label: "Observed this month",
-                    windowKind: .monthly,
-                    used: observedMonth ?? 0,
-                    total: softBudget,
-                    resetDate: resetAt,
-                    unit: "USD",
-                    subtitle: "Muse projected spend from session tokens × catalog rates — not a Meta invoice"
                 )
             )
         }

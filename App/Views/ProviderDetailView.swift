@@ -69,7 +69,7 @@ struct ProviderDetailView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 ProviderCardTitleText(title: snapshot.displayName, accentColor: accent)
-                if let plan = snapshot.planName {
+                if let plan = snapshot.displayPlanName {
                     Text(plan)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -539,7 +539,7 @@ struct CodexDetailView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 ProviderCardTitleText(title: usageSnapshot.displayName, accentColor: accent)
-                if let plan = usageSnapshot.planName {
+                if let plan = usageSnapshot.displayPlanName {
                     Text(plan)
                         .font(.caption)
                         .foregroundStyle(.secondary)

@@ -141,7 +141,7 @@ final class SyncCoordinator {
         let credential = keychain.credential(for: providerID)
         print("[SyncCoordinator] Credential for \(providerID.rawValue): \(credential != nil ? "present" : "nil")")
 
-        // Allow auto-discovery clients (local logs, Windsurf, Cursor,
+        // Allow auto-discovery clients (local logs, Devin, Cursor,
         // Gemini, Grok) to proceed without stored credentials. Grok can
         // run from the local ~/.grok CLI folder in development builds or
         // fall back to TaskWraith activity data when that bookmark exists.
@@ -149,7 +149,7 @@ final class SyncCoordinator {
             client is ClaudeProviderClient
             || client is CodexTelemetryProviderClient
             || client is ChatGPTLocalProviderClient
-            || client is WindsurfProviderClient
+            || client is DevinProviderClient
             || client is CursorProviderClient
             || client is GeminiProviderClient
             || client is GrokProviderClient
@@ -311,7 +311,7 @@ final class SyncCoordinator {
             // refresh, and token-race failures must not erase the last good
             // quota snapshot while the user repairs or retries the session.
             shouldPreserve = true
-        case .antigravity, .mistral, .deepseek, .cerebras, .meta:
+        case .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama:
             // Local probes, imported reports, and billing APIs can all miss a
             // refresh transiently. Keep the last truthful reading visible.
             shouldPreserve = true
@@ -372,9 +372,9 @@ final class SyncCoordinator {
         switch providerID {
         case .codexTelemetry:
             return 30
-        case .claude, .chatgpt, .gemini:
+        case .claude, .chatgpt, .gemini, .ollama:
             return 15
-        case .openai, .openaiAPI, .windsurf, .cursor, .kimi, .grok,
+        case .openai, .openaiAPI, .devin, .cursor, .kimi, .grok,
              .mistral, .deepseek, .cerebras, .meta:
             return 20
         case .antigravity:
