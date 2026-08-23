@@ -239,6 +239,8 @@ struct GrokUsageSnapshot: Decodable {
     let resetAt: String?
     let weeklyResetAt: String?
     let nextResetAt: String?
+    let periodStartAt: String?
+    let periodEndAt: String?
     let limitWindowSeconds: Double?
     let planLabel: String?
     let payAsYouGoEnabled: Bool?
@@ -267,6 +269,8 @@ struct GrokUsageSnapshot: Decodable {
         resetAt: String? = nil,
         weeklyResetAt: String? = nil,
         nextResetAt: String? = nil,
+        periodStartAt: String? = nil,
+        periodEndAt: String? = nil,
         limitWindowSeconds: Double? = nil,
         planLabel: String? = nil,
         payAsYouGoEnabled: Bool? = nil,
@@ -294,6 +298,8 @@ struct GrokUsageSnapshot: Decodable {
         self.resetAt = resetAt
         self.weeklyResetAt = weeklyResetAt
         self.nextResetAt = nextResetAt
+        self.periodStartAt = periodStartAt
+        self.periodEndAt = periodEndAt
         self.limitWindowSeconds = limitWindowSeconds
         self.planLabel = planLabel
         self.payAsYouGoEnabled = payAsYouGoEnabled
@@ -323,6 +329,8 @@ struct GrokUsageSnapshot: Decodable {
         case resetAt
         case weeklyResetAt
         case nextResetAt
+        case periodStartAt
+        case periodEndAt
         case limitWindowSeconds
         case planLabel
         case payAsYouGoEnabled
@@ -353,6 +361,8 @@ struct GrokUsageSnapshot: Decodable {
         resetAt = try container.decodeIfPresent(String.self, forKey: .resetAt)
         weeklyResetAt = try container.decodeIfPresent(String.self, forKey: .weeklyResetAt)
         nextResetAt = try container.decodeIfPresent(String.self, forKey: .nextResetAt)
+        periodStartAt = try container.decodeIfPresent(String.self, forKey: .periodStartAt)
+        periodEndAt = try container.decodeIfPresent(String.self, forKey: .periodEndAt)
         limitWindowSeconds = Self.decodeFlexibleDouble(container, .limitWindowSeconds)
         planLabel = try container.decodeIfPresent(String.self, forKey: .planLabel)
         payAsYouGoEnabled = Self.decodeFlexibleBool(container, .payAsYouGoEnabled)
@@ -367,7 +377,7 @@ struct GrokUsageSnapshot: Decodable {
     var resolvedPlanName: String {
         guard let plan = planLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
               !plan.isEmpty else {
-            return "SuperGrok"
+            return "Grok"
         }
         return plan
     }
@@ -413,6 +423,13 @@ struct GrokUsageSnapshot: Decodable {
 nonisolated enum GrokUsageWindowMapper {
     static func quotaWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
         guard snapshot.isObserved else { return nil }
+        let usageKind = snapshot.usageKind?.lowercased() ?? ""
+        if usageKind.contains("weekly") {
+            return weeklyQuotaWindow(from: snapshot, now: now)
+        }
+        if usageKind.contains("credit") {
+            return legacyCreditWindow(from: snapshot, now: now)
+        }
         if let weeklyWindow = weeklyQuotaWindow(from: snapshot, now: now) {
             return weeklyWindow
         }
@@ -509,6 +526,7 @@ nonisolated enum GrokUsageWindowMapper {
         if let resetDate, resetDate < now {
             return nil
         }
+        guard resetDate != nil else { return nil }
 
         return QuotaWindow(
             label: "Credits",
@@ -824,7 +842,6 @@ nonisolated enum GrokCLIUsageParser {
             weeklyResetAt: resetAt.map(isoString),
             nextResetAt: resetAt.map(isoString),
             limitWindowSeconds: 7 * 24 * 60 * 60,
-            planLabel: "SuperGrok",
             refreshedAt: refreshedAtText,
             confidence: "observed"
         )
@@ -868,7 +885,6 @@ nonisolated enum GrokCLIUsageParser {
             resetAtText: resetText,
             resetAt: resetAt.map(isoString),
             limitWindowSeconds: 30 * 24 * 60 * 60,
-            planLabel: "SuperGrok",
             refreshedAt: refreshedAtText,
             confidence: "observed"
         )
@@ -961,10 +977,13 @@ enum GrokCLIUsageProbe {
             return nil
         }
         defer { access.stop() }
-        if let snapshot = runGrokUsageProbe(binaryURL: access.binaryURL, grokHomeURL: access.rootURL) {
-            return snapshot
+        let cliSnapshot = runGrokUsageProbe(binaryURL: access.binaryURL, grokHomeURL: access.rootURL)
+        let billingSnapshot = GrokLocalBillingLogReader.latestSnapshot(rootURL: access.rootURL)
+        if let billingSnapshot,
+           GrokUsageWindowMapper.quotaWindow(from: billingSnapshot) != nil {
+            return billingSnapshot
         }
-        return GrokLocalBillingLogReader.latestSnapshot(rootURL: access.rootURL)
+        return cliSnapshot
         #else
         return nil
         #endif
@@ -1272,17 +1291,27 @@ nonisolated enum GrokLocalBillingLogReader {
             return nil
         }
 
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
         let decoder = JSONDecoder()
+        let entries = text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { line -> BillingLogEntry? in
+                guard let data = String(line).data(using: .utf8) else { return nil }
+                return try? decoder.decode(BillingLogEntry.self, from: data)
+            }
 
-        for line in lines.reversed() {
-            guard let data = String(line).data(using: .utf8),
-                  let entry = try? decoder.decode(BillingLogEntry.self, from: data),
-                  entry.messageContainsBillingConfig,
-                  let snapshot = snapshot(from: entry, now: now) else {
+        for index in entries.indices.reversed() {
+            let entry = entries[index]
+            guard entry.messageContainsBillingConfig else {
                 continue
             }
-            return snapshot
+            let priorUsage = mostRecentUsagePercent(
+                before: index,
+                in: entries,
+                matchingPeriodOf: entry
+            )
+            if let snapshot = snapshot(from: entry, priorUsageInSamePeriod: priorUsage, now: now) {
+                return snapshot
+            }
         }
 
         return nil
@@ -1313,9 +1342,12 @@ nonisolated enum GrokLocalBillingLogReader {
         }
     }
 
-    private static func snapshot(from entry: BillingLogEntry, now: Date) -> GrokUsageSnapshot? {
-        guard let config = entry.ctx?.config,
-              let used = config.creditUsagePercent else {
+    private static func snapshot(
+        from entry: BillingLogEntry,
+        priorUsageInSamePeriod: Double?,
+        now: Date
+    ) -> GrokUsageSnapshot? {
+        guard let config = entry.ctx?.config else {
             return nil
         }
 
@@ -1326,6 +1358,23 @@ nonisolated enum GrokLocalBillingLogReader {
         let periodEndDate = periodEnd.flatMap(parseISODate)
         let isWeekly = periodType.contains("WEEKLY")
             || periodDurationSeconds(start: periodStartDate, end: periodEndDate).map { $0 <= 8 * 24 * 60 * 60 } == true
+        let isCurrentPeriod = periodStartDate.map { $0 <= now.addingTimeInterval(5 * 60) } == true
+            && periodEndDate.map { $0 > now.addingTimeInterval(-5 * 60) } == true
+        let used: Double
+        if let reportedUsage = config.creditUsagePercent {
+            used = reportedUsage
+        } else if let priorUsageInSamePeriod {
+            // A missing value later in the same period is a transient omission,
+            // not evidence that usage reset again.
+            used = priorUsageInSamePeriod
+        } else if isWeekly && isCurrentPeriod {
+            // xAI omits creditUsagePercent at the beginning of a fresh weekly
+            // period. The dated active period is authoritative evidence of a
+            // zero reset, so do not walk backwards into the exhausted period.
+            used = 0
+        } else {
+            return nil
+        }
         let refreshedAtDate = entry.ts.flatMap(parseISODate) ?? now
         let refreshedAt = isoString(refreshedAtDate)
         let resetAt = periodEndDate.map(isoString) ?? periodEnd
@@ -1339,6 +1388,8 @@ nonisolated enum GrokLocalBillingLogReader {
                 resetAt: resetAt,
                 weeklyResetAt: resetAt,
                 nextResetAt: resetAt,
+                periodStartAt: periodStartDate.map(isoString) ?? periodStart,
+                periodEndAt: resetAt,
                 limitWindowSeconds: windowSeconds ?? 7 * 24 * 60 * 60,
                 planLabel: entry.ctx?.subscriptionTier,
                 refreshedAt: refreshedAt,
@@ -1351,11 +1402,48 @@ nonisolated enum GrokLocalBillingLogReader {
             creditsUsedPercent: clampedPercent(used),
             creditsUsedDisplay: "\(compactPercent(used))%",
             resetAt: resetAt,
+            periodStartAt: periodStartDate.map(isoString) ?? periodStart,
+            periodEndAt: resetAt,
             limitWindowSeconds: windowSeconds ?? 30 * 24 * 60 * 60,
             planLabel: entry.ctx?.subscriptionTier,
             refreshedAt: refreshedAt,
             confidence: "observed"
         )
+    }
+
+    private static func mostRecentUsagePercent(
+        before index: Int,
+        in entries: [BillingLogEntry],
+        matchingPeriodOf entry: BillingLogEntry
+    ) -> Double? {
+        guard index > entries.startIndex,
+              let targetConfig = entry.ctx?.config else {
+            return nil
+        }
+
+        for previous in entries[..<index].reversed() {
+            guard previous.messageContainsBillingConfig,
+                  let previousConfig = previous.ctx?.config,
+                  sameBillingPeriod(previousConfig, targetConfig),
+                  let usage = previousConfig.creditUsagePercent else {
+                continue
+            }
+            return usage
+        }
+        return nil
+    }
+
+    private static func sameBillingPeriod(_ lhs: BillingConfig, _ rhs: BillingConfig) -> Bool {
+        let lhsStart = firstNonEmpty(lhs.currentPeriod?.start, lhs.billingPeriodStart)
+        let lhsEnd = firstNonEmpty(lhs.currentPeriod?.end, lhs.billingPeriodEnd)
+        let rhsStart = firstNonEmpty(rhs.currentPeriod?.start, rhs.billingPeriodStart)
+        let rhsEnd = firstNonEmpty(rhs.currentPeriod?.end, rhs.billingPeriodEnd)
+
+        guard lhsStart != nil || lhsEnd != nil,
+              rhsStart != nil || rhsEnd != nil else {
+            return false
+        }
+        return lhsStart == rhsStart && lhsEnd == rhsEnd
     }
 
     private static func periodDurationSeconds(start: Date?, end: Date?) -> Double? {
@@ -1470,7 +1558,7 @@ public struct GrokProviderClient: ProviderClient {
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         let agbenchData = readTaskWraithGrokData()
         var windows: [QuotaWindow] = []
-        var planName = "SuperGrok"
+        var planName = "Grok"
 
         if let cliSnapshot = await GrokCLIUsageProbe.fetchSnapshot(credentials: credentials),
            let cliWindow = GrokUsageWindowMapper.quotaWindow(from: cliSnapshot) {
@@ -1740,6 +1828,29 @@ public struct ProviderCredential: Codable {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+nonisolated struct CodexSessionCredentialValues: Equatable {
+    let accessToken: String
+    let accountIdentifier: String?
+}
+
+nonisolated enum CodexSessionCredentialParser {
+    static func parse(_ json: [String: Any]) -> CodexSessionCredentialValues? {
+        let tokenContainer = json["tokens"] as? [String: Any]
+        guard let accessToken = (tokenContainer?["access_token"] as? String)
+                ?? (json["access_token"] as? String),
+              !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let accountIdentifier = (tokenContainer?["account_id"] as? String)
+            ?? (json["account_id"] as? String)
+        return CodexSessionCredentialValues(
+            accessToken: accessToken,
+            accountIdentifier: accountIdentifier
+        )
     }
 }
 
@@ -2810,6 +2921,24 @@ public enum CredentialImportService {
             )
         }
 
+        if providerID == .openai, selectedIsDirectory {
+            let authURL = url.appendingPathComponent("auth.json")
+            guard let data = try? Data(contentsOf: authURL, options: [.mappedIfSafe]),
+                  data.count <= 2 * 1024 * 1024,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let values = CodexSessionCredentialParser.parse(json) else {
+                throw ImportError.missingRequiredField("auth.json with access_token")
+            }
+
+            return ImportedCredential(
+                accessToken: values.accessToken,
+                accountIdentifier: values.accountIdentifier,
+                customEndpoint: url.path,
+                extraFields: ["codexAuthSource": "directory"],
+                bookmarkData: makeSecurityScopedBookmarkData(for: url)
+            )
+        }
+
         if providerID == .chatgpt {
             let resolvedRoot = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
             return ImportedCredential(
@@ -3183,7 +3312,7 @@ public enum CredentialImportService {
     private static func parseJSON(_ json: [String: Any], for providerID: ProviderID, sourceURL: URL) throws -> ImportedCredential {
         switch providerID {
         case .openai:
-            return try parseCodexJSON(json)
+            return try parseCodexJSON(json, sourceURL: sourceURL)
         case .openaiAPI:
             return try parseOpenAIAPIJSON(json)
         case .chatgpt:
@@ -3242,37 +3371,25 @@ public enum CredentialImportService {
                 throw ImportError.missingRequiredField("api_key")
             }
             return ImportedCredential(accessToken: token, accountIdentifier: nil)
-        case .grok, .antigravity, .cerebras, .meta, .ollama, .heatmap:
+        case .grok, .antigravity, .cerebras, .meta, .ollama, .openrouter, .heatmap:
             throw ImportError.unsupportedProvider
         }
     }
 
-    private static func parseCodexJSON(_ json: [String: Any]) throws -> ImportedCredential {
-        // Codex: { "tokens": { "access_token": "...", "account_id": "..." } }
-        guard let tokens = json["tokens"] as? [String: Any] else {
-            // Also try direct format
-            if let accessToken = json["access_token"] as? String {
-                return ImportedCredential(
-                    accessToken: accessToken,
-                    accountIdentifier: json["account_id"] as? String,
-                    customEndpoint: nil,
-                    extraFields: nil,
-                    bookmarkData: nil
-                )
-            }
+    private static func parseCodexJSON(
+        _ json: [String: Any],
+        sourceURL: URL
+    ) throws -> ImportedCredential {
+        guard let values = CodexSessionCredentialParser.parse(json) else {
             throw ImportError.missingRequiredField("tokens or access_token")
         }
 
-        guard let accessToken = tokens["access_token"] as? String else {
-            throw ImportError.missingRequiredField("access_token")
-        }
-
         return ImportedCredential(
-            accessToken: accessToken,
-            accountIdentifier: tokens["account_id"] as? String,
-            customEndpoint: nil,
-            extraFields: nil,
-            bookmarkData: nil
+            accessToken: values.accessToken,
+            accountIdentifier: values.accountIdentifier,
+            customEndpoint: sourceURL.path,
+            extraFields: ["codexAuthSource": "file"],
+            bookmarkData: makeSecurityScopedBookmarkData(for: sourceURL)
         )
     }
 
@@ -3543,6 +3660,8 @@ public extension CredentialImportService {
             let panel = NSOpenPanel()
             panel.message = {
                 switch providerID {
+                case .openai:
+                    return "Select your ~/.codex folder so Limit Counter can follow Codex session rotation without repeated file prompts."
                 case .codexTelemetry:
                     return "Select the ~/.codex folder for complete Codex activity, or one log file for limited access."
                 case .cursor:
@@ -3567,7 +3686,7 @@ public extension CredentialImportService {
                 panel.allowedContentTypes = [.folder]
             } else if providerID == .cerebras {
                 panel.allowedContentTypes = [.folder, .commaSeparatedText, .plainText, .data]
-            } else if providerID == .codexTelemetry || providerID == .claude
+            } else if providerID == .openai || providerID == .codexTelemetry || providerID == .claude
                         || providerID == .chatgpt || providerID == .cursor
                         || providerID == .gemini || providerID == .grok {
                 panel.allowedContentTypes = [.folder, .json, .plainText, .data]
@@ -3575,7 +3694,7 @@ public extension CredentialImportService {
                 panel.allowedContentTypes = [.json, .plainText, .data]
             }
             panel.allowsMultipleSelection = false
-            panel.canChooseDirectories = providerID == .codexTelemetry || providerID == .claude
+            panel.canChooseDirectories = providerID == .openai || providerID == .codexTelemetry || providerID == .claude
                 || providerID == .chatgpt || providerID == .cursor || providerID == .gemini
                 || providerID == .kimi || providerID == .grok || providerID == .antigravity
                 || providerID == .mistral || providerID == .cerebras || providerID == .meta
@@ -3589,6 +3708,7 @@ public extension CredentialImportService {
             switch providerID {
             case .openai:
                 panel.directoryURL = home.appendingPathComponent(".codex")
+                panel.prompt = "Grant Access"
             case .openaiAPI:
                 panel.directoryURL = home
             case .chatgpt:
@@ -3638,7 +3758,7 @@ public extension CredentialImportService {
                 panel.directoryURL = home
             case .cerebras:
                 panel.directoryURL = home.appendingPathComponent("Downloads")
-            case .ollama, .heatmap:
+            case .ollama, .openrouter, .heatmap:
                 break
             }
 
@@ -3672,17 +3792,258 @@ public extension CredentialImportService {
 
 // MARK: - Kimi Code Provider Client
 
+nonisolated struct KimiWebSessionTokens: Equatable {
+    let accessToken: String
+    let refreshToken: String?
+}
+
+nonisolated struct KimiWebMonthlyUsageReading: Equatable {
+    let usedPercent: Double
+    let resetDate: Date?
+}
+
+nonisolated enum KimiWebMembershipParser {
+    static func monthlyUsage(from data: Data) -> KimiWebMonthlyUsageReading? {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let balance = dictionary(payload["subscription_balance"])
+                ?? dictionary(payload["subscriptionBalance"]) else {
+            return nil
+        }
+
+        // Kimi's own web client treats an omitted proto default as zero at the
+        // start of a fresh subscription cycle.
+        let rawRatio = number(balance["amount_used_ratio"] ?? balance["amountUsedRatio"]) ?? 0
+        let usedPercent = rawRatio <= 1 ? rawRatio * 100 : rawRatio
+        let resetDate = date(balance["expire_time"] ?? balance["expireTime"])
+        return KimiWebMonthlyUsageReading(
+            usedPercent: min(max(usedPercent, 0), 100),
+            resetDate: resetDate
+        )
+    }
+
+    static func refreshedTokens(from data: Data, previousRefreshToken: String?) -> KimiWebSessionTokens? {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = string(payload["access_token"] ?? payload["accessToken"]) else {
+            return nil
+        }
+        return KimiWebSessionTokens(
+            accessToken: accessToken,
+            refreshToken: string(payload["refresh_token"] ?? payload["refreshToken"])
+                ?? previousRefreshToken
+        )
+    }
+
+    private static func dictionary(_ value: Any?) -> [String: Any]? {
+        value as? [String: Any]
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func date(_ value: Any?) -> Date? {
+        if let value = value as? String {
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: value) { return date }
+            if let date = ISO8601DateFormatter().date(from: value) { return date }
+            if let seconds = Double(value) { return epochDate(seconds) }
+        }
+        if let value = number(value) {
+            return epochDate(value)
+        }
+        if let timestamp = value as? [String: Any],
+           let seconds = number(timestamp["seconds"]) {
+            return epochDate(seconds)
+        }
+        return nil
+    }
+
+    private static func epochDate(_ value: Double) -> Date {
+        Date(timeIntervalSince1970: value > 10_000_000_000 ? value / 1_000 : value)
+    }
+}
+
+nonisolated enum KimiWebCredentialStore {
+    private static let service = "com.chrisizatt.LLMUsageCounter"
+
+    static func persist(_ tokens: KimiWebSessionTokens) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: ProviderID.kimi.rawValue,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let credential = try? JSONDecoder().decode(ProviderCredential.self, from: data) else {
+            return
+        }
+
+        var fields = credential.extraFields ?? [:]
+        fields["kimiWebAccessToken"] = tokens.accessToken
+        if let refreshToken = tokens.refreshToken {
+            fields["kimiWebRefreshToken"] = refreshToken
+        }
+        let updated = ProviderCredential(
+            accessToken: credential.accessToken,
+            accountIdentifier: credential.accountIdentifier,
+            customEndpoint: credential.customEndpoint,
+            extraFields: fields,
+            bookmarkData: credential.bookmarkData
+        )
+        guard let updatedData = try? JSONEncoder().encode(updated) else { return }
+
+        let updateQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: ProviderID.kimi.rawValue
+        ]
+        _ = SecItemUpdate(
+            updateQuery as CFDictionary,
+            [kSecValueData as String: updatedData] as CFDictionary
+        )
+    }
+}
+
+struct KimiWebMembershipClient {
+    private let session: URLSession
+    private let persistTokens: (KimiWebSessionTokens) -> Void
+
+    init(
+        session: URLSession = .shared,
+        persistTokens: @escaping (KimiWebSessionTokens) -> Void = KimiWebCredentialStore.persist
+    ) {
+        self.session = session
+        self.persistTokens = persistTokens
+    }
+
+    func fetchMonthlyUsage(credentials: ProviderCredential) async -> KimiWebMonthlyUsageReading? {
+        guard let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
+            return nil
+        }
+        let refreshToken = normalizedField("kimiWebRefreshToken", credentials: credentials)
+        var tokens = KimiWebSessionTokens(accessToken: accessToken, refreshToken: refreshToken)
+
+        if let response = await fetchStats(accessToken: tokens.accessToken) {
+            if response.statusCode == 200 {
+                return KimiWebMembershipParser.monthlyUsage(from: response.data)
+            }
+            guard response.statusCode == 401,
+                  let refreshed = await refresh(tokens: tokens) else {
+                return nil
+            }
+            tokens = refreshed
+            persistTokens(tokens)
+            if let retry = await fetchStats(accessToken: tokens.accessToken),
+               retry.statusCode == 200 {
+                return KimiWebMembershipParser.monthlyUsage(from: retry.data)
+            }
+        }
+        return nil
+    }
+
+    private func fetchStats(accessToken: String) async -> (statusCode: Int, data: Data)? {
+        guard let url = URL(
+            string: "https://www.kimi.ai/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+        ) else { return nil }
+        var request = baseRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = Data("{}".utf8)
+        return await response(for: request)
+    }
+
+    private func refresh(tokens: KimiWebSessionTokens) async -> KimiWebSessionTokens? {
+        guard let refreshToken = tokens.refreshToken,
+              let url = URL(string: "https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken"),
+              let body = try? JSONSerialization.data(withJSONObject: ["refresh_token": refreshToken]) else {
+            return nil
+        }
+        var request = baseRequest(url: url)
+        request.httpBody = body
+        guard let response = await response(for: request),
+              response.statusCode == 200 else {
+            return nil
+        }
+        return KimiWebMembershipParser.refreshedTokens(
+            from: response.data,
+            previousRefreshToken: refreshToken
+        )
+    }
+
+    private func baseRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.setValue("web", forHTTPHeaderField: "x-msh-platform")
+        request.setValue("en-US", forHTTPHeaderField: "X-Language")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        return request
+    }
+
+    private func response(for request: URLRequest) async -> (statusCode: Int, data: Data)? {
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse else {
+            return nil
+        }
+        return (httpResponse.statusCode, data)
+    }
+
+    private func normalizedField(_ key: String, credentials: ProviderCredential) -> String? {
+        guard let value = credentials.extraFields?[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
 public struct KimiProviderClient: ProviderClient {
     public let providerID: ProviderID = .kimi
 
     private let session: URLSession
+    private let webMembershipClient: KimiWebMembershipClient
 
     public init(session: URLSession = .shared) {
         self.session = session
+        self.webMembershipClient = KimiWebMembershipClient(
+            session: session,
+            persistTokens: KimiWebCredentialStore.persist
+        )
+    }
+
+    init(
+        session: URLSession,
+        persistWebSessionTokens: @escaping (KimiWebSessionTokens) -> Void
+    ) {
+        self.session = session
+        self.webMembershipClient = KimiWebMembershipClient(
+            session: session,
+            persistTokens: persistWebSessionTokens
+        )
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         guard let credentials else { throw ProviderFetchError.notConfigured }
+        async let monthlyUsage = webMembershipClient.fetchMonthlyUsage(credentials: credentials)
 
         let accessToken = try await resolvedAccessToken(from: credentials)
         guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
@@ -3711,6 +4072,7 @@ public struct KimiProviderClient: ProviderClient {
         switch httpResponse.statusCode {
         case 200..<300:
             let apiSnapshot = try KimiUsageNormalizer.snapshot(from: data, fetchedAt: Date())
+            let snapshotWithMonthly = mergeMonthlyUsage(await monthlyUsage, into: apiSnapshot)
             // Best-effort augmentation: read local Kimi CLI session logs.
             // so per-turn activity events surface on the heatmap. Returns [] if
             // the sandbox denies the read (typical when the user only granted a
@@ -3723,7 +4085,7 @@ public struct KimiProviderClient: ProviderClient {
             // own). No-op when the user hasn't granted the bookmark.
             let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "kimi")
             let combinedEvents = cliEvents + agbenchEvents
-            let merged = mergeEvents(into: apiSnapshot, events: combinedEvents)
+            let merged = mergeEvents(into: snapshotWithMonthly, events: combinedEvents)
             // Preserve historical events whose source `wire.jsonl` has aged
             // past the 30-day modification-date window in
             // `KimiLocalTranscriptReader`. Same fix as Claude.
@@ -3735,6 +4097,38 @@ public struct KimiProviderClient: ProviderClient {
         default:
             throw ProviderFetchError.parsingError("Kimi usage endpoint returned HTTP \(httpResponse.statusCode).")
         }
+    }
+
+    private func mergeMonthlyUsage(
+        _ reading: KimiWebMonthlyUsageReading?,
+        into snapshot: QuotaSnapshot
+    ) -> QuotaSnapshot {
+        guard let reading else { return snapshot }
+        let monthlyWindow = QuotaWindow(
+            label: "Monthly",
+            windowKind: .monthly,
+            used: reading.usedPercent,
+            total: 100,
+            resetDate: reading.resetDate,
+            unit: "%",
+            subtitle: "Shared Kimi membership credits"
+        )
+        let windows = snapshot.windows.filter {
+            $0.windowKind != .monthly && $0.label.caseInsensitiveCompare("Monthly") != .orderedSame
+        } + [monthlyWindow]
+        return QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            signals: snapshot.signals,
+            events: snapshot.events,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
     }
 
     private func loadLocalKimiEvents(credentials: ProviderCredential) -> [UsageEvent] {
@@ -4768,6 +5162,67 @@ public enum CodexImportService {
 
 // MARK: - Codex Session Client
 
+nonisolated enum CodexSessionCredentialReader {
+    static func refreshedCredential(from credentials: ProviderCredential) -> ProviderCredential? {
+        guard let source = credentials.extraFields?["codexAuthSource"],
+              source == "directory" || source == "file",
+              let scopedURL = resolvedScopedURL(from: credentials, source: source) else {
+            return nil
+        }
+
+        let didStartAccessing = scopedURL.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccessing {
+                scopedURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let authURL = source == "directory"
+            ? scopedURL.appendingPathComponent("auth.json")
+            : scopedURL
+        guard let data = try? Data(contentsOf: authURL, options: [.mappedIfSafe]),
+              data.count <= 2 * 1024 * 1024,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let values = CodexSessionCredentialParser.parse(json) else {
+            return nil
+        }
+
+        return ProviderCredential(
+            accessToken: values.accessToken,
+            accountIdentifier: values.accountIdentifier ?? credentials.accountIdentifier,
+            customEndpoint: credentials.customEndpoint,
+            extraFields: credentials.extraFields,
+            bookmarkData: credentials.bookmarkData
+        )
+    }
+
+    private static func resolvedScopedURL(
+        from credentials: ProviderCredential,
+        source: String
+    ) -> URL? {
+        let bookmarkData = credentials.bookmarkData
+            ?? credentials.extraFields?["bookmarkData"].flatMap { Data(base64Encoded: $0) }
+        if let bookmarkData {
+            var isStale = false
+            #if os(macOS)
+            let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+            #else
+            let options: URL.BookmarkResolutionOptions = []
+            #endif
+            if let url = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: options,
+                bookmarkDataIsStale: &isStale
+            ) {
+                return url
+            }
+        }
+
+        guard let path = credentials.normalizedCustomEndpoint else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: source == "directory")
+    }
+}
+
 /// Fetches Codex usage via the ChatGPT-authenticated session (the "wham/usage" endpoint).
 /// Returns 5-hour and 7-day rolling windows used by the Codex CLI.
 public struct CodexSessionProviderClient: ProviderClient {
@@ -4782,7 +5237,9 @@ public struct CodexSessionProviderClient: ProviderClient {
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
-        guard let credentials else { throw ProviderFetchError.notConfigured }
+        guard let storedCredentials = credentials else { throw ProviderFetchError.notConfigured }
+        let credentials = CodexSessionCredentialReader.refreshedCredential(from: storedCredentials)
+            ?? storedCredentials
         guard let accessToken = credentials.normalizedAccessToken else {
             print("[CodexSessionProvider] Missing access token")
             throw ProviderFetchError.notConfigured
@@ -4868,18 +5325,33 @@ public struct CodexSessionProviderClient: ProviderClient {
             guard let rateLimit = additionalLimit.rateLimit else { continue }
             let name = additionalLimit.displayName
 
-            if isCodexSparkLimit(name), let weekly = weeklyWindow(in: rateLimit) {
+            guard isCodexSparkLimit(name) else { continue }
+
+            // Surface the 5-hour "Extra limits" window above the weekly meter so
+            // the short rolling allowance is visible first.
+            if let fiveHour = fiveHourWindow(in: rateLimit) {
+                additionalWindows.append(
+                    quotaWindow(
+                        from: fiveHour,
+                        label: "\(name) 5H",
+                        windowKind: .session,
+                        subtitle: "5-hour rolling window"
+                     )
+                 )
+             }
+
+            if let weekly = weeklyWindow(in: rateLimit) {
                 additionalWindows.append(
                     quotaWindow(
                         from: weekly,
                         label: "\(name) Weekly",
                         windowKind: .weekly,
                         subtitle: "7-day usage limit"
-                    )
-                )
-            }
+                     )
+                 )
+             }
 
-        }
+         }
 
         if let credits = payload.credits,
            let balance = credits.balance {
@@ -4937,10 +5409,19 @@ public struct CodexSessionProviderClient: ProviderClient {
     }
 
     private func weeklyWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
-        [rateLimit.primaryWindow, rateLimit.secondaryWindow]
-            .compactMap { $0 }
-            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
-    }
+         [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+             .compactMap { $0 }
+             .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
+     }
+
+    /// The short rolling "Extra limits" window (the 5-hour allowance) for a
+    /// Codex Spark additional limit. Picks the non-weekly window so it can be
+    /// surfaced above the weekly meter.
+    private func fiveHourWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
+         [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+             .compactMap { $0 }
+             .first { $0.limitWindowSeconds < 6 * 24 * 60 * 60 }
+     }
 
     private func chatGPTPlanName(from planType: String?) -> String {
         guard let planType = planType?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -7962,6 +8443,10 @@ enum ClaudeOAuthCredentialPolicy {
             extraFields.removeValue(forKey: keychainAccessEnabledKey)
         }
     }
+
+    static func allowsClaudeCodeKeychainAccess(enabled: Bool, userInitiated: Bool) -> Bool {
+        enabled && userInitiated
+    }
 }
 
 /// Reads the two keychain entries we treat as token stores:
@@ -8179,7 +8664,7 @@ private actor ClaudeOAuthTokenManager {
 
 /// Reads local Claude Code transcript metadata and usage snapshots.
 /// If an OAuth token is supplied, fetches live 5-hour/7-day quota meters instead.
-public struct ClaudeProviderClient: ProviderClient {
+public struct ClaudeProviderClient: UserInitiatedProviderClient {
     public let providerID: ProviderID = .claude
 
     private let fileManager: FileManager
@@ -8189,22 +8674,33 @@ public struct ClaudeProviderClient: ProviderClient {
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        try await fetchSnapshot(credentials: credentials, userInitiated: false)
+    }
+
+    public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
         //   2. Limit Counter's mirrored OAuth token, if available
-        //   3. Claude Code's own keychain item, only when explicitly enabled
+        //   3. Claude Code's own keychain item, only on an opted-in manual refresh
         //   4. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
         let claudeCodeKeychainFallbackEnabled = ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: credentials)
+        let claudeCodeKeychainAccessAllowed = ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(
+            enabled: claudeCodeKeychainFallbackEnabled,
+            userInitiated: userInitiated
+        )
         var oauthToken = manualToken
         var tokenAllowsKeychainRecovery = false
         var tokenAllowsKeychainPlanLookup = false
 
         if oauthToken == nil {
             oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
-                allowClaudeCodeFallback: claudeCodeKeychainFallbackEnabled
+                allowClaudeCodeFallback: claudeCodeKeychainAccessAllowed
             )
-            tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeKeychainFallbackEnabled
+            tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeKeychainAccessAllowed
             tokenAllowsKeychainPlanLookup = oauthToken != nil
         }
         if oauthToken == nil {
@@ -8233,7 +8729,7 @@ public struct ClaudeProviderClient: ProviderClient {
                    let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
                     rejectedToken: token,
                     reason: "OAuth usage fetch failed (\(error.localizedDescription))",
-                    allowClaudeCodeFallback: claudeCodeKeychainFallbackEnabled
+                    allowClaudeCodeFallback: claudeCodeKeychainAccessAllowed
                    ) {
                     do {
                         return try await fetchOAuthSnapshotAndMerge(
@@ -9847,5 +10343,220 @@ public struct OllamaProviderClient: ProviderClient {
             groups.append(String(text[range]))
         }
         return groups
+    }
+}
+
+// MARK: - OpenRouter Provider Client
+
+/// OpenRouter API response structures for the /api/v1/auth/key endpoint
+private struct OpenRouterKeyResponse: Codable {
+    let id: String
+    let name: String?
+    let created: Int?
+    let usage: OpenRouterUsage?
+    let limit: Int?
+}
+
+private struct OpenRouterUsage: Codable {
+    let totalTokens: Int?
+    let totalCostUSD: Double?
+    let promptTokens: Int?
+    let completionTokens: Int?
+    let promptCostUSD: Double?
+    let completionCostUSD: Double?
+    let requests: Int?
+}
+
+public struct OpenRouterProviderClient: ProviderClient {
+    public let providerID: ProviderID = .openrouter
+    private let session: URLSession
+
+    public init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        guard let token = credentials?.normalizedAccessToken, !token.isEmpty else {
+            throw ProviderFetchError.notConfigured
+        }
+
+        let endpoint = credentials?.normalizedCustomEndpoint ?? "https://openrouter.ai/api/v1/auth/key"
+        guard let url = URL(string: endpoint) else {
+            throw ProviderFetchError.parsingError("Invalid OpenRouter endpoint URL")
+        }
+
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw ProviderFetchError.networkError(underlying: URLError(.badServerResponse))
+        }
+
+        // Handle rate limiting
+        if http.statusCode == 429 {
+            throw ProviderFetchError.rateLimited
+        }
+
+        // Handle authentication errors
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw ProviderFetchError.credentialExpired("OpenRouter rejected the API key.")
+        }
+
+        guard (200..<300).contains(http.statusCode) else {
+            throw ProviderFetchError.parsingError("OpenRouter returned HTTP \(http.statusCode)")
+        }
+
+        guard data.count <= 1_048_576 else {
+            throw ProviderFetchError.parsingError("OpenRouter returned an unexpectedly large response")
+        }
+
+        let keyResponse: OpenRouterKeyResponse
+        do {
+            keyResponse = try JSONDecoder().decode(OpenRouterKeyResponse.self, from: data)
+        } catch {
+            // Try to parse as a simple error message or fallback to string parsing
+            if let responseString = String(data: data, encoding: .utf8) {
+                print("[OpenRouter] Raw response: \(responseString)")
+                // Check if it's an error response
+                if responseString.contains("error") || responseString.contains("Error") {
+                    throw ProviderFetchError.parsingError("OpenRouter error: \(responseString)")
+                }
+            }
+            throw ProviderFetchError.parsingError("OpenRouter returned unparseable data")
+        }
+
+        let now = Date()
+        let usage = keyResponse.usage
+        let limit = keyResponse.limit
+
+        var windows: [QuotaWindow] = []
+        var balances: [QuotaBalance] = []
+        var stats: [QuotaStat] = []
+
+        // Build usage windows based on available data
+        if let totalCostUSD = usage?.totalCostUSD, totalCostUSD > 0 {
+            windows.append(
+                QuotaWindow(
+                    label: "Total spend",
+                    windowKind: .monthly,
+                    used: totalCostUSD,
+                    total: limit.map { Double($0) },
+                    resetDate: nil,
+                    unit: "USD",
+                    subtitle: "Official OpenRouter API"
+                )
+            )
+        }
+
+        if let totalTokens = usage?.totalTokens, totalTokens > 0 {
+            windows.append(
+                QuotaWindow(
+                    label: "Total tokens",
+                    windowKind: .monthly,
+                    used: Double(totalTokens),
+                    total: nil,
+                    resetDate: nil,
+                    unit: "tokens",
+                    subtitle: "Official OpenRouter API"
+                )
+            )
+        }
+
+        if let requests = usage?.requests, requests > 0 {
+            windows.append(
+                QuotaWindow(
+                    label: "Total requests",
+                    windowKind: .monthly,
+                    used: Double(requests),
+                    total: nil,
+                    resetDate: nil,
+                    unit: "requests",
+                    subtitle: "Official OpenRouter API"
+                )
+            )
+        }
+
+        // Build balances
+        if let limit = limit {
+            let limitDouble = Double(limit)
+            if let totalCostUSD = usage?.totalCostUSD {
+                let remaining = max(0, limitDouble - totalCostUSD)
+                balances.append(
+                    QuotaBalance(
+                        label: "Remaining budget",
+                        amount: remaining,
+                        unit: "USD",
+                        subtitle: "Limit minus spend"
+                    )
+                )
+            }
+            balances.append(
+                QuotaBalance(
+                    label: "Monthly limit",
+                    amount: limitDouble,
+                    unit: "USD",
+                    subtitle: "Configured budget"
+                )
+            )
+        }
+
+        // Build stats
+        if let promptTokens = usage?.promptTokens, let completionTokens = usage?.completionTokens {
+            stats.append(
+                QuotaStat(
+                    label: "Prompt tokens",
+                    value: Double(promptTokens),
+                    unit: "tokens",
+                    subtitle: "Input tokens"
+                )
+            )
+            stats.append(
+                QuotaStat(
+                    label: "Completion tokens",
+                    value: Double(completionTokens),
+                    unit: "tokens",
+                    subtitle: "Output tokens"
+                )
+            )
+        }
+
+        if let promptCostUSD = usage?.promptCostUSD, let completionCostUSD = usage?.completionCostUSD {
+            stats.append(
+                QuotaStat(
+                    label: "Prompt cost",
+                    value: promptCostUSD,
+                    unit: "USD",
+                    subtitle: "Input cost"
+                )
+            )
+            stats.append(
+                QuotaStat(
+                    label: "Completion cost",
+                    value: completionCostUSD,
+                    unit: "USD",
+                    subtitle: "Output cost"
+                )
+            )
+        }
+
+        // Determine plan name
+        let planName: String? = keyResponse.name?.isEmpty == false ? keyResponse.name : "OpenRouter API"
+
+        return QuotaSnapshot(
+            providerID: .openrouter,
+            displayName: ProviderID.openrouter.snapshotDisplayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: [],
+            events: [],
+            analyticsBuckets: [],
+            fetchState: .success,
+            fetchedAt: now
+        )
     }
 }

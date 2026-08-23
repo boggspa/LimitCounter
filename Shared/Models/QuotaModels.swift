@@ -25,6 +25,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case cerebras
     case meta
     case ollama
+    case openrouter
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -58,6 +59,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras: return "Cerebras"
         case .meta:     return "Meta API"
         case .ollama:   return "Ollama"
+        case .openrouter: return "OpenRouter"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -73,7 +75,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Codex Telemetry"
         case .claude, .devin, .cursor, .gemini, .kimi, .grok,
-             .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .heatmap:
+             .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .heatmap:
             return displayName
         }
     }
@@ -99,6 +101,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras: return "c.circle.fill"
         case .meta:     return "infinity"
         case .ollama:   return "circle.grid.2x2.fill"
+        case .openrouter: return "arrow.left.arrow.right.circle.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -124,6 +127,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras: return "#BB584A"
         case .meta:     return "#0082FB" // Meta Blue
         case .ollama:   return "#F3F4F6" // Ollama White/Silver
+        case .openrouter: return "#8B5CF6" // OpenRouter Purple
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -162,6 +166,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderMetaLogo"
         case .ollama:
             return "ProviderOllamaLogo"
+        case .openrouter:
+            return "ProviderOpenRouterLogo"
         case .heatmap:
             return ""
         }
@@ -172,7 +178,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt, .codexTelemetry:
             return .prototype
         case .claude, .openai, .openaiAPI, .devin, .cursor, .gemini, .kimi,
-             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama:
+             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter:
             return .session
         case .heatmap:
             return .session
@@ -213,6 +219,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Meta API credits and Muse spend"
         case .ollama:
             return "Ollama Cloud session"
+        case .openrouter:
+            return "OpenRouter API usage tracking"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -223,7 +231,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .claude:
             return "Reads local Claude Code transcripts under `~/.claude` for token stats. Uses a pasted OAuth token or Limit Counter's mirrored OAuth token for live 5-hour and 7-day quota meters."
         case .openai:
-            return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface."
+            return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface. An optional `~/.codex` folder grant follows CLI token rotation without repeated prompts."
         case .openaiAPI:
             return "Uses an OpenAI admin API key and project ID to read official 30-day usage, request, and cost history from OpenAI organization APIs."
         case .chatgpt:
@@ -237,7 +245,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:
             return "Reads local Gemini CLI history and metadata from `~/.gemini` and turns it into usage snapshots."
         case .kimi:
-            return "Uses a Kimi Code Console API key or an explicitly imported Kimi CLI OAuth file to read weekly and rolling 5-hour quota."
+            return "Uses a Kimi Code Console API key or imported CLI OAuth folder for 5-hour and weekly quota. An optional kimi.ai web session adds the shared monthly membership-credit meter."
         case .grok:
             return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
         case .antigravity:
@@ -252,6 +260,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Optional Meta console Spend reading anchors a billing-period meter that accumulates Muse spend after that reading; preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
         case .ollama:
             return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters from ollama.com/settings."
+        case .openrouter:
+            return "Uses an OpenRouter API key to read usage tracking and spend from the official `https://openrouter.ai/api/v1/auth/key` endpoint."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -291,6 +301,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Muse data folder"
         case .ollama:
             return "Session Cookie (__Secure-session)"
+        case .openrouter:
+            return "OpenRouter API key"
         case .heatmap:
             return ""
         }
@@ -301,7 +313,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .claude:
             return "OAuth token (optional)"
         case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
-             .codexTelemetry, .meta, .ollama, .heatmap:
+             .codexTelemetry, .meta, .ollama, .openrouter, .heatmap:
             return nil
         case .mistral:
             return "Vibe Code budget (optional)"
@@ -321,7 +333,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     public var securityNote: String {
         switch self {
         case .openai:
-            return "Use only a Codex session you intentionally import or paste from an account you control."
+            return "Use only a Codex session or `~/.codex` folder you intentionally grant from an account you control. Folder access is limited to following `auth.json` session rotation."
         case .openaiAPI:
             return "Use only an OpenAI admin key you intentionally create for usage reporting, and scope it to the organization/project you control."
         case .chatgpt:
@@ -337,7 +349,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:
             return "Use only local Gemini CLI log folders or history you intentionally point the app at."
         case .kimi:
-            return "Use only a Kimi Code Console API key you intentionally enter, or a Kimi CLI OAuth file you explicitly import."
+            return "Use only a Kimi Code API key, CLI OAuth folder, or kimi.ai web session you intentionally provide. Web session tokens are stored in Keychain and used only for membership quota reporting."
         case .grok:
             return "Runs only the local Grok CLI `/usage` command against the `~/.grok` folder you grant. No prompts are sent and no xAI credentials are extracted."
         case .antigravity:
@@ -352,6 +364,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Reads only Muse `session.jsonl` usage fields from a folder you grant. Manual billing anchors are stored in Keychain. Meta has no documented balance API; spend is projected locally."
         case .ollama:
             return "Stores your Ollama `__Secure-session` cookie securely in macOS Keychain. Used only to read your usage meters from ollama.com/settings."
+        case .openrouter:
+            return "Uses only the OpenRouter API key you enter to request the documented usage tracking endpoint at `https://openrouter.ai/api/v1/auth/key`."
         case .heatmap:
             return "Aggregates only locally available data."
         }
@@ -441,7 +455,7 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),
                 AppIconCandidate(bundleIdentifier: "ai.ollama.ollama", applicationNames: ["Ollama.app"])
             ]
-        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .heatmap:
+        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .heatmap:
             return []
         }
     }

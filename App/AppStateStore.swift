@@ -116,6 +116,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(CerebrasProviderClient())
         coordinator.register(MetaProviderClient())
         coordinator.register(OllamaProviderClient())
+        coordinator.register(OpenRouterProviderClient())
         #endif
 
         self.syncCoordinator = coordinator
@@ -193,6 +194,13 @@ final class AppStateStore: ObservableObject {
             QuotaSnapshot(
                 providerID: .kimi,
                 displayName: ProviderID.kimi.snapshotDisplayName,
+                planName: nil,
+                windows: [],
+                fetchState: .notConfigured
+            ),
+            QuotaSnapshot(
+                providerID: .openrouter,
+                displayName: ProviderID.openrouter.snapshotDisplayName,
                 planName: nil,
                 windows: [],
                 fetchState: .notConfigured
