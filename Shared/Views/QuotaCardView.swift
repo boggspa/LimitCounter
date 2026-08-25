@@ -78,7 +78,7 @@ public struct ProviderBrandIconView: View {
         case .deepseek:
             return 1_024 / 217
         case .meta:
-            return 512 / 128
+            return 1_024 / 237 // Official Meta wordmark (infinity loop + "Meta"), 1024×237 RGBA
         default:
             return 2_403 / 1_058
         }
