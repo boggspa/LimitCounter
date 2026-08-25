@@ -157,6 +157,50 @@ private func testBillingLogReaderUsesLatestWeeklyConfig() throws {
     try expectEqual(window.resetDate, makeDate("2026-07-02T17:04:15.560820Z"), "billing log reset date")
 }
 
+private func testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-grok-reset-test-\(UUID().uuidString)", isDirectory: true)
+    let logs = root.appendingPathComponent("logs", isDirectory: true)
+    let log = logs.appendingPathComponent("unified.jsonl")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    try """
+    {"ts":"2026-08-20T16:54:49.719Z","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":99.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-13T17:04:15.560820+00:00","end":"2026-08-20T17:04:15.560820+00:00"}},"subscriptionTier":"SuperGrok"}}
+    {"ts":"2026-08-20T17:27:36.037Z","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-20T17:04:15.560820+00:00","end":"2026-08-27T17:04:15.560820+00:00"}},"subscriptionTier":"X Premium"}}
+    """.data(using: .utf8)!.write(to: log)
+
+    let now = makeDate("2026-08-20T18:00:00Z")
+    let snapshot = try expectSnapshot(GrokLocalBillingLogReader.latestSnapshot(rootURL: root, now: now))
+    let window = try expectWindow(GrokUsageWindowMapper.quotaWindow(from: snapshot, now: now))
+
+    try expectEqual(snapshot.planLabel, "X Premium", "new billing period plan")
+    try expectEqual(snapshot.periodStartAt, "2026-08-20T17:04:15.560Z", "new billing period start")
+    try expectEqual(window.used, 0, "omitted usage in a fresh active period should mean zero")
+    try expectEqual(window.resetDate, makeDate("2026-08-27T17:04:15.560820Z"), "new billing period reset")
+}
+
+private func testBillingLogReaderPreservesUsageAcrossSamePeriodOmission() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-grok-omission-test-\(UUID().uuidString)", isDirectory: true)
+    let logs = root.appendingPathComponent("logs", isDirectory: true)
+    let log = logs.appendingPathComponent("unified.jsonl")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    try """
+    {"ts":"2026-08-22T10:00:00.000Z","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":12.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-20T17:04:15.560820+00:00","end":"2026-08-27T17:04:15.560820+00:00"}},"subscriptionTier":"X Premium"}}
+    {"ts":"2026-08-22T10:05:00.000Z","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-20T17:04:15.560820+00:00","end":"2026-08-27T17:04:15.560820+00:00"}},"subscriptionTier":"X Premium"}}
+    """.data(using: .utf8)!.write(to: log)
+
+    let now = makeDate("2026-08-22T10:06:00Z")
+    let snapshot = try expectSnapshot(GrokLocalBillingLogReader.latestSnapshot(rootURL: root, now: now))
+    let window = try expectWindow(GrokUsageWindowMapper.quotaWindow(from: snapshot, now: now))
+
+    try expectEqual(window.used, 12, "same-period omission should preserve the last reported usage")
+    try expectEqual(snapshot.planLabel, "X Premium", "same-period omission plan")
+}
+
 private func testPercentStringsDecodeWithoutRejectingSnapshot() throws {
     let snapshot = try decodeSnapshot("""
     {
@@ -189,6 +233,43 @@ private func testLegacyCreditSnapshotStillMapsWhenCurrent() throws {
     try expectEqual(window.label, "Credits", "legacy label")
     try expectEqual(window.windowKind, .sliding, "legacy kind")
     try expectEqual(window.used, 3, "legacy used percent")
+}
+
+private func testWeeklyBridgeShapeDoesNotFallBackToLegacyCredits() throws {
+    let snapshot = try decodeSnapshot("""
+    {
+      "usageKind": "weekly_limit",
+      "creditsUsedPercent": 99,
+      "creditsUsedDisplay": "99%",
+      "refreshedAt": "2026-08-20T16:54:50.765Z",
+      "confidence": "observed"
+    }
+    """)
+
+    let window = GrokUsageWindowMapper.quotaWindow(
+        from: snapshot,
+        now: makeDate("2026-08-20T17:00:00Z")
+    )
+
+    try expect(window == nil, "weekly snapshots must not reinterpret legacy credit fields")
+}
+
+private func testUndatedLegacyCreditSnapshotExpiresQuickly() throws {
+    let snapshot = try decodeSnapshot("""
+    {
+      "usageKind": "subscription_credits",
+      "creditsUsedPercent": 99,
+      "refreshedAt": "2026-08-20T12:00:00.000Z",
+      "confidence": "observed"
+    }
+    """)
+
+    let window = GrokUsageWindowMapper.quotaWindow(
+        from: snapshot,
+        now: makeDate("2026-08-20T17:00:00Z")
+    )
+
+    try expect(window == nil, "undated legacy credit snapshots should not persist indefinitely")
 }
 
 private func testExpiredLegacyCreditSnapshotIsNotRenderedAsCurrentQuota() throws {
@@ -300,8 +381,12 @@ private enum GrokUsageTestRunner {
         try testCLIParserReadsCursorPaintedUsageScreen()
         try testCLIParserReadsLegacyCreditScreen()
         try testBillingLogReaderUsesLatestWeeklyConfig()
+        try testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset()
+        try testBillingLogReaderPreservesUsageAcrossSamePeriodOmission()
         try testPercentStringsDecodeWithoutRejectingSnapshot()
         try testLegacyCreditSnapshotStillMapsWhenCurrent()
+        try testWeeklyBridgeShapeDoesNotFallBackToLegacyCredits()
+        try testUndatedLegacyCreditSnapshotExpiresQuickly()
         try testExpiredLegacyCreditSnapshotIsNotRenderedAsCurrentQuota()
         try testExpiredWeeklySnapshotIsNotRenderedAsCurrentQuota()
         try testUnavailableSnapshotProducesNoWindow()

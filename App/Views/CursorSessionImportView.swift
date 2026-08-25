@@ -239,6 +239,193 @@ private struct CursorSessionWebView: NSViewRepresentable {
 }
 #endif
 
+// MARK: - Kimi Session Import View
+
+struct KimiWebSessionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model = KimiWebSessionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    private let startURL = URL(string: "https://www.kimi.ai/membership/subscription?tab=quota")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    ProviderBrandIconView(providerID: .kimi, size: 24)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Kimi web session")
+                            .font(.headline.weight(.semibold))
+                        Text("Sign in inside the embedded browser, then import the active kimi.ai session into Keychain.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Text("Limit Counter stores only the web session tokens needed to read your shared monthly membership-credit percentage and reset date.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            HStack {
+                Text("After the My Quota page appears, import the session.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+                Button {
+                    Task { await importCurrentSession() }
+                } label: {
+                    if isImporting {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                    } else {
+                        Text("Import Session")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(hex: ProviderID.kimi.accentColorHex))
+                .disabled(isImporting)
+            }
+            .padding(20)
+        }
+        .frame(minWidth: 760, minHeight: 720)
+        .onAppear { model.load(startURL: startURL) }
+        .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(importError ?? "No signed-in Kimi web session was found.")
+        }
+    }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let tokens = try await model.captureSessionTokens()
+            var fields = ["kimiWebAccessToken": tokens.accessToken]
+            if let refreshToken = tokens.refreshToken {
+                fields["kimiWebRefreshToken"] = refreshToken
+            }
+            onImport(
+                .success(
+                    CredentialImportService.ImportedCredential(
+                        accessToken: nil,
+                        accountIdentifier: nil,
+                        customEndpoint: nil,
+                        extraFields: fields,
+                        bookmarkData: nil
+                    )
+                )
+            )
+            dismiss()
+        } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+        }
+    }
+}
+
+@MainActor
+final class KimiWebSessionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+    private var popupWebView: WKWebView?
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+    }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        webView.load(URLRequest(url: startURL))
+    }
+
+    func captureSessionTokens() async throws -> KimiWebSessionTokens {
+        let script = """
+        JSON.stringify({
+          accessToken: window.localStorage.getItem('access_token'),
+          refreshToken: window.localStorage.getItem('refresh_token')
+        })
+        """
+        guard let result = try await webView.evaluateJavaScript(script) as? String,
+              let data = result.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = (payload["accessToken"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !accessToken.isEmpty else {
+            throw KimiWebSessionImportError.noSessionFound
+        }
+        let refreshToken = (payload["refreshToken"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return KimiWebSessionTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken?.isEmpty == false ? refreshToken : nil
+        )
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        guard navigationAction.targetFrame == nil else { return nil }
+
+        if let popupWebView {
+            popupWebView.load(navigationAction.request)
+            return nil
+        }
+
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.uiDelegate = self
+        popup.allowsBackForwardNavigationGestures = true
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        webView.addSubview(popup)
+        NSLayoutConstraint.activate([
+            popup.leadingAnchor.constraint(equalTo: webView.leadingAnchor),
+            popup.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
+            popup.topAnchor.constraint(equalTo: webView.topAnchor),
+            popup.bottomAnchor.constraint(equalTo: webView.bottomAnchor)
+        ])
+        popupWebView = popup
+        return popup
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        guard webView === popupWebView else { return }
+        webView.removeFromSuperview()
+        popupWebView = nil
+    }
+}
+
+private enum KimiWebSessionImportError: LocalizedError {
+    case noSessionFound
+
+    var errorDescription: String? {
+        "No Kimi web session was found. Sign in and wait for the My Quota page to finish loading before importing."
+    }
+}
+
 // MARK: - Ollama Session Import View
 
 struct OllamaSessionImportView: View {

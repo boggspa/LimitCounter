@@ -36,6 +36,9 @@ enum KimiUsageTestRunner {
         try testMapsCurrentAndLegacyMembershipLevels()
         try testParsesMissingOptionalFieldsAndUnknownMembership()
         try testParsesExhaustedWeeklyAndUnusedFiveHourQuota()
+        try testParsesWebMonthlyMembershipQuota()
+        try await testMergesWebMonthlyQuotaWithCodeWindows()
+        try await testRefreshesAndPersistsWebSessionTokens()
         try testImportsPlainTextAPIKey()
         try testImportsCLIOAuthJSONAsFileReference()
         try testImportsCLIOAuthDirectory()
@@ -123,7 +126,9 @@ enum KimiUsageTestRunner {
             ("LEVEL_MAX", "Allegro"),
             ("LEVEL_ALLEGRO", "Allegro"),
             ("LEVEL_ULTRA", "Vivace"),
-            ("LEVEL_VIVACE", "Vivace")
+            ("LEVEL_VIVACE", "Vivace"),
+            ("LEVEL_STANDARD", "Vivace"),
+            ("STANDARD", "Vivace")
         ]
 
         for (level, expectedName) in expectedNames {
@@ -202,6 +207,133 @@ enum KimiUsageTestRunner {
         let fiveHour = try requiredWindow("5H", in: snapshot)
         try expectEqual(fiveHour.used, 0, "unused 5h quota")
         try expectEqual(fiveHour.percentageUsed, 0, "unused 5h percentage")
+    }
+
+    private static func testParsesWebMonthlyMembershipQuota() throws {
+        let payload = """
+        {
+          "subscription_balance": {
+            "amount_used_ratio": 0.4767,
+            "kimi_code_used_ratio": 0.2,
+            "expire_time": "2026-08-24T00:00:00Z"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let reading = KimiWebMembershipParser.monthlyUsage(from: payload)
+        try expectEqual(reading?.usedPercent, 47.67, "web monthly total usage")
+        try expectEqual(
+            reading?.resetDate,
+            ISO8601DateFormatter().date(from: "2026-08-24T00:00:00Z"),
+            "web monthly reset"
+        )
+
+        let freshCycle = KimiWebMembershipParser.monthlyUsage(
+            from: #"{"subscription_balance":{"expire_time":"2026-09-24T00:00:00Z"}}"#
+                .data(using: .utf8)!
+        )
+        try expectEqual(freshCycle?.usedPercent, 0, "omitted fresh-cycle ratio")
+    }
+
+    private static func testMergesWebMonthlyQuotaWithCodeWindows() async throws {
+        KimiMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            if request.url?.path.contains("GetSubscriptionStats") == true {
+                try expectEqual(
+                    request.value(forHTTPHeaderField: "Authorization"),
+                    "Bearer web-access-token",
+                    "web membership authorization"
+                )
+                return (
+                    response,
+                    #"{"subscription_balance":{"amount_used_ratio":1,"expire_time":"2099-08-24T00:00:00Z"}}"#
+                        .data(using: .utf8)!
+                )
+            }
+            return (
+                response,
+                #"{"usage":{"limit":100,"used":48,"resetTime":"2099-08-28T00:00:00Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":100,"used":0,"resetTime":"2099-08-22T05:43:00Z"}}]}"#
+                    .data(using: .utf8)!
+            )
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let snapshot = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in }
+        ).fetchSnapshot(
+            credentials: ProviderCredential(
+                accessToken: "code-access-token",
+                extraFields: ["kimiWebAccessToken": "web-access-token"]
+            )
+        )
+
+        let monthly = try requiredWindow("Monthly", in: snapshot)
+        try expectEqual(monthly.windowKind, .monthly, "web monthly kind")
+        try expectEqual(monthly.percentageUsed, 100, "web monthly percentage")
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Weekly", "Monthly"], "Kimi window order")
+    }
+
+    private static func testRefreshesAndPersistsWebSessionTokens() async throws {
+        var persisted: KimiWebSessionTokens?
+        var statsRequests = 0
+        KimiMockURLProtocol.requestHandler = { request in
+            if request.url?.path.contains("RefreshToken") == true {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (
+                    response,
+                    #"{"access_token":"rotated-web-access","refresh_token":"rotated-web-refresh"}"#
+                        .data(using: .utf8)!
+                )
+            }
+
+            statsRequests += 1
+            let authorization = request.value(forHTTPHeaderField: "Authorization")
+            let status = authorization == "Bearer rotated-web-access" ? 200 : 401
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let data = status == 200
+                ? #"{"subscriptionBalance":{"amountUsedRatio":0.25,"expireTime":{"seconds":4102444800}}}"#.data(using: .utf8)!
+                : Data()
+            return (response, data)
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let client = KimiWebMembershipClient(
+            session: URLSession(configuration: configuration),
+            persistTokens: { persisted = $0 }
+        )
+        let reading = await client.fetchMonthlyUsage(
+            credentials: ProviderCredential(
+                extraFields: [
+                    "kimiWebAccessToken": "expired-web-access",
+                    "kimiWebRefreshToken": "web-refresh"
+                ]
+            )
+        )
+
+        try expectEqual(reading?.usedPercent, 25, "refreshed web monthly percentage")
+        try expectEqual(statsRequests, 2, "web stats retry count")
+        try expectEqual(persisted?.accessToken, "rotated-web-access", "persisted web access token")
+        try expectEqual(persisted?.refreshToken, "rotated-web-refresh", "persisted web refresh token")
     }
 
     private static func requiredWindow(_ label: String, in snapshot: QuotaSnapshot) throws -> QuotaWindow {

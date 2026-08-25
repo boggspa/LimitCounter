@@ -909,6 +909,8 @@ struct ProviderCredentialView: View {
     @State private var detectedCredentials: [CredentialImportService.DetectedCredential] = []
     @State private var showCursorSessionImport = false
     @State private var cursorSessionImported = false
+    @State private var showKimiWebSessionImport = false
+    @State private var kimiWebSessionImported = false
     @State private var showOllamaSessionImport = false
     @State private var ollamaSessionImported = false
     @State private var showMistralSessionImport = false
@@ -939,6 +941,8 @@ struct ProviderCredentialView: View {
 
     private var importSectionTitle: String {
         switch providerID {
+        case .openai:
+            return "Grant Codex Session Access"
         case .kimi:
             return "Import Kimi CLI Folder"
         case .antigravity:
@@ -956,6 +960,8 @@ struct ProviderCredentialView: View {
 
     private var importButtonTitle: String {
         switch providerID {
+        case .openai:
+            return "Select ~/.codex folder..."
         case .grok:
             return "Select Grok folder..."
         case .kimi:
@@ -975,6 +981,8 @@ struct ProviderCredentialView: View {
 
     private var importHelpText: String {
         switch providerID {
+        case .openai:
+            return "Grant access to the full `~/.codex` folder. Limit Counter can then follow `auth.json` token rotation inside that grant without another prompt after a Codex CLI update."
         case .grok:
             return "Grant access to your local `~/.grok` folder so Limit Counter can run the Grok CLI usage screen."
         case .kimi:
@@ -1020,6 +1028,21 @@ struct ProviderCredentialView: View {
                 ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(isEnabled, in: &storedExtraFields)
             }
         )
+    }
+
+    private func webSessionImportButton(
+        _ title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(accent)
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     var body: some View {
@@ -1123,22 +1146,44 @@ struct ProviderCredentialView: View {
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
 
-                            Button {
+                            webSessionImportButton(
+                                "Import Cursor web session...",
+                                systemImage: "cursorarrow.rays"
+                            ) {
                                 showCursorSessionImport = true
-                            } label: {
-                                HStack {
-                                    Image(systemName: "cursorarrow.rays")
-                                    Text("Import Cursor web session...")
-                                    Spacer()
-                                }
                             }
-                            .foregroundStyle(accent)
 
                             if cursorSessionImported {
                                 Label("Web session stored", systemImage: "checkmark.circle.fill")
                                     .font(.caption)
                                     .foregroundStyle(.green)
                             }
+                        }
+                    } else if providerID == .kimi {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Import a kimi.ai web session to add the shared monthly membership-credit meter. Kimi Code API keys and CLI OAuth folders continue to provide the separate 5-hour and weekly meters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            webSessionImportButton(
+                                "Import Kimi web session...",
+                                systemImage: "moon.stars.fill"
+                            ) {
+                                showKimiWebSessionImport = true
+                            }
+
+                            if kimiWebSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+
+                            SecureField(providerID.primaryCredentialLabel, text: $accessToken)
+                                .autocorrectionDisabled()
+                            #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                            #endif
                         }
                     } else if providerID == .ollama {
                         VStack(alignment: .leading, spacing: 8) {
@@ -1147,16 +1192,12 @@ struct ProviderCredentialView: View {
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
 
-                            Button {
+                            webSessionImportButton(
+                                "Import Ollama web session...",
+                                systemImage: "circle.grid.2x2.fill"
+                            ) {
                                 showOllamaSessionImport = true
-                            } label: {
-                                HStack {
-                                    Image(systemName: "circle.grid.2x2.fill")
-                                    Text("Import Ollama web session...")
-                                    Spacer()
-                                }
                             }
-                            .foregroundStyle(accent)
 
                             if ollamaSessionImported {
                                 Label("Web session stored", systemImage: "checkmark.circle.fill")
@@ -1177,16 +1218,12 @@ struct ProviderCredentialView: View {
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
 
-                            Button {
+                            webSessionImportButton(
+                                "Import Mistral web session...",
+                                systemImage: "m.square.fill"
+                            ) {
                                 showMistralSessionImport = true
-                            } label: {
-                                HStack {
-                                    Image(systemName: "m.square.fill")
-                                    Text("Import Mistral web session...")
-                                    Spacer()
-                                }
                             }
-                            .foregroundStyle(accent)
 
                             if mistralSessionImported {
                                 Label("Web session stored", systemImage: "checkmark.circle.fill")
@@ -1246,8 +1283,13 @@ struct ProviderCredentialView: View {
 
                 Section("Advanced") {
                     if providerID == .claude {
-                        Toggle("Recover from Claude Code Keychain", isOn: claudeCodeKeychainFallbackEnabled)
-                        Text("Limit Counter uses its own mirrored OAuth token for live quota meters when available. Leave this off to avoid reading Claude Code's keychain item; enable it only to import or recover the mirror from Claude Code.")
+                        Toggle("Allow recovery on manual refresh", isOn: claudeCodeKeychainFallbackEnabled)
+                        Text("Limit Counter normally reads its own mirrored OAuth token. When enabled, clicking Refresh may read Claude Code's Keychain item if the mirror needs recovery and macOS may ask for permission. Automatic background refreshes never request that access.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .openai {
+                        Text("Grant the full `~/.codex` folder above. The app rereads only `auth.json` inside that persistent sandbox grant, so token rotation and CLI updates do not require another file-level permission prompt.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1336,6 +1378,16 @@ struct ProviderCredentialView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                    } else if providerID == .openrouter {
+                        Text("Paste your OpenRouter API key (`sk-or-v1-...`) above. Limit Counter securely saves it to macOS Keychain and requests `https://openrouter.ai/api/v1/auth/key` to track live spend, balance limits, and rate limits.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        TextField("Custom Endpoint (optional)", text: $customEndpoint)
+                            .autocorrectionDisabled()
+                        #if os(iOS)
+                            .textInputAutocapitalization(.never)
+                        #endif
                     } else {
                         TextField("Custom Endpoint (optional)", text: $customEndpoint)
                             .autocorrectionDisabled()
@@ -1388,6 +1440,18 @@ struct ProviderCredentialView: View {
                 switch result {
                 case .success(let imported):
                     applyImportedCredential(imported)
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                }
+            }
+        }
+        .sheet(isPresented: $showKimiWebSessionImport) {
+            KimiWebSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    kimiWebSessionImported = true
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1662,7 +1726,7 @@ struct ProviderCredentialView: View {
     }
 
     private func importDetectedCredential(_ detected: CredentialImportService.DetectedCredential) {
-        if detected.providerID == .kimi || detected.providerID == .antigravity
+        if detected.providerID == .openai || detected.providerID == .kimi || detected.providerID == .antigravity
             || detected.providerID == .mistral || detected.providerID == .cerebras
             || detected.providerID == .meta {
             // Auto-detection can suggest the path, but only NSOpenPanel can
@@ -1774,6 +1838,8 @@ struct ProviderCredentialView: View {
                 cred.extraFields?["cursorAuthMode"] == "cookie"
                 || (cred.extraFields?["cursorCookieHeader"]?.isEmpty == false)
             )
+            kimiWebSessionImported = providerID == .kimi
+                && cred.extraFields?["kimiWebAccessToken"]?.isEmpty == false
             ollamaSessionImported = providerID == .ollama && (
                 !(cred.accessToken ?? "").isEmpty
                 || (cred.extraFields?["ollamaCookie"]?.isEmpty == false)
@@ -1787,6 +1853,7 @@ struct ProviderCredentialView: View {
             accountIdentifier = ""
             customEndpoint = ""
             cursorSessionImported = false
+            kimiWebSessionImported = false
             ollamaSessionImported = false
             mistralSessionImported = false
             storedExtraFields = [:]
@@ -1836,22 +1903,26 @@ struct ProviderCredentialView: View {
             : (customEndpoint.isEmpty ? nil : customEndpoint)
 
         // For local providers, create a security-scoped bookmark if a path is provided
+        // Use folder-grant: bookmark the directory, not the file
         var extraFields = storedExtraFields
         if billingAnchorSignature != loadedBillingAnchorSignature {
             extraFields[SpendProviderCredentialField.anchorUpdatedAt] = ISO8601DateFormatter().string(from: Date())
         }
-        if let path = resolvedCustomEndpoint,
-           providerID == .gemini || providerID == .claude || providerID == .codexTelemetry
-                || providerID == .chatgpt || providerID == .devin || providerID == .grok
-                || providerID == .antigravity || providerID == .mistral || providerID == .cerebras
-                || providerID == .meta {
+        let isLocalFolderProvider = providerID == .openai || providerID == .codexTelemetry
+            || providerID == .claude || providerID == .chatgpt || providerID == .cursor
+            || providerID == .gemini || providerID == .kimi || providerID == .grok
+            || providerID == .antigravity || providerID == .mistral || providerID == .cerebras
+            || providerID == .meta || providerID == .devin
+        if let path = resolvedCustomEndpoint, isLocalFolderProvider {
             let url = URL(fileURLWithPath: path)
             if url.isFileURL {
                 #if os(macOS)
                 do {
-                    let bookmarkData = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+                    // For folder-grant, use the directory URL
+                    let bookmarkURL = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
+                    let bookmarkData = try bookmarkURL.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
                     extraFields["bookmarkData"] = bookmarkData.base64EncodedString()
-                    print("[SettingsView] Created security-scoped bookmark for \(providerID.rawValue)")
+                    print("[SettingsView] Created security-scoped folder-grant bookmark for \(providerID.rawValue)")
                 } catch {
                     print("[SettingsView] Failed to create bookmark: \(error)")
                 }
@@ -1877,6 +1948,8 @@ struct ProviderCredentialView: View {
             storedExtraFields["cursorAuthMode"] == "cookie"
             || (storedExtraFields["cursorCookieHeader"]?.isEmpty == false)
         )
+        kimiWebSessionImported = providerID == .kimi
+            && storedExtraFields["kimiWebAccessToken"]?.isEmpty == false
         isSaved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { isSaved = false }
     }
@@ -1907,6 +1980,8 @@ struct ProviderCredentialView: View {
             extraFields["cursorAuthMode"] == "cookie"
             || (extraFields["cursorCookieHeader"]?.isEmpty == false)
         )
+        kimiWebSessionImported = providerID == .kimi
+            && extraFields["kimiWebAccessToken"]?.isEmpty == false
         isSaved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { isSaved = false }
     }
@@ -1917,7 +1992,10 @@ struct ProviderCredentialView: View {
             return
         }
 
-        let preservesExistingFields = providerID == .antigravity || providerID == .mistral
+        let isKimiWebSessionImport = providerID == .kimi
+            && credential.extraFields?["kimiWebAccessToken"]?.isEmpty == false
+        let preservesExistingFields = isKimiWebSessionImport
+            || providerID == .antigravity || providerID == .mistral
             || providerID == .deepseek || providerID == .cerebras || providerID == .meta
         accessToken = credential.accessToken ?? (preservesExistingFields ? accessToken : "")
         accountIdentifier = credential.accountIdentifier ?? (preservesExistingFields ? accountIdentifier : "")
@@ -1987,6 +2065,7 @@ struct ProviderCredentialView: View {
         accountIdentifier = ""
         customEndpoint = ""
         cursorSessionImported = false
+        kimiWebSessionImported = false
         storedExtraFields = [:]
         loadedBillingAnchorSignature = ""
     }

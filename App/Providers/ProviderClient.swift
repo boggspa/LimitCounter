@@ -5094,7 +5094,8 @@ enum KimiUsageNormalizer {
              "LEVEL_ALLEGRO", "ALLEGRO":
             return "Allegro"
         case "LEVEL_ULTRA", "ULTRA",
-             "LEVEL_VIVACE", "VIVACE":
+             "LEVEL_VIVACE", "VIVACE",
+             "LEVEL_STANDARD", "STANDARD":
             return "Vivace"
         default:
             return prettyRawName(rawLevel, droppingPrefix: "LEVEL_")

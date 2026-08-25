@@ -30,6 +30,77 @@ private func date(_ value: String) -> Date {
     ISO8601DateFormatter().date(from: value)!
 }
 
+private func testCodexSessionCredentialParserSupportsNestedAndDirectAuth() throws {
+    let nested = CodexSessionCredentialParser.parse([
+        "tokens": [
+            "access_token": "nested-token",
+            "account_id": "nested-account"
+        ]
+    ])
+    try expectEqual(nested?.accessToken, "nested-token", "Codex nested access token")
+    try expectEqual(nested?.accountIdentifier, "nested-account", "Codex nested account")
+
+    let direct = CodexSessionCredentialParser.parse([
+        "access_token": "direct-token",
+        "account_id": "direct-account"
+    ])
+    try expectEqual(direct?.accessToken, "direct-token", "Codex direct access token")
+    try expectEqual(direct?.accountIdentifier, "direct-account", "Codex direct account")
+}
+
+private func testCodexSessionCredentialReaderFollowsDirectoryRotation() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-codex-auth-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try """
+    {"tokens":{"access_token":"rotated-token","account_id":"rotated-account"}}
+    """.write(
+        to: root.appendingPathComponent("auth.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let stored = ProviderCredential(
+        accessToken: "stale-token",
+        accountIdentifier: "stale-account",
+        customEndpoint: root.path,
+        extraFields: ["codexAuthSource": "directory"]
+    )
+    let refreshed = CodexSessionCredentialReader.refreshedCredential(from: stored)
+
+    try expectEqual(refreshed?.accessToken, "rotated-token", "Codex rotated access token")
+    try expectEqual(refreshed?.accountIdentifier, "rotated-account", "Codex rotated account")
+
+    let pasted = ProviderCredential(accessToken: "pasted-token", accountIdentifier: "pasted-account")
+    let pastedRefresh = CodexSessionCredentialReader.refreshedCredential(from: pasted)
+    try expect(
+        pastedRefresh.map { _ in false } ?? true,
+        "pasted Codex credentials should remain independent of local files"
+    )
+}
+
+private func testCodexDirectoryImportStoresPersistentSource() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-codex-import-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try """
+    {"tokens":{"access_token":"import-token","account_id":"import-account"}}
+    """.write(
+        to: root.appendingPathComponent("auth.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let imported = try CredentialImportService.importFromURL(root, for: .openai)
+    try expectEqual(imported.accessToken, "import-token", "Codex directory import token")
+    try expectEqual(imported.accountIdentifier, "import-account", "Codex directory import account")
+    try expectEqual(imported.customEndpoint, root.path, "Codex directory import root")
+    try expectEqual(imported.extraFields?["codexAuthSource"], "directory", "Codex directory source")
+    try expect(imported.bookmarkData != nil, "Codex directory import should retain a security-scoped bookmark")
+}
+
 private func testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets() throws {
     let payload = """
     {
@@ -1482,9 +1553,114 @@ private func testCurrencyFormatting() throws {
     try expectEqual(cnyWindow.leadingValueText, "1.50 CNY", "ISO currency amount headline")
 }
 
+private func testOpenRouterParsesValidKeyResponse() throws {
+    let json = """
+    {
+        "data": {
+            "label": "My API Key",
+            "usage": 123.45,
+            "limit": 1000.00,
+            "is_free_tier": false,
+            "rate_limit": {
+                "requests": 60,
+                "interval": "min"
+            }
+        }
+    }
+    """
+    let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    guard let data = parsed["data"] as? [String: Any] else {
+        throw AdditionalProviderTestError.failure("Missing data field")
+    }
+    try expectEqual(data["label"] as? String, "My API Key", "OpenRouter label")
+    try expectClose(data["usage"] as? Double ?? 0, 123.45, "OpenRouter usage")
+    try expectClose(data["limit"] as? Double ?? 0, 1000.00, "OpenRouter limit")
+    try expectEqual(data["is_free_tier"] as? Bool, false, "OpenRouter is not free tier")
+    if let rateLimit = data["rate_limit"] as? [String: Any] {
+        try expectEqual(rateLimit["requests"] as? Int, 60, "OpenRouter rate limit requests")
+        try expectEqual(rateLimit["interval"] as? String, "min", "OpenRouter rate limit interval")
+    } else {
+        throw AdditionalProviderTestError.failure("Missing rate_limit")
+    }
+}
+
+private func testOpenRouterParsesUnlimitedKey() throws {
+    let json = """
+    {
+        "data": {
+            "label": "Unlimited Key",
+            "usage": 500.00,
+            "limit": null,
+            "is_free_tier": false,
+            "rate_limit": null
+        }
+    }
+    """
+    let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    guard let data = parsed["data"] as? [String: Any?] else {
+        throw AdditionalProviderTestError.failure("Missing data field")
+    }
+    try expectClose(data["usage"] as? Double ?? 0, 500.00, "OpenRouter unlimited usage")
+    try expect(data["limit"] is NSNull || (data["limit"] as? Double) == nil, "OpenRouter unlimited key has null limit")
+}
+
+private func testOpenRouterParsesFreeTier() throws {
+    let json = """
+    {
+        "data": {
+            "label": "Free Tier Key",
+            "usage": 5.50,
+            "limit": 20.00,
+            "is_free_tier": true,
+            "rate_limit": {
+                "requests": 20,
+                "interval": "min"
+            }
+        }
+    }
+    """
+    let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    guard let data = parsed["data"] as? [String: Any] else {
+        throw AdditionalProviderTestError.failure("Missing data field")
+    }
+    try expectEqual(data["is_free_tier"] as? Bool, true, "OpenRouter free tier flag")
+}
+
+private func testOpenRouterParsesRateLimit() throws {
+    let json = """
+    {
+        "data": {
+            "label": "Test Key",
+            "usage": 10.00,
+            "limit": 100.00,
+            "is_free_tier": false,
+            "rate_limit": {
+                "requests": 120,
+                "interval": "hour"
+            }
+        }
+    }
+    """
+    let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    guard let data = parsed["data"] as? [String: Any] else {
+        throw AdditionalProviderTestError.failure("Missing data field")
+    }
+    if let rateLimit = data["rate_limit"] as? [String: Any] {
+        try expectEqual(rateLimit["requests"] as? Int, 120, "OpenRouter rate limit requests")
+        try expectEqual(rateLimit["interval"] as? String, "hour", "OpenRouter rate limit interval")
+    } else {
+        throw AdditionalProviderTestError.failure("Missing rate_limit")
+    }
+}
+
+
+
 @main
 private enum AdditionalProviderUsageTestRunner {
     static func main() throws {
+        try testCodexSessionCredentialParserSupportsNestedAndDirectAuth()
+        try testCodexSessionCredentialReaderFollowsDirectoryRotation()
+        try testCodexDirectoryImportStoresPersistentSource()
         try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
         try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
@@ -1522,6 +1698,10 @@ private enum AdditionalProviderUsageTestRunner {
         try testTaskWraithMusePricingUsesMuseCostEstimator()
         try testCerebrasCSVHandlesQuotedNumbersAndCurrency()
         try testCurrencyFormatting()
+        try testOpenRouterParsesValidKeyResponse()
+        try testOpenRouterParsesUnlimitedKey()
+        try testOpenRouterParsesFreeTier()
+        try testOpenRouterParsesRateLimit()
         print("Additional provider usage tests passed")
     }
 }

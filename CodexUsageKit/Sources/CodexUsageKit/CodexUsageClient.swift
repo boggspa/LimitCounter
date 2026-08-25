@@ -83,18 +83,33 @@ public struct CodexUsageClient: Sendable {
             guard let rateLimit = additionalLimit.rateLimit else { continue }
             let name = additionalLimit.displayName
 
-            if isCodexSparkLimit(name), let weekly = weeklyWindow(in: rateLimit) {
+            guard isCodexSparkLimit(name) else { continue }
+
+             // Surface the 5-hour "Extra limits" window above the weekly meter so
+             // the short rolling allowance is visible first.
+            if let fiveHour = fiveHourWindow(in: rateLimit) {
+                additionalWindows.append(
+                    quotaWindow(
+                        from: fiveHour,
+                        label: "\(name) 5H",
+                        windowKind: .session,
+                        subtitle: "5-hour rolling window"
+                      )
+                  )
+              }
+
+            if let weekly = weeklyWindow(in: rateLimit) {
                 additionalWindows.append(
                     quotaWindow(
                         from: weekly,
                         label: "\(name) Weekly",
                         windowKind: .weekly,
                         subtitle: "7-day usage limit"
-                    )
-                )
-            }
+                      )
+                  )
+              }
 
-        }
+          }
 
         if let balance = payload.credits?.balance {
             balances.append(
@@ -151,10 +166,19 @@ public struct CodexUsageClient: Sendable {
     }
 
     private func weeklyWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
-        [rateLimit.primaryWindow, rateLimit.secondaryWindow]
-            .compactMap { $0 }
-            .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
-    }
+          [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+              .compactMap { $0 }
+              .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
+      }
+
+     /// The short rolling "Extra limits" window (the 5-hour allowance) for a
+     /// Codex Spark additional limit. Picks the non-weekly window so it can be
+     /// surfaced above the weekly meter.
+    private func fiveHourWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
+          [rateLimit.primaryWindow, rateLimit.secondaryWindow]
+              .compactMap { $0 }
+              .first { $0.limitWindowSeconds < 6 * 24 * 60 * 60 }
+      }
 
     private func chatGPTPlanName(from planType: String?) -> String {
         guard let planType = planType?.trimmingCharacters(in: .whitespacesAndNewlines),

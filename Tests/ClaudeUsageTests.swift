@@ -387,6 +387,19 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     var extraFields = [ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey: "true"]
     ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(false, in: &extraFields)
     try expectEqual(extraFields[ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey], nil, "disabled Claude Code keychain fallback flag should not be persisted")
+
+    try expect(
+        !ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: true, userInitiated: false),
+        "background refresh must never read Claude Code's keychain item"
+    )
+    try expect(
+        !ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: false, userInitiated: true),
+        "manual refresh must still respect the opt-in setting"
+    )
+    try expect(
+        ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: true, userInitiated: true),
+        "an opted-in manual refresh may recover from Claude Code's keychain item"
+    )
 }
 
 private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {
