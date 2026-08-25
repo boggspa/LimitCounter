@@ -40,6 +40,17 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         self != .codexTelemetry && self != .heatmap
     }
 
+    /// Every dashboard surface the user can drag to reorder.
+    ///
+    /// Deliberately wider than `isUserFacingInProviderLists`: the
+    /// activity heatmap is not a provider in the settings/visibility
+    /// lists, but it *is* a dashboard card that takes part in the
+    /// drag-to-reorder order. Codex telemetry never renders its own
+    /// card (it folds into the Codex card), so it stays out.
+    public nonisolated var isOrderableDashboardCard: Bool {
+        self != .codexTelemetry
+    }
+
     public var displayName: String {
         switch self {
         case .claude:   return "Claude"

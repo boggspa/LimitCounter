@@ -510,19 +510,32 @@ public final class ProviderCardOrderStore: ObservableObject {
 
     private let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
     private let orderedProvidersKey = "dashboardCardProviderOrder"
+    private let defaultsOverride: UserDefaults?
 
     @Published private var orderedProviderIDs: [ProviderID]
 
     private var defaults: UserDefaults {
-        UserDefaults(suiteName: appGroupID) ?? .standard
+        if let defaultsOverride { return defaultsOverride }
+        return UserDefaults(suiteName: appGroupID) ?? .standard
     }
 
-    private init() {
-        let stored = (UserDefaults(suiteName: appGroupID) ?? .standard)
-            .array(forKey: orderedProvidersKey) as? [String] ?? []
+    public convenience init(defaults: UserDefaults) {
+        self.init(defaultsProvider: defaults)
+    }
+
+    private init(defaultsProvider: UserDefaults? = nil) {
+        self.defaultsOverride = defaultsProvider
+        let resolvedDefaults = defaultsProvider ?? (UserDefaults(suiteName: appGroupID) ?? .standard)
+        let stored = resolvedDefaults.array(forKey: orderedProvidersKey) as? [String] ?? []
         self.orderedProviderIDs = Self.normalizedOrder(
             from: stored.compactMap(ProviderID.init(rawValue:))
         )
+    }
+
+    /// The full, normalized card order — every orderable dashboard
+    /// card, newest providers included, in the order the user sees.
+    public var orderedCards: [ProviderID] {
+        orderedProviderIDs
     }
 
     public func rank(for providerID: ProviderID) -> Int {
@@ -543,20 +556,31 @@ public final class ProviderCardOrderStore: ObservableObject {
         return currentOrder.firstIndex(of: providerID) ?? Int.max
     }
 
-    public func move(_ providerID: ProviderID, before targetProviderID: ProviderID) {
+    /// Moves `providerID` next to `targetProviderID`, picking the side
+    /// that matches the drag direction: a card dragged downwards lands
+    /// *after* the card it was dropped on, a card dragged upwards lands
+    /// *before* it.
+    ///
+    /// Insert-before-only reordering could never place a card in the
+    /// final slot, so the bottom of the dashboard behaved like a wall.
+    public func move(_ providerID: ProviderID, toward targetProviderID: ProviderID) {
         guard providerID != targetProviderID else { return }
 
         var updatedOrder = Self.normalizedOrder(from: orderedProviderIDs)
         guard
             let sourceIndex = updatedOrder.firstIndex(of: providerID),
-            updatedOrder.contains(targetProviderID)
+            let targetIndex = updatedOrder.firstIndex(of: targetProviderID)
         else {
             return
         }
 
+        let isMovingDown = sourceIndex < targetIndex
         updatedOrder.remove(at: sourceIndex)
-        let targetIndex = updatedOrder.firstIndex(of: targetProviderID) ?? updatedOrder.endIndex
-        updatedOrder.insert(providerID, at: targetIndex)
+        guard let landingIndex = updatedOrder.firstIndex(of: targetProviderID) else { return }
+        let insertionIndex = isMovingDown ? updatedOrder.index(after: landingIndex) : landingIndex
+        updatedOrder.insert(providerID, at: insertionIndex)
+
+        guard updatedOrder != orderedProviderIDs else { return }
         orderedProviderIDs = updatedOrder
         save()
     }
@@ -572,16 +596,17 @@ public final class ProviderCardOrderStore: ObservableObject {
         defaults.set(orderedProviderIDs.map(\.rawValue), forKey: orderedProvidersKey)
     }
 
-    private nonisolated static func normalizedOrder(from providerIDs: [ProviderID]) -> [ProviderID] {
+    /// Produces the canonical order: the user's saved order first, then
+    /// the curated defaults, then — as a safety net — any remaining
+    /// orderable case. That last pass is what keeps a newly added
+    /// provider from silently dropping to rank `Int.max`, which is how
+    /// the OpenRouter/Qwen/MiMo/heatmap cards ended up pinned to the
+    /// bottom of the dashboard and immovable.
+    internal nonisolated static func normalizedOrder(from providerIDs: [ProviderID]) -> [ProviderID] {
         var ordered: [ProviderID] = []
 
-        for providerID in providerIDs where providerID.isUserFacingInProviderLists {
-            if !ordered.contains(providerID) {
-                ordered.append(providerID)
-            }
-        }
-
-        for providerID in defaultOrder where !ordered.contains(providerID) {
+        for providerID in providerIDs + defaultOrder + ProviderID.allCases
+        where providerID.isOrderableDashboardCard && !ordered.contains(providerID) {
             ordered.append(providerID)
         }
 
@@ -603,7 +628,13 @@ public final class ProviderCardOrderStore: ObservableObject {
         .deepseek,
         .cerebras,
         .meta,
-        .ollama
+        .ollama,
+        .openrouter,
+        .qwen,
+        .mimo,
+        // The activity heatmap is a footer-style card by default, but
+        // it is draggable like any other card.
+        .heatmap
     ]
 }
 

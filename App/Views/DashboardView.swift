@@ -891,15 +891,44 @@ struct DashboardView: View {
                 emptyDashboardState
             }
         } else {
+            let showsHeatmap = visibilityStore.isVisible(.heatmap)
+            let heatmapLeads = showsHeatmap && heatmapSortsAboveCompactStack(snapshots)
+
+            if heatmapLeads {
+                compactHeatmapCard
+            }
+
             CompactDashboardCardView(
                 snapshots: snapshots,
-                sevenDayResetCounts: appState.sevenDayResetCounts
+                sevenDayResetCounts: appState.sevenDayResetCounts,
+                reorderableProviderIDs: reorderableProviderIDs,
+                draggedProviderID: $draggedProviderID,
+                orderStore: orderStore
             )
 
-            if visibilityStore.isVisible(.heatmap) {
-                LLMActivityHeatmapView(snapshots: appState.snapshots)
+            if showsHeatmap && !heatmapLeads {
+                compactHeatmapCard
             }
         }
+    }
+
+    private var compactHeatmapCard: some View {
+        LLMActivityHeatmapView(snapshots: appState.snapshots)
+            .dashboardReorderable(
+                providerID: .heatmap,
+                reorderableProviderIDs: reorderableProviderIDs,
+                draggedProviderID: $draggedProviderID,
+                orderStore: orderStore
+            )
+    }
+
+    /// Compact mode folds every provider into a single card, so the
+    /// heatmap can only sit above or below that stack. It leads when the
+    /// user has dragged it above the first visible provider in the
+    /// standard layout.
+    private func heatmapSortsAboveCompactStack(_ snapshots: [QuotaSnapshot]) -> Bool {
+        guard let first = snapshots.first else { return false }
+        return orderStore.rank(for: .heatmap) < orderStore.rank(for: first.providerID)
     }
 
     /// Returns visible snapshots in the same order the standard layout
@@ -930,19 +959,22 @@ struct DashboardView: View {
             }
         }
         .buttonStyle(.plain)
-        .onDrag {
-            draggedProviderID = item.orderProviderID
-            return NSItemProvider(object: item.orderProviderID.rawValue as NSString)
-        }
-        .onDrop(
-            of: [UTType.text],
-            delegate: DashboardCardDropDelegate(
-                target: item,
-                orderedItems: dashboardCards,
-                draggedProviderID: $draggedProviderID,
-                orderStore: orderStore
-            )
+        .dashboardReorderable(
+            providerID: item.orderProviderID,
+            reorderableProviderIDs: reorderableProviderIDs,
+            draggedProviderID: $draggedProviderID,
+            orderStore: orderStore
         )
+    }
+
+    /// Every card currently on screen, so a drop only reorders cards
+    /// that belong to the same visible stack.
+    private var reorderableProviderIDs: Set<ProviderID> {
+        var ids = Set(visibleSnapshots.map { $0.providerID == .codexTelemetry ? .openai : $0.providerID })
+        if visibilityStore.isVisible(.heatmap) {
+            ids.insert(.heatmap)
+        }
+        return ids
     }
 
     private var emptyDashboardState: some View {
@@ -1539,21 +1571,23 @@ private enum DashboardRoute: Hashable {
 }
 
 private struct DashboardCardDropDelegate: DropDelegate {
-    let target: DashboardCardItem
-    let orderedItems: [DashboardCardItem]
+    let targetProviderID: ProviderID
+    let reorderableProviderIDs: Set<ProviderID>
     @Binding var draggedProviderID: ProviderID?
     let orderStore: ProviderCardOrderStore
 
     func dropEntered(info: DropInfo) {
         guard
             let draggedProviderID,
-            draggedProviderID != target.orderProviderID,
-            orderedItems.contains(where: { $0.orderProviderID == draggedProviderID })
+            draggedProviderID != targetProviderID,
+            reorderableProviderIDs.contains(draggedProviderID)
         else {
             return
         }
 
-        orderStore.move(draggedProviderID, before: target.orderProviderID)
+        withAnimation(.easeInOut(duration: 0.18)) {
+            orderStore.move(draggedProviderID, toward: targetProviderID)
+        }
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -1563,6 +1597,52 @@ private struct DashboardCardDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         draggedProviderID = nil
         return true
+    }
+}
+
+/// Shared drag-to-reorder plumbing for every dashboard surface — the
+/// standard card stack, the compact stacked-meters rows, and the
+/// activity heatmap card.
+private struct DashboardReorderModifier: ViewModifier {
+    let providerID: ProviderID
+    let reorderableProviderIDs: Set<ProviderID>
+    @Binding var draggedProviderID: ProviderID?
+    let orderStore: ProviderCardOrderStore
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(draggedProviderID == providerID ? 0.5 : 1)
+            .onDrag {
+                draggedProviderID = providerID
+                return NSItemProvider(object: providerID.rawValue as NSString)
+            }
+            .onDrop(
+                of: [UTType.text],
+                delegate: DashboardCardDropDelegate(
+                    targetProviderID: providerID,
+                    reorderableProviderIDs: reorderableProviderIDs,
+                    draggedProviderID: $draggedProviderID,
+                    orderStore: orderStore
+                )
+            )
+    }
+}
+
+extension View {
+    fileprivate func dashboardReorderable(
+        providerID: ProviderID,
+        reorderableProviderIDs: Set<ProviderID>,
+        draggedProviderID: Binding<ProviderID?>,
+        orderStore: ProviderCardOrderStore
+    ) -> some View {
+        modifier(
+            DashboardReorderModifier(
+                providerID: providerID,
+                reorderableProviderIDs: reorderableProviderIDs,
+                draggedProviderID: draggedProviderID,
+                orderStore: orderStore
+            )
+        )
     }
 }
 
@@ -1646,11 +1726,21 @@ extension SettingsWindowManager: NSWindowDelegate {
 struct CompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
     let sevenDayResetCounts: [ProviderID: Int]
+    let reorderableProviderIDs: Set<ProviderID>
+    @Binding var draggedProviderID: ProviderID?
+    let orderStore: ProviderCardOrderStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             ForEach(snapshots) { snapshot in
                 providerBlock(snapshot)
+                    .contentShape(Rectangle())
+                    .dashboardReorderable(
+                        providerID: snapshot.providerID,
+                        reorderableProviderIDs: reorderableProviderIDs,
+                        draggedProviderID: $draggedProviderID,
+                        orderStore: orderStore
+                    )
                 if snapshot.id != snapshots.last?.id {
                     Divider().overlay(Color.white.opacity(0.08))
                 }
