@@ -188,9 +188,9 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .openrouter:
             return "ProviderOpenRouterLogo"
         case .qwen:
-            return ""
+            return "ProviderQwenLogo"
         case .mimo:
-            return ""
+            return "ProviderMiMoLogo"
         case .heatmap:
             return ""
         }

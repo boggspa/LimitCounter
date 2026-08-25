@@ -67,6 +67,7 @@ public struct ProviderBrandIconView: View {
 
     private var usesLeadingBrandMark: Bool {
         providerID == .deepseek || providerID == .cerebras || providerID == .meta
+            || providerID == .qwen || providerID == .mimo
     }
 
     private var leadingBrandMarkHeight: CGFloat {
@@ -79,6 +80,10 @@ public struct ProviderBrandIconView: View {
             return 1_024 / 217
         case .meta:
             return 1_024 / 237 // Official Meta wordmark (infinity loop + "Meta"), 1024×237 RGBA
+        case .qwen:
+            return 1_024 / 235 // Official Qwen wordmark, 1024×235 RGBA
+        case .mimo:
+            return 1_024 / 131 // Official Xiaomi MiMo wordmark, 1024×131 RGBA
         default:
             return 2_403 / 1_058
         }
