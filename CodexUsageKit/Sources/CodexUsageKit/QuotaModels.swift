@@ -3,6 +3,8 @@ import Foundation
 public enum QuotaProviderID: String, Codable, Hashable, Sendable {
     case codex
     case codexTelemetry
+    case qwen
+    case xiaomiMimo
 }
 
 public enum QuotaWindowKind: String, Codable, Hashable, Sendable {

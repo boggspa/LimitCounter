@@ -1199,6 +1199,402 @@ private enum CerebrasWebSessionImportError: LocalizedError {
         switch self {
         case .noCookiesFound:
             return "No Cerebras session cookies were found. Make sure you signed in to cloud.cerebras.ai in the embedded browser first."
-         }
-     }
+          }
+      }
+}
+
+// MARK: - Qwen Token Plan Web Session Import View
+
+struct QwenWebSessionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model = QwenWebSessionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    private let startURL = URL(string: "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan&productCode=p_efm#/efm/subscription/token-plan/personal")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                  .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            footer
+          }
+          .frame(minWidth: 760, minHeight: 720)
+          .onAppear {
+            model.load(startURL: startURL)
+          }
+          .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+          } message: {
+            Text(importError ?? "No Qwen session cookies were found in the embedded browser.")
+          }
+      }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProviderBrandIconView(providerID: .qwen, size: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Qwen token plan web session")
+                          .font(.headline.weight(.semibold))
+
+                    Text("Sign in inside the embedded browser, then import the active Alibaba Cloud Model Studio session into Keychain.")
+                          .font(.subheadline)
+                          .foregroundStyle(.secondary)
+                  }
+
+                Spacer()
+              }
+              .padding(.horizontal, 20)
+              .padding(.top, 18)
+
+            Text("We only capture cookies from this embedded Qwen session. The session is saved to macOS Keychain to read your token plan 7-day quota meter from the Model Studio console.")
+                  .font(.footnote)
+                  .foregroundStyle(.secondary)
+                  .padding(.horizontal, 20)
+          }
+          .padding(.bottom, 14)
+      }
+
+    private var footer: some View {
+        HStack {
+            Text("After signing in, click Import Session to securely save the session cookie in Keychain.")
+                  .font(.footnote)
+                  .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+              }
+              .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    await importCurrentSession()
+                  }
+              } label: {
+                if isImporting {
+                    ProgressView()
+                          .progressViewStyle(.circular)
+                  } else {
+                    Text("Import Session")
+                  }
+              }
+              .buttonStyle(.borderedProminent)
+              .tint(Color(hex: ProviderID.qwen.accentColorHex))
+              .disabled(isImporting)
+          }
+          .padding(20)
+      }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let cookieHeader = try await model.captureCookieHeader()
+            let imported = CredentialImportService.ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: nil,
+                extraFields: [
+                      "qwenCookieHeader": cookieHeader
+                  ],
+                bookmarkData: nil
+              )
+            onImport(.success(imported))
+            dismiss()
+          } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+          }
+      }
+}
+
+@MainActor
+final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+      }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        webView.load(URLRequest(url: startURL))
+      }
+
+    func captureCookieHeader() async throws -> String {
+        let cookies = try await webView.allCookies()
+        let relevantCookies = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "alibabacloud.com" || domain.hasSuffix(".alibabacloud.com")
+                  || domain == "aliyun.com" || domain.hasSuffix(".aliyun.com")
+          }
+
+        guard !relevantCookies.isEmpty else {
+            throw QwenWebSessionImportError.noCookiesFound
+          }
+
+        let header = relevantCookies
+              .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+              .map { "\($0.name)=\($0.value)" }
+              .joined(separator: "; ")
+
+        guard !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw QwenWebSessionImportError.noCookiesFound
+          }
+
+        return header
+      }
+
+    func webView(
+          _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+      ) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+          }
+        return nil
+      }
+
+    static func clearStoredWebsiteData() {
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let qwenRecords = records.filter { record in
+                let name = record.displayName.lowercased()
+                return name == "alibabacloud.com" || name.hasSuffix(".alibabacloud.com")
+                      || name == "aliyun.com" || name.hasSuffix(".aliyun.com")
+              }
+            guard !qwenRecords.isEmpty else { return }
+            store.removeData(ofTypes: dataTypes, for: qwenRecords) {}
+          }
+      }
+}
+
+private enum QwenWebSessionImportError: LocalizedError {
+    case noCookiesFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noCookiesFound:
+            return "No Qwen session cookies were found. Make sure you signed in to the Model Studio console in the embedded browser first."
+          }
+      }
+}
+
+// MARK: - Xiaomi MiMo Web Session Import View
+
+struct MimoWebSessionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model = MimoWebSessionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    private let startURL = URL(string: "https://platform.xiaomimimo.com/console/plan-manage")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                  .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            footer
+          }
+          .frame(minWidth: 760, minHeight: 720)
+          .onAppear {
+            model.load(startURL: startURL)
+          }
+          .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+          } message: {
+            Text(importError ?? "No MiMo session cookies were found in the embedded browser.")
+          }
+      }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProviderBrandIconView(providerID: .mimo, size: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Xiaomi MiMo web session")
+                          .font(.headline.weight(.semibold))
+
+                    Text("Sign in inside the embedded browser, then import the active platform.xiaomimimo.com session into Keychain.")
+                          .font(.subheadline)
+                          .foregroundStyle(.secondary)
+                  }
+
+                Spacer()
+              }
+              .padding(.horizontal, 20)
+              .padding(.top, 18)
+
+            Text("We only capture cookies from this embedded MiMo session. The session is saved to macOS Keychain to read your plan quota meter from the Xiaomi MiMo console.")
+                  .font(.footnote)
+                  .foregroundStyle(.secondary)
+                  .padding(.horizontal, 20)
+          }
+          .padding(.bottom, 14)
+      }
+
+    private var footer: some View {
+        HStack {
+            Text("After signing in, click Import Session to securely save the session cookie in Keychain.")
+                  .font(.footnote)
+                  .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+              }
+              .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    await importCurrentSession()
+                  }
+              } label: {
+                if isImporting {
+                    ProgressView()
+                          .progressViewStyle(.circular)
+                  } else {
+                    Text("Import Session")
+                  }
+              }
+              .buttonStyle(.borderedProminent)
+              .tint(Color(hex: ProviderID.mimo.accentColorHex))
+              .disabled(isImporting)
+          }
+          .padding(20)
+      }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let cookieHeader = try await model.captureCookieHeader()
+            let imported = CredentialImportService.ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: nil,
+                extraFields: [
+                      "mimoCookieHeader": cookieHeader
+                  ],
+                bookmarkData: nil
+              )
+            onImport(.success(imported))
+            dismiss()
+          } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+          }
+      }
+}
+
+@MainActor
+final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+      }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        webView.load(URLRequest(url: startURL))
+      }
+
+    func captureCookieHeader() async throws -> String {
+        let cookies = try await webView.allCookies()
+        let relevantCookies = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "xiaomimimo.com" || domain.hasSuffix(".xiaomimimo.com")
+          }
+
+        guard !relevantCookies.isEmpty else {
+            throw MimoWebSessionImportError.noCookiesFound
+          }
+
+        let header = relevantCookies
+              .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+              .map { "\($0.name)=\($0.value)" }
+              .joined(separator: "; ")
+
+        guard !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MimoWebSessionImportError.noCookiesFound
+          }
+
+        return header
+      }
+
+    func webView(
+          _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+      ) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+          }
+        return nil
+      }
+
+    static func clearStoredWebsiteData() {
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let mimoRecords = records.filter { record in
+                let name = record.displayName.lowercased()
+                return name == "xiaomimimo.com" || name.hasSuffix(".xiaomimimo.com")
+              }
+            guard !mimoRecords.isEmpty else { return }
+            store.removeData(ofTypes: dataTypes, for: mimoRecords) {}
+          }
+      }
+}
+
+private enum MimoWebSessionImportError: LocalizedError {
+    case noCookiesFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noCookiesFound:
+            return "No MiMo session cookies were found. Make sure you signed in to platform.xiaomimimo.com in the embedded browser first."
+          }
+      }
 }

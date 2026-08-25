@@ -117,6 +117,8 @@ final class AppStateStore: ObservableObject {
         coordinator.register(MetaProviderClient())
         coordinator.register(OllamaProviderClient())
         coordinator.register(OpenRouterProviderClient())
+        coordinator.register(QwenProviderClient())
+        coordinator.register(MimoProviderClient())
         #endif
 
         self.syncCoordinator = coordinator

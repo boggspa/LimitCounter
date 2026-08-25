@@ -3371,7 +3371,7 @@ public enum CredentialImportService {
                 throw ImportError.missingRequiredField("api_key")
             }
             return ImportedCredential(accessToken: token, accountIdentifier: nil)
-        case .grok, .antigravity, .cerebras, .meta, .ollama, .openrouter, .heatmap:
+        case .grok, .antigravity, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .heatmap:
             throw ImportError.unsupportedProvider
         }
     }
@@ -3758,7 +3758,7 @@ public extension CredentialImportService {
                 panel.directoryURL = home
             case .cerebras:
                 panel.directoryURL = home.appendingPathComponent("Downloads")
-            case .ollama, .openrouter, .heatmap:
+            case .ollama, .openrouter, .qwen, .mimo, .heatmap:
                 break
             }
 

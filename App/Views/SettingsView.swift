@@ -919,6 +919,10 @@ struct ProviderCredentialView: View {
     @State private var metaWebSessionImported = false
     @State private var showCerebrasWebSessionImport = false
     @State private var cerebrasWebSessionImported = false
+    @State private var showQwenWebSessionImport = false
+    @State private var qwenWebSessionImported = false
+    @State private var showMimoWebSessionImport = false
+    @State private var mimoWebSessionImported = false
     @State private var storedExtraFields: [String: String] = [:]
     @State private var codexTelemetryEndpoint = ""
     @State private var codexTelemetryHasCredential = false
@@ -1293,7 +1297,59 @@ struct ProviderCredentialView: View {
                                  .textInputAutocapitalization(.never)
                              #endif
                          }
-                     } else if providerID == .claude {
+                      } else if providerID == .qwen {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into Alibaba Cloud Model Studio in the embedded browser to automatically track your Qwen token plan 7-day quota, or enter a manual weekly-percent anchor below:")
+                                  .font(.caption)
+                                  .foregroundStyle(.secondary)
+                                  .fixedSize(horizontal: false, vertical: true)
+
+                            webSessionImportButton(
+                                  "Import Qwen web session...",
+                                systemImage: "q.circle.fill"
+                              ) {
+                                showQwenWebSessionImport = true
+                              }
+
+                            if qwenWebSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                      .font(.caption)
+                                      .foregroundStyle(.green)
+                              }
+
+                            TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
+                                  .autocorrectionDisabled()
+                              #if os(iOS)
+                                  .textInputAutocapitalization(.never)
+                              #endif
+                          }
+                      } else if providerID == .mimo {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into the Xiaomi MiMo console in the embedded browser to automatically track your plan quota meter, or enter a manual weekly-percent anchor below:")
+                                  .font(.caption)
+                                  .foregroundStyle(.secondary)
+                                  .fixedSize(horizontal: false, vertical: true)
+
+                            webSessionImportButton(
+                                  "Import MiMo web session...",
+                                systemImage: "m.circle.fill"
+                              ) {
+                                showMimoWebSessionImport = true
+                              }
+
+                            if mimoWebSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                      .font(.caption)
+                                      .foregroundStyle(.green)
+                              }
+
+                            TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
+                                  .autocorrectionDisabled()
+                              #if os(iOS)
+                                  .textInputAutocapitalization(.never)
+                              #endif
+                          }
+                      } else if providerID == .claude {
                         TextField(providerID.primaryCredentialLabel, text: $accessToken)
                              .autocorrectionDisabled()
                          #if os(iOS)
@@ -1333,9 +1389,9 @@ struct ProviderCredentialView: View {
                 .listRowBackground(Color.white.opacity(0.04))
 
                 if providerID == .mistral || providerID == .deepseek || providerID == .cerebras
-                    || providerID == .meta {
+                     || providerID == .meta || providerID == .qwen || providerID == .mimo {
                     billingAnchorSection
-                }
+                 }
 
                 Section("Advanced") {
                     if providerID == .claude {
@@ -1550,7 +1606,7 @@ struct ProviderCredentialView: View {
                  }
              }
          }
-         .sheet(isPresented: $showCerebrasWebSessionImport) {
+          .sheet(isPresented: $showCerebrasWebSessionImport) {
             CerebrasWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
@@ -1559,9 +1615,33 @@ struct ProviderCredentialView: View {
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
-                 }
-             }
-         }
+                  }
+              }
+          }
+          .sheet(isPresented: $showQwenWebSessionImport) {
+            QwenWebSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    qwenWebSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                  }
+              }
+          }
+          .sheet(isPresented: $showMimoWebSessionImport) {
+            MimoWebSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    mimoWebSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                  }
+              }
+          }
          .alert("Import Failed", isPresented: $showImportError) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -1615,10 +1695,6 @@ struct ProviderCredentialView: View {
                     text: extraFieldBinding(SpendProviderCredentialField.manualCurrentBalance)
                 )
                 TextField(
-                    "Payment threshold (optional)",
-                    text: extraFieldBinding(SpendProviderCredentialField.manualPaymentThreshold)
-                )
-                TextField(
                     "Currency (USD, GBP, EUR)",
                     text: extraFieldBinding(SpendProviderCredentialField.manualCurrency, defaultValue: "USD")
                 )
@@ -1630,20 +1706,37 @@ struct ProviderCredentialView: View {
                     "Plan name (optional)",
                     text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
                 )
-                Text("Console spend is optional. If unset, Limit Counter uses threshold−remaining when both are set, otherwise Muse-only from £0/$0. GBP/EUR remaining auto-decrements using Muse USD×FX. Enter the console Spend reading for best Mistral-style parity. Payment threshold is the £15 / $15 auto-pay ceiling; preload minus remaining is credit used.")
+                Text("Console spend is optional. If unset, Limit Counter uses threshold−remaining when both are set, otherwise Muse-only from £0/$0. GBP/EUR remaining auto-decrements using Muse USD×FX. Enter the console Spend reading for best Mistral-style parity. Preload minus remaining is credit used.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if providerID == .deepseek {
+             } else if providerID == .deepseek {
                 TextField(
                     "Total topped up",
                     text: extraFieldBinding(SpendProviderCredentialField.manualTopUpTotal)
-                )
+                 )
                 Text("Limit Counter subtracts the official live remaining balance from this cumulative top-up total to derive the credit-used meter. Update it whenever you add more credit.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else {
+             } else if providerID == .qwen || providerID == .mimo {
+                TextField(
+                    "Weekly quota used (%)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualWeeklyUsedPercent)
+                 )
+                TextField(
+                    "Plan reset (ISO date, optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualResetAt)
+                 )
+                TextField(
+                    "Plan name (optional)",
+                    text: extraFieldBinding(SpendProviderCredentialField.manualPlanName)
+                 )
+                Text("Import the web session above for automatic tracking. Otherwise enter the dashboard's \"% Used\" reading as a manual anchor and update it after each check.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+             } else {
                 TextField(
                     "Current balance",
                     text: extraFieldBinding(SpendProviderCredentialField.manualCurrentBalance)
@@ -1701,7 +1794,13 @@ struct ProviderCredentialView: View {
                 storedExtraFields[SpendProviderCredentialField.manualSpent] ?? "",
                 storedExtraFields[SpendProviderCredentialField.manualCurrency] ?? "",
                 storedExtraFields[SpendProviderCredentialField.manualResetAt] ?? ""
-            ].joined(separator: "|")
+             ].joined(separator: "|")
+        case .qwen, .mimo:
+            return [
+                storedExtraFields[SpendProviderCredentialField.manualWeeklyUsedPercent] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualResetAt] ?? "",
+                storedExtraFields[SpendProviderCredentialField.manualPlanName] ?? ""
+             ].joined(separator: "|")
         default:
             return ""
         }

@@ -26,6 +26,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case meta
     case ollama
     case openrouter
+    case qwen
+    case mimo
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -60,6 +62,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .meta:     return "Meta API"
         case .ollama:   return "Ollama"
         case .openrouter: return "OpenRouter"
+        case .qwen:     return "Qwen Token Plan"
+        case .mimo:     return "MiMo Token Plan"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -75,7 +79,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Codex Telemetry"
         case .claude, .devin, .cursor, .gemini, .kimi, .grok,
-             .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .heatmap:
+                .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .heatmap:
             return displayName
         }
     }
@@ -102,6 +106,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .meta:     return "infinity"
         case .ollama:   return "circle.grid.2x2.fill"
         case .openrouter: return "arrow.left.arrow.right.circle.fill"
+        case .qwen:     return "q.circle.fill"
+        case .mimo:     return "m.circle.fill"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -128,6 +134,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .meta:     return "#0082FB" // Meta Blue
         case .ollama:   return "#F3F4F6" // Ollama White/Silver
         case .openrouter: return "#8B5CF6" // OpenRouter Purple
+        case .qwen:     return "#615CED" // Qwen Purple
+        case .mimo:     return "#FF6900" // Xiaomi Orange
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -168,6 +176,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderOllamaLogo"
         case .openrouter:
             return "ProviderOpenRouterLogo"
+        case .qwen:
+            return ""
+        case .mimo:
+            return ""
         case .heatmap:
             return ""
         }
@@ -178,7 +190,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt, .codexTelemetry:
             return .prototype
         case .claude, .openai, .openaiAPI, .devin, .cursor, .gemini, .kimi,
-             .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter:
+                .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo:
             return .session
         case .heatmap:
             return .session
@@ -221,6 +233,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Ollama Cloud session"
         case .openrouter:
             return "OpenRouter API usage tracking"
+        case .qwen:
+            return "Qwen Model Studio token plan"
+        case .mimo:
+            return "Xiaomi MiMo Token Plan"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -262,6 +278,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters from ollama.com/settings."
         case .openrouter:
             return "Uses an OpenRouter API key to read usage tracking and spend from the official `https://openrouter.ai/api/v1/auth/key` endpoint."
+        case .qwen:
+            return "Uses an imported Alibaba Cloud Model Studio web session to read the personal token plan 7-day quota meter, plan metadata, and renewal date. A manual weekly-percent anchor is used when no session is imported."
+        case .mimo:
+            return "Uses an imported Xiaomi MiMo console web session to read the plan quota meter and renewal metadata from platform.xiaomimimo.com."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -303,17 +323,21 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Session Cookie (__Secure-session)"
         case .openrouter:
             return "OpenRouter API key"
+        case .qwen:
+            return "Qwen Model Studio web session"
+        case .mimo:
+            return "Xiaomi MiMo web session"
         case .heatmap:
             return ""
-        }
-    }
+         }
+     }
 
     public var secondaryCredentialLabel: String? {
         switch self {
         case .claude:
             return "OAuth token (optional)"
         case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
-             .codexTelemetry, .meta, .ollama, .openrouter, .heatmap:
+              .codexTelemetry, .meta, .ollama, .openrouter, .qwen, .mimo, .heatmap:
             return nil
         case .mistral:
             return "Vibe Code budget (optional)"
@@ -366,10 +390,14 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Stores your Ollama `__Secure-session` cookie securely in macOS Keychain. Used only to read your usage meters from ollama.com/settings."
         case .openrouter:
             return "Uses only the OpenRouter API key you enter to request the documented usage tracking endpoint at `https://openrouter.ai/api/v1/auth/key`."
+        case .qwen:
+            return "Stores your imported Alibaba Cloud Model Studio web session securely in macOS Keychain. Used only to read your token plan quota meter from the Model Studio console."
+        case .mimo:
+            return "Stores your imported Xiaomi MiMo console web session securely in macOS Keychain. Used only to read your plan quota meter from platform.xiaomimimo.com."
         case .heatmap:
             return "Aggregates only locally available data."
-        }
-    }
+          }
+      }
 }
 
 #if os(macOS)
@@ -455,7 +483,7 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),
                 AppIconCandidate(bundleIdentifier: "ai.ollama.ollama", applicationNames: ["Ollama.app"])
             ]
-        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .heatmap:
+        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .qwen, .mimo, .heatmap:
             return []
         }
     }

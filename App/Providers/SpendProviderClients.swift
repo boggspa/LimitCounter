@@ -9,11 +9,13 @@ enum SpendProviderCredentialField {
     static let manualResetAt = "manualResetAt"
     static let manualCurrentBalance = "manualCurrentBalance"
     static let manualTopUpTotal = "manualTopUpTotal"
-    static let manualPaymentThreshold = "manualPaymentThreshold"
     static let manualPlanName = "manualPlanName"
+    static let manualWeeklyUsedPercent = "manualWeeklyUsedPercent"
     static let anchorUpdatedAt = "anchorUpdatedAt"
     static let metaCookieHeader = "metaCookieHeader"
     static let cerebrasCookieHeader = "cerebrasCookieHeader"
+    static let qwenCookieHeader = "qwenCookieHeader"
+    static let mimoCookieHeader = "mimoCookieHeader"
 }
 
 private enum ProviderDateParser {
@@ -3296,7 +3298,257 @@ enum MetaRemainingWatermarkStore {
     }
 }
 
+// MARK: - Token Plan web metering (Qwen Model Studio / Xiaomi MiMo)
+
+/// A percent-based plan-quota reading scraped from a token-plan dashboard.
+/// These consoles render "7-Day Quota — N% Used" style meters rather than
+/// currency balances, so the generic WebBillingClient currency parser does
+/// not apply.
+public struct TokenPlanWebReading: Sendable {
+    public let quotaUsedPercent: Double?
+    public let planName: String?
+    public let remainingDays: Int?
+    public let periodEnd: Date?
+
+    public var isEmpty: Bool {
+        quotaUsedPercent == nil && planName == nil && remainingDays == nil && periodEnd == nil
+    }
+}
+
+/// Fetches a token-plan console page with an imported cookie header and
+/// parses the plan quota meter. Mirrors the Meta/Cerebras web-session
+/// pattern: the user signs in inside the embedded browser, the normalized
+/// cookie header is stored in Keychain, and this client re-reads the page on
+/// each refresh.
+public struct TokenPlanWebClient: Sendable {
+    public let baseURL: URL
+
+    public init(baseURL: URL) {
+        self.baseURL = baseURL
+    }
+
+    public func fetch(cookieHeader: String) async -> TokenPlanWebReading? {
+        guard !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        var request = URLRequest(url: baseURL, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+        // Cookie-inert session: console pages rotate session cookies via
+        // Set-Cookie, and the shared cookie jar would override the imported
+        // Keychain header on every fetch after the first.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode),
+              let html = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return Self.parse(html: html)
+    }
+
+    // MARK: Parsing
+
+    static func parse(html: String) -> TokenPlanWebReading? {
+        let renderedText = MistralWebSubscriptionClient.normalizedRenderedText(from: html)
+        let payloadText = MistralWebSubscriptionClient.normalizedScriptPayloadText(from: html)
+
+        let quotaUsedPercent = firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%\\s*Used", in: renderedText)
+            .flatMap { Double($0) }
+            ?? firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%\\s*Used", in: payloadText).flatMap { Double($0) }
+            ?? firstMatch(pattern: "Used[^0-9%]{0,40}(\\d+(?:\\.\\d+)?)\\s*%", in: renderedText).flatMap { Double($0) }
+            ?? firstMatch(pattern: "Used[^0-9%]{0,40}(\\d+(?:\\.\\d+)?)\\s*%", in: payloadText).flatMap { Double($0) }
+        let remainingDays = firstMatch(pattern: "Remaining\\s*Days?\\s*:?\\s*(\\d+)", in: renderedText)
+            .flatMap { Int($0) }
+            ?? firstMatch(pattern: "Remaining\\s*Days?\\s*:?\\s*(\\d+)", in: payloadText).flatMap { Int($0) }
+        let planName = planName(in: renderedText) ?? planName(in: payloadText)
+        let periodEnd = periodEnd(in: renderedText) ?? periodEnd(in: payloadText)
+
+        let reading = TokenPlanWebReading(
+            quotaUsedPercent: quotaUsedPercent,
+            planName: planName,
+            remainingDays: remainingDays,
+            periodEnd: periodEnd
+        )
+        return reading.isEmpty ? nil : reading
+    }
+
+    private static func firstMatch(pattern: String, in text: String) -> String? {
+        guard !text.isEmpty else { return nil }
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges > 1,
+              let capture = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[capture])
+    }
+
+    private static func planName(in text: String) -> String? {
+        // The console renders e.g. "Lite Plan" above "Plan Status". Filter out
+        // generic phrases so "Token Plan" chrome never becomes the plan name.
+        let blacklist: Set<String> = ["token", "the", "your", "a", "an", "this", "subscription", "upgrade"]
+        var searchStart = text.startIndex
+        while searchStart < text.endIndex,
+              let range = text.range(of: "Plan", options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            let lineStart = text[..<range.lowerBound].lastIndex(of: "\n") ?? text.startIndex
+            let prefix = String(text[lineStart..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let words = prefix.split(separator: " ")
+            if let last = words.last {
+                let candidate = last.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+                let lowered = candidate.lowercased()
+                if candidate.count >= 2, candidate.count <= 24, !blacklist.contains(lowered) {
+                    return candidate + " Plan"
+                }
+            }
+            searchStart = range.upperBound
+        }
+        return nil
+    }
+
+    private static func periodEnd(in text: String) -> Date? {
+        guard let datePart = firstMatch(pattern: "End\\s*Time\\s*:?\\s*(\\d{4}-\\d{2}-\\d{2})", in: text) else {
+            return nil
+        }
+        let timePart = firstMatch(pattern: "End\\s*Time\\s*:?\\s*\\d{4}-\\d{2}-\\d{2}\\s+(\\d{2}:\\d{2}(?::\\d{2})?)", in: text)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = timePart != nil ? "yyyy-MM-dd HH:mm:ss" : "yyyy-MM-dd"
+        if timePart?.count == 5 { formatter.dateFormat = "yyyy-MM-dd HH:mm" }
+        return formatter.date(from: timePart != nil ? "\(datePart) \(timePart!)" : datePart)
+    }
+}
+
+public struct QwenProviderClient: ProviderClient {
+    public let providerID: ProviderID = .qwen
+
+    public init() {}
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        try await tokenPlanSnapshot(
+            providerID: .qwen,
+            credentials: credentials,
+            dashboardURL: URL(string: "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan&productCode=p_efm#/efm/subscription/token-plan/personal")!,
+            cookieField: SpendProviderCredentialField.qwenCookieHeader,
+            windowLabel: "7-Day Quota",
+            windowKind: .weekly,
+            defaultPlanName: "Token Plan"
+        )
+    }
+}
+
+public struct MimoProviderClient: ProviderClient {
+    public let providerID: ProviderID = .mimo
+
+    public init() {}
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        try await tokenPlanSnapshot(
+            providerID: .mimo,
+            credentials: credentials,
+            dashboardURL: URL(string: "https://platform.xiaomimimo.com/console/plan-manage")!,
+            cookieField: SpendProviderCredentialField.mimoCookieHeader,
+            windowLabel: "Plan Quota",
+            windowKind: .custom,
+            defaultPlanName: "MiMo Plan"
+        )
+    }
+}
+
+/// Shared assembly for percent-based token-plan consoles: web scrape first,
+/// then the manual weekly-percent anchor entered in Settings.
+private func tokenPlanSnapshot(
+    providerID: ProviderID,
+    credentials: ProviderCredential?,
+    dashboardURL: URL,
+    cookieField: String,
+    windowLabel: String,
+    windowKind: QuotaWindowKind,
+    defaultPlanName: String
+) async throws -> QuotaSnapshot {
+    let now = Date()
+    let fields = credentials?.extraFields ?? [:]
+    let webCookie = fields[cookieField]
+    let webReading: TokenPlanWebReading? = if let webCookie, !webCookie.isEmpty {
+        await TokenPlanWebClient(baseURL: dashboardURL).fetch(cookieHeader: webCookie)
+    } else {
+        nil
+    }
+
+    let usedPercent = webReading?.quotaUsedPercent
+        ?? positiveDouble(fields[SpendProviderCredentialField.manualWeeklyUsedPercent])
+    let planName = webReading?.planName
+        ?? fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        ?? defaultPlanName
+    let resetAt = webReading?.periodEnd ?? ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
+
+    var windows: [QuotaWindow] = []
+    var stats: [QuotaStat] = []
+    if let usedPercent {
+        windows.append(
+            QuotaWindow(
+                label: windowLabel,
+                windowKind: windowKind,
+                used: usedPercent,
+                total: 100,
+                resetDate: resetAt,
+                unit: "%",
+                subtitle: webReading?.quotaUsedPercent != nil
+                    ? "Scraped from the token plan dashboard"
+                    : "Manual anchor — update after each dashboard check"
+            )
+        )
+    }
+    if let remainingDays = webReading?.remainingDays {
+        stats.append(
+            QuotaStat(
+                label: "Remaining days",
+                value: Double(remainingDays),
+                unit: "days",
+                subtitle: "Plan renewal countdown"
+            )
+        )
+    }
+
+    if webCookie?.isEmpty == true || (webCookie == nil && usedPercent == nil) {
+        throw ProviderFetchError.notConfigured
+    }
+    if windows.isEmpty {
+        throw ProviderFetchError.parsingError(
+            "Signed-in token plan page loaded but no quota meter was found (page layout may have changed, or the session expired)."
+        )
+    }
+
+    return QuotaSnapshot(
+        providerID: providerID,
+        displayName: providerID.snapshotDisplayName,
+        planName: planName,
+        windows: windows,
+        stats: stats,
+        fetchState: .success,
+        fetchedAt: now
+    )
+}
+
 public struct MetaProviderClient: ProviderClient {
+
     public let providerID: ProviderID = .meta
 
     public init() {}
@@ -3329,7 +3581,6 @@ public struct MetaProviderClient: ProviderClient {
         // Web reading overrides manual remaining when present.
         let remaining = webReading?.balance
              ?? nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
-        let threshold = positiveDouble(fields[SpendProviderCredentialField.manualPaymentThreshold])
         // Web reading overrides manual spend when present.
         let manualSpent = webReading?.spend
              ?? nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
@@ -3391,19 +3642,6 @@ public struct MetaProviderClient: ProviderClient {
             )
         }
 
-        if let threshold {
-            windows.append(
-                QuotaWindow(
-                    label: "Payment threshold",
-                    windowKind: .custom,
-                    used: observedMonth ?? local?.currentMonthCostUSD ?? taskWraith?.currentMonthCostUSD ?? 0,
-                    total: threshold,
-                    unit: currency,
-                    subtitle: "Advisory vs Meta auto-charge threshold"
-                )
-            )
-        }
-
         if local == nil, let estimated = taskWraith?.currentMonthCostUSD, estimated > 0 {
             windows.append(
                 QuotaWindow(
@@ -3433,12 +3671,6 @@ public struct MetaProviderClient: ProviderClient {
                 )
             )
         }
-        if let threshold {
-            balances.append(
-                QuotaBalance(label: "Payment threshold", amount: threshold, unit: currency, subtitle: "Manual billing anchor")
-            )
-        }
-
         var stats: [QuotaStat] = []
         if let local {
             stats.append(
@@ -3471,7 +3703,7 @@ public struct MetaProviderClient: ProviderClient {
             )
         }
 
-        let hasAnchors = preload != nil || remaining != nil || threshold != nil || manualSpent != nil
+        let hasAnchors = preload != nil || remaining != nil || manualSpent != nil
         guard !windows.isEmpty || local != nil || hasAnchors || taskWraith != nil else {
             throw ProviderFetchError.notConfigured
         }
