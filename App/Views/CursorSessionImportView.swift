@@ -799,6 +799,406 @@ private enum MistralSessionImportError: LocalizedError {
         switch self {
         case .noCookiesFound:
             return "No Mistral session cookies were found. Make sure you signed in to admin.mistral.ai in the embedded browser first."
-        }
-    }
+         }
+     }
+}
+
+// MARK: - Meta Web Session Import View
+
+struct MetaWebSessionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model = MetaWebSessionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    /// The user's Meta billing page. The project/team query params are
+     /// preserved so the embedded browser lands on the right billing context.
+    private let startURL = URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            footer
+         }
+         .frame(minWidth: 760, minHeight: 720)
+         .onAppear {
+            model.load(startURL: startURL)
+         }
+         .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+         } message: {
+            Text(importError ?? "No Meta session cookies were found in the embedded browser.")
+         }
+     }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProviderBrandIconView(providerID: .meta, size: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Meta API web session")
+                         .font(.headline.weight(.semibold))
+
+                    Text("Sign in inside the embedded browser, then import the active dev.meta.ai session into Keychain.")
+                         .font(.subheadline)
+                         .foregroundStyle(.secondary)
+                 }
+
+                Spacer()
+             }
+             .padding(.horizontal, 20)
+             .padding(.top, 18)
+
+            Text("We only capture cookies from this embedded Meta session. The session is saved to macOS Keychain to read your Meta API current balance and billing-period spend from dev.meta.ai/billing.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+                 .padding(.horizontal, 20)
+         }
+         .padding(.bottom, 14)
+     }
+
+    private var footer: some View {
+        HStack {
+            Text("After signing in, click Import Session to securely save the session cookie in Keychain.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+             }
+             .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    await importCurrentSession()
+                 }
+             } label: {
+                if isImporting {
+                    ProgressView()
+                         .progressViewStyle(.circular)
+                 } else {
+                    Text("Import Session")
+                 }
+             }
+             .buttonStyle(.borderedProminent)
+             .tint(Color(hex: ProviderID.meta.accentColorHex))
+             .disabled(isImporting)
+         }
+         .padding(20)
+     }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let cookieHeader = try await model.captureCookieHeader()
+            let imported = CredentialImportService.ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: nil,
+                extraFields: [
+                     "metaCookieHeader": cookieHeader
+                 ],
+                bookmarkData: nil
+             )
+            onImport(.success(imported))
+            dismiss()
+         } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+         }
+     }
+}
+
+@MainActor
+final class MetaWebSessionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+     }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        webView.load(URLRequest(url: startURL))
+     }
+
+    func captureCookieHeader() async throws -> String {
+        let cookies = try await webView.allCookies()
+        let relevantCookies = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "meta.ai" || domain.hasSuffix(".meta.ai")
+                 || domain == "meta.com" || domain.hasSuffix(".meta.com")
+         }
+
+        guard !relevantCookies.isEmpty else {
+            throw MetaWebSessionImportError.noCookiesFound
+         }
+
+        let header = relevantCookies
+             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+             .map { "\($0.name)=\($0.value)" }
+             .joined(separator: "; ")
+
+        guard !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MetaWebSessionImportError.noCookiesFound
+         }
+
+        return header
+     }
+
+    func webView(
+         _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+     ) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+         }
+        return nil
+     }
+
+    static func clearStoredWebsiteData() {
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let metaRecords = records.filter { record in
+                let name = record.displayName.lowercased()
+                return name == "meta.ai" || name.hasSuffix(".meta.ai")
+                     || name == "meta.com" || name.hasSuffix(".meta.com")
+             }
+            guard !metaRecords.isEmpty else { return }
+            store.removeData(ofTypes: dataTypes, for: metaRecords) {}
+         }
+     }
+}
+
+private enum MetaWebSessionImportError: LocalizedError {
+    case noCookiesFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noCookiesFound:
+            return "No Meta session cookies were found. Make sure you signed in to dev.meta.ai in the embedded browser first."
+         }
+     }
+}
+
+// MARK: - Cerebras Web Session Import View
+
+struct CerebrasWebSessionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model = CerebrasWebSessionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    /// The user's Cerebras billing page. The org id is preserved so the
+     /// embedded browser lands on the right billing context.
+    private let startURL = URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                 .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            footer
+         }
+         .frame(minWidth: 760, minHeight: 720)
+         .onAppear {
+            model.load(startURL: startURL)
+         }
+         .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+         } message: {
+            Text(importError ?? "No Cerebras session cookies were found in the embedded browser.")
+         }
+     }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProviderBrandIconView(providerID: .cerebras, size: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Cerebras web session")
+                         .font(.headline.weight(.semibold))
+
+                    Text("Sign in inside the embedded browser, then import the active cloud.cerebras.ai session into Keychain.")
+                         .font(.subheadline)
+                         .foregroundStyle(.secondary)
+                 }
+
+                Spacer()
+             }
+             .padding(.horizontal, 20)
+             .padding(.top, 18)
+
+            Text("We only capture cookies from this embedded Cerebras session. The session is saved to macOS Keychain to read your Cerebras current balance and billing-period spend from cloud.cerebras.ai/billing.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+                 .padding(.horizontal, 20)
+         }
+         .padding(.bottom, 14)
+     }
+
+    private var footer: some View {
+        HStack {
+            Text("After signing in, click Import Session to securely save the session cookie in Keychain.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+             }
+             .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    await importCurrentSession()
+                 }
+             } label: {
+                if isImporting {
+                    ProgressView()
+                         .progressViewStyle(.circular)
+                 } else {
+                    Text("Import Session")
+                 }
+             }
+             .buttonStyle(.borderedProminent)
+             .tint(Color(hex: ProviderID.cerebras.accentColorHex))
+             .disabled(isImporting)
+         }
+         .padding(20)
+     }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let cookieHeader = try await model.captureCookieHeader()
+            let imported = CredentialImportService.ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: nil,
+                extraFields: [
+                     "cerebrasCookieHeader": cookieHeader
+                 ],
+                bookmarkData: nil
+             )
+            onImport(.success(imported))
+            dismiss()
+         } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+         }
+     }
+}
+
+@MainActor
+final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+     }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        webView.load(URLRequest(url: startURL))
+     }
+
+    func captureCookieHeader() async throws -> String {
+        let cookies = try await webView.allCookies()
+        let relevantCookies = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "cerebras.ai" || domain.hasSuffix(".cerebras.ai")
+         }
+
+        guard !relevantCookies.isEmpty else {
+            throw CerebrasWebSessionImportError.noCookiesFound
+         }
+
+        let header = relevantCookies
+             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+             .map { "\($0.name)=\($0.value)" }
+             .joined(separator: "; ")
+
+        guard !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CerebrasWebSessionImportError.noCookiesFound
+         }
+
+        return header
+     }
+
+    func webView(
+         _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+     ) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+         }
+        return nil
+     }
+
+    static func clearStoredWebsiteData() {
+        let store = WKWebsiteDataStore.default()
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        store.fetchDataRecords(ofTypes: dataTypes) { records in
+            let cerebrasRecords = records.filter { record in
+                let name = record.displayName.lowercased()
+                return name == "cerebras.ai" || name.hasSuffix(".cerebras.ai")
+             }
+            guard !cerebrasRecords.isEmpty else { return }
+            store.removeData(ofTypes: dataTypes, for: cerebrasRecords) {}
+         }
+     }
+}
+
+private enum CerebrasWebSessionImportError: LocalizedError {
+    case noCookiesFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noCookiesFound:
+            return "No Cerebras session cookies were found. Make sure you signed in to cloud.cerebras.ai in the embedded browser first."
+         }
+     }
 }

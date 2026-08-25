@@ -537,12 +537,9 @@ public struct LargeSingleProviderView: View {
                     Spacer()
                     if let plan = snapshot.planName {
                         Text(plan)
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(accent)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(accent.opacity(0.12), in: Capsule(style: .continuous))
-                    }
+                             .font(.caption.weight(.bold))
+                             .foregroundStyle(accent)
+                     }
                 }
 
                 if !windows.isEmpty {

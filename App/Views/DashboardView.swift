@@ -1678,19 +1678,9 @@ struct CompactDashboardCardView: View {
 
                 if let plan = snapshot.displayPlanName, !plan.isEmpty, plan != snapshot.displayName {
                     Text(plan)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(accent.opacity(0.14))
-                        )
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .strokeBorder(accent.opacity(0.28), lineWidth: 0.5)
-                        )
-                }
+                         .font(.system(size: 10, weight: .semibold))
+                         .foregroundStyle(.secondary)
+                 }
 
                 Spacer(minLength: 4)
 

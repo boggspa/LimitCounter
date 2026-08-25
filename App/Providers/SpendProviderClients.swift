@@ -12,6 +12,8 @@ enum SpendProviderCredentialField {
     static let manualPaymentThreshold = "manualPaymentThreshold"
     static let manualPlanName = "manualPlanName"
     static let anchorUpdatedAt = "anchorUpdatedAt"
+    static let metaCookieHeader = "metaCookieHeader"
+    static let cerebrasCookieHeader = "cerebrasCookieHeader"
 }
 
 private enum ProviderDateParser {
@@ -1157,7 +1159,7 @@ public struct MistralWebSubscriptionClient: Sendable {
 
     /// The currency of the first symbol-plus-number match. A lone symbol is
     /// not evidence: RSC flight payloads use `"$"` as an element marker.
-    private static func detectedCurrency(in block: String) -> String? {
+    static func detectedCurrency(in block: String) -> String? {
         guard let regex = try? NSRegularExpression(
             pattern: #"(€|\$|£|EUR|USD|GBP)\s*[0-9]"#,
             options: [.caseInsensitive]
@@ -1177,7 +1179,7 @@ public struct MistralWebSubscriptionClient: Sendable {
         }
     }
 
-    private static func fallbackCurrency(in text: String) -> String {
+    static func fallbackCurrency(in text: String) -> String {
         if text.contains("€") { return "EUR" }
         if text.contains("$") { return "USD" }
         if text.contains("£") { return "GBP" }
@@ -1194,7 +1196,7 @@ public struct MistralWebSubscriptionClient: Sendable {
         return nil
     }
 
-    private static func extractResetDate(from chunk: String, now: Date) -> Date? {
+    static func extractResetDate(from chunk: String, now: Date) -> Date? {
         if let daysMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:days?|d))"#),
            let days = Double(daysMatch) {
             return now.addingTimeInterval(days * 86400)
@@ -1209,16 +1211,195 @@ public struct MistralWebSubscriptionClient: Sendable {
     private static func firstMatch(in text: String, pattern: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return nil
-        }
+         }
         let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: nsRange) else {
             return nil
-        }
+         }
         if match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: text) {
             return String(text[range])
-        }
+         }
         return nil
-    }
+     }
+}
+
+// MARK: - Generic Web Billing Client (Meta / Cerebras)
+
+/// A balance reading scraped from a provider's billing page. `balance` is the
+/// current available credit; `spend` is the billing-period spend when the page
+/// exposes it; `periodEnd` is the next reset when the page exposes it.
+public struct WebBillingReading: Sendable {
+    public let balance: Double?
+    public let spend: Double?
+    public let currency: String
+    public let periodEnd: Date?
+
+    public init(
+        balance: Double?,
+        spend: Double?,
+        currency: String,
+        periodEnd: Date?
+     ) {
+        self.balance = balance
+        self.spend = spend
+        self.currency = currency
+        self.periodEnd = periodEnd
+     }
+
+    public var isEmpty: Bool {
+        balance == nil && spend == nil
+     }
+}
+
+/// Scrapes a provider billing page with an imported cookie header and extracts
+/// the current balance / billing-period spend. Mirrors the Ollama/Mistral
+/// web-session pattern: the user signs in inside the embedded browser, the
+/// normalized cookie header is stored in Keychain, and this client re-reads the
+/// page on each refresh.
+public struct WebBillingClient: Sendable {
+    public let baseURL: URL
+    public let cookieDomains: [String]
+
+    public init(baseURL: URL, cookieDomains: [String]) {
+        self.baseURL = baseURL
+        self.cookieDomains = cookieDomains
+     }
+
+    public func fetch(cookieHeader: String, now: Date) async -> WebBillingReading? {
+        guard !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+         }
+
+        var request = URLRequest(url: baseURL, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        request.setValue(
+             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+         )
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+         // Cookie-inert session: billing pages rotate session cookies via
+         // Set-Cookie, and the shared cookie jar would override the imported
+         // Keychain header on every fetch after the first.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode),
+              let html = String(data: data, encoding: .utf8) else {
+            return nil
+         }
+
+        return Self.parse(html: html, now: now)
+     }
+
+     // MARK: Parsing
+
+     /// Parses a billing page into a balance reading. The parser is
+      /// provider-agnostic: it scans the rendered text and any embedded
+      /// script/RSC payload for currency amounts near balance/spend labels,
+      /// so it survives React comment splitting, tag splitting, and
+      /// flight-payload-only pages the same way the Mistral parser does.
+    public static func parse(html: String, now: Date) -> WebBillingReading? {
+        let renderedText = MistralWebSubscriptionClient.normalizedRenderedText(from: html)
+        let payloadText = MistralWebSubscriptionClient.normalizedScriptPayloadText(from: html)
+
+         // A signed-out page renders a login form and no balance.
+        if renderedText.range(of: "Sign in", options: .caseInsensitive) != nil
+            || renderedText.range(of: "Log in", options: .caseInsensitive) != nil {
+            if renderedText.range(of: "balance", options: .caseInsensitive) == nil
+                 && renderedText.range(of: "spend", options: .caseInsensitive) == nil {
+                return nil
+             }
+         }
+
+        let balance = balanceReading(in: renderedText, now: now)
+             ?? balanceReading(in: payloadText, now: now)
+        let spend = spendReading(in: renderedText, now: now)
+             ?? spendReading(in: payloadText, now: now)
+        let periodEnd = balance?.periodEnd ?? spend?.periodEnd
+        let currency = balance?.currency ?? spend?.currency ?? MistralWebSubscriptionClient.fallbackCurrency(in: renderedText)
+
+        guard balance != nil || spend != nil else { return nil }
+
+        return WebBillingReading(
+            balance: balance?.amount,
+            spend: spend?.amount,
+            currency: currency,
+            periodEnd: periodEnd
+         )
+     }
+
+     /// A labeled currency amount. `labels` are the phrases that introduce the
+      /// value (e.g. "current balance", "available credit"). The first currency
+      /// amount after a label wins; a second amount in the same block is the
+      /// allowance/limit.
+    private struct LabeledAmount {
+        let amount: Double
+        let allowance: Double?
+        let currency: String?
+        let periodEnd: Date?
+     }
+
+    private static func balanceReading(in text: String, now: Date) -> LabeledAmount? {
+        labeledAmount(
+            labels: ["current balance", "available balance", "available credit", "balance", "credit balance", "remaining balance"],
+            in: text,
+            now: now
+         )
+     }
+
+    private static func spendReading(in text: String, now: Date) -> LabeledAmount? {
+        labeledAmount(
+            labels: ["spend this billing period", "spend to date", "billing period spend", "spend", "total spend", "used this period"],
+            in: text,
+            now: now
+         )
+     }
+
+    private static func labeledAmount(labels: [String], in text: String, now: Date) -> LabeledAmount? {
+        guard !text.isEmpty else { return nil }
+        for label in labels {
+            if let reading = firstLabeledAmount(label: label, in: text, now: now) {
+                return reading
+             }
+         }
+        return nil
+     }
+
+    private static func firstLabeledAmount(label: String, in text: String, now: Date) -> LabeledAmount? {
+        var searchStart = text.startIndex
+        while searchStart < text.endIndex,
+              let labelRange = text.range(of: label, options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            let blockStart = labelRange.upperBound
+            var blockEnd = text.index(blockStart, offsetBy: 400, limitedBy: text.endIndex) ?? text.endIndex
+            for stop in ["current balance", "available balance", "available credit", "spend this billing period", "spend to date", "billing period spend", "total spend"] where stop != label {
+                if let stopRange = text.range(of: stop, options: .caseInsensitive, range: blockStart..<blockEnd) {
+                    blockEnd = stopRange.lowerBound
+                 }
+             }
+            let block = String(text[blockStart..<blockEnd])
+            let amounts = MistralWebSubscriptionClient.extractCurrencyAmounts(from: block)
+            if let amount = amounts.first {
+                return LabeledAmount(
+                    amount: amount,
+                    allowance: amounts.count >= 2 ? amounts[1] : nil,
+                    currency: MistralWebSubscriptionClient.detectedCurrency(in: block),
+                    periodEnd: MistralWebSubscriptionClient.extractResetDate(from: block, now: now)
+                  )
+             }
+            searchStart = labelRange.upperBound
+         }
+        return nil
+     }
 }
 
 public struct MistralProviderClient: ProviderClient {
@@ -2190,10 +2371,27 @@ public struct CerebrasProviderClient: ProviderClient {
                     .flatMap { CerebrasCSVUsageParser.parse(data: $0) }
             }
         }
+         // Web billing scrape: the user signs in inside the embedded browser and
+         // the normalized cookie header is stored in Keychain. This re-reads the
+         // cloud.cerebras.ai/billing page on each refresh, mirroring the Mistral
+         // web-session pattern.
+        let webCookie = fields[SpendProviderCredentialField.cerebrasCookieHeader]
+        let webReading: WebBillingReading? = if let webCookie, !webCookie.isEmpty {
+            await WebBillingClient(
+                baseURL: URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!,
+                cookieDomains: ["cerebras.ai"]
+            ).fetch(cookieHeader: webCookie, now: now)
+         } else {
+            nil
+         }
+
         let purchased = positiveDouble(credentials?.normalizedAccountIdentifier)
-            ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
-        let current = nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
-        let manualCurrency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
+             ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
+         // Web reading overrides manual current balance when present.
+        let current = webReading?.balance
+             ?? nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
+        let manualCurrency = webReading?.currency
+             ?? normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
         let taskWraith = TaskWraithSpendReader.read(provider: .cerebras)
         let budgetUSD = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .cerebras)
         var windows: [QuotaWindow] = []
@@ -3112,19 +3310,38 @@ public struct MetaProviderClient: ProviderClient {
         let local = access.flatMap { MuseLocalUsageReader.read(rootURL: $0.url, now: now) }
         let taskWraith = TaskWraithSpendReader.read(provider: .meta, now: now)
 
+        // Web billing scrape: the user signs in inside the embedded browser and
+        // the normalized cookie header is stored in Keychain. This re-reads the
+        // dev.meta.ai/billing page on each refresh, mirroring the Mistral/Ollama
+        // web-session pattern.
+        let webCookie = fields[SpendProviderCredentialField.metaCookieHeader]
+        let webReading: WebBillingReading? = if let webCookie, !webCookie.isEmpty {
+            await WebBillingClient(
+                baseURL: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!,
+                cookieDomains: ["meta.ai", "meta.com"]
+            ).fetch(cookieHeader: webCookie, now: now)
+        } else {
+            nil
+        }
+
         let preload = positiveDouble(fields[SpendProviderCredentialField.manualTopUpTotal])
-            ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
-        let remaining = nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
+             ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
+        // Web reading overrides manual remaining when present.
+        let remaining = webReading?.balance
+             ?? nonnegativeDouble(fields[SpendProviderCredentialField.manualCurrentBalance])
         let threshold = positiveDouble(fields[SpendProviderCredentialField.manualPaymentThreshold])
-        let manualSpent = nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
-        let currency = normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
-        let manualResetAt = ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
+        // Web reading overrides manual spend when present.
+        let manualSpent = webReading?.spend
+             ?? nonnegativeDouble(fields[SpendProviderCredentialField.manualSpent])
+        let currency = webReading?.currency
+             ?? normalizedCurrency(fields[SpendProviderCredentialField.manualCurrency])
+        let manualResetAt = webReading?.periodEnd
+             ?? ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
         let resetAt = manualResetAt ?? MetaBillingReset.nextResetDate(from: now)
         let softBudget = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .meta) ?? 15.0
-        let convertedSoftBudget = MetaSpendWatermarkStore.amountInCurrency(softBudget, currency: currency)
         let planName = fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(
             in: .whitespacesAndNewlines
-        ).nilIfEmpty ?? "API Credits"
+         ).nilIfEmpty ?? "API Credits"
 
         let observedMonth = observedMonthCostUSD(local: local, taskWraith: taskWraith)
         let remainingAdjustment: MetaRemainingWatermarkStore.Adjustment? = remaining.map { anchored in
@@ -3148,111 +3365,12 @@ public struct MetaProviderClient: ProviderClient {
         let displayRemaining = remainingAdjustment?.effectiveRemaining
         let remainingLocalDecrement = remainingAdjustment?.localDecrementUSD ?? 0
         let remainingDrivenSubtitle = remainingLocalDecrement > 0
-            ? "Manual remaining minus tracked Muse spend since anchor"
-            : nil
-
-        let impliedSpendFromBalance: Double? = {
-            guard let threshold, let remaining else { return nil }
-            return max(0, threshold - remaining)
-        }()
-        let spendAnchor = manualSpent ?? impliedSpendFromBalance
+             ? "Manual remaining minus tracked Muse spend since anchor"
+             : nil
 
         var windows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
         var signals: [QuotaSignal] = []
-        var spendPeriodUsesThreshold = false
-
-        // Always drive a cumulative spend window when we have a console spend
-        // reading, a payment threshold to accumulate toward, or Muse observations.
-        let shouldDriveSpendWindow = manualSpent != nil
-            || threshold != nil
-            || local != nil
-            || observedMonth != nil
-        if shouldDriveSpendWindow {
-            if let manualResetAt, manualResetAt <= now {
-                signals.append(
-                    QuotaSignal(
-                        kind: .scheduledReset,
-                        title: "Billing anchor expired",
-                        message: "Update the Meta console Spend reading for the new billing cycle.",
-                        severity: .info,
-                        confidence: 1,
-                        windowLabel: "Spend this billing period",
-                        detectedAt: now
-                    )
-                )
-            }
-
-            let anchoredSpend = spendAnchor ?? 0
-            let signature: String = {
-                if let anchorUpdatedAt = fields[SpendProviderCredentialField.anchorUpdatedAt],
-                   !anchorUpdatedAt.isEmpty {
-                    return anchorUpdatedAt
-                }
-                var parts = ["\(manualSpent ?? -1)", "\(threshold ?? -1)"]
-                // Include remaining only when it contributes to implied spend.
-                if manualSpent == nil, impliedSpendFromBalance != nil {
-                    parts.append("\(remaining ?? -1)")
-                }
-                parts.append(currency)
-                parts.append("\(manualResetAt?.timeIntervalSince1970 ?? 0)")
-                return parts.joined(separator: "|")
-            }()
-            let anchorUpdatedAt = ProviderDateParser.parse(
-                fields[SpendProviderCredentialField.anchorUpdatedAt]
-            )
-            let currentLocalSpendUSD = observedMonth ?? local?.currentMonthCostUSD
-            let initialLocalIncrementUSD: Double = {
-                if let anchorUpdatedAt {
-                    return local?.costUSD(since: anchorUpdatedAt) ?? 0
-                }
-                // Muse-only / zero-anchor: seed with current MTD so the first card
-                // isn't stuck at zero until the next scan delta.
-                if spendAnchor == nil {
-                    return currentLocalSpendUSD ?? 0
-                }
-                return 0
-            }()
-            let adjustment = MetaSpendWatermarkStore.adjustment(
-                anchoredSpend: anchoredSpend,
-                currentLocalSpendUSD: currentLocalSpendUSD,
-                currency: currency,
-                signature: signature,
-                initialLocalIncrementUSD: initialLocalIncrementUSD,
-                now: now
-            )
-            let spendTotal = threshold ?? convertedSoftBudget ?? preload
-            spendPeriodUsesThreshold = threshold != nil && spendTotal == threshold
-            let spendSubtitle: String = {
-                if adjustment.localIncrement > 0 {
-                    if manualSpent != nil {
-                        return "Meta console reading plus tracked Muse spend"
-                    }
-                    if impliedSpendFromBalance != nil {
-                        return "Threshold minus remaining, plus tracked Muse spend"
-                    }
-                    return "Tracked Muse spend since billing period start"
-                }
-                if manualSpent != nil {
-                    return "Meta console reading"
-                }
-                if impliedSpendFromBalance != nil {
-                    return "Threshold minus remaining balance"
-                }
-                return "Muse projected spend"
-            }()
-            windows.append(
-                QuotaWindow(
-                    label: "Spend this billing period",
-                    windowKind: .monthly,
-                    used: adjustment.spend,
-                    total: spendTotal,
-                    resetDate: resetAt,
-                    unit: currency,
-                    subtitle: spendSubtitle
-                )
-            )
-        }
 
         if let preload, let displayRemaining,
            let creditUsed = DeepSeekTopUpMeter.creditUsed(
@@ -3273,9 +3391,7 @@ public struct MetaProviderClient: ProviderClient {
             )
         }
 
-        // Skip a separate Payment threshold window when the spend window already
-        // uses the threshold as its total (avoids mislabeling USD Muse as GBP).
-        if let threshold, !spendPeriodUsesThreshold {
+        if let threshold {
             windows.append(
                 QuotaWindow(
                     label: "Payment threshold",

@@ -915,6 +915,10 @@ struct ProviderCredentialView: View {
     @State private var ollamaSessionImported = false
     @State private var showMistralSessionImport = false
     @State private var mistralSessionImported = false
+    @State private var showMetaWebSessionImport = false
+    @State private var metaWebSessionImported = false
+    @State private var showCerebrasWebSessionImport = false
+    @State private var cerebrasWebSessionImported = false
     @State private var storedExtraFields: [String: String] = [:]
     @State private var codexTelemetryEndpoint = ""
     @State private var codexTelemetryHasCredential = false
@@ -1237,13 +1241,65 @@ struct ProviderCredentialView: View {
                                 .textInputAutocapitalization(.never)
                             #endif
                         }
-                    } else if providerID == .claude {
+                     } else if providerID == .meta {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into dev.meta.ai in the embedded browser to automatically track your Meta API current balance and billing-period spend, or enter a manual billing anchor below:")
+                                 .font(.caption)
+                                 .foregroundStyle(.secondary)
+                                 .fixedSize(horizontal: false, vertical: true)
+
+                            webSessionImportButton(
+                                 "Import Meta web session...",
+                                systemImage: "infinity"
+                             ) {
+                                showMetaWebSessionImport = true
+                             }
+
+                            if metaWebSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                     .font(.caption)
+                                     .foregroundStyle(.green)
+                             }
+
+                            TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
+                                 .autocorrectionDisabled()
+                             #if os(iOS)
+                                 .textInputAutocapitalization(.never)
+                             #endif
+                         }
+                     } else if providerID == .cerebras {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sign into cloud.cerebras.ai in the embedded browser to automatically track your Cerebras current balance, or enter a manual billing anchor below:")
+                                 .font(.caption)
+                                 .foregroundStyle(.secondary)
+                                 .fixedSize(horizontal: false, vertical: true)
+
+                            webSessionImportButton(
+                                 "Import Cerebras web session...",
+                                systemImage: "cpu"
+                             ) {
+                                showCerebrasWebSessionImport = true
+                             }
+
+                            if cerebrasWebSessionImported {
+                                Label("Web session stored", systemImage: "checkmark.circle.fill")
+                                     .font(.caption)
+                                     .foregroundStyle(.green)
+                             }
+
+                            TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
+                                 .autocorrectionDisabled()
+                             #if os(iOS)
+                                 .textInputAutocapitalization(.never)
+                             #endif
+                         }
+                     } else if providerID == .claude {
                         TextField(providerID.primaryCredentialLabel, text: $accessToken)
-                            .autocorrectionDisabled()
-                        #if os(iOS)
-                            .textInputAutocapitalization(.never)
-                        #endif
-                    } else if usesLocalPathAsPrimaryCredential {
+                             .autocorrectionDisabled()
+                         #if os(iOS)
+                             .textInputAutocapitalization(.never)
+                         #endif
+                     } else if usesLocalPathAsPrimaryCredential {
                         TextField(providerID.primaryCredentialLabel, text: $customEndpoint)
                             .autocorrectionDisabled()
                         #if os(iOS)
@@ -1470,7 +1526,7 @@ struct ProviderCredentialView: View {
                 }
             }
         }
-        .sheet(isPresented: $showMistralSessionImport) {
+         .sheet(isPresented: $showMistralSessionImport) {
             MistralSessionImportView { result in
                 switch result {
                 case .success(let imported):
@@ -1479,10 +1535,34 @@ struct ProviderCredentialView: View {
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
-                }
-            }
-        }
-        .alert("Import Failed", isPresented: $showImportError) {
+                 }
+             }
+         }
+         .sheet(isPresented: $showMetaWebSessionImport) {
+            MetaWebSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    metaWebSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                 }
+             }
+         }
+         .sheet(isPresented: $showCerebrasWebSessionImport) {
+            CerebrasWebSessionImportView { result in
+                switch result {
+                case .success(let imported):
+                    applyImportedCredential(imported)
+                    cerebrasWebSessionImported = true
+                case .failure(let error):
+                    importError = error.localizedDescription
+                    showImportError = true
+                 }
+             }
+         }
+         .alert("Import Failed", isPresented: $showImportError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(importError ?? "Could not import credentials from file.")
