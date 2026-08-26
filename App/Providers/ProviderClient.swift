@@ -8379,7 +8379,7 @@ private final class ClaudeModelLimitDiagnostics: @unchecked Sendable {
 /// `fetchOAuthQuota` for that gate.
 private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> ClaudePlanInfo? {
     guard allowKeychainLookup,
-          let (creds, _) = ClaudeKeychainStore.readBest(allowClaudeCodeFallback: false) else {
+          let (creds, _) = ClaudeKeychainStore.readBest(claudeCodeReadBudget: nil) else {
         return nil
     }
     let raw = creds.rawOAuthDict
@@ -8448,6 +8448,36 @@ enum ClaudeOAuthCredentialPolicy {
     static func allowsClaudeCodeKeychainAccess(enabled: Bool, userInitiated: Bool) -> Bool {
         enabled && userInitiated
     }
+
+    static func makeClaudeCodeKeychainReadBudget(
+        enabled: Bool,
+        userInitiated: Bool
+    ) -> ClaudeCodeKeychainReadBudget? {
+        guard allowsClaudeCodeKeychainAccess(
+            enabled: enabled,
+            userInitiated: userInitiated
+        ) else {
+            return nil
+        }
+        return ClaudeCodeKeychainReadBudget()
+    }
+}
+
+/// A refresh-cycle-scoped, one-shot capability for reading another app's
+/// Keychain item. Every path to Claude Code's item must claim this budget
+/// before calling SecItemCopyMatching.
+nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isAvailable = true
+
+    func claimRead() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard isAvailable else { return false }
+        isAvailable = false
+        return true
+    }
 }
 
 /// Reads the two keychain entries we treat as token stores:
@@ -8463,7 +8493,7 @@ private nonisolated enum ClaudeKeychainStore {
 
     private static var account: String { NSUserName() }
 
-    static func readClaudeCode() -> ClaudeOAuthCredentials? { read(service: claudeCodeService) }
+    private static func readClaudeCode() -> ClaudeOAuthCredentials? { read(service: claudeCodeService) }
     static func readBackup() -> ClaudeOAuthCredentials? { read(service: backupService) }
 
     /// Returns the best available credential.
@@ -8482,7 +8512,7 @@ private nonisolated enum ClaudeKeychainStore {
     /// so steady-state reads do not touch the CLI's entry. Claude Code
     /// remains the sole owner of refresh-token rotation; Limit Counter
     /// re-reads the CLI entry through the explicit recovery path.
-    static func readBest(allowClaudeCodeFallback: Bool) -> (ClaudeOAuthCredentials, source: String)? {
+    static func readBest(claudeCodeReadBudget: ClaudeCodeKeychainReadBudget?) -> (ClaudeOAuthCredentials, source: String)? {
         if let backup = readBackup() {
             // Migrate mirrors created by older builds, which retained Claude
             // Code's rotating refresh token. `write` strips it from backups.
@@ -8492,17 +8522,20 @@ private nonisolated enum ClaudeKeychainStore {
             return (backup, backupService)
         }
 
-        guard allowClaudeCodeFallback else {
+        guard let claudeCodeReadBudget,
+              claudeCodeReadBudget.claimRead() else {
             return nil
         }
 
         // Mirror missing (first launch, or user cleared keychain) —
-        // fall back to the CLI's entry, which may prompt the user
-        // exactly once for permission. Immediately mirror what we
-        // get so future reads stay silent.
+        // claim this refresh cycle's only cross-app read before falling
+        // back to the CLI entry. Immediately mirror a successful result.
         if let cc = readClaudeCode() {
-            _ = write(cc, service: backupService)
-            print("[ClaudeKeychain] Mirrored Claude Code credentials to backup store — future reads will avoid CLI entry")
+            if write(cc, service: backupService) {
+                print("[ClaudeKeychain] Mirrored Claude Code credentials to backup store — future reads will avoid CLI entry")
+            } else {
+                print("[ClaudeKeychain] Failed to persist Claude Code credential mirror; a later manual refresh may need authorization again")
+            }
             return (cc, claudeCodeService)
         }
 
@@ -8512,9 +8545,16 @@ private nonisolated enum ClaudeKeychainStore {
     /// Escape hatch for when the mirrored access token is rejected or near
     /// expiry. This can prompt, but it is only used by the explicit recovery
     /// path rather than during steady-state reads.
-    static func readClaudeCodeAsFallback() -> ClaudeOAuthCredentials? {
-        guard let cc = readClaudeCode() else { return nil }
-        _ = write(cc, service: backupService)
+    static func readClaudeCodeAsFallback(
+        using readBudget: ClaudeCodeKeychainReadBudget
+    ) -> ClaudeOAuthCredentials? {
+        guard readBudget.claimRead(),
+              let cc = readClaudeCode() else {
+            return nil
+        }
+        if !write(cc, service: backupService) {
+            print("[ClaudeKeychain] Failed to persist recovered Claude Code credential mirror")
+        }
         return cc
     }
 
@@ -8565,6 +8605,7 @@ private nonisolated enum ClaudeKeychainStore {
 
         let payload: [String: Any] = ["claudeAiOauth": oauthDict]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            print("[ClaudeKeychainStore] Failed to serialize credential mirror for \(service)")
             return false
         }
 
@@ -8585,9 +8626,15 @@ private nonisolated enum ClaudeKeychainStore {
             addQuery[kSecValueData as String] = data
             addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            return addStatus == errSecSuccess
+            guard addStatus == errSecSuccess else {
+                let detail = SecCopyErrorMessageString(addStatus, nil) as String? ?? "Unknown Keychain error"
+                print("[ClaudeKeychainStore] SecItemAdd for \(service) failed: OSStatus \(addStatus) (\(detail))")
+                return false
+            }
+            return true
         }
-        print("[ClaudeKeychainStore] SecItemUpdate for \(service) failed: OSStatus \(updateStatus)")
+        let detail = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "Unknown Keychain error"
+        print("[ClaudeKeychainStore] SecItemUpdate for \(service) failed: OSStatus \(updateStatus) (\(detail))")
         return false
     }
 }
@@ -8596,6 +8643,12 @@ private nonisolated enum ClaudeKeychainStore {
 /// Code's rotating refresh-token lineage. Claude Code is the sole refresh
 /// client; Limit Counter only mirrors its current access token when the user
 /// explicitly enables keychain recovery.
+private enum ClaudeOAuthTokenResolution {
+    case token(String)
+    case unavailable
+    case requiresUserInitiatedRecovery
+}
+
 private actor ClaudeOAuthTokenManager {
     static let shared = ClaudeOAuthTokenManager()
 
@@ -8605,52 +8658,63 @@ private actor ClaudeOAuthTokenManager {
 
     /// Returns the mirrored access token and, when permitted, replaces a
     /// near-expiry mirror with Claude Code's current access token.
-    func currentAccessTokenFromKeychain(allowClaudeCodeFallback: Bool) -> String? {
+    func currentAccessTokenFromKeychain(
+        readBudget: ClaudeCodeKeychainReadBudget?
+    ) -> ClaudeOAuthTokenResolution {
         guard let (creds, source) = ClaudeKeychainStore.readBest(
-            allowClaudeCodeFallback: allowClaudeCodeFallback
+            claudeCodeReadBudget: readBudget
         ) else {
-            return nil
+            return .unavailable
         }
 
         if !creds.needsRefresh(buffer: refreshBuffer) {
-            return creds.accessToken
+            return .token(creds.accessToken)
         }
 
-        if allowClaudeCodeFallback, source != ClaudeKeychainStore.claudeCodeService,
+        if let readBudget,
+           source != ClaudeKeychainStore.claudeCodeService,
            let current = recoverFromClaudeCodeKeychain(
                rejectedToken: nil,
-               reason: "mirrored access token near expiry"
+               reason: "mirrored access token near expiry",
+               readBudget: readBudget
            ) {
-            return current
+            return .token(current)
         }
 
         print("[ClaudeOAuth] Access token near expiry (source: \(source)); Claude Code owns token refresh")
-        return creds.accessToken
+        if creds.needsRefresh(buffer: 0) {
+            return .requiresUserInitiatedRecovery
+        }
+        return .token(creds.accessToken)
     }
 
     /// Recovery path for when our mirrored OAuth token was invalidated or
     /// endpoint-throttled after Claude Code rewrote its own keychain item.
-    /// This can prompt, so callers use it only after the mirror already failed.
+    /// The one-shot budget ensures no refresh cycle can prompt more than once.
     func accessTokenAfterOAuthFailure(
         rejectedToken: String?,
         reason: String,
-        allowClaudeCodeFallback: Bool
+        readBudget: ClaudeCodeKeychainReadBudget?
     ) -> String? {
-        guard allowClaudeCodeFallback else {
+        guard let readBudget else {
             return nil
         }
 
         return recoverFromClaudeCodeKeychain(
             rejectedToken: rejectedToken,
-            reason: reason
+            reason: reason,
+            readBudget: readBudget
         )
     }
 
     private func recoverFromClaudeCodeKeychain(
         rejectedToken: String?,
-        reason: String
+        reason: String,
+        readBudget: ClaudeCodeKeychainReadBudget
     ) -> String? {
-        guard let fallback = ClaudeKeychainStore.readClaudeCodeAsFallback() else {
+        guard let fallback = ClaudeKeychainStore.readClaudeCodeAsFallback(
+            using: readBudget
+        ) else {
             return nil
         }
 
@@ -8689,23 +8753,38 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         //   4. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
         let claudeCodeKeychainFallbackEnabled = ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: credentials)
-        let claudeCodeKeychainAccessAllowed = ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(
+        let claudeCodeReadBudget = ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
             enabled: claudeCodeKeychainFallbackEnabled,
             userInitiated: userInitiated
         )
         var oauthToken = manualToken
         var tokenAllowsKeychainRecovery = false
         var tokenAllowsKeychainPlanLookup = false
+        var requiresUserInitiatedKeychainRecovery = false
 
         if oauthToken == nil {
-            oauthToken = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
-                allowClaudeCodeFallback: claudeCodeKeychainAccessAllowed
+            let resolution = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
+                readBudget: claudeCodeReadBudget
             )
-            tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeKeychainAccessAllowed
+            switch resolution {
+            case .token(let token):
+                oauthToken = token
+            case .requiresUserInitiatedRecovery:
+                requiresUserInitiatedKeychainRecovery = true
+            case .unavailable:
+                break
+            }
+            tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeReadBudget != nil
             tokenAllowsKeychainPlanLookup = oauthToken != nil
         }
         if oauthToken == nil {
             oauthToken = Self.autoDetectedOAuthTokenFile()
+        }
+        if oauthToken == nil, requiresUserInitiatedKeychainRecovery {
+            let message = userInitiated
+                ? "Claude Code authorization could not be refreshed. Re-authenticate Claude Code, then refresh again."
+                : "Claude Code authorization needs a user-initiated refresh before Limit Counter can read the updated token."
+            throw ProviderFetchError.credentialExpired(message)
         }
         if let token = oauthToken, !token.isEmpty {
             // 1) Serve fresh cached snapshot if we hit the endpoint very recently.
@@ -8730,7 +8809,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                    let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
                     rejectedToken: token,
                     reason: "OAuth usage fetch failed (\(error.localizedDescription))",
-                    allowClaudeCodeFallback: claudeCodeKeychainAccessAllowed
+                    readBudget: claudeCodeReadBudget
                    ) {
                     do {
                         return try await fetchOAuthSnapshotAndMerge(

@@ -400,6 +400,28 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
         ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: true, userInitiated: true),
         "an opted-in manual refresh may recover from Claude Code's keychain item"
     )
+
+    try expect(
+        ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
+            enabled: true,
+            userInitiated: false
+        ) == nil,
+        "background refresh must not receive a Claude Code keychain read budget"
+    )
+    guard let manualRefreshBudget = ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
+        enabled: true,
+        userInitiated: true
+    ) else {
+        throw TestError.failure("opted-in manual refresh should receive a Claude Code keychain read budget")
+    }
+    try expect(
+        manualRefreshBudget.claimRead(),
+        "the first Claude Code keychain read in a manual refresh should be allowed"
+    )
+    try expect(
+        !manualRefreshBudget.claimRead(),
+        "a refresh cycle must never read Claude Code's keychain item more than once"
+    )
 }
 
 private func testClaudeJSONLReaderStreamsAcrossChunkBoundaries() throws {

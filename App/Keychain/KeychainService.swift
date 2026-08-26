@@ -19,9 +19,18 @@ public final class KeychainService {
         return try? decoder.decode(ProviderCredential.self, from: data)
     }
 
-    public func save(_ credential: ProviderCredential, for providerID: ProviderID) {
-        guard let data = try? encoder.encode(credential) else { return }
-        write(data: data, account: providerID.rawValue)
+    /// Persists a credential and reports whether Keychain accepted the write.
+    /// Callers that rotate browser sessions can use the result to avoid
+    /// treating an in-memory token as durable when the OS rejected it.
+    @discardableResult
+    public func save(_ credential: ProviderCredential, for providerID: ProviderID) -> Bool {
+        do {
+            let data = try encoder.encode(credential)
+            return write(data: data, account: providerID.rawValue)
+        } catch {
+            print("[KeychainService] Failed to encode credential for \(providerID.rawValue): \(error.localizedDescription)")
+            return false
+        }
     }
 
     public func delete(for providerID: ProviderID) {
@@ -48,7 +57,7 @@ public final class KeychainService {
         return result as? Data
     }
 
-    private func write(data: Data, account: String) {
+    private func write(data: Data, account: String) -> Bool {
         let query: [CFString: Any] = [
             kSecClass:       kSecClassGenericPassword,
             kSecAttrService: serviceName,
@@ -56,12 +65,29 @@ public final class KeychainService {
         ]
         let attributes: [CFString: Any] = [kSecValueData: data]
 
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+
+        if updateStatus == errSecItemNotFound {
             var newItem = query
             newItem[kSecValueData] = data
-            SecItemAdd(newItem as CFDictionary, nil)
+            let addStatus = SecItemAdd(newItem as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                logWriteFailure(operation: "add", account: account, status: addStatus)
+                return false
+            }
+            return true
         }
+
+        logWriteFailure(operation: "update", account: account, status: updateStatus)
+        return false
+    }
+
+    private func logWriteFailure(operation: String, account: String, status: OSStatus) {
+        let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown Keychain error"
+        print("[KeychainService] Keychain \(operation) failed for \(account): OSStatus \(status) (\(detail))")
     }
 
     private func delete(account: String) {
