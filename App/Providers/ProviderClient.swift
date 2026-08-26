@@ -3874,23 +3874,8 @@ nonisolated enum KimiWebMembershipParser {
     }
 }
 
-nonisolated enum KimiWebCredentialStore {
-    private static let service = "com.chrisizatt.LLMUsageCounter"
-
-    static func persist(_ tokens: KimiWebSessionTokens) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: ProviderID.kimi.rawValue,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let credential = try? JSONDecoder().decode(ProviderCredential.self, from: data) else {
-            return
-        }
+actor KimiWebCredentialStore {
+    static let shared = KimiWebCredentialStore()
 
         var fields = credential.extraFields ?? [:]
         fields["kimiWebAccessToken"] = tokens.accessToken
@@ -3906,25 +3891,26 @@ nonisolated enum KimiWebCredentialStore {
         )
         guard let updatedData = try? JSONEncoder().encode(updated) else { return }
 
-        let updateQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: ProviderID.kimi.rawValue
-        ]
-        _ = SecItemUpdate(
-            updateQuery as CFDictionary,
-            [kSecValueData as String: updatedData] as CFDictionary
-        )
+        let persistedUpdates = updates
+        let didPersist = await MainActor.run {
+            KeychainService.shared.updateExtraFields(persistedUpdates, for: .kimi)
+        }
+        if !didPersist {
+            print("[KimiWebCredentialStore] Failed to persist rotated web-session tokens")
+        }
+        return didPersist
     }
 }
 
-struct KimiWebMembershipClient {
+actor KimiWebMembershipClient {
     private let session: URLSession
-    private let persistTokens: (KimiWebSessionTokens) -> Void
+    private let persistTokens: (KimiWebSessionTokens) async -> Bool
 
     init(
         session: URLSession = .shared,
-        persistTokens: @escaping (KimiWebSessionTokens) -> Void = KimiWebCredentialStore.persist
+        persistTokens: @escaping (KimiWebSessionTokens) async -> Bool = {
+            await KimiWebCredentialStore.shared.persist($0)
+        }
     ) {
         self.session = session
         self.persistTokens = persistTokens
@@ -3946,7 +3932,11 @@ struct KimiWebMembershipClient {
                 return nil
             }
             tokens = refreshed
-            persistTokens(tokens)
+            guard await persistTokens(tokens) else {
+                throw ProviderFetchError.credentialExpired(
+                    "Kimi refreshed the browser session, but Limit Counter could not save the rotated tokens. Unlock Keychain and import the Kimi browser session again."
+                )
+            }
             if let retry = await fetchStats(accessToken: tokens.accessToken),
                retry.statusCode == 200 {
                 return KimiWebMembershipParser.monthlyUsage(from: retry.data)
@@ -4025,14 +4015,13 @@ public struct KimiProviderClient: ProviderClient {
     public init(session: URLSession = .shared) {
         self.session = session
         self.webMembershipClient = KimiWebMembershipClient(
-            session: session,
-            persistTokens: KimiWebCredentialStore.persist
+            session: session
         )
     }
 
     init(
         session: URLSession,
-        persistWebSessionTokens: @escaping (KimiWebSessionTokens) -> Void
+        persistWebSessionTokens: @escaping (KimiWebSessionTokens) async -> Bool
     ) {
         self.session = session
         self.webMembershipClient = KimiWebMembershipClient(
@@ -4043,7 +4032,7 @@ public struct KimiProviderClient: ProviderClient {
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         guard let credentials else { throw ProviderFetchError.notConfigured }
-        async let monthlyUsage = webMembershipClient.fetchMonthlyUsage(credentials: credentials)
+        async let monthlyUsage = try webMembershipClient.fetchMonthlyUsage(credentials: credentials)
 
         let accessToken = try await resolvedAccessToken(from: credentials)
         guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
@@ -4072,7 +4061,7 @@ public struct KimiProviderClient: ProviderClient {
         switch httpResponse.statusCode {
         case 200..<300:
             let apiSnapshot = try KimiUsageNormalizer.snapshot(from: data, fetchedAt: Date())
-            let snapshotWithMonthly = mergeMonthlyUsage(await monthlyUsage, into: apiSnapshot)
+            let snapshotWithMonthly = mergeMonthlyUsage(try await monthlyUsage, into: apiSnapshot)
             // Best-effort augmentation: read local Kimi CLI session logs.
             // so per-turn activity events surface on the heatmap. Returns [] if
             // the sandbox denies the read (typical when the user only granted a

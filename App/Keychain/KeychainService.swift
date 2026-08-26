@@ -33,6 +33,33 @@ public final class KeychainService {
         }
     }
 
+    /// Atomically merges credential metadata and persists the complete
+    /// credential. Rotating browser sessions use this to avoid rebuilding a
+    /// credential from a stale copy and clobbering unrelated fields.
+    @discardableResult
+    public func updateExtraFields(
+        _ updates: [String: String],
+        for providerID: ProviderID
+    ) -> Bool {
+        guard let credential = credential(for: providerID) else {
+            print("[KeychainService] Cannot update \(providerID.rawValue): stored credential is unavailable")
+            return false
+        }
+
+        var extraFields = credential.extraFields ?? [:]
+        for (key, value) in updates {
+            extraFields[key] = value
+        }
+        let updated = ProviderCredential(
+            accessToken: credential.accessToken,
+            accountIdentifier: credential.accountIdentifier,
+            customEndpoint: credential.customEndpoint,
+            extraFields: extraFields,
+            bookmarkData: credential.bookmarkData
+        )
+        return save(updated, for: providerID)
+    }
+
     public func delete(for providerID: ProviderID) {
         delete(account: providerID.rawValue)
     }

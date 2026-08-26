@@ -1655,6 +1655,70 @@ private func testOpenRouterParsesRateLimit() throws {
 
 
 
+private func testImportedCookieHeaderMergePreservesAndRotates() throws {
+    let requestURL = URL(string: "https://admin.mistral.ai/subscription")!
+    let existing = "session=old-token; theme=dark"
+    let now = Date()
+
+    let rotated = ImportedCookieHeaderMerger.mergedHeader(
+        existingHeader: existing,
+        responseHeaderFields: [
+            "Set-Cookie": "session=new-token; Domain=.mistral.ai; Path=/subscription; Max-Age=3600; Secure; HttpOnly"
+        ],
+        requestURL: requestURL,
+        allowedDomains: ["mistral.ai"],
+        now: now
+    )
+    try expectEqual(
+        rotated,
+        "session=new-token; theme=dark",
+        "Set-Cookie rotation should preserve unrelated imported cookies"
+    )
+
+    let withoutRotation = ImportedCookieHeaderMerger.mergedHeader(
+        existingHeader: existing,
+        responseHeaderFields: ["Content-Type": "text/html"],
+        requestURL: requestURL,
+        allowedDomains: ["mistral.ai"],
+        now: now
+    )
+    try expectEqual(
+        withoutRotation,
+        nil,
+        "responses without Set-Cookie must not replace the imported header"
+    )
+
+    let wrongPath = ImportedCookieHeaderMerger.mergedHeader(
+        existingHeader: existing,
+        responseHeaderFields: [
+            "Set-Cookie": "session=wrong-path; Domain=.mistral.ai; Path=/admin; Max-Age=3600"
+        ],
+        requestURL: requestURL,
+        allowedDomains: ["mistral.ai"],
+        now: now
+    )
+    try expectEqual(
+        wrongPath,
+        nil,
+        "cookies outside the request path must be ignored"
+    )
+
+    let deleted = ImportedCookieHeaderMerger.mergedHeader(
+        existingHeader: existing,
+        responseHeaderFields: [
+            "Set-Cookie": "session=; Domain=.mistral.ai; Path=/subscription; Max-Age=0"
+        ],
+        requestURL: requestURL,
+        allowedDomains: ["mistral.ai"],
+        now: now
+    )
+    try expectEqual(
+        deleted,
+        "theme=dark",
+        "Max-Age=0 should remove only the rotated cookie"
+    )
+}
+
 @main
 private enum AdditionalProviderUsageTestRunner {
     static func main() throws {
@@ -1702,6 +1766,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testOpenRouterParsesUnlimitedKey()
         try testOpenRouterParsesFreeTier()
         try testOpenRouterParsesRateLimit()
+        try testImportedCookieHeaderMergePreservesAndRotates()
         print("Additional provider usage tests passed")
     }
 }

@@ -917,10 +917,141 @@ public struct MistralWebSubscriptionResult: Sendable {
     }
 }
 
+nonisolated enum ImportedCookieHeaderMerger {
+    static func mergedHeader(
+        existingHeader: String,
+        response: HTTPURLResponse,
+        requestURL: URL,
+        allowedDomains: [String],
+        now: Date = Date()
+    ) -> String? {
+        let fields = response.allHeaderFields.reduce(into: [String: String]()) { result, entry in
+            result[String(describing: entry.key)] = entry.value as? String
+                ?? String(describing: entry.value)
+        }
+        return mergedHeader(
+            existingHeader: existingHeader,
+            responseHeaderFields: fields,
+            requestURL: requestURL,
+            allowedDomains: allowedDomains,
+            now: now
+        )
+    }
+
+    static func mergedHeader(
+        existingHeader: String,
+        responseHeaderFields: [String: String],
+        requestURL: URL,
+        allowedDomains: [String],
+        now: Date = Date()
+    ) -> String? {
+        guard let setCookie = responseHeaderFields.first(where: {
+            $0.key.caseInsensitiveCompare("Set-Cookie") == .orderedSame
+        })?.value else {
+            return nil
+        }
+
+        let cookies = HTTPCookie.cookies(
+            withResponseHeaderFields: ["Set-Cookie": setCookie],
+            for: requestURL
+        )
+        guard !cookies.isEmpty else { return nil }
+
+        var order: [String] = []
+        var values: [String: String] = [:]
+        for component in existingHeader.split(separator: ";", omittingEmptySubsequences: true) {
+            let pair = component.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let rawName = pair.first else { continue }
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            if values[name] == nil {
+                order.append(name)
+            }
+            values[name] = pair.count == 2
+                ? String(pair[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+        }
+
+        let host = requestURL.host?.lowercased() ?? ""
+        let requestPath = requestURL.path.isEmpty ? "/" : requestURL.path
+        var didApplyCookie = false
+
+        for cookie in cookies {
+            let cookieDomain = cookie.domain
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+            guard domain(host, matches: cookieDomain),
+                  allowedDomains.isEmpty || allowedDomains.contains(where: {
+                      domain(cookieDomain, matches: $0.lowercased())
+                          || domain(host, matches: $0.lowercased())
+                  }),
+                  path(requestPath, matches: cookie.path) else {
+                continue
+            }
+
+            didApplyCookie = true
+            if let expiresDate = cookie.expiresDate, expiresDate <= now {
+                values.removeValue(forKey: cookie.name)
+                order.removeAll { $0 == cookie.name }
+                continue
+            }
+
+            if values[cookie.name] == nil {
+                order.append(cookie.name)
+            }
+            values[cookie.name] = cookie.value
+        }
+
+        guard didApplyCookie else { return nil }
+        return order.compactMap { name in
+            values[name].map { "\(name)=\($0)" }
+        }.joined(separator: "; ")
+    }
+
+    private static func domain(_ host: String, matches allowedDomain: String) -> Bool {
+        let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let normalizedDomain = allowedDomain.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".")
+        ).lowercased()
+        return normalizedHost == normalizedDomain
+            || normalizedHost.hasSuffix("." + normalizedDomain)
+    }
+
+    private static func path(_ requestPath: String, matches cookiePath: String) -> Bool {
+        let normalizedCookiePath = cookiePath.isEmpty ? "/" : cookiePath
+        guard normalizedCookiePath != "/" else { return true }
+        guard requestPath.hasPrefix(normalizedCookiePath) else { return false }
+        return requestPath.count == normalizedCookiePath.count
+            || normalizedCookiePath.hasSuffix("/")
+            || requestPath.dropFirst(normalizedCookiePath.count).first == "/"
+    }
+}
+
+private nonisolated func persistImportedCookieHeader(
+    _ cookieHeader: String,
+    providerID: ProviderID,
+    field: String
+) async -> Bool {
+    let didPersist = await MainActor.run {
+        KeychainService.shared.updateExtraFields(
+            [field: cookieHeader],
+            for: providerID
+        )
+    }
+    if !didPersist {
+        print("[ImportedCookieHeader] Failed to persist rotated cookies for \(providerID.rawValue)")
+    }
+    return didPersist
+}
+
 public struct MistralWebSubscriptionClient: Sendable {
     public init() {}
 
-    public func fetch(cookieHeader: String, now: Date) async -> MistralWebSubscriptionResult? {
+    public func fetch(
+        cookieHeader: String,
+        now: Date,
+        persistCookieHeader: ((String) async -> Bool)? = nil
+    ) async -> MistralWebSubscriptionResult? {
         guard let url = URL(string: "https://admin.mistral.ai/subscription") else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.httpMethod = "GET"
@@ -948,6 +1079,19 @@ public struct MistralWebSubscriptionClient: Sendable {
               (200...299).contains(httpResponse.statusCode),
               let html = String(data: data, encoding: .utf8) else {
             return nil
+        }
+
+        if let rotatedHeader = ImportedCookieHeaderMerger.mergedHeader(
+            existingHeader: cookieHeader,
+            response: httpResponse,
+            requestURL: url,
+            allowedDomains: ["mistral.ai"]
+        ), rotatedHeader != cookieHeader {
+            guard let persistCookieHeader,
+                  await persistCookieHeader(rotatedHeader) else {
+                print("[MistralWebSubscriptionClient] Rotated cookies were received but could not be persisted")
+                return nil
+            }
         }
 
         return Self.parse(html: html, now: now)
@@ -1267,7 +1411,11 @@ public struct WebBillingClient: Sendable {
         self.cookieDomains = cookieDomains
      }
 
-    public func fetch(cookieHeader: String, now: Date) async -> WebBillingReading? {
+    public func fetch(
+        cookieHeader: String,
+        now: Date,
+        persistCookieHeader: ((String) async -> Bool)? = nil
+    ) async -> WebBillingReading? {
         guard !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
          }
@@ -1299,6 +1447,19 @@ public struct WebBillingClient: Sendable {
               let html = String(data: data, encoding: .utf8) else {
             return nil
          }
+
+        if let rotatedHeader = ImportedCookieHeaderMerger.mergedHeader(
+            existingHeader: cookieHeader,
+            response: httpResponse,
+            requestURL: baseURL,
+            allowedDomains: cookieDomains
+        ), rotatedHeader != cookieHeader {
+            guard let persistCookieHeader,
+                  await persistCookieHeader(rotatedHeader) else {
+                print("[WebBillingClient] Rotated cookies were received but could not be persisted")
+                return nil
+            }
+        }
 
         return Self.parse(html: html, now: now)
      }
@@ -1655,7 +1816,17 @@ public struct MistralProviderClient: ProviderClient {
         }
         let webSessionCookie = fields["mistralCookieHeader"] ?? fields["mistralCookie"]
         let webResult: MistralWebSubscriptionResult? = if let webSessionCookie, !webSessionCookie.isEmpty {
-            await MistralWebSubscriptionClient().fetch(cookieHeader: webSessionCookie, now: now)
+            await MistralWebSubscriptionClient().fetch(
+                cookieHeader: webSessionCookie,
+                now: now,
+                persistCookieHeader: {
+                    await persistImportedCookieHeader(
+                        $0,
+                        providerID: .mistral,
+                        field: "mistralCookieHeader"
+                    )
+                }
+            )
         } else {
             nil
         }
@@ -2382,7 +2553,17 @@ public struct CerebrasProviderClient: ProviderClient {
             await WebBillingClient(
                 baseURL: URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!,
                 cookieDomains: ["cerebras.ai"]
-            ).fetch(cookieHeader: webCookie, now: now)
+            ).fetch(
+                cookieHeader: webCookie,
+                now: now,
+                persistCookieHeader: {
+                    await persistImportedCookieHeader(
+                        $0,
+                        providerID: .cerebras,
+                        field: SpendProviderCredentialField.cerebrasCookieHeader
+                    )
+                }
+            )
          } else {
             nil
          }
@@ -3571,7 +3752,17 @@ public struct MetaProviderClient: ProviderClient {
             await WebBillingClient(
                 baseURL: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!,
                 cookieDomains: ["meta.ai", "meta.com"]
-            ).fetch(cookieHeader: webCookie, now: now)
+            ).fetch(
+                cookieHeader: webCookie,
+                now: now,
+                persistCookieHeader: {
+                    await persistImportedCookieHeader(
+                        $0,
+                        providerID: .meta,
+                        field: SpendProviderCredentialField.metaCookieHeader
+                    )
+                }
+            )
         } else {
             nil
         }

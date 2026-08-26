@@ -39,6 +39,7 @@ enum KimiUsageTestRunner {
         try testParsesWebMonthlyMembershipQuota()
         try await testMergesWebMonthlyQuotaWithCodeWindows()
         try await testRefreshesAndPersistsWebSessionTokens()
+        try await testPersistenceFailureStopsWebSessionRetry()
         try testImportsPlainTextAPIKey()
         try testImportsCLIOAuthJSONAsFileReference()
         try testImportsCLIOAuthDirectory()
@@ -267,7 +268,7 @@ enum KimiUsageTestRunner {
         configuration.protocolClasses = [KimiMockURLProtocol.self]
         let snapshot = try await KimiProviderClient(
             session: URLSession(configuration: configuration),
-            persistWebSessionTokens: { _ in }
+            persistWebSessionTokens: { _ in true }
         ).fetchSnapshot(
             credentials: ProviderCredential(
                 accessToken: "code-access-token",
@@ -319,9 +320,12 @@ enum KimiUsageTestRunner {
         configuration.protocolClasses = [KimiMockURLProtocol.self]
         let client = KimiWebMembershipClient(
             session: URLSession(configuration: configuration),
-            persistTokens: { persisted = $0 }
+            persistTokens: {
+                persisted = $0
+                return true
+            }
         )
-        let reading = await client.fetchMonthlyUsage(
+        let reading = try await client.fetchMonthlyUsage(
             credentials: ProviderCredential(
                 extraFields: [
                     "kimiWebAccessToken": "expired-web-access",
@@ -334,6 +338,65 @@ enum KimiUsageTestRunner {
         try expectEqual(statsRequests, 2, "web stats retry count")
         try expectEqual(persisted?.accessToken, "rotated-web-access", "persisted web access token")
         try expectEqual(persisted?.refreshToken, "rotated-web-refresh", "persisted web refresh token")
+    }
+
+    private static func testPersistenceFailureStopsWebSessionRetry() async throws {
+        var statsRequests = 0
+        KimiMockURLProtocol.requestHandler = { request in
+            if request.url?.path.contains("RefreshToken") == true {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (
+                    response,
+                    #"{"access_token":"rotated-web-access","refresh_token":"rotated-web-refresh"}"#
+                        .data(using: .utf8)!
+                )
+            }
+
+            statsRequests += 1
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 401,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data())
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let client = KimiWebMembershipClient(
+            session: URLSession(configuration: configuration),
+            persistTokens: { _ in false }
+        )
+
+        do {
+            _ = try await client.fetchMonthlyUsage(
+                credentials: ProviderCredential(
+                    extraFields: [
+                        "kimiWebAccessToken": "expired-web-access",
+                        "kimiWebRefreshToken": "web-refresh"
+                    ]
+                )
+            )
+            throw TestFailure.failed("failed Kimi token persistence should throw")
+        } catch ProviderFetchError.credentialExpired(let message) {
+            try expect(
+                message.contains("could not save the rotated tokens"),
+                "Kimi persistence failure should explain the re-import requirement"
+            )
+        }
+
+        try expectEqual(
+            statsRequests,
+            1,
+            "Kimi must not retry usage with an unpersisted rotated token"
+        )
     }
 
     private static func requiredWindow(_ label: String, in snapshot: QuotaSnapshot) throws -> QuotaWindow {

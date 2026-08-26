@@ -1562,8 +1562,9 @@ struct ProviderCredentialView: View {
             KimiWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    kimiWebSessionImported = true
+                    if applyImportedCredential(imported) {
+                        kimiWebSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1574,8 +1575,9 @@ struct ProviderCredentialView: View {
             OllamaSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    ollamaSessionImported = true
+                    if applyImportedCredential(imported) {
+                        ollamaSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1586,8 +1588,9 @@ struct ProviderCredentialView: View {
             MistralSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    mistralSessionImported = true
+                    if applyImportedCredential(imported) {
+                        mistralSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1598,8 +1601,9 @@ struct ProviderCredentialView: View {
             MetaWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    metaWebSessionImported = true
+                    if applyImportedCredential(imported) {
+                        metaWebSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1610,8 +1614,9 @@ struct ProviderCredentialView: View {
             CerebrasWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    cerebrasWebSessionImported = true
+                    if applyImportedCredential(imported) {
+                        cerebrasWebSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1622,8 +1627,9 @@ struct ProviderCredentialView: View {
             QwenWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    qwenWebSessionImported = true
+                    if applyImportedCredential(imported) {
+                        qwenWebSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1634,8 +1640,9 @@ struct ProviderCredentialView: View {
             MimoWebSessionImportView { result in
                 switch result {
                 case .success(let imported):
-                    applyImportedCredential(imported)
-                    mimoWebSessionImported = true
+                    if applyImportedCredential(imported) {
+                        mimoWebSessionImported = true
+                    }
                 case .failure(let error):
                     importError = error.localizedDescription
                     showImportError = true
@@ -1968,8 +1975,9 @@ struct ProviderCredentialView: View {
 
         if credential.isEmpty {
             KeychainService.shared.delete(for: .codexTelemetry)
-        } else {
-            KeychainService.shared.save(credential, for: .codexTelemetry)
+        } else if !KeychainService.shared.save(credential, for: .codexTelemetry) {
+            showKeychainSaveFailure(for: .codexTelemetry)
+            return
         }
 
         loadCodexTelemetryCredential()
@@ -2120,7 +2128,10 @@ struct ProviderCredentialView: View {
             return
         }
 
-        KeychainService.shared.save(credential, for: providerID)
+        guard KeychainService.shared.save(credential, for: providerID) else {
+            showKeychainSaveFailure(for: providerID)
+            return
+        }
         storedExtraFields = extraFields
         loadedBillingAnchorSignature = billingAnchorSignature
         cursorSessionImported = providerID == .cursor && (
@@ -2133,7 +2144,10 @@ struct ProviderCredentialView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { isSaved = false }
     }
 
-    private func saveCredentialWithExtraFields(_ suppliedExtraFields: [String: String]) {
+    @discardableResult
+    private func saveCredentialWithExtraFields(
+        _ suppliedExtraFields: [String: String]
+    ) -> Bool {
         var extraFields = suppliedExtraFields
         if billingAnchorSignature != loadedBillingAnchorSignature {
             extraFields[SpendProviderCredentialField.anchorUpdatedAt] = ISO8601DateFormatter().string(from: Date())
@@ -2149,10 +2163,13 @@ struct ProviderCredentialView: View {
         )
         if credential.isEmpty {
             deleteCredential()
-            return
+            return true
         }
 
-        KeychainService.shared.save(credential, for: providerID)
+        guard KeychainService.shared.save(credential, for: providerID) else {
+            showKeychainSaveFailure(for: providerID)
+            return false
+        }
         storedExtraFields = extraFields
         loadedBillingAnchorSignature = billingAnchorSignature
         cursorSessionImported = providerID == .cursor && (
@@ -2163,12 +2180,15 @@ struct ProviderCredentialView: View {
             && extraFields["kimiWebAccessToken"]?.isEmpty == false
         isSaved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { isSaved = false }
+        return true
     }
 
-    private func applyImportedCredential(_ credential: CredentialImportService.ImportedCredential) {
+    @discardableResult
+    private func applyImportedCredential(
+        _ credential: CredentialImportService.ImportedCredential
+    ) -> Bool {
         if providerID == .cursor {
-            applyImportedCursorCredential(credential)
-            return
+            return applyImportedCursorCredential(credential)
         }
 
         let isKimiWebSessionImport = providerID == .kimi
@@ -2193,13 +2213,13 @@ struct ProviderCredentialView: View {
             let bookmarkBase64 = bookmarkData.base64EncodedString()
             print("[SettingsView] Got bookmark data (length: \(bookmarkData.count), base64 length: \(bookmarkBase64.count))")
             extraFields["bookmarkData"] = bookmarkBase64
-            saveCredentialWithExtraFields(extraFields)
-        } else {
-            saveCredentialWithExtraFields(extraFields)
         }
+        return saveCredentialWithExtraFields(extraFields)
     }
 
-    private func applyImportedCursorCredential(_ credential: CredentialImportService.ImportedCredential) {
+    private func applyImportedCursorCredential(
+        _ credential: CredentialImportService.ImportedCredential
+    ) -> Bool {
         let existing = KeychainService.shared.credential(for: .cursor)
 
         let resolvedAccessToken = credential.accessToken
@@ -2232,7 +2252,13 @@ struct ProviderCredentialView: View {
             extraFields["cursorAuthMode"] = "localState"
         }
 
-        saveCredentialWithExtraFields(extraFields)
+        return saveCredentialWithExtraFields(extraFields)
+    }
+
+    private func showKeychainSaveFailure(for targetProviderID: ProviderID) {
+        isSaved = false
+        importError = "Limit Counter could not save \(targetProviderID.displayName) credentials to Keychain. Unlock the login keychain, check the permission prompt, and try again."
+        showImportError = true
     }
 
     private func deleteCredential() {

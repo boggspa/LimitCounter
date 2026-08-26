@@ -10,6 +10,7 @@ xcrun --sdk macosx swiftc -enable-testing \
   Shared/Models/QuotaModels.swift \
   Shared/Storage/QuotaSnapshotStore.swift \
   Shared/Storage/TelemetryParseCache.swift \
+  App/Keychain/KeychainService.swift \
   App/Providers/ProviderClient.swift \
   App/Providers/AntigravityProviderClient.swift \
   App/Providers/SpendProviderClients.swift \
