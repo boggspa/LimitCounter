@@ -287,7 +287,11 @@ final class AppStateStore: ObservableObject {
         defer { isSyncing = false }
 
         #if os(macOS)
-        await syncCoordinator.syncAll(userInitiated: userInitiated)
+        await syncCoordinator.syncAll(userInitiated: userInitiated) { [weak self] progressiveSnapshots, progressiveErrors in
+            guard let self else { return }
+            snapshots = progressiveSnapshots.isEmpty ? Self.initialSnapshots : progressiveSnapshots
+            syncErrors = progressiveErrors
+        }
         let loaded = store.loadSnapshots()
         snapshots = loaded.isEmpty ? Self.initialSnapshots : loaded
         lastSyncDate = syncCoordinator.lastSyncDate

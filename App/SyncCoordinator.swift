@@ -15,6 +15,8 @@ final class SyncCoordinator {
     private let keychain: KeychainService
     private let signalDetector = SnapshotSignalDetector()
     private var clients: [ProviderID: any ProviderClient]
+    private let maximumConcurrentRefreshes = 3
+    private let refreshStartSpacingNanoseconds: UInt64 = 175_000_000
 
     init(
         store: QuotaSnapshotStore? = nil,
@@ -34,8 +36,12 @@ final class SyncCoordinator {
 
     // MARK: - Sync
 
-    /// Fetches all registered providers in display order.
-    func syncAll(userInitiated: Bool = false) async {
+    /// Fetches all registered providers with bounded, staggered concurrency.
+    /// The progress callback runs on the main actor after each provider lands.
+    func syncAll(
+        userInitiated: Bool = false,
+        onProgress: (([QuotaSnapshot], [ProviderID: String]) -> Void)? = nil
+    ) async {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
@@ -44,54 +50,73 @@ final class SyncCoordinator {
         let storedSnapshots = store.loadSnapshots()
         let previousSnapshots = Dictionary(uniqueKeysWithValues: storedSnapshots.map { ($0.providerID, $0) })
         var mergedSnapshots = previousSnapshots
+        let scheduledProviders: [(providerID: ProviderID, client: any ProviderClient)] =
+            ProviderID.allCases.compactMap { providerID in
+                guard let client = clients[providerID] else { return nil }
+                return (providerID, client)
+            }
+        let startGate = ProviderRefreshStartGate(
+            spacingNanoseconds: refreshStartSpacingNanoseconds
+        )
 
-        // 1. Fetch all providers concurrently
+        // Keep only a small number of provider requests in flight. The start
+        // gate also spaces launches within each rolling chunk so keychain and
+        // network work do not arrive as a burst.
         await withTaskGroup(of: (providerID: ProviderID, outcome: ProviderSyncOutcome).self) { group in
-            for providerID in ProviderID.allCases {
-                if let client = clients[providerID] {
-                    group.addTask {
-                        let outcome = await self.syncOutcome(
-                            providerID: providerID,
-                            client: client,
-                            previousSnapshot: previousSnapshots[providerID],
-                            userInitiated: userInitiated
-                        )
-                        return (providerID, outcome)
-                    }
+            var nextProviderIndex = 0
+            let initialCount = min(maximumConcurrentRefreshes, scheduledProviders.count)
+
+            for _ in 0..<initialCount {
+                let scheduled = scheduledProviders[nextProviderIndex]
+                nextProviderIndex += 1
+                group.addTask {
+                    await startGate.waitForTurn()
+                    let outcome = await self.syncOutcome(
+                        providerID: scheduled.providerID,
+                        client: scheduled.client,
+                        previousSnapshot: previousSnapshots[scheduled.providerID],
+                        userInitiated: userInitiated
+                    )
+                    return (scheduled.providerID, outcome)
                 }
             }
 
-            for await (providerID, outcome) in group {
+            while let (providerID, outcome) = await group.next() {
                 mergedSnapshots[providerID] = outcome.snapshot
+                applySyncOutcome(outcome)
 
-                if let errorMessage = outcome.errorMessage {
-                    syncErrors[providerID] = errorMessage
-                } else {
-                    syncErrors.removeValue(forKey: providerID)
+                if (providerID == .openai || providerID == .codexTelemetry),
+                   let coalesced = coalescedCodexUsageSnapshot(in: mergedSnapshots) {
+                    mergedSnapshots[.openai] = coalesced
+                    store.upsert(coalesced)
+                }
+
+                onProgress?(
+                    ProviderID.allCases.compactMap { mergedSnapshots[$0] },
+                    syncErrors
+                )
+
+                if nextProviderIndex < scheduledProviders.count {
+                    let scheduled = scheduledProviders[nextProviderIndex]
+                    nextProviderIndex += 1
+                    group.addTask {
+                        await startGate.waitForTurn()
+                        let outcome = await self.syncOutcome(
+                            providerID: scheduled.providerID,
+                            client: scheduled.client,
+                            previousSnapshot: previousSnapshots[scheduled.providerID],
+                            userInitiated: userInitiated
+                        )
+                        return (scheduled.providerID, outcome)
+                    }
                 }
             }
         }
 
-        // 2. Coalesce Codex (OpenAI) and Codex Telemetry events
-        if let usage = mergedSnapshots[.openai], let telemetry = mergedSnapshots[.codexTelemetry] {
-            let combinedEvents = mergedUsageEventsPreservingHistory(
-                current: usage.events,
-                previous: telemetry.events
-            )
-
-            mergedSnapshots[.openai] = QuotaSnapshot(
-                id: usage.id,
-                providerID: usage.providerID,
-                displayName: usage.displayName,
-                planName: usage.planName,
-                windows: usage.windows,
-                stats: usage.stats,
-                balances: usage.balances,
-                signals: usage.signals,
-                events: combinedEvents,
-                fetchState: usage.fetchState,
-                fetchedAt: max(usage.fetchedAt, telemetry.fetchedAt)
-            )
+        // Re-run coalescence with the final pair so the atomic final ordering
+        // matches every progressive update.
+        if let coalesced = coalescedCodexUsageSnapshot(in: mergedSnapshots) {
+            mergedSnapshots[.openai] = coalesced
         }
 
         store.replaceAll(ProviderID.allCases.compactMap { mergedSnapshots[$0] })
@@ -471,6 +496,51 @@ final class SyncCoordinator {
         }
 
         store.upsert(outcome.snapshot)
+    }
+
+    private func coalescedCodexUsageSnapshot(
+        in snapshots: [ProviderID: QuotaSnapshot]
+    ) -> QuotaSnapshot? {
+        guard let usage = snapshots[.openai],
+              let telemetry = snapshots[.codexTelemetry] else {
+            return nil
+        }
+
+        let combinedEvents = mergedUsageEventsPreservingHistory(
+            current: usage.events,
+            previous: telemetry.events
+        )
+        return QuotaSnapshot(
+            id: usage.id,
+            providerID: usage.providerID,
+            displayName: usage.displayName,
+            planName: usage.planName,
+            windows: usage.windows,
+            stats: usage.stats,
+            balances: usage.balances,
+            signals: usage.signals,
+            events: combinedEvents,
+            fetchState: usage.fetchState,
+            fetchedAt: max(usage.fetchedAt, telemetry.fetchedAt)
+        )
+    }
+}
+
+private actor ProviderRefreshStartGate {
+    private let spacingNanoseconds: UInt64
+    private var nextStartNanoseconds: UInt64 = 0
+
+    init(spacingNanoseconds: UInt64) {
+        self.spacingNanoseconds = spacingNanoseconds
+    }
+
+    func waitForTurn() async {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let scheduledStart = max(now, nextStartNanoseconds)
+        nextStartNanoseconds = scheduledStart &+ spacingNanoseconds
+
+        guard scheduledStart > now else { return }
+        try? await Task.sleep(nanoseconds: scheduledStart - now)
     }
 }
 
