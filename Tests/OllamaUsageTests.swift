@@ -236,6 +236,161 @@ private func testOllamaWeeklyResetStoreKeepsEpisodeDateStable() throws {
     try expectEqual(jumped, farFuture, "A far-future recomputation replaces the stored date")
 }
 
+private func testOllamaFreeAccountParsesMonthlyIncludedUsage() throws {
+    let suiteName = "limit-counter-ollama-free-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fetchedAt = date("2026-09-13T13:00:00Z")
+    let html = """
+    <html><body>
+    <main>
+      <section>
+        <h2>Included usage</h2>
+        <span>Free</span>
+        <p>Cloud models and capabilities such as web search draw from your included usage. Upgrade for monthly included usage.</p>
+        <p>Free usage credits can be used with the following cloud models:</p>
+        <ul>
+          <li>gemma4:31b</li>
+          <li>nemotron-3-nano-30b</li>
+          <li>gpt-oss:120b</li>
+        </ul>
+        <p>Add usage credits or upgrade to use any cloud model.</p>
+        <h3>Free usage</h3>
+        <p>12.8% used</p>
+        <div role="progressbar" aria-valuenow="12.8" aria-valuemin="0" aria-valuemax="100"></div>
+        <p>Resets in 3 weeks.</p>
+        <p>Add more usage anytime, or upgrade for more included monthly usage.</p>
+      </section>
+      <h3>Models used this month</h3>
+      <p>gemma4:31b 146 requests</p>
+    </main>
+    </body></html>
+    """
+
+    let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
+    try expectEqual(snapshot.windows.count, 1, "Free page yields a single monthly meter")
+    try expectEqual(snapshot.planName, "Free", "Free plan badge")
+    let monthly = try snapshot.windows.first(where: { $0.windowKind == .monthly })
+        ?? { throw OllamaTestError.failure("Missing Ollama Free monthly window") }()
+
+    try expectEqual(monthly.label, "Free usage", "Free meter label")
+    try expectClose(monthly.used, 12.8, "Free usage percent")
+    try expectEqual(monthly.resetDate, fetchedAt.addingTimeInterval(3 * 7 * 86_400), "Free monthly reset from weeks countdown")
+    try expectEqual(monthly.subtitle, "Resets in 3w", "Free monthly subtitle")
+    try expect(snapshot.windows.allSatisfy { $0.windowKind != .session && $0.windowKind != .weekly }, "Free page must not invent session or weekly meters")
+}
+
+private func testOllamaFreePageWithLoginLinkStillParses() throws {
+    let suiteName = "limit-counter-ollama-free-login-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fetchedAt = date("2026-09-13T13:00:00Z")
+    let html = """
+    <html><body>
+    <nav><a href="/login">Account</a></nav>
+    <main>
+      <h2>Included usage</h2>
+      <span>Free</span>
+      <h3>Free usage</h3>
+      <p>12.8% used</p>
+      <p>Resets in 3 weeks.</p>
+      <h3>Models used this month</h3>
+    </main>
+    </body></html>
+    """
+
+    let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
+    try expectEqual(snapshot.windows.count, 1, "Free page with /login still parses")
+    try expectClose(snapshot.windows[0].used, 12.8, "Free usage percent with /login chrome")
+}
+
+private func testOllamaProPageDoesNotInventFreeMonthlyMeter() throws {
+    let suiteName = "limit-counter-ollama-pro-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fetchedAt = date("2026-09-13T13:12:00Z")
+    let html = """
+    <html><body>
+    <main>
+      <h2>Cloud usage</h2>
+      <span>Pro</span>
+      <p>Cloud models and capabilities such as web search consume usage. Upgrade for monthly included usage.</p>
+      <section>
+        <h2>Session usage</h2>
+        <p>0% used</p>
+        <div role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+        <p>Resets in 47 minutes.</p>
+      </section>
+      <section>
+        <h2>Weekly usage</h2>
+        <p>64.2% used</p>
+        <div role="progressbar" aria-valuenow="64.2" aria-valuemin="0" aria-valuemax="100"></div>
+        <p>Resets in 11 hours.</p>
+      </section>
+      <h3>Models used this week</h3>
+    </main>
+    </body></html>
+    """
+
+    let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
+    try expectEqual(snapshot.windows.count, 2, "Pro page keeps session and weekly meters")
+    try expectEqual(snapshot.planName, "Pro", "Pro plan badge")
+    try expect(snapshot.windows.allSatisfy { $0.windowKind != .monthly }, "Pro page must not invent a Free monthly meter")
+    let session = try snapshot.windows.first(where: { $0.windowKind == .session })
+        ?? { throw OllamaTestError.failure("Missing Ollama session window") }()
+    let weekly = try snapshot.windows.first(where: { $0.windowKind == .weekly })
+        ?? { throw OllamaTestError.failure("Missing Ollama weekly window") }()
+    try expectClose(session.used, 0, "Pro session percent")
+    try expectEqual(session.resetDate, fetchedAt.addingTimeInterval(47 * 60), "Pro session minutes reset")
+    try expectEqual(session.subtitle, "Resets in 47m", "Pro session minutes subtitle")
+    try expectClose(weekly.used, 64.2, "Pro weekly percent")
+    try expectEqual(weekly.subtitle, "Resets in 11h", "Pro weekly subtitle")
+}
+
+private func testOllamaMonthlyResetStoreKeepsEpisodeDateStable() throws {
+    let suiteName = "limit-counter-ollama-monthly-reset-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let start = date("2026-09-13T13:00:00Z")
+    let episodeDate = start.addingTimeInterval(3 * 7 * 86_400)
+
+    let adopted = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+        candidate: episodeDate,
+        now: start,
+        defaults: defaults
+    )
+    try expectEqual(adopted, episodeDate, "First Free monthly sighting adopts the computed reset")
+
+    let thirtyMinutesLater = start.addingTimeInterval(30 * 60)
+    let drifted = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+        candidate: thirtyMinutesLater.addingTimeInterval(3 * 7 * 86_400),
+        now: thirtyMinutesLater,
+        defaults: defaults
+    )
+    try expectEqual(drifted, episodeDate, "Recomputed 3-week countdown keeps the stored monthly date")
+
+    let oneWeekLater = start.addingTimeInterval(7 * 86_400)
+    let twoWeeksLeft = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+        candidate: oneWeekLater.addingTimeInterval(2 * 7 * 86_400),
+        now: oneWeekLater,
+        defaults: defaults
+    )
+    try expectEqual(twoWeeksLeft, episodeDate, "A week-granular tick from 3w to 2w stays in the same episode")
+
+    let nextEpisodeNow = start.addingTimeInterval(22 * 86_400)
+    let nextEpisodeDate = nextEpisodeNow.addingTimeInterval(3 * 7 * 86_400)
+    let replaced = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+        candidate: nextEpisodeDate,
+        now: nextEpisodeNow,
+        defaults: defaults
+    )
+    try expectEqual(replaced, nextEpisodeDate, "A new monthly episode after the stored reset passes adopts the new date")
+}
+
 @main
 private enum OllamaUsageTestRunner {
     static func main() throws {
@@ -244,6 +399,10 @@ private enum OllamaUsageTestRunner {
         try testOllamaReorderedLandmarksDoNotTrap()
         try testOllamaIgnoresJunkPercentagesInMarkup()
         try testOllamaWeeklyResetStoreKeepsEpisodeDateStable()
+        try testOllamaFreeAccountParsesMonthlyIncludedUsage()
+        try testOllamaFreePageWithLoginLinkStillParses()
+        try testOllamaProPageDoesNotInventFreeMonthlyMeter()
+        try testOllamaMonthlyResetStoreKeepsEpisodeDateStable()
         print("Ollama usage tests passed")
     }
 }
