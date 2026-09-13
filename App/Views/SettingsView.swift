@@ -1486,7 +1486,7 @@ struct ProviderCredentialView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else if providerID == .ollama {
-                        Text("Paste your `__Secure-session` cookie from ollama.com (found in browser DevTools → Storage/Application → Cookies → ollama.com → `__Secure-session`). Limit Counter securely saves it to macOS Keychain and reads your 5-hour and Weekly usage meters from ollama.com/settings.")
+                        Text("Paste your `__Secure-session` cookie from ollama.com (found in browser DevTools → Storage/Application → Cookies → ollama.com → `__Secure-session`). Limit Counter securely saves it to macOS Keychain and reads your 5-hour, Weekly, or Free monthly usage meters from ollama.com/settings.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

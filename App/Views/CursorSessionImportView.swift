@@ -484,7 +484,7 @@ struct OllamaSessionImportView: View {
             .padding(.horizontal, 20)
             .padding(.top, 18)
 
-            Text("We only capture cookies from this embedded Ollama session. The session is saved to macOS Keychain to read your 5-hour and Weekly usage meters.")
+            Text("We only capture cookies from this embedded Ollama session. The session is saved to macOS Keychain to read your 5-hour, Weekly, or Free monthly usage meters.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
