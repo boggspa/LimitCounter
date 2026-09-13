@@ -10083,20 +10083,55 @@ private extension ProviderFetchError {
 enum OllamaWeeklyResetStore {
     private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
     private static let resetDateKey = "ollama.weeklyReset.date"
+    private static let monthlyResetDateKey = "ollama.monthlyReset.date"
     private static let sameEpisodeTolerance: TimeInterval = 1.5 * 86_400
+    /// Free accounts expose "Resets in N weeks", which jumps by ~7 days when
+    /// the countdown ticks. Keep the first computed date while the candidate
+    /// is still inside that week-sized band.
+    private static let monthlySameEpisodeTolerance: TimeInterval = 10 * 86_400
 
     static func stabilizedResetDate(
         candidate: Date,
         now: Date = Date(),
         defaults overrideDefaults: UserDefaults? = nil
     ) -> Date {
+        stabilize(
+            candidate: candidate,
+            now: now,
+            defaults: overrideDefaults,
+            key: resetDateKey,
+            tolerance: sameEpisodeTolerance
+        )
+    }
+
+    static func stabilizedMonthlyResetDate(
+        candidate: Date,
+        now: Date = Date(),
+        defaults overrideDefaults: UserDefaults? = nil
+    ) -> Date {
+        stabilize(
+            candidate: candidate,
+            now: now,
+            defaults: overrideDefaults,
+            key: monthlyResetDateKey,
+            tolerance: monthlySameEpisodeTolerance
+        )
+    }
+
+    private static func stabilize(
+        candidate: Date,
+        now: Date,
+        defaults overrideDefaults: UserDefaults?,
+        key: String,
+        tolerance: TimeInterval
+    ) -> Date {
         let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
-        if let stored = defaults.object(forKey: resetDateKey) as? Date,
+        if let stored = defaults.object(forKey: key) as? Date,
            stored > now,
-           abs(stored.timeIntervalSince(candidate)) <= sameEpisodeTolerance {
+           abs(stored.timeIntervalSince(candidate)) <= tolerance {
             return stored
         }
-        defaults.set(candidate, forKey: resetDateKey)
+        defaults.set(candidate, forKey: key)
         return candidate
     }
 }
