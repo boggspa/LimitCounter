@@ -10221,13 +10221,13 @@ public struct OllamaProviderClient: ProviderClient {
         fetchedAt: Date,
         defaults: UserDefaults? = nil
     ) throws -> QuotaSnapshot {
-        if html.contains("Sign in to Ollama") || (html.contains("/login") && !html.contains("Session usage") && !html.contains("Weekly usage")) {
+        if html.contains("Sign in to Ollama") || (html.contains("/login") && !looksLikeSignedInOllamaSettings(html)) {
             throw ProviderFetchError.credentialExpired("Ollama session cookie expired or invalid. Please update in settings.")
         }
 
         var windows: [QuotaWindow] = []
 
-        let (sessionChunk, weeklyChunk) = extractSections(from: html)
+        let (sessionChunk, weeklyChunk, includedChunk) = extractSections(from: html)
         // The weekly-limit banner sits between the two usage headings, so it is
         // detected once against the whole usage region and attributed to the
         // weekly window rather than whichever chunk it happens to land in.
@@ -10282,17 +10282,44 @@ public struct OllamaProviderClient: ProviderClient {
             }
         }
 
+
+        let parsedPaidMeter = windows.contains { $0.windowKind == .session || $0.windowKind == .weekly }
+        if !parsedPaidMeter, let includedChunk {
+            if let includedMetric = parseMetricFromChunk(includedChunk, isWeekly: false, now: fetchedAt) {
+                var resetDate = includedMetric.resetDate
+                let subtitle = includedMetric.resetDescription ?? "Monthly included usage"
+                if let candidate = resetDate {
+                    resetDate = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+                        candidate: candidate,
+                        now: fetchedAt,
+                        defaults: defaults
+                    )
+                }
+                windows.append(
+                    QuotaWindow(
+                        label: "Free usage",
+                        windowKind: .monthly,
+                        used: includedMetric.percent,
+                        total: 100,
+                        resetDate: resetDate,
+                        unit: "%",
+                        subtitle: subtitle
+                    )
+                )
+            }
+        }
+
         guard !windows.isEmpty else {
             if html.contains("Sign in") || html.contains("Log in") {
                 throw ProviderFetchError.credentialExpired("Ollama session cookie expired. Please update in settings.")
             }
-            throw ProviderFetchError.parsingError("Could not find Session or Weekly usage on ollama.com/settings")
+            throw ProviderFetchError.parsingError("Could not find Session, Weekly, or Free usage on ollama.com/settings")
         }
 
         return QuotaSnapshot(
             providerID: .ollama,
             displayName: "Ollama",
-            planName: nil,
+            planName: extractOllamaPlanName(from: html),
             windows: windows,
             stats: [],
             balances: [],
@@ -10303,9 +10330,11 @@ public struct OllamaProviderClient: ProviderClient {
         )
     }
 
-    private func extractSections(from html: String) -> (session: String?, weekly: String?) {
-        let sessionRange = html.range(of: "Session usage", options: .caseInsensitive)
-        let weeklyRange = html.range(of: "Weekly usage", options: .caseInsensitive)
+    private func extractSections(from html: String) -> (session: String?, weekly: String?, included: String?) {
+        let sessionRange = rangeOfUsageHeading("Session usage", in: html)
+        let weeklyRange = rangeOfUsageHeading("Weekly usage", in: html)
+        let includedRange = rangeOfUsageHeading("Included usage", in: html)
+            ?? rangeOfUsageHeading("Free usage", in: html)
 
         func forwardChunk(from start: String.Index) -> String {
             var end = html.index(start, offsetBy: min(1000, html.distance(from: start, to: html.endIndex)))
@@ -10317,6 +10346,7 @@ public struct OllamaProviderClient: ProviderClient {
 
         var sessionChunk: String? = nil
         var weeklyChunk: String? = nil
+        var includedChunk: String? = nil
 
         if let sRange = sessionRange {
             if let wRange = weeklyRange, wRange.lowerBound > sRange.lowerBound {
@@ -10330,8 +10360,62 @@ public struct OllamaProviderClient: ProviderClient {
             weeklyChunk = forwardChunk(from: wRange.lowerBound)
         }
 
-        return (sessionChunk, weeklyChunk)
+        if let iRange = includedRange {
+            includedChunk = forwardChunk(from: iRange.lowerBound)
+        }
+
+        return (sessionChunk, weeklyChunk, includedChunk)
     }
+
+    private func looksLikeSignedInOllamaSettings(_ html: String) -> Bool {
+        html.localizedCaseInsensitiveContains("Session usage")
+            || html.localizedCaseInsensitiveContains("Weekly usage")
+            || html.localizedCaseInsensitiveContains("Included usage")
+            || rangeOfUsageHeading("Free usage", in: html) != nil
+    }
+
+    private func extractOllamaPlanName(from html: String) -> String? {
+        guard let groups = firstMatchGroups(
+            in: html,
+            pattern: #"(?:Included usage|Cloud usage)[\s\S]{0,120}?(Free|Pro|Plus|Max|Team|Enterprise)\b"#
+        ), let name = groups.first else {
+            return nil
+        }
+        return name
+    }
+
+    /// Headings like "Free usage" also appear inside sentences ("Free usage credits").
+    /// Only treat a match as a meter landmark when it is not the prefix of a longer phrase.
+    private func rangeOfUsageHeading(_ heading: String, in html: String) -> Range<String.Index>? {
+        var searchStart = html.startIndex
+        while searchStart < html.endIndex {
+            guard let range = html.range(of: heading, options: .caseInsensitive, range: searchStart..<html.endIndex) else {
+                return nil
+            }
+            if isStandaloneUsageHeading(after: range.upperBound, in: html) {
+                return range
+            }
+            searchStart = range.upperBound
+        }
+        return nil
+    }
+
+    private func isStandaloneUsageHeading(after: String.Index, in html: String) -> Bool {
+        var idx = after
+        while idx < html.endIndex, html[idx].isWhitespace {
+            html.formIndex(after: &idx)
+        }
+        guard idx < html.endIndex else { return true }
+        let ch = html[idx]
+        if ch == "<" || ch == "%" || ch.isNumber || ch == "." || ch == ":" {
+            return true
+        }
+        if ch.isLetter {
+            return false
+        }
+        return true
+    }
+
 
     private func parseWeeklyLimitBanner(in usageRegion: String, now: Date) -> WeeklyLimitBanner? {
         var resumeDate: Date? = nil
@@ -10398,10 +10482,20 @@ public struct OllamaProviderClient: ProviderClient {
                 resetDate = now.addingTimeInterval(hours * 3600)
                 resetDesc = "Resumes in \(Int(hours))h"
             }
+        } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:minutes?|mins?|m\b))"#) {
+            if let minutes = Double(resetMatch) {
+                resetDate = now.addingTimeInterval(minutes * 60)
+                resetDesc = "Resets in \(Int(minutes))m"
+            }
         } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:hours?|hrs?|h))"#) {
             if let hours = Double(resetMatch) {
                 resetDate = now.addingTimeInterval(hours * 3600)
                 resetDesc = "Resets in \(Int(hours))h"
+            }
+        } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:weeks?|w\b))"#) {
+            if let weeks = Double(resetMatch) {
+                resetDate = now.addingTimeInterval(weeks * 7 * 86400)
+                resetDesc = "Resets in \(Int(weeks))w"
             }
         } else if let resetMatch = firstMatch(in: chunk, pattern: #"(?:[Rr]esets?\s+in\s+([0-9]+)\s*(?:days?|d))"#) {
             if let days = Double(resetMatch) {
