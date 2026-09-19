@@ -3,6 +3,9 @@ import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
+#if os(iOS)
+import Photos
+#endif
 
 struct DashboardView: View {
     @EnvironmentObject private var appState: AppStateStore
@@ -1209,11 +1212,74 @@ struct DashboardView: View {
             hostingController.view.drawHierarchy(in: hostingController.view.bounds, afterScreenUpdates: true)
         }
 
-        // Save to photo library
-        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+        saveQuotaCardScreenshot(image)
+    }
+
+    @MainActor private func saveQuotaCardScreenshot(_ image: UIImage) {
+        handlePhotoLibraryAuthorization(
+            PHPhotoLibrary.authorizationStatus(for: .addOnly),
+            image: image
+        )
+    }
+
+    @MainActor private func handlePhotoLibraryAuthorization(
+        _ status: PHAuthorizationStatus,
+        image: UIImage
+    ) {
+        switch status {
+        case .authorized, .limited:
+            writeQuotaCardScreenshot(image)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                Task { @MainActor in
+                    handlePhotoLibraryAuthorization(status, image: image)
+                }
+            }
+        case .denied, .restricted:
+            screenshotSaveAlert = ScreenshotSaveAlert(
+                title: "Photos Access Needed",
+                message: "Allow Limit Counter to add photos in Settings before saving a quota-card screenshot.",
+                offersSettings: true
+            )
+        @unknown default:
+            screenshotSaveAlert = ScreenshotSaveAlert(
+                title: "Could Not Save Screenshot",
+                message: "Photos access is unavailable on this device.",
+                offersSettings: false
+            )
+        }
+    }
+
+    @MainActor private func writeQuotaCardScreenshot(_ image: UIImage) {
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.creationRequestForAsset(from: image)
+        }) { success, error in
+            Task { @MainActor in
+                screenshotSaveAlert = ScreenshotSaveAlert(
+                    title: success ? "Screenshot Saved" : "Could Not Save Screenshot",
+                    message: success
+                        ? "The quota-card screenshot was added to your photo library."
+                        : error?.localizedDescription ?? "Photos could not save the quota-card screenshot.",
+                    offersSettings: false
+                )
+            }
+        }
+    }
+
+    @MainActor private func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
     #endif
 }
+
+#if os(iOS)
+private struct ScreenshotSaveAlert {
+    let title: String
+    let message: String
+    let offersSettings: Bool
+}
+#endif
 
 private struct UsageAlertToastView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
