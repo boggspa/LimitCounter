@@ -3880,19 +3880,11 @@ nonisolated enum KimiWebMembershipParser {
 actor KimiWebCredentialStore {
     static let shared = KimiWebCredentialStore()
 
-        var fields = credential.extraFields ?? [:]
-        fields["kimiWebAccessToken"] = tokens.accessToken
+    func persist(_ tokens: KimiWebSessionTokens) async -> Bool {
+        var updates = ["kimiWebAccessToken": tokens.accessToken]
         if let refreshToken = tokens.refreshToken {
-            fields["kimiWebRefreshToken"] = refreshToken
+            updates["kimiWebRefreshToken"] = refreshToken
         }
-        let updated = ProviderCredential(
-            accessToken: credential.accessToken,
-            accountIdentifier: credential.accountIdentifier,
-            customEndpoint: credential.customEndpoint,
-            extraFields: fields,
-            bookmarkData: credential.bookmarkData
-        )
-        guard let updatedData = try? JSONEncoder().encode(updated) else { return }
 
         let persistedUpdates = updates
         let didPersist = await MainActor.run {
@@ -3919,7 +3911,7 @@ actor KimiWebMembershipClient {
         self.persistTokens = persistTokens
     }
 
-    func fetchMonthlyUsage(credentials: ProviderCredential) async -> KimiWebMonthlyUsageReading? {
+    func fetchMonthlyUsage(credentials: ProviderCredential) async throws -> KimiWebMonthlyUsageReading? {
         guard let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
             return nil
         }
