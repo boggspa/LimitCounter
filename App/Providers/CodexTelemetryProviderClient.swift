@@ -8,6 +8,9 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     public let providerID: ProviderID = .codexTelemetry
 
     private let fileManager: FileManager
+    private let previousEvents: @Sendable () -> [UsageEvent]
+    private let parseCache: TelemetryParseCache
+    private let supplementalEvents: @Sendable () -> [UsageEvent]
     // 30 days: matches the heatmap window so historical activity remains
     // visible even after a multi-day quiet period on Codex CLI.
     private let sessionScanLookback: TimeInterval = 30 * 24 * 60 * 60
@@ -24,12 +27,31 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     // the file. Matches `maxTextTelemetryBytes`.
     private let maxSessionTelemetryBytes = 8 * 1024 * 1024
     private let maxTextTelemetryBytes = 8 * 1024 * 1024
-    private let sqliteTelemetryLookback: TimeInterval = 35 * 24 * 60 * 60
-    private let maxSQLiteEventsPerHeatmapBucket = 8
+    private let maxEventsPerHeatmapBucket = 8
     private static let parseCacheProvider = "codexTelemetry"
 
     public init(fileManager: FileManager = .default) {
+        self.init(
+            fileManager: fileManager,
+            previousEvents: {
+                QuotaSnapshotStore.shared.loadSnapshots()
+                    .first { $0.providerID == .codexTelemetry }?.events ?? []
+            },
+            parseCache: .shared,
+            supplementalEvents: { AGBenchUsageReader.loadEvents(forProviderKey: "codex") }
+        )
+    }
+
+    init(
+        fileManager: FileManager,
+        previousEvents: @escaping @Sendable () -> [UsageEvent],
+        parseCache: TelemetryParseCache,
+        supplementalEvents: @escaping @Sendable () -> [UsageEvent]
+    ) {
         self.fileManager = fileManager
+        self.previousEvents = previousEvents
+        self.parseCache = parseCache
+        self.supplementalEvents = supplementalEvents
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
@@ -112,7 +134,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         // only pay for the ones that changed. Bounded to a few multiples of the
         // primary scan so the store stays small; backfill's historical files
         // are read once and would never be looked up again.
-        TelemetryParseCache.shared.prune(
+        parseCache.prune(
             provider: Self.parseCacheProvider,
             keepingNewest: maxSessionTelemetryFiles * 3
         )
@@ -122,12 +144,13 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             guard !records.isEmpty else { continue }
 
             for record in records {
+                guard record.timestamp <= now else { continue }
                 events.append(UsageEvent(
                     id: stableEventID(for: record),
                     timestamp: record.timestamp,
                     tokens: record.tokenCount,
                     model: "Codex",
-                    type: .telemetry
+                    type: record.tokenCount > 0 ? .telemetry : .activity
                 ))
 
                 if record.timestamp >= now.addingTimeInterval(-5 * 60 * 60) {
@@ -163,7 +186,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         }
 
         // No-op unless this scan actually parsed something new.
-        TelemetryParseCache.shared.persist()
+        parseCache.persist()
 
         // Previous behavior threw `notConfigured` whenever the lookback window
         // contained no recent activity, which made Codex flicker off the
@@ -207,7 +230,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         // squares on the heatmap even if the underlying telemetry files
         // have rotated out of Codex's own SQLite/session retention.
         // No-op when the user hasn't granted the AGBench bookmark.
-        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "codex")
+        let agbenchEvents = supplementalEvents()
         let mergedEvents = events + agbenchEvents
 
         let cappedEvents = cappedHeatmapEvents(from: mergedEvents, now: now)
@@ -356,17 +379,11 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         // so counting any event as coverage let a zero-token marker mark a day
         // as done and permanently suppress the backfill that would have found
         // that day's actual usage.
-        let datesWithEvents: Set<Date> = {
-            guard let previous = QuotaSnapshotStore.shared.loadSnapshots()
-                .first(where: { $0.providerID == .codexTelemetry }) else {
-                return []
-            }
-            return Set(
-                previous.events
-                    .filter { ($0.tokens ?? 0) > 0 }
-                    .map { calendar.startOfDay(for: $0.timestamp) }
-            )
-        }()
+        let datesWithEvents = Set(
+            previousEvents()
+                .filter { ($0.tokens ?? 0) > 0 }
+                .map { calendar.startOfDay(for: $0.timestamp) }
+        )
 
         // Walk the 30-day window newest-first, collecting session files
         // for each missing day. Stop once we hit the per-fetch file
@@ -420,7 +437,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             return (try? readTelemetryRecords(from: info.url)) ?? []
         }
 
-        if let payload = TelemetryParseCache.shared.payload(
+        if let payload = parseCache.payload(
             provider: Self.parseCacheProvider,
             path: info.url.path,
             modifiedAt: info.modificationDate,
@@ -431,7 +448,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
 
         let records = (try? readTelemetryRecords(from: info.url)) ?? []
         if let payload = try? JSONEncoder().encode(records) {
-            TelemetryParseCache.shared.store(
+            parseCache.store(
                 provider: Self.parseCacheProvider,
                 path: info.url.path,
                 modifiedAt: info.modificationDate,
@@ -444,7 +461,10 @@ public struct CodexTelemetryProviderClient: ProviderClient {
 
     private func readTelemetryRecords(from url: URL) throws -> [CodexTelemetryRecord] {
         if url.lastPathComponent == "logs_2.sqlite" {
-            return try readSQLiteTelemetryRecords(from: url)
+            // This database is a diagnostic log, not a record of model usage.
+            // Configuration reloads, polling and other idle messages must not
+            // become synthetic heatmap events. Use session records instead.
+            return []
         }
 
         let data = try telemetryTextData(from: url)
@@ -498,201 +518,92 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         return data
     }
 
-    private func readSQLiteTelemetryRecords(from url: URL) throws -> [CodexTelemetryRecord] {
-        guard fileManager.isReadableFile(atPath: url.path) else {
-            return []
-        }
-
-        guard let db = openReadOnlySQLiteDatabase(at: url) else {
-            return []
-        }
-        defer { sqlite3_close(db) }
-
-        let cutoff = Int64(Date().addingTimeInterval(-sqliteTelemetryLookback).timeIntervalSince1970)
-        let query = """
-        SELECT (ts / 7200) * 7200 AS bucket_ts, COUNT(*) AS event_count
-        FROM logs
-        WHERE ts >= ?
-        GROUP BY bucket_ts
-        ORDER BY bucket_ts ASC;
-        """
-
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else {
-            return []
-        }
-        defer { sqlite3_finalize(statement) }
-        sqlite3_bind_int64(statement, 1, cutoff)
-
-        var records: [CodexTelemetryRecord] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let bucketTimestamp = sqlite3_column_int64(statement, 0)
-            let eventCount = max(1, sqlite3_column_int64(statement, 1))
-            let markerCount = min(maxSQLiteEventsPerHeatmapBucket, max(1, Int(ceil(log2(Double(eventCount) + 1)))))
-            let countPerMarker = Double(eventCount) / Double(markerCount)
-            let spacing = 7200.0 / Double(markerCount + 1)
-
-            for index in 0..<markerCount {
-                records.append(
-                    CodexTelemetryRecord(
-                        timestamp: Date(timeIntervalSince1970: Double(bucketTimestamp) + spacing * Double(index + 1)),
-                        conversationID: nil,
-                        eventName: "codex.sqlite.bucket.\(bucketTimestamp).\(index)",
-                        tokenCount: 0,
-                        isPrompt: false,
-                        isResponse: false,
-                        isToolEvent: false,
-                        isApprovalEvent: false,
-                        eventCount: countPerMarker
-                    )
-                )
-            }
-        }
-
-        return records
-    }
-
-    private func sqliteEventName(target: String, body: String) -> String {
-        if !target.isEmpty {
-            return target
-        }
-
-        if let delimiterIndex = body.firstIndex(of: ":") {
-            let prefix = body[body.startIndex..<delimiterIndex]
-            return prefix.trimmingCharacters(in: .whitespaces)
-        }
-
-        return "codex.sqlite"
-    }
-
-    private func sqliteClassificationSample(target: String, body: String) -> String {
-        let prefix = body.prefix(4096)
-        return "\(target) \(prefix)".lowercased()
-    }
-
-    private func fastSQLiteTokenEstimate(target: String, body: String) -> Double {
-        let lowerTarget = target.lowercased()
-        guard lowerTarget.contains("response")
-                || lowerTarget.contains("completion")
-                || body.contains(#""usage""#)
-                || body.contains("total_tokens")
-                || body.contains("input_tokens")
-                || body.contains("output_tokens") else {
-            return 0
-        }
-
-        if let total = fastJSONNumber(in: body, key: "total_tokens")
-            ?? fastJSONNumber(in: body, key: "totalTokens"),
-           total > 0 {
-            return total
-        }
-
-        let input = fastJSONNumber(in: body, key: "input_tokens")
-            ?? fastJSONNumber(in: body, key: "prompt_tokens")
-            ?? fastJSONNumber(in: body, key: "cached_input_tokens")
-        let output = fastJSONNumber(in: body, key: "output_tokens")
-            ?? fastJSONNumber(in: body, key: "completion_tokens")
-
-        if let input, let output { return input + output }
-        return input ?? output ?? 0
-    }
-
-    private func fastJSONNumber(in text: String, key: String) -> Double? {
-        let quotedKey = "\"\(key)\""
-        guard let keyRange = text.range(of: quotedKey, options: [.caseInsensitive]) else {
-            return nil
-        }
-
-        let afterKey = text[keyRange.upperBound...]
-        guard let colon = afterKey.firstIndex(of: ":") else {
-            return nil
-        }
-
-        var index = afterKey.index(after: colon)
-        while index < afterKey.endIndex,
-              afterKey[index].isWhitespace || afterKey[index] == "\"" {
-            index = afterKey.index(after: index)
-        }
-
-        let start = index
-        while index < afterKey.endIndex,
-              afterKey[index].isNumber || afterKey[index] == "." {
-            index = afterKey.index(after: index)
-        }
-
-        guard start < index else { return nil }
-        return Double(afterKey[start..<index])
-    }
-
-    private func openReadOnlySQLiteDatabase(at url: URL) -> OpaquePointer? {
-        var db: OpaquePointer?
-        if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db {
-            return db
-        }
-        if let db {
-            sqlite3_close(db)
-        }
-
-        db = nil
-        let uri = url.absoluteString + "?mode=ro&immutable=1"
-        if sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK, let db {
-            return db
-        }
-        if let db {
-            sqlite3_close(db)
-        }
-        return nil
-    }
-
     private func parseRecord(from json: Any, previousCumulative: inout Double?) -> CodexTelemetryRecord? {
-        guard let timestamp = firstDate(in: json, keys: ["timestamp", "time", "created_at", "createdAt", "date"]) else {
+        guard let dict = json as? [String: Any],
+              let timestamp = firstDate(in: dict, keys: ["timestamp", "time", "created_at", "createdAt", "date"]) else {
             return nil
         }
 
-        if let tokenCountRecord = parseSessionTokenCountRecord(
-            from: json,
-            timestamp: timestamp,
-            previousCumulative: &previousCumulative
-        ) {
-            return tokenCountRecord
+        let envelopeType = dict["type"] as? String ?? ""
+        let payload = dict["payload"] as? [String: Any] ?? [:]
+        let payloadType = payload["type"] as? String ?? ""
+
+        // A repeated or empty token_count is not another activity event. Do
+        // not fall through to a generic timestamp-based record when it is nil.
+        if envelopeType == "event_msg", payloadType == "token_count" {
+            return parseSessionTokenCountRecord(
+                from: dict,
+                timestamp: timestamp,
+                previousCumulative: &previousCumulative
+            )
         }
 
-        let eventName = firstString(in: json, keys: ["event", "name", "type", "kind", "metric"]) ?? ""
-        let conversationID = firstString(
-            in: json,
-            keys: ["conversation_id", "conversationId", "thread_id", "threadId", "session_id", "sessionId", "chat_id", "chatId"]
-        )
+        var isPrompt = false
+        var isResponse = false
+        var isToolEvent = false
+        var tokens = 0.0
+        let eventName: String
 
-        let totalTokens = tokenEstimate(
-            from: json,
-            eventName: eventName,
-            target: eventName,
-            body: ""
-        )
+        switch envelopeType {
+        case "event_msg":
+            eventName = "\(envelopeType).\(payloadType)"
+            switch payloadType {
+            case "user_message":
+                isPrompt = true
+            case "agent_message":
+                isResponse = true
+            case "task_started", "task_complete":
+                break
+            default:
+                return nil
+            }
 
-        let lowercasedEvent = eventName.lowercased()
-        let isPrompt = lowercasedEvent.contains("prompt")
-            || lowercasedEvent.contains("user")
-            || lowercasedEvent.contains("conversation.start")
-        let isResponse = lowercasedEvent.contains("response")
-            || lowercasedEvent.contains("assistant")
-            || lowercasedEvent.contains("completion")
-        let isToolEvent = lowercasedEvent.contains("tool")
-        let isApprovalEvent = lowercasedEvent.contains("approval")
-            || lowercasedEvent.contains("permission")
+        case "response_item":
+            eventName = "\(envelopeType).\(payloadType)"
+            switch payloadType {
+            case "message":
+                switch payload["role"] as? String {
+                case "user": isPrompt = true
+                case "assistant": isResponse = true
+                default: return nil // Developer/system context is not usage.
+                }
+            case "reasoning", "agent_message":
+                isResponse = true
+            case "function_call", "function_call_output",
+                 "custom_tool_call", "custom_tool_call_output":
+                isToolEvent = true
+            default:
+                return nil
+            }
 
-        let promptTextPresent = firstString(in: json, keys: ["prompt", "prompt_text", "promptText"]) != nil
-        let responseTextPresent = firstString(in: json, keys: ["response", "output", "content", "message"]) != nil
+        default:
+            // Support structured response logs with explicit usage, while
+            // rejecting session metadata, world-state updates, diagnostics and
+            // the separate token_usage_record copy of session token counts.
+            eventName = ["event", "name", "type", "kind", "metric"]
+                .compactMap { dict[$0] as? String }.first ?? ""
+            let responseEvents: Set<String> = [
+                "response", "response.completed", "completion",
+                "codex.response", "codex.completion"
+            ]
+            guard responseEvents.contains(eventName.lowercased()) else { return nil }
+            tokens = tokenEstimate(from: dict, eventName: eventName, target: eventName, body: "")
+            guard tokens.isFinite, tokens > 0 else { return nil }
+            isResponse = true
+        }
 
         return CodexTelemetryRecord(
             timestamp: timestamp,
-            conversationID: conversationID,
+            conversationID: firstString(
+                in: dict,
+                keys: ["conversation_id", "conversationId", "thread_id", "threadId", "session_id", "sessionId", "chat_id", "chatId"]
+            ),
             eventName: eventName,
-            tokenCount: totalTokens,
-            isPrompt: isPrompt || promptTextPresent,
-            isResponse: isResponse || responseTextPresent,
+            tokenCount: tokens,
+            isPrompt: isPrompt,
+            isResponse: isResponse,
             isToolEvent: isToolEvent,
-            isApprovalEvent: isApprovalEvent,
+            isApprovalEvent: false,
             eventCount: 1
         )
     }
@@ -738,6 +649,8 @@ public struct CodexTelemetryProviderClient: ProviderClient {
             return nil
         }
 
+        guard tokens.isFinite, tokens > 0 else { return nil }
+
         let conversationID = firstString(
             in: json,
             keys: ["thread_id", "threadId", "conversation_id", "conversationId", "session_id", "sessionId"]
@@ -773,9 +686,9 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         var bucketCounts: [CodexTelemetryBucketKey: Int] = [:]
         let calendar = Calendar.current
 
-        for event in events.sorted(by: { $0.timestamp > $1.timestamp }) where event.timestamp >= cutoff {
+        for event in events.sorted(by: { $0.timestamp > $1.timestamp }) where event.timestamp >= cutoff && event.timestamp <= now {
             let key = CodexTelemetryBucketKey(timestamp: event.timestamp, calendar: calendar)
-            guard bucketCounts[key, default: 0] < maxSQLiteEventsPerHeatmapBucket else {
+            guard bucketCounts[key, default: 0] < maxEventsPerHeatmapBucket else {
                 // Bucket is full: carry the tokens over rather than dropping them.
                 if let tokens = event.tokens, tokens > 0, let index = indexOfLastRetained[key] {
                     let carrier = retained[index]

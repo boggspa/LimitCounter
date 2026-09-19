@@ -20,8 +20,9 @@ import Foundation
 /// semantics.** Entries are keyed on file identity alone, so an unchanged file
 /// would otherwise keep serving the previous parser's records indefinitely.
 public final class TelemetryParseCache: @unchecked Sendable {
-    /// v1: initial — Codex session rollout records.
-    private static let formatVersion = 1
+    /// v2: Codex records require usage or recognised task activity; metadata and
+    /// repeated token-count notifications no longer produce activity markers.
+    private static let formatVersion = 2
 
     public static let shared = TelemetryParseCache(filename: "telemetry-parse-cache.jsonl")
 
@@ -46,13 +47,15 @@ public final class TelemetryParseCache: @unchecked Sendable {
     }
 
     private let filename: String
+    private let directoryOverride: URL?
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
     private var loaded = false
     private var dirty = false
 
-    public init(filename: String) {
+    public init(filename: String, directory: URL? = nil) {
         self.filename = filename
+        self.directoryOverride = directory
     }
 
     // MARK: - Lookup
@@ -184,6 +187,9 @@ public final class TelemetryParseCache: @unchecked Sendable {
     }
 
     private func cacheFileURL() -> URL? {
+        if let directoryOverride {
+            return directoryOverride.appendingPathComponent(filename)
+        }
         let manager = FileManager.default
         if let container = manager.containerURL(
             forSecurityApplicationGroupIdentifier: UsageRefreshCadence.appGroupID

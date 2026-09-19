@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 
 private enum TestError: Error, CustomStringConvertible {
     case failure(String)
@@ -75,8 +76,13 @@ private func writeSession(
     )
 }
 
-private func snapshotTokens(root: URL) throws -> Double {
-    let client = CodexTelemetryProviderClient()
+private func snapshot(root: URL) throws -> QuotaSnapshot {
+    let client = CodexTelemetryProviderClient(
+        fileManager: .default,
+        previousEvents: { [] },
+        parseCache: TelemetryParseCache(filename: "parse-cache.jsonl", directory: root),
+        supplementalEvents: { [] }
+    )
     let credential = ProviderCredential(customEndpoint: root.path)
 
     var result: Result<QuotaSnapshot, Error>?
@@ -93,12 +99,25 @@ private func snapshotTokens(root: URL) throws -> Double {
 
     switch result {
     case .success(let snapshot):
-        return snapshot.events.reduce(0) { $0 + ($1.tokens ?? 0) }
+        return snapshot
     case .failure(let error):
         throw error
     case .none:
         throw TestError.failure("fetchSnapshot produced no result")
     }
+}
+
+private func snapshotTokens(root: URL) throws -> Double {
+    try snapshot(root: root).events.reduce(0) { $0 + ($1.tokens ?? 0) }
+}
+
+private func sessionLine(at date: Date, type: String, payload: [String: Any]) throws -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let data = try JSONSerialization.data(withJSONObject: [
+        "timestamp": formatter.string(from: date), "type": type, "payload": payload
+    ])
+    return String(decoding: data, as: UTF8.self)
 }
 
 // MARK: - Tests
@@ -123,7 +142,9 @@ private func testRepeatedTokenCountCountedOnce() throws {
         on: now
     )
 
-    try expectEqual(try snapshotTokens(root: root), 200, "repeated token_count events counted once")
+    let result = try snapshot(root: root)
+    try expectEqual(result.events.reduce(0) { $0 + ($1.tokens ?? 0) }, 200, "repeated token_count events counted once")
+    try expectEqual(result.events.count, 2, "repeated token_count events do not create activity markers")
 }
 
 /// A turn with no `last_token_usage` must be billed the cumulative ADVANCE,
@@ -191,6 +212,110 @@ private func testSessionFilesReadDespiteSQLite() throws {
     try expectEqual(try snapshotTokens(root: root), 2_500, "all session files read when logs_2.sqlite is present")
 }
 
+private func testDiagnosticDatabaseDoesNotCreateActivity() throws {
+    let root = try makeTempRoot("idle-sqlite")
+    defer { try? FileManager.default.removeItem(at: root) }
+    var db: OpaquePointer?
+    try expectEqual(sqlite3_open(root.appendingPathComponent("logs_2.sqlite").path, &db), SQLITE_OK, "create log database")
+    defer { sqlite3_close(db) }
+    try expectEqual(sqlite3_exec(db, "CREATE TABLE logs (ts INTEGER, target TEXT, feedback_log_body TEXT)", nil, nil, nil), SQLITE_OK, "create logs table")
+    let timestamp = Int(Date().addingTimeInterval(-3_600).timeIntervalSince1970)
+    for _ in 0..<300 {
+        let sql = "INSERT INTO logs VALUES (\(timestamp), 'codex_config::loader', 'background configuration reload')"
+        try expectEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, "insert idle diagnostic")
+    }
+    let result = try snapshot(root: root)
+    try expect(result.events.isEmpty, "idle logs do not light any heatmap cells")
+    try expect(result.windows.allSatisfy { $0.used == 0 }, "idle logs do not increase session or weekly activity counts")
+}
+
+private func testMetadataAndEmptyTokenNotificationsAreIgnored() throws {
+    let root = try makeTempRoot("metadata")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date().addingTimeInterval(-3_600)
+    let lines = try [
+        sessionLine(at: now, type: "session_meta", payload: ["name": "user prompt", "content": "assistant response"]),
+        sessionLine(at: now, type: "world_state", payload: ["message": "updated"]),
+        sessionLine(at: now, type: "turn_context", payload: ["type": "message", "role": "user"]),
+        sessionLine(at: now, type: "response_item", payload: ["type": "message", "role": "developer", "content": "context"]),
+        sessionLine(at: now, type: "event_msg", payload: ["type": "thread_settings_applied"]),
+        sessionLine(at: now, type: "event_msg", payload: ["type": "token_count", "info": NSNull()]),
+        sessionLine(at: now, type: "token_usage_record", payload: ["usage": ["total_tokens": 500]]),
+        tokenCountLine(at: now, cumulative: 0, lastTurn: 0)
+    ]
+    try writeSession(in: root, named: "rollout-metadata.jsonl", lines: lines, on: now)
+    try expect(try snapshot(root: root).events.isEmpty, "metadata and empty token notifications are not activity")
+}
+
+private func testConfirmedActivityKeepsItsRealTimestamp() throws {
+    let root = try makeTempRoot("confirmed-activity")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let calendar = Calendar.current
+    let yesterday = calendar.date(byAdding: .day, value: -1, to: Date())!
+    let promptTime = calendar.date(bySettingHour: 11, minute: 59, second: 0, of: yesterday)!
+    let toolTime = promptTime.addingTimeInterval(120)
+    let futureTime = Date().addingTimeInterval(7_200)
+    try writeSession(in: root, named: "rollout-activity.jsonl", lines: [
+        try sessionLine(at: promptTime, type: "response_item", payload: ["type": "message", "role": "user"]),
+        try sessionLine(at: toolTime, type: "response_item", payload: ["type": "function_call", "name": "exec_command"]),
+        try sessionLine(at: futureTime, type: "event_msg", payload: ["type": "task_started"])
+    ], on: yesterday)
+    let events = try snapshot(root: root).events.sorted { $0.timestamp < $1.timestamp }
+    try expectEqual(events.map(\.timestamp), [promptTime, toolTime], "activity is not spread across a bucket or into the future")
+    try expect(events.allSatisfy { $0.type == .activity && $0.tokens == 0 }, "recognised work without token counts stays visible")
+}
+
+private func testLegacyHistoryIsCleanedOnReadAndWrite() throws {
+    let suiteName = "codex-history-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let store = QuotaSnapshotStore(defaults: defaults)
+    let date = Date().addingTimeInterval(-3_600)
+    let legacyNoise = UsageEvent(timestamp: date, tokens: 0, model: "Codex", type: .telemetry)
+    let legacyUsage = UsageEvent(timestamp: date, tokens: 100, model: "Codex", type: .telemetry)
+    let task = UsageEvent(timestamp: date, tokens: 0, model: "Codex", type: .activity)
+    let importedRun = UsageEvent(timestamp: date, model: "Codex", type: .message)
+    let future = UsageEvent(timestamp: Date().addingTimeInterval(3_600), tokens: 100, model: "Codex", type: .telemetry)
+    let events = [legacyNoise, legacyUsage, task, importedRun, future]
+    let snapshots = [ProviderID.openai, .codexTelemetry, .claude].map {
+        QuotaSnapshot(providerID: $0, displayName: $0.displayName, events: events, fetchState: .success)
+    }
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    defaults.set(try encoder.encode(snapshots), forKey: "cachedQuotaSnapshots")
+    let cleaned = store.loadSnapshots()
+    for snapshot in cleaned where snapshot.providerID != .claude {
+        try expectEqual(snapshot.events.map(\.id), [legacyUsage.id, task.id, importedRun.id], "clean both Codex snapshot copies without deleting verified history")
+    }
+    try expectEqual(cleaned.last?.events.map(\.id), events.map(\.id), "other providers are unchanged")
+    let persisted = try decoder.decode([QuotaSnapshot].self, from: defaults.data(forKey: "cachedQuotaSnapshots")!)
+    try expectEqual(persisted, cleaned, "migration persists cleaned history")
+    store.replaceAll(snapshots)
+    let written = try decoder.decode([QuotaSnapshot].self, from: defaults.data(forKey: "cachedQuotaSnapshots")!)
+    try expectEqual(written, cleaned, "old synced snapshots cannot restore diagnostic markers")
+    try expectEqual(store.loadSnapshots(), cleaned, "cleanup is idempotent")
+}
+
+private func testPreviousParserCacheIsInvalidated() throws {
+    let root = try makeTempRoot("old-parser-cache")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appendingPathComponent("rollout.jsonl")
+    let modifiedAt = Date()
+    let stalePayload = Data("old diagnostic activity".utf8)
+    let entry = try JSONSerialization.data(withJSONObject: [
+        "p": "codexTelemetry", "f": file.path,
+        "m": modifiedAt.timeIntervalSince1970, "s": 100,
+        "d": stalePayload.base64EncodedString()
+    ])
+    let contents = "{\"version\":1}\n" + String(decoding: entry, as: UTF8.self) + "\n"
+    try contents.write(to: root.appendingPathComponent("cache.jsonl"), atomically: true, encoding: .utf8)
+    let cache = TelemetryParseCache(filename: "cache.jsonl", directory: root)
+    try expect(cache.payload(provider: "codexTelemetry", path: file.path, modifiedAt: modifiedAt, size: 100) == nil,
+               "unchanged session files are reparsed instead of serving old diagnostic records")
+}
+
 // MARK: - Runner
 
 @main
@@ -200,6 +325,11 @@ private enum CodexTelemetryTokenTestRunner {
         try testMissingDeltaUsesAdvance()
         try testBucketOverflowKeepsTokens()
         try testSessionFilesReadDespiteSQLite()
+        try testDiagnosticDatabaseDoesNotCreateActivity()
+        try testMetadataAndEmptyTokenNotificationsAreIgnored()
+        try testConfirmedActivityKeepsItsRealTimestamp()
+        try testLegacyHistoryIsCleanedOnReadAndWrite()
+        try testPreviousParserCacheIsInvalidated()
         print("Codex telemetry token tests passed")
     }
 }

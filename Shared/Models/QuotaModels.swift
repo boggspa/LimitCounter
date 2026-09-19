@@ -1103,6 +1103,73 @@ public struct UsageEvent: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+/// Old Codex telemetry treated every diagnostic log line as activity. Those
+/// records have no usage evidence and must not survive in either the telemetry
+/// snapshot or its copy on the Codex quota card. Confirmed task events now use
+/// `.activity`; imported runs use `.message`, including runs without tokens.
+public enum CodexActivityHistory {
+    public static func cleaned(_ snapshot: QuotaSnapshot, now: Date = Date()) -> QuotaSnapshot {
+        guard snapshot.providerID == .codexTelemetry || snapshot.providerID == .openai else {
+            return snapshot
+        }
+        let events = snapshot.events.filter { event in
+            guard event.timestamp <= now else { return false }
+            return event.type != .telemetry || (event.tokens ?? 0) > 0
+        }
+        return events == snapshot.events ? snapshot : snapshot.withEvents(events)
+    }
+}
+
+/// Flattens the events carried by a set of snapshots into one list with
+/// duplicates removed.
+///
+/// Two duplication modes reach this point and they need different keys:
+///
+///  - The same event surfacing under two providers. The `openai` and
+///    `codexTelemetry` snapshots carry Codex events verbatim, sharing their
+///    `UUID`s, so a global id filter collapses those.
+///  - The same usage re-appended to one provider's own event list across
+///    refreshes. `UsageEvent` mints a fresh `id` on every construction, so
+///    those copies are identical in content yet distinct by id and slip
+///    straight past an id filter. Comparing on the payload is what actually
+///    detects a repeat — the same trap `QuotaSnapshot.mergingSignals`
+///    documents for `QuotaSignal`.
+///
+/// The content key is deliberately scoped to the snapshot that supplied the
+/// event, so two providers legitimately reporting identical totals in the same
+/// second still both count.
+public enum UsageEventDeduplicator {
+    public static func flatten(_ snapshots: [QuotaSnapshot]) -> [UsageEvent] {
+        var seenIDs = Set<UUID>()
+        var events: [UsageEvent] = []
+
+        for snapshot in snapshots {
+            var seenContent = Set<ContentKey>()
+            for event in snapshot.events {
+                guard seenIDs.insert(event.id).inserted,
+                      seenContent.insert(ContentKey(event)).inserted else { continue }
+                events.append(event)
+            }
+        }
+
+        return events
+    }
+
+    private struct ContentKey: Hashable {
+        let timestamp: Date
+        let model: String
+        let tokens: Double?
+        let type: UsageEvent.EventType
+
+        init(_ event: UsageEvent) {
+            timestamp = event.timestamp
+            model = event.model ?? ""
+            tokens = event.tokens
+            type = event.type
+        }
+    }
+}
+
 // MARK: - Usage Analytics
 
 public enum UsageAnalyticsSource: String, Codable, Hashable {

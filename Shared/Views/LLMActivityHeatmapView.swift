@@ -10,10 +10,9 @@ public struct LLMActivityHeatmapView: View {
     private let bucketMap: [HeatmapBucketKey: [UsageEvent]]
 
     public init(snapshots: [QuotaSnapshot]) {
-        // 1. De-duplicate and extract all events once
-        var seen = Set<UUID>()
-        let events = snapshots.flatMap(\.events)
-            .filter { seen.insert($0.id).inserted }
+        // 1. Extract all events once, dropping duplicates. See
+        // `UsageEventDeduplicator` for the two duplication modes this covers.
+        let events = UsageEventDeduplicator.flatten(snapshots)
         self.allEvents = events
 
         // 2. Create a fast lookup for event -> provider

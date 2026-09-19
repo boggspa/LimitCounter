@@ -14,12 +14,15 @@ public final class QuotaSnapshotStore {
     private let snapshotsKey = "cachedQuotaSnapshots"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let defaultsOverride: UserDefaults?
 
     private var defaults: UserDefaults {
-        UserDefaults(suiteName: appGroupID) ?? .standard
+        if let defaultsOverride { return defaultsOverride }
+        return UserDefaults(suiteName: appGroupID) ?? .standard
     }
 
-    private init() {
+    public init(defaults: UserDefaults? = nil) {
+        defaultsOverride = defaults
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
     }
@@ -33,7 +36,11 @@ public final class QuotaSnapshotStore {
         else {
             return []
         }
-        return snapshots
+        let cleaned = snapshots.map { CodexActivityHistory.cleaned($0) }
+        if cleaned != snapshots {
+            save(cleaned)
+        }
+        return cleaned
     }
 
     public func snapshot(for providerID: ProviderID) -> QuotaSnapshot? {
@@ -79,7 +86,10 @@ public final class QuotaSnapshotStore {
     // MARK: - Private
 
     private func save(_ snapshots: [QuotaSnapshot]) {
-        if let data = try? encoder.encode(snapshots) {
+        // Apply this on writes too, so an older synced snapshot cannot restore
+        // diagnostic markers that were already removed from local history.
+        let cleaned = snapshots.map { CodexActivityHistory.cleaned($0) }
+        if let data = try? encoder.encode(cleaned) {
             defaults.set(data, forKey: snapshotsKey)
         }
     }
