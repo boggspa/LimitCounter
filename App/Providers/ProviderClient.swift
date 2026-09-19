@@ -5612,7 +5612,13 @@ public struct DevinProviderClient: ProviderClient {
             signals: allSignals,
             events: allEvents,
             fetchState: .success,
-            fetchedAt: Date()
+            // Every account is read from the same `state.vscdb`, so they share
+            // one cache timestamp. Reporting `Date()` here would have claimed
+            // the merged reading was fresh — the single-account path above
+            // already reports the editor's last write, and a snapshot that
+            // carries a "reading is stale" signal must not also claim it was
+            // just fetched.
+            fetchedAt: states.compactMap(\.cachedAt).min() ?? Date()
         )
     }
 
@@ -5654,19 +5660,30 @@ public struct DevinProviderClient: ProviderClient {
             dailyUsedPercent = (Double(usage.usedMessages) / Double(usage.messages)) * 100
         }
 
+        // A window whose reset has already passed describes a period that
+        // ended: the cache was never refreshed because only the editor writes
+        // it. Rendering it as a live meter states something untrue, so it is
+        // dropped and reported as stale instead.
+        var expiredWindowLabels: [String] = []
+
         if !planInfo.hideDailyQuota, let used = dailyUsedPercent {
             let resetDate = dailyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
-            windows.append(
-                QuotaWindow(
-                    label: userLabel.map { "Daily quota (\($0))" } ?? "Daily quota usage",
-                    windowKind: .session,
-                    used: used,
-                    total: 100,
-                    resetDate: resetDate,
-                    unit: "%",
-                    subtitle: "Resets daily"
+            let label = userLabel.map { "Daily quota (\($0))" } ?? "Daily quota usage"
+            if resetDate > now {
+                windows.append(
+                    QuotaWindow(
+                        label: label,
+                        windowKind: .session,
+                        used: used,
+                        total: 100,
+                        resetDate: resetDate,
+                        unit: "%",
+                        subtitle: "Resets daily"
+                    )
                 )
-            )
+            } else {
+                expiredWindowLabels.append(label)
+            }
         }
 
         var weeklyUsedPercent: Double? = nil
@@ -5681,21 +5698,28 @@ public struct DevinProviderClient: ProviderClient {
 
         if !planInfo.hideWeeklyQuota, let used = weeklyUsedPercent {
             let resetDate = weeklyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
-            windows.append(
-                QuotaWindow(
-                    label: userLabel.map { "Weekly quota (\($0))" } ?? "Weekly quota usage",
-                    windowKind: .weekly,
-                    used: used,
-                    total: 100,
-                    resetDate: resetDate,
-                    unit: "%",
-                    subtitle: "Resets weekly"
+            let label = userLabel.map { "Weekly quota (\($0))" } ?? "Weekly quota usage"
+            if resetDate > now {
+                windows.append(
+                    QuotaWindow(
+                        label: label,
+                        windowKind: .weekly,
+                        used: used,
+                        total: 100,
+                        resetDate: resetDate,
+                        unit: "%",
+                        subtitle: "Resets weekly"
+                    )
                 )
-            )
+            } else {
+                expiredWindowLabels.append(label)
+            }
         }
 
         if let overageBalanceMicros = planInfo.quotaUsage?.overageBalanceMicros {
-            let balance = Double(overageBalanceMicros) / 1_000_000.0
+            // The cache reports tiny negative micro-balances; a negative
+            // "balance" reads as credit the user does not have.
+            let balance = max(0, Double(overageBalanceMicros) / 1_000_000.0)
             balances.append(
                 QuotaBalance(
                     label: userLabel.map { "Extra usage (\($0))" } ?? "Extra usage balance",
@@ -5839,6 +5863,13 @@ public struct DevinProviderClient: ProviderClient {
             )
         }
 
+        // Every Devin signal below describes the *contents* of the cache file,
+        // not something observed at this instant. Stamping them with `now` made
+        // the snapshot differ on every sync, which changed its CloudKit status
+        // hash and pushed a background APNs update to every device — for a
+        // reading that had not changed since the last one.
+        let observedAt = state.cachedAt ?? now
+
         if planInfo.hasBillingWritePermissions == true {
             signals.append(
                 QuotaSignal(
@@ -5846,7 +5877,7 @@ public struct DevinProviderClient: ProviderClient {
                     title: "Billing write permissions enabled",
                     message: "The local Devin cache reports billing write access is available.",
                     severity: .info,
-                    detectedAt: now
+                    detectedAt: observedAt
                 )
             )
         }
@@ -5858,7 +5889,24 @@ public struct DevinProviderClient: ProviderClient {
                     title: "Grace period state \(gracePeriodStatus)",
                     message: "The local cache reports a non-zero grace period status.",
                     severity: .info,
-                    detectedAt: now
+                    detectedAt: observedAt
+                )
+            )
+        }
+
+        if !expiredWindowLabels.isEmpty {
+            let names = expiredWindowLabels.joined(separator: " and ")
+            let age = state.cachedAt.map { cachedAt -> String in
+                let days = Calendar.current.dateComponents([.day], from: cachedAt, to: now).day ?? 0
+                return days > 0 ? " The cache was last written \(days) day\(days == 1 ? "" : "s") ago." : ""
+            } ?? ""
+            signals.append(
+                QuotaSignal(
+                    kind: .scheduledReset,
+                    title: "Devin quota reading is stale",
+                    message: "\(names) covered a period that has already reset, so \(expiredWindowLabels.count == 1 ? "it is" : "they are") hidden rather than shown as current.\(age) Only the Devin app refreshes this cache — open it, or reopen its settings panel, to update.",
+                    severity: .warning,
+                    detectedAt: observedAt
                 )
             )
         }
@@ -5878,7 +5926,9 @@ public struct DevinProviderClient: ProviderClient {
             signals: signals,
             events: events,
             fetchState: .success,
-            fetchedAt: now
+            // The data is only as fresh as the editor's last write, so report
+            // that rather than the moment this snapshot was assembled.
+            fetchedAt: state.cachedAt ?? now
         )
     }
 }
@@ -5988,6 +6038,8 @@ private enum DevinLocalStateReader {
             return []
         }
 
+        let cachedAt = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+
         var db: OpaquePointer?
         let result = sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil)
         guard result == SQLITE_OK, let db else {
@@ -6008,7 +6060,7 @@ private enum DevinLocalStateReader {
             print("[DevinLocalStateReader] Found \(snapshots.count) reactSettings user account(s)")
             // Load shared local metadata once
             let localMetadata = try loadLocalMetadata(from: db)
-            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata) }
+            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata, cachedAt: cachedAt) }
         }
 
         // Fallback: try legacy keys
@@ -6027,7 +6079,7 @@ private enum DevinLocalStateReader {
         snapshots = try decodeAllRows(db: db, query: legacyQuery)
         if !snapshots.isEmpty {
             let localMetadata = try loadLocalMetadata(from: db)
-            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata) }
+            return snapshots.map { DevinStateSnapshot(planInfo: $0, localMetadata: localMetadata, cachedAt: cachedAt) }
         }
 
         print("[DevinLocalStateReader] No plan info rows found")
@@ -6234,6 +6286,20 @@ private struct DevinCachedPlanInfo: Decodable {
 private struct DevinStateSnapshot {
     let planInfo: DevinCachedPlanInfo
     let localMetadata: DevinLocalMetadata?
+    /// When the editor last wrote `state.vscdb`. Only the Devin/Windsurf
+    /// editor refreshes this cache — on launch, and when its settings panel is
+    /// reopened — so this, not the read time, is how fresh the numbers are.
+    let cachedAt: Date?
+
+    init(
+        planInfo: DevinCachedPlanInfo,
+        localMetadata: DevinLocalMetadata?,
+        cachedAt: Date? = nil
+    ) {
+        self.planInfo = planInfo
+        self.localMetadata = localMetadata
+        self.cachedAt = cachedAt
+    }
 }
 
 private struct DevinLocalMetadata {
