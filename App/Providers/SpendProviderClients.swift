@@ -1,4 +1,10 @@
 import Foundation
+import CryptoKit
+#if os(macOS)
+import AppKit
+import Darwin
+import WebKit
+#endif
 
 enum SpendProviderCredentialField {
     static let manualSpent = "manualSpent"
@@ -13,9 +19,27 @@ enum SpendProviderCredentialField {
     static let manualWeeklyUsedPercent = "manualWeeklyUsedPercent"
     static let anchorUpdatedAt = "anchorUpdatedAt"
     static let metaCookieHeader = "metaCookieHeader"
+    static let museCliBookmark = "museCliBookmark"
+    static let museCachedCurrentPercent = "museCachedCurrentPercent"
+    static let museCachedCurrentResetAt = "museCachedCurrentResetAt"
+    static let museCachedWeeklyPercent = "museCachedWeeklyPercent"
+    static let museCachedWeeklyResetAt = "museCachedWeeklyResetAt"
+    static let museCachedPlanName = "museCachedPlanName"
+    static let museCachedAt = "museCachedAt"
     static let cerebrasCookieHeader = "cerebrasCookieHeader"
+    static let cerebrasCachedBalance = "cerebrasCachedBalance"
+    static let cerebrasCachedSpend = "cerebrasCachedSpend"
+    static let cerebrasCachedCurrency = "cerebrasCachedCurrency"
+    static let cerebrasCachedResetAt = "cerebrasCachedResetAt"
+    static let browserSessionID = "browserSessionID"
+    static let browserSessionURL = "browserSessionURL"
+    static let cerebrasCachedAt = "cerebrasCachedAt"
     static let qwenCookieHeader = "qwenCookieHeader"
     static let mimoCookieHeader = "mimoCookieHeader"
+    static let tokenPlanCachedUsedPercent = "tokenPlanCachedUsedPercent"
+    static let tokenPlanCachedPlanName = "tokenPlanCachedPlanName"
+    static let tokenPlanCachedResetAt = "tokenPlanCachedResetAt"
+    static let tokenPlanCachedAt = "tokenPlanCachedAt"
 }
 
 private enum ProviderDateParser {
@@ -1369,12 +1393,259 @@ public struct MistralWebSubscriptionClient: Sendable {
      }
 }
 
+// MARK: - Persistent imported browser sessions
+
+nonisolated struct BrowserMeterResult<Value: Codable & Sendable>: Sendable {
+    let value: Value?
+    let fetchedAt: Date?
+    let failure: String?
+
+    var sourceDescription: String {
+        guard let fetchedAt else { return failure ?? "Browser reading unavailable" }
+        let stamp = ISO8601DateFormatter().string(from: fetchedAt)
+        return failure.map { "Last browser reading \(stamp). \($0)" } ?? "Browser reading \(stamp)"
+    }
+}
+
+nonisolated enum BrowserSessionRefreshPolicy {
+    static func allowsNavigation(to url: URL, dashboardHost: String) -> Bool {
+        guard url.scheme == "https", let host = url.host?.lowercased() else { return false }
+        if host == dashboardHost { return true }
+        // The console obtains a short-lived ticket through Alibaba's own
+        // account service even when its Google/GitHub SSO is still valid.
+        if dashboardHost == "modelstudio.console.alibabacloud.com" {
+            return ["alibabacloud.com", "aliyun.com"].contains {
+                host == $0 || host.hasSuffix("." + $0)
+            }
+        }
+        return false
+    }
+
+    static func validatedURL(_ value: String?, fallback: URL) -> URL {
+        guard let value, let url = URL(string: value),
+              url.scheme == "https", url.host == fallback.host,
+              url.user == nil, url.password == nil,
+              url.port == nil || url.port == 443 else { return fallback }
+        return url
+    }
+
+    static func cacheKey(url: URL, sessionID: String) -> String {
+        let digest = SHA256.hash(data: Data("\(url.absoluteString)|\(sessionID)".utf8))
+        return "browserMeter.v1." + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func shouldSeedCookies(existing: [HTTPCookie], host: String, now: Date = Date()) -> Bool {
+        !existing.contains {
+            let domain = $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+            return (host == domain || host.hasSuffix("." + domain))
+                && ($0.expiresDate.map { $0 > now } ?? true)
+        }
+    }
+}
+
+/// Caches parsed readings, never browser HTML or cookies. The in-flight task
+/// belongs to the store so overlapping refreshes share one browser navigation.
+@MainActor
+final class BrowserMeterRefreshStore {
+    static let shared = BrowserMeterRefreshStore()
+    private nonisolated struct Entry: Codable, Sendable {
+        var value: Data?
+        var fetchedAt: Date?
+        var nextAttemptAt: Date
+        var failure: String?
+    }
+    private let defaults: UserDefaults
+    private var inFlight: [String: Task<Entry, Never>] = [:]
+
+    init(defaults: UserDefaults? = nil) {
+        self.defaults = defaults ?? UserDefaults(suiteName: "group.com.chrisizatt.LLMUsageCounter") ?? .standard
+    }
+
+    func read<Value: Codable & Sendable>(
+        url: URL,
+        sessionID: String,
+        initial: Value?,
+        initialAt: Date?,
+        interval: TimeInterval,
+        failureInterval: TimeInterval,
+        now: Date = Date(),
+        fetch: @escaping @MainActor () async throws -> Value
+    ) async -> BrowserMeterResult<Value> {
+        let key = BrowserSessionRefreshPolicy.cacheKey(url: url, sessionID: sessionID)
+        func result(_ entry: Entry) -> BrowserMeterResult<Value> {
+            BrowserMeterResult(
+                value: entry.value.flatMap { try? JSONDecoder().decode(Value.self, from: $0) },
+                fetchedAt: entry.fetchedAt,
+                failure: entry.failure
+            )
+        }
+        if let task = inFlight[key] { return result(await task.value) }
+        var entry = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Entry.self, from: $0) }
+            ?? Entry(value: nil, fetchedAt: nil, nextAttemptAt: .distantPast, failure: nil)
+        if let initial, let initialAt, initialAt > (entry.fetchedAt ?? .distantPast) {
+            entry.value = try? JSONEncoder().encode(initial)
+            entry.fetchedAt = initialAt
+            entry.nextAttemptAt = max(entry.nextAttemptAt, initialAt.addingTimeInterval(interval))
+        }
+        if now < entry.nextAttemptAt { return result(entry) }
+
+        entry.nextAttemptAt = now.addingTimeInterval(failureInterval)
+        defaults.set(try? JSONEncoder().encode(entry), forKey: key)
+        let previous = entry
+        let task = Task { @MainActor in
+            var next = previous
+            do {
+                let value = try await fetch()
+                next.value = try JSONEncoder().encode(value)
+                next.fetchedAt = now
+                next.nextAttemptAt = now.addingTimeInterval(interval)
+                next.failure = nil
+            } catch {
+                next.failure = error.localizedDescription
+            }
+            defaults.set(try? JSONEncoder().encode(next), forKey: key)
+            return next
+        }
+        inFlight[key] = task
+        let completed = await task.value
+        inFlight[key] = nil
+        return result(completed)
+    }
+}
+
+#if os(macOS)
+/// Renders with the importer's WebKit store. Its current cookies and local
+/// storage are authoritative; an old imported Cookie header must not replace them.
+@MainActor
+private final class ImportedSessionPageReader: NSObject, WKNavigationDelegate {
+    private let webView: WKWebView
+    private let panel: NSPanel
+    private var continuation: CheckedContinuation<String, Error>?
+    private var polling: Task<Void, Never>?
+    private var deadline: Task<Void, Never>?
+    private let host: String
+    private let isReady: (String) -> Bool
+
+    private init(url: URL, isReady: @escaping (String) -> Bool) {
+        host = url.host ?? ""
+        self.isReady = isReady
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1100, height: 800), configuration: configuration)
+        panel = NSPanel(
+            contentRect: NSRect(x: -20_000, y: -20_000, width: 1100, height: 800),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false
+        )
+        super.init()
+        webView.navigationDelegate = self
+        panel.contentView = webView
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.alphaValue = 0.01
+    }
+
+    static func read(url: URL, cookieHeader: String, isReady: @escaping (String) -> Bool) async throws -> String {
+        let reader = ImportedSessionPageReader(url: url, isReady: isReady)
+        try await reader.seedMissingSession(cookieHeader)
+        try Task.checkCancellation()
+        return try await reader.load(url)
+    }
+
+    private func seedMissingSession(_ header: String) async throws {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let cookies = await store.allCookies()
+        guard BrowserSessionRefreshPolicy.shouldSeedCookies(existing: cookies, host: host) else { return }
+        for part in header.split(separator: ";") {
+            let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard pair.count == 2, !pair[0].isEmpty,
+                  let cookie = HTTPCookie(properties: [
+                    .name: pair[0], .value: pair[1], .domain: host, .path: "/", .secure: "TRUE"
+                  ]) else { continue }
+            await store.setCookie(cookie)
+        }
+    }
+
+    private func load(_ url: URL) async throws -> String {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                guard !Task.isCancelled else {
+                    finish(.failure(CancellationError()))
+                    return
+                }
+                panel.orderFrontRegardless()
+                deadline = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(18))
+                    guard !Task.isCancelled else { return }
+                    self?.finish(.failure(ProviderFetchError.parsingError("Browser meters did not load. Open the provider's session import to check its sign-in.")))
+                }
+                webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18))
+                polling = Task { @MainActor [weak self] in
+                    while !Task.isCancelled {
+                        guard let self else { return }
+                        if self.webView.url?.host == self.host,
+                           let value = try? await self.webView.evaluateJavaScript("document.body ? document.body.innerText.slice(0, 250000) : ''"),
+                           let text = value as? String {
+                            if text.localizedCaseInsensitiveContains("temporarily blocked") {
+                                self.finish(.failure(ProviderFetchError.rateLimited))
+                                return
+                            }
+                            if self.isReady(text) {
+                                self.finish(.success(text))
+                                return
+                            }
+                        }
+                        try? await Task.sleep(for: .milliseconds(500))
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.finish(.failure(CancellationError())) }
+        }
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if action.targetFrame?.isMainFrame == true, let url = action.request.url,
+           !BrowserSessionRefreshPolicy.allowsNavigation(to: url, dashboardHost: host) {
+            decisionHandler(.cancel)
+            finish(.failure(ProviderFetchError.credentialExpired("Browser sign-in expired. Open the session import to reconnect.")))
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        finish(.failure(ProviderFetchError.parsingError("Browser session process ended; retry after the refresh cooldown.")))
+    }
+    private func finish(_ result: Result<String, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        polling?.cancel()
+        deadline?.cancel()
+        polling = nil
+        deadline = nil
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        panel.orderOut(nil)
+        panel.contentView = nil
+        continuation.resume(with: result)
+    }
+}
+#endif
+
 // MARK: - Generic Web Billing Client (Meta / Cerebras)
 
 /// A balance reading scraped from a provider's billing page. `balance` is the
 /// current available credit; `spend` is the billing-period spend when the page
 /// exposes it; `periodEnd` is the next reset when the page exposes it.
-public struct WebBillingReading: Sendable {
+public nonisolated struct WebBillingReading: Sendable, Codable {
     public let balance: Double?
     public let spend: Double?
     public let currency: String
@@ -1394,7 +1665,146 @@ public struct WebBillingReading: Sendable {
 
     public var isEmpty: Bool {
         balance == nil && spend == nil
-     }
+    }
+}
+
+/// Meta's browser billing surface is not a public API and applies aggressive
+/// anti-abuse controls. Keep dashboard refreshes from repeatedly navigating an
+/// authenticated browser-equivalent request while retaining the last reading.
+enum MetaWebBillingRefreshCadence {
+    static let successfulFetchInterval: TimeInterval = 60 * 60
+    static let failedFetchRetryInterval: TimeInterval = 6 * 60 * 60
+
+    static func isDue(
+        now: Date,
+        lastSuccessfulFetchAt: Date?,
+        lastAttemptAt: Date?
+    ) -> Bool {
+        guard let lastAttemptAt else { return true }
+
+        if let lastSuccessfulFetchAt, lastSuccessfulFetchAt >= lastAttemptAt {
+            return now.timeIntervalSince(lastSuccessfulFetchAt) >= successfulFetchInterval
+        }
+
+        return now.timeIntervalSince(lastAttemptAt) >= failedFetchRetryInterval
+    }
+}
+
+private actor MetaWebBillingRefreshCache {
+    enum FetchDecision {
+        case fetch
+        case cached(WebBillingReading?)
+    }
+
+    private struct PersistedReading: Codable {
+        let balance: Double?
+        let spend: Double?
+        let currency: String
+        let periodEnd: Date?
+
+        init(_ reading: WebBillingReading) {
+            balance = reading.balance
+            spend = reading.spend
+            currency = reading.currency
+            periodEnd = reading.periodEnd
+        }
+
+        var webBillingReading: WebBillingReading {
+            WebBillingReading(
+                balance: balance,
+                spend: spend,
+                currency: currency,
+                periodEnd: periodEnd
+            )
+        }
+    }
+
+    private struct PersistedState: Codable {
+        let sessionFingerprint: String
+        var reading: PersistedReading?
+        var lastSuccessfulFetchAt: Date?
+        var lastAttemptAt: Date?
+    }
+
+    static let shared = MetaWebBillingRefreshCache()
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let defaultPersistenceKey = "meta.webBillingRefreshCache.v1"
+
+    private let defaults: UserDefaults
+    private let persistenceKey: String
+    private var state: PersistedState?
+
+    init(
+        defaults: UserDefaults? = nil,
+        persistenceKey: String = MetaWebBillingRefreshCache.defaultPersistenceKey
+    ) {
+        self.defaults = defaults
+            ?? UserDefaults(suiteName: Self.appGroupID)
+            ?? .standard
+        self.persistenceKey = persistenceKey
+        state = self.defaults.data(forKey: persistenceKey).flatMap {
+            try? JSONDecoder().decode(PersistedState.self, from: $0)
+        }
+    }
+
+    func decision(for cookieHeader: String, now: Date) -> FetchDecision {
+        let fingerprint = Self.fingerprint(for: cookieHeader)
+        guard let state, state.sessionFingerprint == fingerprint else {
+            return .fetch
+        }
+        guard !MetaWebBillingRefreshCadence.isDue(
+            now: now,
+            lastSuccessfulFetchAt: state.lastSuccessfulFetchAt,
+            lastAttemptAt: state.lastAttemptAt
+        ) else {
+            return .fetch
+        }
+        return .cached(state.reading?.webBillingReading)
+    }
+
+    @discardableResult
+    func recordResult(
+        _ reading: WebBillingReading?,
+        for cookieHeader: String,
+        now: Date
+    ) -> WebBillingReading? {
+        let fingerprint = Self.fingerprint(for: cookieHeader)
+        var next = state?.sessionFingerprint == fingerprint
+            ? state!
+            : PersistedState(
+                sessionFingerprint: fingerprint,
+                reading: nil,
+                lastSuccessfulFetchAt: nil,
+                lastAttemptAt: nil
+            )
+
+        next.lastAttemptAt = now
+        if let reading {
+            next.reading = PersistedReading(reading)
+            next.lastSuccessfulFetchAt = now
+        }
+        state = next
+        persist()
+
+        return reading ?? next.reading?.webBillingReading
+    }
+
+    private func persist() {
+        guard let state, let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: persistenceKey)
+    }
+
+    /// Cache partitioning only: this prevents cross-session readings without
+    /// persisting the imported cookie header outside Keychain.
+    private static func fingerprint(for value: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16)
+    }
 }
 
 /// Scrapes a provider billing page with an imported cookie header and extracts
@@ -2528,6 +2938,19 @@ private enum CSVReader {
     }
 }
 
+private func cachedCerebrasWebBillingReading(from fields: [String: String]) -> WebBillingReading? {
+    let balance = nonnegativeDouble(fields[SpendProviderCredentialField.cerebrasCachedBalance])
+    let spend = nonnegativeDouble(fields[SpendProviderCredentialField.cerebrasCachedSpend])
+    guard balance != nil || spend != nil else { return nil }
+
+    return WebBillingReading(
+        balance: balance,
+        spend: spend,
+        currency: normalizedCurrency(fields[SpendProviderCredentialField.cerebrasCachedCurrency]),
+        periodEnd: ProviderDateParser.parse(fields[SpendProviderCredentialField.cerebrasCachedResetAt])
+    )
+}
+
 public struct CerebrasProviderClient: ProviderClient {
     public let providerID: ProviderID = .cerebras
 
@@ -2544,29 +2967,40 @@ public struct CerebrasProviderClient: ProviderClient {
                     .flatMap { CerebrasCSVUsageParser.parse(data: $0) }
             }
         }
-         // Web billing scrape: the user signs in inside the embedded browser and
-         // the normalized cookie header is stored in Keychain. This re-reads the
-         // cloud.cerebras.ai/billing page on each refresh, mirroring the Mistral
-         // web-session pattern.
         let webCookie = fields[SpendProviderCredentialField.cerebrasCookieHeader]
-        let webReading: WebBillingReading? = if let webCookie, !webCookie.isEmpty {
-            await WebBillingClient(
-                baseURL: URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!,
-                cookieDomains: ["cerebras.ai"]
-            ).fetch(
-                cookieHeader: webCookie,
+        let browserResult: BrowserMeterResult<WebBillingReading>?
+        if let webCookie, !webCookie.isEmpty {
+            let endpoint = BrowserSessionRefreshPolicy.validatedURL(
+                fields[SpendProviderCredentialField.browserSessionURL],
+                fallback: URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!
+            )
+            browserResult = await BrowserMeterRefreshStore.shared.read(
+                url: endpoint,
+                sessionID: fields[SpendProviderCredentialField.browserSessionID] ?? webCookie,
+                initial: cachedCerebrasWebBillingReading(from: fields),
+                initialAt: ProviderDateParser.parse(fields[SpendProviderCredentialField.cerebrasCachedAt]),
+                interval: 5 * 60,
+                failureInterval: 15 * 60,
                 now: now,
-                persistCookieHeader: {
-                    await persistImportedCookieHeader(
-                        $0,
-                        providerID: .cerebras,
-                        field: SpendProviderCredentialField.cerebrasCookieHeader
-                    )
+                fetch: {
+                    #if os(macOS)
+                    let text = try await ImportedSessionPageReader.read(url: endpoint, cookieHeader: webCookie) {
+                        WebBillingClient.parse(html: $0, now: now)?.balance != nil
+                    }
+                    guard let reading = WebBillingClient.parse(html: text, now: now) else {
+                        throw ProviderFetchError.parsingError("Cerebras billing balance unavailable.")
+                    }
+                    return reading
+                    #else
+                    throw ProviderFetchError.credentialExpired("Reconnect Cerebras in the browser on your Mac.")
+                    #endif
                 }
             )
-         } else {
-            nil
-         }
+        } else {
+            browserResult = nil
+        }
+        if let failure = browserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+        let webReading = browserResult?.value ?? cachedCerebrasWebBillingReading(from: fields)
 
         let purchased = positiveDouble(credentials?.normalizedAccountIdentifier)
              ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
@@ -2602,11 +3036,19 @@ public struct CerebrasProviderClient: ProviderClient {
                     used: max(purchased - current, 0),
                     total: purchased,
                     unit: manualCurrency,
-                    subtitle: "Manual billing anchor"
+                    subtitle: browserResult?.sourceDescription ?? "Manual billing anchor"
                 )
             )
+        }
+        if let current {
             balances.append(
-                QuotaBalance(label: "Current balance", amount: current, unit: manualCurrency, subtitle: "Manual billing anchor")
+                QuotaBalance(
+                    label: "Current balance",
+                    amount: current,
+                    unit: manualCurrency,
+                    subtitle: browserResult?.sourceDescription
+                        ?? (webReading?.balance != nil ? "Captured at import" : "Manual billing anchor")
+                )
             )
         }
         if windows.isEmpty, let estimated = taskWraith?.currentMonthCostUSD, estimated > 0 {
@@ -2622,7 +3064,9 @@ public struct CerebrasProviderClient: ProviderClient {
             )
         }
 
-        guard !windows.isEmpty || taskWraith != nil else { throw ProviderFetchError.notConfigured }
+        guard !windows.isEmpty || !balances.isEmpty || taskWraith != nil else {
+            throw ProviderFetchError.notConfigured
+        }
         return QuotaSnapshot(
             providerID: .cerebras,
             displayName: ProviderID.cerebras.snapshotDisplayName,
@@ -2634,7 +3078,9 @@ public struct CerebrasProviderClient: ProviderClient {
             balances: balances,
             events: taskWraith?.events ?? [],
             analyticsBuckets: csv?.analyticsBuckets ?? taskWraith?.analyticsBuckets ?? [],
-            fetchState: .success
+            fetchState: .success,
+            fetchedAt: browserResult?.fetchedAt ?? (webCookie == nil ? now
+                : ProviderDateParser.parse(fields[SpendProviderCredentialField.cerebrasCachedAt]) ?? .distantPast)
         )
     }
 
@@ -3485,27 +3931,54 @@ enum MetaRemainingWatermarkStore {
 /// These consoles render "7-Day Quota — N% Used" style meters rather than
 /// currency balances, so the generic WebBillingClient currency parser does
 /// not apply.
-public struct TokenPlanWebReading: Sendable {
+public nonisolated struct TokenPlanWebReading: Sendable, Codable {
     public let quotaUsedPercent: Double?
     public let planName: String?
     public let remainingDays: Int?
     public let periodEnd: Date?
+    /// Banked usage-limit resets the console offers to redeem ("Reset ⓘ 1
+    /// available"); nil when the source did not show the figure.
+    public let resetAvailableCount: Int?
+
+    public init(
+        quotaUsedPercent: Double?,
+        planName: String?,
+        remainingDays: Int?,
+        periodEnd: Date?,
+        resetAvailableCount: Int? = nil
+    ) {
+        self.quotaUsedPercent = quotaUsedPercent
+        self.planName = planName
+        self.remainingDays = remainingDays
+        self.periodEnd = periodEnd
+        self.resetAvailableCount = resetAvailableCount
+    }
 
     public var isEmpty: Bool {
         quotaUsedPercent == nil && planName == nil && remainingDays == nil && periodEnd == nil
     }
 }
 
-/// Fetches a token-plan console page with an imported cookie header and
-/// parses the plan quota meter. Mirrors the Meta/Cerebras web-session
-/// pattern: the user signs in inside the embedded browser, the normalized
-/// cookie header is stored in Keychain, and this client re-reads the page on
-/// each refresh.
+public enum TokenPlanResetDatePolicy: Sendable, Equatable {
+    case usageResetOnly
+    case planEndFallback
+}
+
+/// Fetches and renders a token-plan console page with the imported browser
+/// session, then parses the visible quota meter. Qwen and MiMo are client-side
+/// applications: a plain URLSession request only receives their JavaScript
+/// shell and cannot see the values shown in the browser.
+/// The rendered path also preserves WebKit local-storage authentication.
 public struct TokenPlanWebClient: Sendable {
     public let baseURL: URL
+    public let resetDatePolicy: TokenPlanResetDatePolicy
 
-    public init(baseURL: URL) {
+    public init(
+        baseURL: URL,
+        resetDatePolicy: TokenPlanResetDatePolicy = .planEndFallback
+    ) {
         self.baseURL = baseURL
+        self.resetDatePolicy = resetDatePolicy
     }
 
     public func fetch(cookieHeader: String) async -> TokenPlanWebReading? {
@@ -3513,6 +3986,13 @@ public struct TokenPlanWebClient: Sendable {
             return nil
         }
 
+        #if os(macOS)
+        return await TokenPlanRenderedPageReader.read(
+            url: baseURL,
+            cookieHeader: cookieHeader,
+            resetDatePolicy: resetDatePolicy
+        )
+        #else
         var request = URLRequest(url: baseURL, timeoutInterval: 15)
         request.httpMethod = "GET"
         request.httpShouldHandleCookies = false
@@ -3541,34 +4021,104 @@ public struct TokenPlanWebClient: Sendable {
             return nil
         }
 
-        return Self.parse(html: html)
+        return Self.parse(html: html, resetDatePolicy: resetDatePolicy)
+        #endif
     }
 
     // MARK: Parsing
 
-    static func parse(html: String) -> TokenPlanWebReading? {
+    static func parse(
+        html: String,
+        resetDatePolicy: TokenPlanResetDatePolicy = .planEndFallback
+    ) -> TokenPlanWebReading? {
         let renderedText = MistralWebSubscriptionClient.normalizedRenderedText(from: html)
         let payloadText = MistralWebSubscriptionClient.normalizedScriptPayloadText(from: html)
 
+        return parse(
+            renderedText: renderedText,
+            payloadText: payloadText,
+            resetDatePolicy: resetDatePolicy
+        )
+    }
+
+    static func parse(renderedText: String) -> TokenPlanWebReading? {
+        return parse(
+            renderedText: MistralWebSubscriptionClient.normalizedRenderedText(from: renderedText),
+            payloadText: "",
+            resetDatePolicy: .planEndFallback
+        )
+    }
+
+    static func parseQwen(renderedText: String) -> TokenPlanWebReading? {
+        return parse(
+            renderedText: MistralWebSubscriptionClient.normalizedRenderedText(from: renderedText),
+            payloadText: "",
+            resetDatePolicy: .usageResetOnly
+        )
+    }
+
+    private static func parse(
+        renderedText: String,
+        payloadText: String,
+        resetDatePolicy: TokenPlanResetDatePolicy
+    ) -> TokenPlanWebReading? {
         let quotaUsedPercent = firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%\\s*Used", in: renderedText)
             .flatMap { Double($0) }
             ?? firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%\\s*Used", in: payloadText).flatMap { Double($0) }
             ?? firstMatch(pattern: "Used[^0-9%]{0,40}(\\d+(?:\\.\\d+)?)\\s*%", in: renderedText).flatMap { Double($0) }
             ?? firstMatch(pattern: "Used[^0-9%]{0,40}(\\d+(?:\\.\\d+)?)\\s*%", in: payloadText).flatMap { Double($0) }
+            ?? firstMatch(pattern: Self.percentAfterResetRowPattern, in: renderedText).flatMap { Double($0) }
+            ?? firstMatch(pattern: Self.percentAfterResetRowPattern, in: payloadText).flatMap { Double($0) }
         let remainingDays = firstMatch(pattern: "Remaining\\s*Days?\\s*:?\\s*(\\d+)", in: renderedText)
             .flatMap { Int($0) }
             ?? firstMatch(pattern: "Remaining\\s*Days?\\s*:?\\s*(\\d+)", in: payloadText).flatMap { Int($0) }
         let planName = planName(in: renderedText) ?? planName(in: payloadText)
-        let periodEnd = periodEnd(in: renderedText) ?? periodEnd(in: payloadText)
+        let periodEnd = periodEnd(in: renderedText, resetDatePolicy: resetDatePolicy)
+            ?? periodEnd(in: payloadText, resetDatePolicy: resetDatePolicy)
+        let resetAvailableCount = resetAvailableCount(in: renderedText)
+            ?? resetAvailableCount(in: payloadText)
 
         let reading = TokenPlanWebReading(
-            quotaUsedPercent: quotaUsedPercent,
+            quotaUsedPercent: quotaUsedPercent.flatMap { (0...100).contains($0) ? $0 : nil },
             planName: planName,
             remainingDays: remainingDays,
-            periodEnd: periodEnd
+            periodEnd: periodEnd,
+            resetAvailableCount: resetAvailableCount
         )
         return reading.isEmpty ? nil : reading
     }
+
+    /// Model Studio's Plan Quota card shows the banked resets beside its
+    /// Reset button — "Reset ⓘ 1 available". The gap allows the icon and a
+    /// line break but not a percent sign, so the meter's own "Will reset at
+    /// … 100%" row can never supply the number.
+    static func resetAvailableCount(in text: String) -> Int? {
+        firstMatch(pattern: #"\bReset\b[^%]{0,40}?(\d{1,2})\s*available"#, in: text)
+            .flatMap(Int.init)
+    }
+
+    /// Reads Model Studio's 7-day meter.
+    ///
+    /// The meter used to render its value against its label ("0% Used"), which
+    /// the two patterns above match. It now renders that value at the far end
+    /// of the reset row instead —
+    /// "7-Day Used … Will reset at 2026-09-16 10:03:00 (UTC+8) 100%" — and both
+    /// of those patterns stop at the first digit of the timestamp, so the meter
+    /// stopped parsing and neither the session import nor the background
+    /// refresh could see a quota at all.
+    ///
+    /// Anchoring on the reset row steps over the timestamp while staying
+    /// specific to the row that owns the number. Barring `%` from the gap stops
+    /// the match running past the meter into the progress bar's "0% / 100%"
+    /// axis labels below it.
+    ///
+    /// Keying off the axis labels instead — take every percentage in the card,
+    /// drop one "0%" and one "100%", keep the survivor — looks more robust and
+    /// is not: the import sheet's embedded browser is narrow enough to scroll
+    /// the axis out of the rendered text entirely, so that rule finds nothing
+    /// there. Only the value itself is reliably present in both callers' text.
+    private static let percentAfterResetRowPattern =
+        "Will\\s*reset\\s*at[^%()]{0,60}\\(UTC[^)]{0,10}\\)\\s*(\\d+(?:\\.\\d+)?)\\s*%"
 
     private static func firstMatch(pattern: String, in text: String) -> String? {
         guard !text.isEmpty else { return nil }
@@ -3583,8 +4133,16 @@ public struct TokenPlanWebClient: Sendable {
     }
 
     private static func planName(in text: String) -> String? {
-        // The console renders e.g. "Lite Plan" above "Plan Status". Filter out
-        // generic phrases so "Token Plan" chrome never becomes the plan name.
+        // MiMo renders "Lite Monthly Plan" before the renewal and validity labels.
+        if let namedTier = firstMatch(
+            pattern: "\\b((?:Lite|Free|Pro|Team|Enterprise|Personal|Basic|Standard|Premium)(?:\\s+[A-Za-z0-9+._-]+){0,3}\\s+Plan)\\b",
+            in: text
+        ) {
+            return normalizedTokenPlanName(namedTier)
+        }
+
+        // Filter out generic phrases so "Token Plan" chrome never becomes
+        // the plan name.
         let blacklist: Set<String> = ["token", "the", "your", "a", "an", "this", "subscription", "upgrade"]
         var searchStart = text.startIndex
         while searchStart < text.endIndex,
@@ -3596,7 +4154,7 @@ public struct TokenPlanWebClient: Sendable {
                 let candidate = last.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
                 let lowered = candidate.lowercased()
                 if candidate.count >= 2, candidate.count <= 24, !blacklist.contains(lowered) {
-                    return candidate + " Plan"
+                    return normalizedTokenPlanName(candidate + " Plan")
                 }
             }
             searchStart = range.upperBound
@@ -3604,18 +4162,55 @@ public struct TokenPlanWebClient: Sendable {
         return nil
     }
 
-    private static func periodEnd(in text: String) -> Date? {
-        guard let datePart = firstMatch(pattern: "End\\s*Time\\s*:?\\s*(\\d{4}-\\d{2}-\\d{2})", in: text) else {
+    private static func periodEnd(
+        in text: String,
+        resetDatePolicy: TokenPlanResetDatePolicy
+    ) -> Date? {
+        if let usageReset = timestamp(after: "Will\\s*reset\\s*at", in: text) {
+            return usageReset
+        }
+        guard resetDatePolicy == .planEndFallback else { return nil }
+        return timestamp(after: "(?:End\\s*Time|Valid\\s*until)", in: text)
+    }
+
+    private static func timestamp(after labelPattern: String, in text: String) -> Date? {
+        let datePart = firstMatch(
+            pattern: "\(labelPattern)\\s*:?\\s*(\\d{4}-\\d{2}-\\d{2})",
+            in: text
+        )
+        guard let datePart else {
             return nil
         }
-        let timePart = firstMatch(pattern: "End\\s*Time\\s*:?\\s*\\d{4}-\\d{2}-\\d{2}\\s+(\\d{2}:\\d{2}(?::\\d{2})?)", in: text)
+        let timePart = firstMatch(
+            pattern: "\(labelPattern)\\s*:?\\s*\\d{4}-\\d{2}-\\d{2}\\s+(\\d{2}:\\d{2}(?::\\d{2})?)",
+            in: text
+        )
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        let utcOffsetHours = firstMatch(
+            pattern: "\(labelPattern)[^\\n]{0,96}\\(\\s*UTC\\s*([+-]\\d{1,2})\\s*\\)",
+            in: text
+        ).flatMap(Int.init)
+        formatter.timeZone = utcOffsetHours.flatMap { TimeZone(secondsFromGMT: $0 * 3_600) }
+            ?? TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = timePart != nil ? "yyyy-MM-dd HH:mm:ss" : "yyyy-MM-dd"
         if timePart?.count == 5 { formatter.dateFormat = "yyyy-MM-dd HH:mm" }
         return formatter.date(from: timePart != nil ? "\(datePart) \(timePart!)" : datePart)
     }
 }
+
+#if os(macOS)
+/// Loads the same browser session used during import.
+@MainActor
+private enum TokenPlanRenderedPageReader {
+    static func read(url: URL, cookieHeader: String, resetDatePolicy: TokenPlanResetDatePolicy) async -> TokenPlanWebReading? {
+        guard let text = try? await ImportedSessionPageReader.read(url: url, cookieHeader: cookieHeader, isReady: {
+            TokenPlanWebClient.parse(html: $0, resetDatePolicy: resetDatePolicy)?.quotaUsedPercent != nil
+        }) else { return nil }
+        return TokenPlanWebClient.parse(html: text, resetDatePolicy: resetDatePolicy)
+    }
+}
+#endif
 
 public struct QwenProviderClient: ProviderClient {
     public let providerID: ProviderID = .qwen
@@ -3628,9 +4223,11 @@ public struct QwenProviderClient: ProviderClient {
             credentials: credentials,
             dashboardURL: URL(string: "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan&productCode=p_efm#/efm/subscription/token-plan/personal")!,
             cookieField: SpendProviderCredentialField.qwenCookieHeader,
+            resetDatePolicy: .usageResetOnly,
             windowLabel: "7-Day Quota",
             windowKind: .weekly,
-            defaultPlanName: "Token Plan"
+            defaultPlanName: "Token Plan",
+            consoleUsageAPI: .qwenPersonalUsage
         )
     }
 }
@@ -3646,8 +4243,9 @@ public struct MimoProviderClient: ProviderClient {
             credentials: credentials,
             dashboardURL: URL(string: "https://platform.xiaomimimo.com/console/plan-manage")!,
             cookieField: SpendProviderCredentialField.mimoCookieHeader,
+            resetDatePolicy: .planEndFallback,
             windowLabel: "Plan Quota",
-            windowKind: .custom,
+            windowKind: .monthly,
             defaultPlanName: "MiMo Plan"
         )
     }
@@ -3655,30 +4253,339 @@ public struct MimoProviderClient: ProviderClient {
 
 /// Shared assembly for percent-based token-plan consoles: web scrape first,
 /// then the manual weekly-percent anchor entered in Settings.
+/// Coordinates for one Model Studio console-gateway API.
+///
+/// The console reaches its own backend through a CLI gateway that takes the
+/// target API as an RPC name. Region and site pick the gateway host and action:
+/// `ap-southeast-1` on the international site answers on
+/// `bailian-singapore-cs.alibabacloud.com` / `IntlBroadScopeAspnGateway`.
+struct TokenPlanConsoleAPI {
+    let host: String
+    let action: String
+    let region: String
+    let api: String
+    let referer: String
+
+    static let qwenPersonalUsage = TokenPlanConsoleAPI(
+        host: "bailian-singapore-cs.alibabacloud.com",
+        action: "IntlBroadScopeAspnGateway",
+        region: "ap-southeast-1",
+        api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+        referer: "https://modelstudio.console.alibabacloud.com/"
+    )
+
+    /// The personal plan's subscription record on the same gateway; the
+    /// console's Plan Quota card draws its reset allowance from here.
+    static let qwenPersonalSubscription = TokenPlanConsoleAPI(
+        host: "bailian-singapore-cs.alibabacloud.com",
+        action: "IntlBroadScopeAspnGateway",
+        region: "ap-southeast-1",
+        api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription",
+        referer: "https://modelstudio.console.alibabacloud.com/"
+    )
+
+    var subscriptionSibling: TokenPlanConsoleAPI? {
+        api == Self.qwenPersonalUsage.api ? Self.qwenPersonalSubscription : nil
+    }
+}
+
+/// Reads the Token Plan quota as data instead of scraping the rendered console.
+///
+/// The console draws its 7-day meter from this API, and the same session cookie
+/// the app already imports authenticates it. Scraping the page for the same
+/// number was fragile in a way that could not be fixed by better patterns: the
+/// value's position relative to the progress bar's "0% / 100%" axis labels is
+/// not stable in flat `innerText`, and the readiness poll driving the refresh
+/// would accept an axis label the moment it painted — reporting a confident 0%
+/// against a page showing 100%. This returns the figure the console itself uses.
+enum TokenPlanConsoleAPIClient {
+    /// `per1WeekPercentage` is a 0-1 fraction, not a percentage: the official
+    /// CLI renders it as `percentage * 100`, and this account read `1.0` while
+    /// the console displayed 100%. `per1WeekResetTime` is epoch milliseconds and
+    /// matched the reset already on file exactly.
+    static func usageReading(
+        _ config: TokenPlanConsoleAPI = .qwenPersonalUsage,
+        cookieHeader: String
+    ) async throws -> TokenPlanWebReading? {
+        guard let data = try await requestData(config, cookieHeader: cookieHeader) else { return nil }
+        return try parseUsage(data)
+    }
+
+    /// Best-effort read of the banked reset count from the subscription
+    /// record. The field is undocumented, so the payload is scanned for a key
+    /// that pairs "reset" with a count-like word and holds a small integer;
+    /// its top-level keys are logged so a renamed field is easy to spot.
+    static func resetAvailableCount(
+        _ config: TokenPlanConsoleAPI = .qwenPersonalSubscription,
+        cookieHeader: String
+    ) async throws -> Int? {
+        guard let data = try await requestData(config, cookieHeader: cookieHeader) else { return nil }
+        return parseResetAvailableCount(data)
+    }
+
+    static func parseResetAvailableCount(_ data: Data) -> Int? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let envelope = root["data"] as? [String: Any] else { return nil }
+        if let succeeded = envelope["success"] as? Bool, !succeeded { return nil }
+        guard let dataV2 = envelope["DataV2"] as? [String: Any],
+              let body = dataV2["data"] as? [String: Any] else { return nil }
+        let payload = (body["data"] as? [String: Any]) ?? body
+        print("[TokenPlanConsoleAPI] subscription payload keys: \(payload.keys.sorted())")
+        return resetAvailableCount(in: payload)
+    }
+
+    /// `insideResetObject` relaxes the key test for the children of an
+    /// object that was itself named for resets (`resetInfo.availableTimes`).
+    static func resetAvailableCount(
+        in payload: [String: Any],
+        depth: Int = 0,
+        insideResetObject: Bool = false
+    ) -> Int? {
+        let countWords = ["count", "times", "remain", "avail", "num", "quantity", "left"]
+        for key in payload.keys.sorted() {
+            let lowered = key.lowercased()
+            guard insideResetObject || lowered.contains("reset"),
+                  countWords.contains(where: { lowered.contains($0) }),
+                  let number = numericValue(payload[key]),
+                  number >= 0, number <= 50, number == number.rounded() else {
+                continue
+            }
+            return Int(number)
+        }
+        guard depth < 2 else { return nil }
+        for key in payload.keys.sorted() {
+            if let nested = payload[key] as? [String: Any],
+               let count = resetAvailableCount(
+                   in: nested,
+                   depth: depth + 1,
+                   insideResetObject: insideResetObject || key.lowercased().contains("reset")
+               ) {
+                return count
+            }
+        }
+        return nil
+    }
+
+    private static func requestData(
+        _ config: TokenPlanConsoleAPI,
+        cookieHeader: String
+    ) async throws -> Data? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = config.host
+        components.path = "/cli/api.json"
+        components.queryItems = [
+            URLQueryItem(name: "action", value: config.action),
+            URLQueryItem(name: "product", value: "sfm_bailian"),
+            URLQueryItem(name: "api", value: config.api)
+        ]
+        guard let url = components.url else { return nil }
+
+        let params: [String: Any] = [
+            "Api": config.api,
+            "V": "1.0",
+            "Data": [
+                "cornerstoneParam": [
+                    "protocol": "V2",
+                    "console": "ONE_CONSOLE",
+                    "productCode": "p_efm",
+                    "switchUserType": 3,
+                    "consoleSite": "BAILIAN_ALIYUN"
+                ]
+            ]
+        ]
+        guard let paramsData = try? JSONSerialization.data(withJSONObject: params),
+              let paramsJSON = String(data: paramsData, encoding: .utf8) else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        // The gateway is a different host from the console page that normally
+        // calls it, so it sees these as cross-origin and expects both.
+        request.setValue("https://modelstudio.console.alibabacloud.com", forHTTPHeaderField: "Origin")
+        request.setValue(config.referer, forHTTPHeaderField: "Referer")
+        request.httpBody = formEncodedBody(["params": paramsJSON, "region": config.region])
+
+        // Cookie-inert: the console rotates session cookies, and the shared jar
+        // would shadow the imported Keychain header on every later request.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse else { return nil }
+        guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw ProviderFetchError.credentialExpired("Qwen console session expired. Reconnect the browser session.")
+            }
+            return nil
+        }
+
+        return data
+    }
+
+    static func parseUsage(_ data: Data) throws -> TokenPlanWebReading? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let envelope = root["data"] as? [String: Any] else { return nil }
+
+        if let succeeded = envelope["success"] as? Bool, !succeeded {
+            let code = (envelope["errorCode"] as? String) ?? ""
+            // The gateway reports an expired console session in the body, not
+            // the status code.
+            if code.localizedCaseInsensitiveContains("NotLogined") {
+                throw ProviderFetchError.credentialExpired("Qwen console session expired. Reconnect the browser session.")
+            }
+            throw ProviderFetchError.parsingError("Model Studio console API error\(code.isEmpty ? "" : ": \(code)")")
+        }
+
+        guard let dataV2 = envelope["DataV2"] as? [String: Any],
+              let body = dataV2["data"] as? [String: Any],
+              let payload = body["data"] as? [String: Any] else { return nil }
+
+        let fraction = numericValue(payload["per1WeekPercentage"])
+        let resetMilliseconds = numericValue(payload["per1WeekResetTime"])
+
+        let usedPercent = fraction.map { min(max($0 * 100, 0), 100) }
+        let periodEnd = resetMilliseconds.map { Date(timeIntervalSince1970: $0 / 1000) }
+
+        guard usedPercent != nil || periodEnd != nil else { return nil }
+        return TokenPlanWebReading(
+            quotaUsedPercent: usedPercent,
+            planName: nil,
+            remainingDays: nil,
+            periodEnd: periodEnd
+        )
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let v = value as? Double { return v }
+        if let v = value as? Int { return Double(v) }
+        if let v = value as? NSNumber { return v.doubleValue }
+        if let v = value as? String { return Double(v) }
+        return nil
+    }
+
+    private static func formEncodedBody(_ fields: [String: String]) -> Data {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let encoded = fields
+            .map { key, value in
+                let k = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+                let v = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+                return "\(k)=\(v)"
+            }
+            .sorted()
+            .joined(separator: "&")
+        return Data(encoded.utf8)
+    }
+}
+
 private func tokenPlanSnapshot(
     providerID: ProviderID,
     credentials: ProviderCredential?,
     dashboardURL: URL,
     cookieField: String,
+    resetDatePolicy: TokenPlanResetDatePolicy,
     windowLabel: String,
     windowKind: QuotaWindowKind,
-    defaultPlanName: String
+    defaultPlanName: String,
+    consoleUsageAPI: TokenPlanConsoleAPI? = nil
 ) async throws -> QuotaSnapshot {
     let now = Date()
     let fields = credentials?.extraFields ?? [:]
     let webCookie = fields[cookieField]
-    let webReading: TokenPlanWebReading? = if let webCookie, !webCookie.isEmpty {
-        await TokenPlanWebClient(baseURL: dashboardURL).fetch(cookieHeader: webCookie)
+    let cachedReading = cachedTokenPlanReading(
+        from: fields,
+        resetDatePolicy: resetDatePolicy,
+        now: now
+    )
+    let endpoint = BrowserSessionRefreshPolicy.validatedURL(fields[SpendProviderCredentialField.browserSessionURL], fallback: dashboardURL)
+    let browserResult: BrowserMeterResult<TokenPlanWebReading>?
+    if let webCookie, !webCookie.isEmpty {
+        browserResult = await BrowserMeterRefreshStore.shared.read(
+            url: endpoint,
+            sessionID: fields[SpendProviderCredentialField.browserSessionID] ?? webCookie,
+            initial: cachedReading,
+            initialAt: ProviderDateParser.parse(fields[SpendProviderCredentialField.tokenPlanCachedAt]),
+            interval: 5 * 60,
+            failureInterval: 15 * 60,
+            now: now
+        ) {
+            // Prefer the console's own API. It returns the same figure the
+            // page renders, without depending on where the meter's value sits
+            // in the rendered text. The scrape below stays as a fallback for
+            // sessions or regions the API rejects.
+            if let consoleUsageAPI,
+               let apiReading = try await TokenPlanConsoleAPIClient.usageReading(
+                   consoleUsageAPI,
+                   cookieHeader: webCookie
+               ) {
+                // The API carries the quota and its reset, not the plan
+                // metadata, so keep whatever the last page read established.
+                // The banked reset count is read separately, and rarely.
+                let resetAvailableCount = await TokenPlanResetAvailabilityReader.availableCount(
+                    providerID: providerID,
+                    pageURL: endpoint,
+                    cookieHeader: webCookie,
+                    subscriptionAPI: consoleUsageAPI.subscriptionSibling,
+                    now: now
+                )
+                return TokenPlanWebReading(
+                    quotaUsedPercent: apiReading.quotaUsedPercent,
+                    planName: cachedReading?.planName,
+                    remainingDays: cachedReading?.remainingDays,
+                    periodEnd: apiReading.periodEnd ?? cachedReading?.periodEnd,
+                    resetAvailableCount: resetAvailableCount
+                )
+            }
+
+            #if os(macOS)
+            let text = try await ImportedSessionPageReader.read(url: endpoint, cookieHeader: webCookie) {
+                TokenPlanWebClient.parse(html: $0, resetDatePolicy: resetDatePolicy)?.quotaUsedPercent != nil
+            }
+            guard let reading = TokenPlanWebClient.parse(html: text, resetDatePolicy: resetDatePolicy) else {
+                throw ProviderFetchError.parsingError("No token-plan meters found.")
+            }
+            return reading
+            #else
+            guard let reading = await TokenPlanWebClient(baseURL: endpoint, resetDatePolicy: resetDatePolicy).fetch(cookieHeader: webCookie) else {
+                throw ProviderFetchError.credentialExpired("Reconnect the browser session on your Mac.")
+            }
+            return reading
+            #endif
+        }
     } else {
-        nil
+        browserResult = nil
     }
+    if let failure = browserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+    let webReading = browserResult?.value
 
     let usedPercent = webReading?.quotaUsedPercent
-        ?? positiveDouble(fields[SpendProviderCredentialField.manualWeeklyUsedPercent])
+        ?? cachedReading?.quotaUsedPercent
+        ?? nonnegativePercent(fields[SpendProviderCredentialField.manualWeeklyUsedPercent])
     let planName = webReading?.planName
+        ?? cachedReading?.planName
         ?? fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         ?? defaultPlanName
-    let resetAt = webReading?.periodEnd ?? ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
+    let resetAt = acceptedTokenPlanResetDate(
+        webReading?.periodEnd,
+        policy: resetDatePolicy,
+        now: now
+    ) ?? acceptedTokenPlanResetDate(
+        cachedReading?.periodEnd,
+        policy: resetDatePolicy,
+        now: now
+    ) ?? acceptedTokenPlanResetDate(
+        ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt]),
+        policy: resetDatePolicy,
+        now: now
+    )
 
     var windows: [QuotaWindow] = []
     var stats: [QuotaStat] = []
@@ -3692,8 +4599,10 @@ private func tokenPlanSnapshot(
                 resetDate: resetAt,
                 unit: "%",
                 subtitle: webReading?.quotaUsedPercent != nil
-                    ? "Scraped from the token plan dashboard"
-                    : "Manual anchor — update after each dashboard check"
+                    ? browserResult?.sourceDescription
+                    : cachedReading?.quotaUsedPercent != nil
+                        ? "Captured from the imported browser session"
+                        : "Manual anchor — update after each dashboard check"
             )
         )
     }
@@ -3717,6 +4626,15 @@ private func tokenPlanSnapshot(
         )
     }
 
+    let observedAt = browserResult?.fetchedAt ?? now
+    let resetCredits = webReading?.resetAvailableCount.map { count in
+        QuotaResetCreditSummary(
+            availableCount: count,
+            redeemHint: "Redeem it from the Plan Quota card in the Model Studio console.",
+            observedAt: observedAt
+        )
+    }
+
     return QuotaSnapshot(
         providerID: providerID,
         displayName: providerID.snapshotDisplayName,
@@ -3724,17 +4642,1347 @@ private func tokenPlanSnapshot(
         windows: windows,
         stats: stats,
         fetchState: .success,
-        fetchedAt: now
+        fetchedAt: browserResult?.fetchedAt
+            ?? (webCookie == nil ? now : ProviderDateParser.parse(fields[SpendProviderCredentialField.tokenPlanCachedAt]) ?? .distantPast),
+        resetCredits: resetCredits
     )
 }
 
-public struct MetaProviderClient: ProviderClient {
+/// Reads the banked reset count Model Studio shows on its Plan Quota card
+/// ("Reset ⓘ 1 available") at a slower cadence than the meter itself: the
+/// subscription API first, then the rendered page. A successful read is
+/// good for half an hour, a miss is retried after ten minutes.
+enum TokenPlanResetAvailabilityReader {
+    private static let refreshInterval: TimeInterval = 30 * 60
+    private static let retryInterval: TimeInterval = 10 * 60
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+
+    private struct Cache: Codable {
+        let count: Int?
+        let checkedAt: Date
+    }
+
+    static func availableCount(
+        providerID: ProviderID,
+        pageURL: URL,
+        cookieHeader: String,
+        subscriptionAPI: TokenPlanConsoleAPI?,
+        now: Date = Date()
+    ) async -> Int? {
+        let key = "\(providerID.rawValue).resetAvailability.v1"
+        let defaults = UserDefaults(suiteName: appGroupID) ?? .standard
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let cached = defaults.data(forKey: key).flatMap { try? decoder.decode(Cache.self, from: $0) }
+        if let cached {
+            let interval = cached.count == nil ? retryInterval : refreshInterval
+            if now.timeIntervalSince(cached.checkedAt) < interval {
+                return cached.count
+            }
+        }
+
+        var count: Int?
+        if let subscriptionAPI {
+            count = try? await TokenPlanConsoleAPIClient.resetAvailableCount(subscriptionAPI, cookieHeader: cookieHeader)
+        }
+        #if os(macOS)
+        if count == nil {
+            let text = try? await ImportedSessionPageReader.read(url: pageURL, cookieHeader: cookieHeader) { html in
+                let reading = TokenPlanWebClient.parse(html: html, resetDatePolicy: .usageResetOnly)
+                return reading?.resetAvailableCount != nil || reading?.quotaUsedPercent != nil
+            }
+            count = text.flatMap { TokenPlanWebClient.parse(html: $0, resetDatePolicy: .usageResetOnly)?.resetAvailableCount }
+        }
+        #endif
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(Cache(count: count, checkedAt: now)) {
+            defaults.set(data, forKey: key)
+        }
+        print("[TokenPlanResetAvailability] \(providerID.rawValue): \(count.map(String.init) ?? "unknown") banked reset(s)")
+        return count ?? cached?.count
+    }
+}
+
+private func cachedTokenPlanReading(
+    from fields: [String: String],
+    resetDatePolicy: TokenPlanResetDatePolicy,
+    now: Date
+) -> TokenPlanWebReading? {
+    let usedPercent = nonnegativePercent(fields[SpendProviderCredentialField.tokenPlanCachedUsedPercent])
+    let planName = normalizedTokenPlanName(
+        fields[SpendProviderCredentialField.tokenPlanCachedPlanName]
+    )
+    let periodEnd = acceptedTokenPlanResetDate(
+        ProviderDateParser.parse(fields[SpendProviderCredentialField.tokenPlanCachedResetAt]),
+        policy: resetDatePolicy,
+        now: now
+    )
+    let reading = TokenPlanWebReading(
+        quotaUsedPercent: usedPercent,
+        planName: planName,
+        remainingDays: nil,
+        periodEnd: periodEnd
+    )
+    return reading.isEmpty ? nil : reading
+}
+
+private func acceptedTokenPlanResetDate(
+    _ candidate: Date?,
+    policy: TokenPlanResetDatePolicy,
+    now: Date
+) -> Date? {
+    guard let candidate else { return nil }
+    guard policy == .usageResetOnly else { return candidate }
+    let maximumWeeklyReset = now.addingTimeInterval(8 * 24 * 60 * 60)
+    return candidate > now && candidate <= maximumWeeklyReset ? candidate : nil
+}
+
+private func normalizedTokenPlanName(_ value: String?) -> String? {
+    guard var name = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !name.isEmpty else {
+        return nil
+    }
+    while name.range(
+        of: #"\bPlan\s+Plan$"#,
+        options: [.regularExpression, .caseInsensitive]
+    ) != nil {
+        name = name.replacingOccurrences(
+            of: #"\s+Plan$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+    }
+    return name.isEmpty ? nil : name
+}
+
+private func nonnegativePercent(_ value: String?) -> Double? {
+    guard let result = nonnegativeDouble(value), result <= 100 else { return nil }
+    return result
+}
+
+// MARK: - Muse Code subscription CLI metering (`muse` → /usage)
+
+/// The Muse Code subscription meters as reported by the local CLI. The CLI
+/// talks to Meta's own API with the user's OAuth session, so unlike the
+/// console scrape it carries no anti-abuse risk and can be polled far more
+/// often. It also reports a reset for the rolling *current* window, which the
+/// console page does not expose.
+public struct MuseCliSubscriptionReading: Sendable, Equatable, Codable {
+    public let planName: String?
+    public let currentUsedPercent: Double?
+    public let currentResetAt: Date?
+    public let weeklyUsedPercent: Double?
+    public let weeklyResetAt: Date?
+
+    public init(
+        planName: String?,
+        currentUsedPercent: Double?,
+        currentResetAt: Date?,
+        weeklyUsedPercent: Double?,
+        weeklyResetAt: Date?
+    ) {
+        self.planName = planName
+        self.currentUsedPercent = currentUsedPercent
+        self.currentResetAt = currentResetAt
+        self.weeklyUsedPercent = weeklyUsedPercent
+        self.weeklyResetAt = weeklyResetAt
+    }
+
+    public var isEmpty: Bool {
+        currentUsedPercent == nil && weeklyUsedPercent == nil
+    }
+}
+
+/// Parses the `/usage` screen of the Muse TUI.
+///
+/// The TUI paints with cursor positioning rather than spaces, so a partial
+/// redraw arrives as `Subscription·MuseCodeHighUsageCurrent14%used·Resets…`
+/// while a full redraw keeps the spacing. Every match therefore runs against
+/// the *whitespace-stripped* text, which is identical in both cases.
+nonisolated enum MuseCliUsageParser {
+    /// ESC is embedded as a Swift escape rather than a regex escape: ICU
+    /// understands `\\uHHHH` but not Swift's `\\u{...}`, and a literal control
+    /// byte in source would be invisible to the next reader.
+    private static let escape = "\u{001B}"
+
+    static func stripANSI(_ text: String) -> String {
+        var result = text
+        for pattern in [
+            "\(escape)\\][^\u{0007}\u{001B}]*(\u{0007}|\(escape)\\\\)",  // OSC
+            "\(escape)P[\\s\\S]*?\(escape)\\\\",                          // DCS
+            "\(escape)\\[[0-9;?<>=]*[ -/]*[@-~]",                       // CSI
+            "\(escape)[()][0-9A-B]",                                    // charset
+            "\(escape)[=>NOM78]"                                        // single-char
+        ] {
+            result = result.replacingOccurrences(
+                of: pattern,
+                with: "",
+                options: .regularExpression
+            )
+        }
+        return result
+    }
+
+    /// ANSI-stripped and whitespace-free, the form every pattern matches on.
+    static func compacted(_ rawText: String) -> String {
+        stripANSI(rawText).replacingOccurrences(
+            of: #"\s+"#,
+            with: "",
+            options: .regularExpression
+        )
+    }
+
+    /// True once the weekly meter has painted, i.e. the screen is complete
+    /// enough to parse. The probe stops reading at this point.
+    static func hasSubscriptionScreen(_ compacted: String) -> Bool {
+        firstMatch(pattern: #"weekly\d+(?:\.\d+)?%used"#, in: compacted) != nil
+    }
+
+    static func parse(
+        rawText: String,
+        now: Date,
+        calendar: Calendar = .current
+    ) -> MuseCliSubscriptionReading? {
+        parse(compacted: compacted(rawText), now: now, calendar: calendar)
+    }
+
+    static func parse(
+        compacted text: String,
+        now: Date,
+        calendar: Calendar = .current
+    ) -> MuseCliSubscriptionReading? {
+        guard !text.isEmpty else { return nil }
+
+        let currentPercent = capture(
+            pattern: #"current(\d+(?:\.\d+)?)%used"#,
+            group: 1,
+            in: text
+        ).flatMap(Double.init)
+        let weeklyPercent = capture(
+            pattern: #"weekly(\d+(?:\.\d+)?)%used"#,
+            group: 1,
+            in: text
+        ).flatMap(Double.init)
+
+        guard currentPercent != nil || weeklyPercent != nil else { return nil }
+
+        // "Current 14% used · Resets at 9:18 PM" — a clock time only, so the
+        // reset is the next occurrence of that time.
+        let currentReset = capture(
+            pattern: #"current\d+(?:\.\d+)?%used[·•]?resetsat(\d{1,2}:\d{2})(am|pm)?"#,
+            group: 1,
+            in: text
+        ).flatMap { clock in
+            nextOccurrence(
+                clock: clock,
+                meridiem: capture(
+                    pattern: #"current\d+(?:\.\d+)?%used[·•]?resetsat\d{1,2}:\d{2}(am|pm)"#,
+                    group: 1,
+                    in: text
+                ),
+                now: now,
+                calendar: calendar
+            )
+        }
+
+        // "Weekly 30% used · Resets Sep 7 at 1:00 AM" — month/day plus a time.
+        let weeklyReset = weeklyResetDate(in: text, now: now, calendar: calendar)
+
+        let reading = MuseCliSubscriptionReading(
+            planName: planName(in: text),
+            currentUsedPercent: clampedPercent(currentPercent),
+            currentResetAt: currentReset,
+            weeklyUsedPercent: clampedPercent(weeklyPercent),
+            weeklyResetAt: weeklyReset
+        )
+        return reading.isEmpty ? nil : reading
+    }
+
+    private static func clampedPercent(_ value: Double?) -> Double? {
+        guard let value, (0...100).contains(value) else { return nil }
+        return value
+    }
+
+    /// `Subscription·MuseCodeHighUsageCurrent14%used` → "Muse Code High Usage".
+    /// Whitespace is already gone, so the CamelCase run is re-spaced.
+    private static func planName(in text: String) -> String? {
+        // Bounded gap: an unbounded lazy group could bridge the label of one
+        // painted frame to the meters of the next.
+        guard let raw = capture(
+            pattern: #"subscription[·•]?(.{1,48}?)current\d+(?:\.\d+)?%used"#,
+            group: 1,
+            in: text
+        ), !raw.isEmpty else {
+            return nil
+        }
+        let spaced = raw.replacingOccurrences(
+            of: #"(?<=[a-z0-9])(?=[A-Z])"#,
+            with: " ",
+            options: .regularExpression
+        )
+        let trimmed = spaced.trimmingCharacters(in: CharacterSet(charactersIn: " ·•-"))
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func weeklyResetDate(
+        in text: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        let block = #"weekly\d+(?:\.\d+)?%used[·•]?resets"#
+        guard let month = capture(pattern: block + #"([a-z]{3})[a-z]*\d{1,2}"#, group: 1, in: text),
+              let monthNumber = monthNumber(month),
+              let day = capture(pattern: block + #"[a-z]{3}[a-z]*(\d{1,2})"#, group: 1, in: text)
+                  .flatMap(Int.init) else {
+            // No date component: fall back to the next occurrence of the time.
+            guard let clock = capture(pattern: block + #"at(\d{1,2}:\d{2})"#, group: 1, in: text) else {
+                return nil
+            }
+            return nextOccurrence(
+                clock: clock,
+                meridiem: capture(pattern: block + #"at\d{1,2}:\d{2}(am|pm)"#, group: 1, in: text),
+                now: now,
+                calendar: calendar
+            )
+        }
+
+        let clock = capture(pattern: block + #"[a-z]{3}[a-z]*\d{1,2}at(\d{1,2}:\d{2})"#, group: 1, in: text)
+        let meridiem = capture(
+            pattern: block + #"[a-z]{3}[a-z]*\d{1,2}at\d{1,2}:\d{2}(am|pm)"#,
+            group: 1,
+            in: text
+        )
+        let time = clockComponents(clock, meridiem: meridiem)
+
+        var components = DateComponents()
+        components.month = monthNumber
+        components.day = day
+        components.hour = time.hour
+        components.minute = time.minute
+        components.second = 0
+
+        // The CLI prints no year: choose the nearest candidate that has not
+        // already passed by more than a day, so a December→January weekly
+        // reset rolls forward correctly.
+        let nowYear = calendar.component(.year, from: now)
+        let tolerance = now.addingTimeInterval(-24 * 60 * 60)
+        for candidateYear in [nowYear - 1, nowYear, nowYear + 1] {
+            components.year = candidateYear
+            if let candidate = calendar.date(from: components), candidate >= tolerance {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// The next time the clock reads `clock` — today if still ahead, else tomorrow.
+    private static func nextOccurrence(
+        clock: String,
+        meridiem: String?,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        let time = clockComponents(clock, meridiem: meridiem)
+        guard let today = calendar.date(
+            bySettingHour: time.hour,
+            minute: time.minute,
+            second: 0,
+            of: now
+        ) else {
+            return nil
+        }
+        if today > now { return today }
+        return calendar.date(byAdding: .day, value: 1, to: today)
+    }
+
+    private static func clockComponents(
+        _ clock: String?,
+        meridiem: String?
+    ) -> (hour: Int, minute: Int) {
+        let parts = (clock ?? "").split(separator: ":")
+        var hour = parts.first.flatMap { Int($0) } ?? 0
+        let minute = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+        switch meridiem?.lowercased() {
+        case "pm": hour = hour == 12 ? 12 : hour + 12
+        case "am": hour = hour == 12 ? 0 : hour
+        default: break
+        }
+        return (min(max(hour, 0), 23), min(max(minute, 0), 59))
+    }
+
+    private static func monthNumber(_ name: String) -> Int? {
+        let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        guard let index = months.firstIndex(of: name.lowercased()) else { return nil }
+        return index + 1
+    }
+
+    /// Returns the capture from the **last** match, not the first.
+    ///
+    /// The probe accumulates every frame the TUI paints, so the buffer holds a
+    /// history of renders. The final match is the most recently painted — and
+    /// taking the first would both report stale percentages and let a lazy
+    /// group span two frames.
+    private static func capture(pattern: String, group: Int, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, options: [], range: range)
+        guard let match = matches.last,
+              match.numberOfRanges > group,
+              let captured = Range(match.range(at: group), in: text) else {
+            return nil
+        }
+        return String(text[captured])
+    }
+
+    private static func firstMatch(pattern: String, in text: String) -> String? {
+        capture(pattern: pattern, group: 0, in: text)
+    }
+}
+
+#if os(macOS)
+/// Drives the Muse TUI under a pty and reads its `/usage` screen, mirroring
+/// the Grok CLI probe. `--no-session-log` keeps the probe from writing session
+/// records, so polling leaves the user's Muse session history untouched.
+enum MuseCliUsageProbe {
+    /// Measured cold-start to a parsed reading is ~6s; the deadline leaves
+    /// headroom for a slow network without stalling a dashboard refresh.
+    static let deadlineSeconds: TimeInterval = 20
+
+    static func probe(binaryURL: URL, now: Date = Date()) -> MuseCliSubscriptionReading? {
+        var masterFD: Int32 = -1
+        var slaveFD: Int32 = -1
+        var terminalSize = winsize(ws_row: 45, ws_col: 130, ws_xpixel: 0, ws_ypixel: 0)
+        guard openpty(&masterFD, &slaveFD, nil, nil, &terminalSize) == 0 else {
+            print("[MuseCliUsage] openpty failed")
+            return nil
+        }
+        defer {
+            if masterFD >= 0 { close(masterFD) }
+        }
+
+        let fileManager = FileManager.default
+        let workingURL = fileManager.temporaryDirectory
+            .appendingPathComponent("limit-counter-muse-\(UUID().uuidString)", isDirectory: true)
+        try? fileManager.createDirectory(at: workingURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: workingURL) }
+
+        let process = Process()
+        process.executableURL = binaryURL
+        // An empty scratch workspace keeps the probe hermetic: there are no
+        // project-local skills, rules or hooks to load, and `--trust-workspace`
+        // (this run only, never saved) stops the CLI blocking on its trust
+        // prompt. `--no-session-log` keeps it out of the session history.
+        process.arguments = ["--no-session-log", "--trust-workspace"]
+        process.currentDirectoryURL = workingURL
+        var environment = ProcessInfo.processInfo.environment
+        // The CLI resolves its config/data roots and keychain from HOME; the
+        // app's own HOME is its sandbox container, which holds neither.
+        if let realHome = realHomeDirectoryPath() {
+            environment["HOME"] = realHome
+        }
+        environment["MUSE_NO_AUTO_UPDATE"] = "1"
+        environment["TERM"] = "xterm-256color"
+        environment["NO_COLOR"] = "1"
+        process.environment = environment
+
+        let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: true)
+        process.standardInput = slaveHandle
+        process.standardOutput = slaveHandle
+        process.standardError = slaveHandle
+
+        do {
+            try process.run()
+            slaveHandle.closeFile()
+        } catch {
+            print("[MuseCliUsage] Failed to launch muse CLI: \(error.localizedDescription)")
+            slaveHandle.closeFile()
+            return nil
+        }
+        defer {
+            if process.isRunning {
+                process.terminate()
+                usleep(200_000)
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+            }
+        }
+
+        let flags = fcntl(masterFD, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
+        }
+
+        var data = Data()
+        var queryState = MuseTerminalQueryState()
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(deadlineSeconds)
+        var typedCommand = false
+        var typedAt: Date?
+        var submittedAt: Date?
+        var sentSecondReturn = false
+
+        while Date() < deadline {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let bufferCount = buffer.count
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                read(masterFD, rawBuffer.baseAddress, bufferCount)
+            }
+            if bytesRead > 0 {
+                data.append(contentsOf: buffer.prefix(Int(bytesRead)))
+            }
+
+            let rawText = String(decoding: data, as: UTF8.self)
+            respondToMuseTerminalQueries(in: rawText, masterFD: masterFD, state: &queryState)
+
+            let compacted = MuseCliUsageParser.compacted(rawText)
+            if MuseCliUsageParser.hasSubscriptionScreen(compacted),
+               let reading = MuseCliUsageParser.parse(compacted: compacted, now: now) {
+                return reading
+            }
+
+            // Never answer a trust prompt on the user's behalf: if one appears
+            // the scratch workspace was not accepted, and blindly sending keys
+            // would be answering a security question for them.
+            if compacted.range(of: "doyoutrustthisworkspace", options: .caseInsensitive) != nil {
+                print("[MuseCliUsage] The CLI asked for workspace trust; leaving that decision to the user")
+                return nil
+            }
+
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if !typedCommand, elapsed >= 4.0 {
+                // Typed as keystrokes: the TUI's editor drops a pasted burst
+                // while it is still hydrating.
+                for character in "/usage" {
+                    writeMusePTYString(String(character), to: masterFD)
+                    usleep(100_000)
+                }
+                typedCommand = true
+                typedAt = Date()
+            } else if let typedAt, submittedAt == nil,
+                      Date().timeIntervalSince(typedAt) >= 1.0 {
+                // The slash-command menu needs a beat to settle before it will
+                // accept the return that runs the command.
+                writeMusePTYString("\r", to: masterFD)
+                submittedAt = Date()
+            } else if let submittedAt,
+                      !sentSecondReturn,
+                      Date().timeIntervalSince(submittedAt) >= 2.0 {
+                // Second return runs the command when the first only dismissed
+                // the menu.
+                writeMusePTYString("\r", to: masterFD)
+                sentSecondReturn = true
+            }
+
+            usleep(100_000)
+        }
+
+        print("[MuseCliUsage] Timed out before the subscription screen rendered")
+        return nil
+    }
+
+    private static func realHomeDirectoryPath() -> String? {
+        let homePath = NSHomeDirectory()
+        guard let range = homePath.range(of: "/Library/Containers/") else {
+            return homePath
+        }
+        return String(homePath[..<range.lowerBound])
+    }
+}
+
+private struct MuseTerminalQueryState {
+    var answeredCursorPosition = false
+    var answeredPrimaryAttributes = false
+    var answeredSecondaryAttributes = false
+    var answeredXtermVersion = false
+    var answeredKittyKeyboard = false
+    var answeredBackgroundColor = false
+}
+
+/// The TUI blocks its first paint until these capability queries are answered.
+private func respondToMuseTerminalQueries(
+    in rawText: String,
+    masterFD: Int32,
+    state: inout MuseTerminalQueryState
+) {
+    if !state.answeredCursorPosition, rawText.contains("\u{001B}[6n") {
+        writeMusePTYString("\u{001B}[45;130R", to: masterFD)
+        state.answeredCursorPosition = true
+    }
+    if !state.answeredXtermVersion,
+       rawText.contains("\u{001B}[>q") || rawText.contains("\u{001B}[>0q") {
+        writeMusePTYString("\u{001B}P>|LimitCounter 1.0\u{001B}\\", to: masterFD)
+        state.answeredXtermVersion = true
+    }
+    if !state.answeredSecondaryAttributes, rawText.contains("\u{001B}[>c") {
+        writeMusePTYString("\u{001B}[>41;351;0c", to: masterFD)
+        state.answeredSecondaryAttributes = true
+    }
+    if !state.answeredPrimaryAttributes, rawText.contains("\u{001B}[c") {
+        writeMusePTYString("\u{001B}[?62;1;2;6;9;15;22c", to: masterFD)
+        state.answeredPrimaryAttributes = true
+    }
+    if !state.answeredKittyKeyboard, rawText.contains("\u{001B}[?u") {
+        writeMusePTYString("\u{001B}[?0u", to: masterFD)
+        state.answeredKittyKeyboard = true
+    }
+    if !state.answeredBackgroundColor, rawText.contains("\u{001B}]11;?") {
+        writeMusePTYString("\u{001B}]11;rgb:1e1e/1e1e/1e1e\u{001B}\\", to: masterFD)
+        state.answeredBackgroundColor = true
+    }
+}
+
+private func writeMusePTYString(_ string: String, to fd: Int32) {
+    let bytes = Array(string.utf8)
+    bytes.withUnsafeBufferPointer { pointer in
+        guard let baseAddress = pointer.baseAddress else { return }
+        _ = write(fd, baseAddress, pointer.count)
+    }
+}
+#endif
+
+/// Locates the `muse` launcher. A user-granted bookmark wins; otherwise the
+/// standard install path is tried, which works when the app is not sandboxed.
+enum MuseCliBinaryLocator {
+    static let defaultRelativePath = ".local/bin/muse"
+
+    static func resolve(fields: [String: String]) -> (url: URL, stop: () -> Void)? {
+        #if os(macOS)
+        if let bookmarkBase64 = fields[SpendProviderCredentialField.museCliBookmark],
+           let bookmarkData = Data(base64Encoded: bookmarkBase64) {
+            var isStale = false
+            if let url = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: .withSecurityScope,
+                bookmarkDataIsStale: &isStale
+            ) {
+                if isStale {
+                    print("[MuseCliUsage] Muse CLI bookmark is stale; re-grant it in Settings")
+                }
+                let didStart = url.startAccessingSecurityScopedResource()
+                if let binary = binaryURL(within: url) {
+                    return (binary, { if didStart { url.stopAccessingSecurityScopedResource() } })
+                }
+                if didStart { url.stopAccessingSecurityScopedResource() }
+            }
+        }
+
+        // Fall back to the standard install path when it is genuinely
+        // runnable, the same way the Grok CLI probe resolves `~/.grok`. The
+        // explicit grant above stays the preferred route and is how to point
+        // the app at a launcher installed elsewhere.
+        let fallback = defaultBinaryURL()
+        if FileManager.default.fileExists(atPath: fallback.path) {
+            return (fallback, {})
+        }
+        #endif
+        return nil
+    }
+
+    /// Accepts either the launcher itself or a folder that contains it.
+    ///
+    /// Existence, not `isExecutableFile`: the sandbox denies the execute-bit
+    /// check (`access(X_OK)`) even for a folder the user just granted through
+    /// the open panel, so testing executability here rejects a launcher that
+    /// is plainly present. Whether it actually runs is settled by launching
+    /// it, which reports a real error.
+    static func binaryURL(within url: URL) -> URL? {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return nil }
+        if !isDirectory.boolValue {
+            return url
+        }
+        for candidate in ["muse", "bin/muse", ".local/bin/muse"] {
+            let candidateURL = url.appendingPathComponent(candidate)
+            var candidateIsDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: candidateURL.path, isDirectory: &candidateIsDirectory),
+               !candidateIsDirectory.boolValue {
+                return candidateURL
+            }
+        }
+        return nil
+    }
+
+    static func defaultBinaryURL() -> URL {
+        let homePath = NSHomeDirectory()
+        let realHome: String
+        if let range = homePath.range(of: "/Library/Containers/") {
+            realHome = String(homePath[..<range.lowerBound])
+        } else {
+            realHome = homePath
+        }
+        return URL(fileURLWithPath: realHome, isDirectory: true)
+            .appendingPathComponent(defaultRelativePath)
+    }
+}
+
+/// The CLI carries no anti-abuse risk, so it refreshes on a normal dashboard
+/// cadence rather than the console scrape's hourly cap. The probe still costs
+/// a few seconds of process time, so successive refreshes reuse the cache.
+enum MuseCliRefreshCadence {
+    static let successfulFetchInterval: TimeInterval = 10 * 60
+    static let failedFetchRetryInterval: TimeInterval = 30 * 60
+
+    static func isDue(
+        now: Date,
+        lastSuccessfulFetchAt: Date?,
+        lastAttemptAt: Date?,
+        userInitiated: Bool = false
+    ) -> Bool {
+        // A manual refresh always re-probes: the user is asking for now.
+        if userInitiated { return true }
+        guard let lastAttemptAt else { return true }
+
+        if let lastSuccessfulFetchAt, lastSuccessfulFetchAt >= lastAttemptAt {
+            return now.timeIntervalSince(lastSuccessfulFetchAt) >= successfulFetchInterval
+        }
+        return now.timeIntervalSince(lastAttemptAt) >= failedFetchRetryInterval
+    }
+}
+
+actor MuseCliRefreshCache {
+    enum FetchDecision {
+        case fetch
+        case cached(MuseCliSubscriptionReading?)
+    }
+
+    private struct PersistedState: Codable {
+        var reading: MuseCliSubscriptionReading?
+        var lastSuccessfulFetchAt: Date?
+        var lastAttemptAt: Date?
+    }
+
+    static let shared = MuseCliRefreshCache()
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let defaultPersistenceKey = "meta.museCliRefreshCache.v1"
+
+    private let defaults: UserDefaults
+    private let persistenceKey: String
+    private var state: PersistedState?
+
+    init(
+        defaults: UserDefaults? = nil,
+        persistenceKey: String = MuseCliRefreshCache.defaultPersistenceKey
+    ) {
+        self.defaults = defaults
+            ?? UserDefaults(suiteName: Self.appGroupID)
+            ?? .standard
+        self.persistenceKey = persistenceKey
+        state = self.defaults.data(forKey: persistenceKey).flatMap {
+            try? JSONDecoder().decode(PersistedState.self, from: $0)
+        }
+    }
+
+    func decision(now: Date, userInitiated: Bool) -> FetchDecision {
+        guard let state else { return .fetch }
+        guard !MuseCliRefreshCadence.isDue(
+            now: now,
+            lastSuccessfulFetchAt: state.lastSuccessfulFetchAt,
+            lastAttemptAt: state.lastAttemptAt,
+            userInitiated: userInitiated
+        ) else {
+            return .fetch
+        }
+        return .cached(state.reading)
+    }
+
+    @discardableResult
+    func recordResult(_ reading: MuseCliSubscriptionReading?, now: Date) -> MuseCliSubscriptionReading? {
+        var next = state ?? PersistedState(reading: nil, lastSuccessfulFetchAt: nil, lastAttemptAt: nil)
+        next.lastAttemptAt = now
+        if let reading {
+            next.reading = reading
+            next.lastSuccessfulFetchAt = now
+        }
+        state = next
+        if let data = try? JSONEncoder().encode(next) {
+            defaults.set(data, forKey: persistenceKey)
+        }
+        return reading ?? next.reading
+    }
+}
+
+// MARK: - Muse Code subscription web metering (dev.meta.ai/usage)
+
+/// A subscription-quota reading scraped from the Meta Model API usage page.
+/// Muse Code subscriptions surface "Current usage" and "Weekly limit" percent
+/// meters (plus the weekly reset time) that the CLI does not expose yet.
+public nonisolated struct MuseSubscriptionWebReading: Sendable, Equatable, Codable {
+    public let planName: String?
+    public let currentUsedPercent: Double?
+    /// The rolling current-window reset. The console renders it as a bare
+    /// clock time ("Resets at 9:18 PM") because the window is hours long.
+    public let currentResetAt: Date?
+    public let weeklyUsedPercent: Double?
+    public let weeklyResetAt: Date?
+
+    public init(
+        planName: String?,
+        currentUsedPercent: Double?,
+        currentResetAt: Date? = nil,
+        weeklyUsedPercent: Double?,
+        weeklyResetAt: Date?
+    ) {
+        self.planName = planName
+        self.currentUsedPercent = currentUsedPercent
+        self.currentResetAt = currentResetAt
+        self.weeklyUsedPercent = weeklyUsedPercent
+        self.weeklyResetAt = weeklyResetAt
+    }
+
+    /// A reading with no meter is not a successful scrape: the plan name also
+    /// appears on upsell chrome for accounts without a subscription.
+    public var isEmpty: Bool {
+        currentUsedPercent == nil && weeklyUsedPercent == nil
+    }
+}
+
+/// Scrapes the Meta usage console for the Muse Code subscription meters using
+/// the same imported dev.meta.ai session as the billing reader. A plain
+/// request is tried first (it can see server-rendered markup and RSC
+/// payloads); on macOS a hidden rendered load is the fallback for
+/// client-side-only rollouts of the console.
+public struct MuseSubscriptionWebClient: Sendable {
+    public let baseURL: URL
+    public let cookieDomains: [String]
+
+    public init(baseURL: URL, cookieDomains: [String]) {
+        self.baseURL = baseURL
+        self.cookieDomains = cookieDomains
+    }
+
+    public func fetch(
+        cookieHeader: String,
+        now: Date,
+        persistCookieHeader: ((String) async -> Bool)? = nil
+    ) async -> MuseSubscriptionWebReading? {
+        guard !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        if let reading = await fetchViaURLSession(
+            cookieHeader: cookieHeader,
+            now: now,
+            persistCookieHeader: persistCookieHeader
+        ) {
+            return reading
+        }
+
+        #if os(macOS)
+        return await MuseSubscriptionRenderedPageReader.read(
+            url: baseURL,
+            cookieHeader: cookieHeader,
+            now: now
+        )
+        #else
+        return nil
+        #endif
+    }
+
+    private func fetchViaURLSession(
+        cookieHeader: String,
+        now: Date,
+        persistCookieHeader: ((String) async -> Bool)?
+    ) async -> MuseSubscriptionWebReading? {
+        var request = URLRequest(url: baseURL, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+        // Cookie-inert session: the console rotates session cookies via
+        // Set-Cookie, and the shared cookie jar would override the imported
+        // Keychain header on every fetch after the first.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        guard let (data, response) = try? await session.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode),
+              let html = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        if let rotatedHeader = ImportedCookieHeaderMerger.mergedHeader(
+            existingHeader: cookieHeader,
+            response: httpResponse,
+            requestURL: baseURL,
+            allowedDomains: cookieDomains
+        ), rotatedHeader != cookieHeader {
+            guard let persistCookieHeader,
+                  await persistCookieHeader(rotatedHeader) else {
+                print("[MuseSubscriptionWebClient] Rotated cookies were received but could not be persisted")
+                return nil
+            }
+        }
+
+        return Self.parse(html: html, now: now)
+    }
+
+    // MARK: Parsing
+
+    static func parse(html: String, now: Date, calendar: Calendar = .current) -> MuseSubscriptionWebReading? {
+        parse(
+            renderedText: MistralWebSubscriptionClient.normalizedRenderedText(from: html),
+            payloadText: MistralWebSubscriptionClient.normalizedScriptPayloadText(from: html),
+            now: now,
+            calendar: calendar
+        )
+    }
+
+    /// Entry point for already-rendered `document.body.innerText` (used by the
+    /// import sheet and the hidden rendered reader).
+    static func parse(renderedText: String, now: Date, calendar: Calendar = .current) -> MuseSubscriptionWebReading? {
+        parse(
+            renderedText: MistralWebSubscriptionClient.normalizedRenderedText(from: renderedText),
+            payloadText: "",
+            now: now,
+            calendar: calendar
+        )
+    }
+
+    static func parse(
+        renderedText: String,
+        payloadText: String,
+        now: Date,
+        calendar: Calendar = .current
+    ) -> MuseSubscriptionWebReading? {
+        for text in [renderedText, payloadText] where !text.isEmpty {
+            if let reading = parseText(text, now: now, calendar: calendar) {
+                return reading
+            }
+        }
+        return nil
+    }
+
+    private static func parseText(
+        _ text: String,
+        now: Date,
+        calendar: Calendar
+    ) -> MuseSubscriptionWebReading? {
+        // A signed-out console renders a login form and no meters.
+        let hasMeterLabels = text.range(of: "Current usage", options: .caseInsensitive) != nil
+            || text.range(of: "Weekly limit", options: .caseInsensitive) != nil
+        guard hasMeterLabels else { return nil }
+
+        let currentUsedPercent = labeledUsedPercent(
+            label: "Current usage",
+            stops: ["Weekly limit", "Pay as you go"],
+            in: text
+        )
+        let currentBlock = labeledBlock(
+            label: "Current usage",
+            stops: ["Weekly limit", "Pay as you go"],
+            in: text
+        )
+        let currentResetAt = currentBlock.flatMap {
+            resetDate(in: $0, now: now, calendar: calendar)
+        }
+        let weeklyBlock = labeledBlock(
+            label: "Weekly limit",
+            stops: ["Current usage", "Pay as you go"],
+            in: text
+        )
+        let weeklyUsedPercent = weeklyBlock.flatMap { usedPercent(in: $0) }
+            ?? labeledUsedPercent(label: "Weekly limit", stops: ["Current usage", "Pay as you go"], in: text)
+        // The whole-page fallback must not pick up the current window's bare
+        // clock time and present it as the weekly reset.
+        let weeklyResetAt = weeklyBlock.flatMap {
+            resetDate(in: $0, now: now, calendar: calendar)
+        } ?? resetDate(in: text, now: now, calendar: calendar, allowClockOnly: false)
+
+        let reading = MuseSubscriptionWebReading(
+            planName: subscriptionPlanName(in: text),
+            currentUsedPercent: currentUsedPercent,
+            currentResetAt: currentResetAt,
+            weeklyUsedPercent: weeklyUsedPercent,
+            weeklyResetAt: weeklyResetAt
+        )
+        return reading.isEmpty ? nil : reading
+    }
+
+    /// The block of text following `label`, truncated at the earliest `stop`
+    /// label so one card's values never bleed into the next card's parse.
+    private static func labeledBlock(label: String, stops: [String], in text: String) -> String? {
+        guard let labelRange = text.range(of: label, options: .caseInsensitive) else { return nil }
+        let blockStart = labelRange.upperBound
+        var blockEnd = text.index(blockStart, offsetBy: 240, limitedBy: text.endIndex) ?? text.endIndex
+        for stop in stops {
+            if let stopRange = text.range(of: stop, options: .caseInsensitive, range: blockStart..<blockEnd) {
+                blockEnd = stopRange.lowerBound
+            }
+        }
+        return String(text[blockStart..<blockEnd])
+    }
+
+    private static func labeledUsedPercent(label: String, stops: [String], in text: String) -> Double? {
+        if let block = labeledBlock(label: label, stops: stops, in: text),
+           let percent = usedPercent(in: block) {
+            return percent
+        }
+        // Some DOM orders render the value element before its label; scan a
+        // short window backwards as a fallback.
+        guard let labelRange = text.range(of: label, options: .caseInsensitive) else { return nil }
+        let backStart = text.index(labelRange.lowerBound, offsetBy: -80, limitedBy: text.startIndex)
+            ?? text.startIndex
+        return usedPercent(in: String(text[backStart..<labelRange.lowerBound]), requireUsedSuffix: true)
+    }
+
+    private static func usedPercent(in block: String, requireUsedSuffix: Bool = false) -> Double? {
+        let candidate = firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%\\s*used", in: block)
+            ?? (requireUsedSuffix ? nil : firstMatch(pattern: "(\\d+(?:\\.\\d+)?)\\s*%", in: block))
+        guard let value = candidate.flatMap(Double.init), (0...100).contains(value) else { return nil }
+        return value
+    }
+
+    private static func subscriptionPlanName(in text: String) -> String? {
+        // Upstream normalization collapses all whitespace, so the page heading
+        // ("Usage") and the plan title share one line. Anchor on the product
+        // name first so page chrome cannot leak into the captured plan.
+        var candidate = firstMatch(
+            pattern: "\\b(Muse(?:\\s+[A-Za-z0-9+.-]+){0,5})\\s+subscription\\b",
+            in: text
+        )
+        if candidate == nil {
+            candidate = firstMatch(
+                pattern: "\\b([A-Z][A-Za-z0-9+.-]*(?:\\s+[A-Za-z0-9+.-]+){0,5}?)\\s+subscription\\b",
+                in: text
+            )
+        }
+        guard let candidate else { return nil }
+
+        var words = candidate
+            .split(separator: " ")
+            .map(String.init)
+        let chromeTokens: Set<String> = ["usage", "billing", "dashboard", "overview", "your"]
+        while let first = words.first, chromeTokens.contains(first.lowercased()) {
+            words.removeFirst()
+        }
+        let name = words.joined(separator: " ")
+        guard !name.isEmpty, name.count <= 48 else { return nil }
+        return name
+    }
+
+    /// Parses "Resets 7 Sep at 01:00" style labels (also "Sep 7", 12-hour
+    /// clocks, "today"/"tomorrow", and "in N days"). The console renders the
+    /// reset in local time without a year, so the year is inferred as the
+    /// nearest occurrence that is not far in the past.
+    static func resetDate(
+        in block: String,
+        now: Date,
+        calendar: Calendar = .current,
+        allowClockOnly: Bool = true
+    ) -> Date? {
+        if let dayFirst = matchGroups(
+            pattern: "Resets\\s+(?:on\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\s+([A-Za-z]{3,9})\\.?(?:\\s+(\\d{4}))?(?:\\s+at\\s+(\\d{1,2}):(\\d{2})(?:\\s*([AaPp])\\.?[Mm]\\.?)?)?",
+            in: block
+        ), let month = monthNumber(dayFirst[2]) {
+            return assembledResetDate(
+                day: Int(dayFirst[1] ?? ""),
+                month: month,
+                year: Int(dayFirst[3] ?? ""),
+                hour: Int(dayFirst[4] ?? ""),
+                minute: Int(dayFirst[5] ?? ""),
+                meridiem: dayFirst[6],
+                now: now,
+                calendar: calendar
+            )
+        }
+
+        if let monthFirst = matchGroups(
+            pattern: "Resets\\s+(?:on\\s+)?([A-Za-z]{3,9})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?(?:\\s+at\\s+(\\d{1,2}):(\\d{2})(?:\\s*([AaPp])\\.?[Mm]\\.?)?)?",
+            in: block
+        ), let month = monthNumber(monthFirst[1]) {
+            return assembledResetDate(
+                day: Int(monthFirst[2] ?? ""),
+                month: month,
+                year: Int(monthFirst[3] ?? ""),
+                hour: Int(monthFirst[4] ?? ""),
+                minute: Int(monthFirst[5] ?? ""),
+                meridiem: monthFirst[6],
+                now: now,
+                calendar: calendar
+            )
+        }
+
+        if let relativeDay = matchGroups(
+            pattern: "Resets\\s+(today|tomorrow)(?:\\s+at\\s+(\\d{1,2}):(\\d{2})(?:\\s*([AaPp])\\.?[Mm]\\.?)?)?",
+            in: block
+        ) {
+            let dayOffset = relativeDay[1]?.lowercased() == "tomorrow" ? 1 : 0
+            guard let base = calendar.date(byAdding: .day, value: dayOffset, to: calendar.startOfDay(for: now)) else {
+                return nil
+            }
+            let hour = adjustedHour(Int(relativeDay[2] ?? ""), meridiem: relativeDay[4])
+            return calendar.date(
+                bySettingHour: hour ?? 0,
+                minute: Int(relativeDay[3] ?? "") ?? 0,
+                second: 0,
+                of: base
+            )
+        }
+
+        if let inDays = firstMatch(pattern: "Resets\\s+in\\s+(\\d+)\\s+day", in: block)
+            .flatMap(Int.init) {
+            return calendar.date(byAdding: .day, value: inDays, to: now)
+        }
+
+        // "Resets at 9:18 PM" — a bare clock time, used for the rolling
+        // current-usage window. Resolve to the next time that clock reads.
+        if allowClockOnly, let clockOnly = matchGroups(
+            pattern: "Resets\\s+at\\s+(\\d{1,2}):(\\d{2})(?:\\s*([AaPp])\\.?[Mm]\\.?)?",
+            in: block
+        ), let hour = Int(clockOnly[1] ?? "") {
+            let adjusted = adjustedHour(hour, meridiem: clockOnly[3]) ?? hour
+            guard let today = calendar.date(
+                bySettingHour: adjusted,
+                minute: Int(clockOnly[2] ?? "") ?? 0,
+                second: 0,
+                of: now
+            ) else {
+                return nil
+            }
+            return today > now ? today : calendar.date(byAdding: .day, value: 1, to: today)
+        }
+
+        return nil
+    }
+
+    private static func assembledResetDate(
+        day: Int?,
+        month: Int,
+        year: Int?,
+        hour: Int?,
+        minute: Int?,
+        meridiem: String?,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        guard let day, (1...31).contains(day) else { return nil }
+        var components = DateComponents()
+        components.day = day
+        components.month = month
+        components.hour = adjustedHour(hour, meridiem: meridiem) ?? 0
+        components.minute = minute ?? 0
+        components.second = 0
+
+        if let year {
+            components.year = year
+            return calendar.date(from: components)
+        }
+
+        // No explicit year: pick the nearest candidate that is not more than
+        // two days in the past, so a slightly stale page reading survives while
+        // a December "Resets 2 Jan" lands in the next year.
+        let nowYear = calendar.component(.year, from: now)
+        let pastTolerance = now.addingTimeInterval(-2 * 24 * 60 * 60)
+        for candidateYear in [nowYear - 1, nowYear, nowYear + 1] {
+            components.year = candidateYear
+            if let candidate = calendar.date(from: components), candidate >= pastTolerance {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func adjustedHour(_ hour: Int?, meridiem: String?) -> Int? {
+        guard let hour else { return nil }
+        guard let meridiem = meridiem?.lowercased() else { return hour }
+        if meridiem == "p" { return hour == 12 ? 12 : hour + 12 }
+        return hour == 12 ? 0 : hour
+    }
+
+    private static func monthNumber(_ name: String?) -> Int? {
+        guard let prefix = name?.lowercased().prefix(3), prefix.count == 3 else { return nil }
+        let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        guard let index = months.firstIndex(of: String(prefix)) else { return nil }
+        return index + 1
+    }
+
+    private static func firstMatch(pattern: String, in text: String) -> String? {
+        matchGroups(pattern: pattern, in: text)?[1]
+    }
+
+    /// 1-indexed capture groups of the first match; nil entries for
+    /// unmatched optional groups. Index 0 is unused.
+    private static func matchGroups(pattern: String, in text: String) -> [String?]? {
+        guard !text.isEmpty,
+              let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
+        var groups: [String?] = [nil]
+        for index in 1..<match.numberOfRanges {
+            if let captureRange = Range(match.range(at: index), in: text) {
+                groups.append(String(text[captureRange]))
+            } else {
+                groups.append(nil)
+            }
+        }
+        return groups
+    }
+}
+
+#if os(macOS)
+/// Uses the persistent console session, including refreshed cookies and local storage.
+@MainActor
+private enum MuseSubscriptionRenderedPageReader {
+    static func read(url: URL, cookieHeader: String, now: Date) async -> MuseSubscriptionWebReading? {
+        guard let text = try? await ImportedSessionPageReader.read(url: url, cookieHeader: cookieHeader, isReady: {
+            let reading = MuseSubscriptionWebClient.parse(renderedText: $0, now: now)
+            return reading?.currentUsedPercent != nil && reading?.weeklyUsedPercent != nil
+        }) else { return nil }
+        return MuseSubscriptionWebClient.parse(renderedText: text, now: now)
+    }
+}
+#endif
+
+/// Same anti-abuse posture as the billing cache: the usage console is an
+/// authenticated browser surface, so live fetches are capped at
+/// `MetaWebBillingRefreshCadence` (hourly on success, 6-hourly after a
+/// failure) and the last reading is persisted across launches.
+actor MuseSubscriptionRefreshCache {
+    enum FetchDecision {
+        case fetch
+        case cached(MuseSubscriptionWebReading?)
+    }
+
+    private struct PersistedState: Codable {
+        let sessionFingerprint: String
+        var reading: MuseSubscriptionWebReading?
+        var lastSuccessfulFetchAt: Date?
+        var lastAttemptAt: Date?
+    }
+
+    static let shared = MuseSubscriptionRefreshCache()
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private static let defaultPersistenceKey = "meta.museSubscriptionRefreshCache.v1"
+
+    private let defaults: UserDefaults
+    private let persistenceKey: String
+    private var state: PersistedState?
+
+    init(
+        defaults: UserDefaults? = nil,
+        persistenceKey: String = MuseSubscriptionRefreshCache.defaultPersistenceKey
+    ) {
+        self.defaults = defaults
+            ?? UserDefaults(suiteName: Self.appGroupID)
+            ?? .standard
+        self.persistenceKey = persistenceKey
+        state = self.defaults.data(forKey: persistenceKey).flatMap {
+            try? JSONDecoder().decode(PersistedState.self, from: $0)
+        }
+    }
+
+    func decision(for cookieHeader: String, now: Date) -> FetchDecision {
+        let fingerprint = Self.fingerprint(for: cookieHeader)
+        guard let state, state.sessionFingerprint == fingerprint else {
+            return .fetch
+        }
+        guard !MetaWebBillingRefreshCadence.isDue(
+            now: now,
+            lastSuccessfulFetchAt: state.lastSuccessfulFetchAt,
+            lastAttemptAt: state.lastAttemptAt
+        ) else {
+            return .fetch
+        }
+        return .cached(state.reading)
+    }
+
+    @discardableResult
+    func recordResult(
+        _ reading: MuseSubscriptionWebReading?,
+        for cookieHeader: String,
+        now: Date
+    ) -> MuseSubscriptionWebReading? {
+        let fingerprint = Self.fingerprint(for: cookieHeader)
+        var next = state?.sessionFingerprint == fingerprint
+            ? state!
+            : PersistedState(
+                sessionFingerprint: fingerprint,
+                reading: nil,
+                lastSuccessfulFetchAt: nil,
+                lastAttemptAt: nil
+            )
+
+        next.lastAttemptAt = now
+        if let reading {
+            next.reading = reading
+            next.lastSuccessfulFetchAt = now
+        }
+        state = next
+        persist()
+
+        return reading ?? next.reading
+    }
+
+    private func persist() {
+        guard let state, let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: persistenceKey)
+    }
+
+    /// Cache partitioning only: this prevents cross-session readings without
+    /// persisting the imported cookie header outside Keychain.
+    private static func fingerprint(for value: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16)
+    }
+}
+
+public struct MetaProviderClient: UserInitiatedProviderClient {
 
     public let providerID: ProviderID = .meta
 
-    public init() {}
+    /// Injectable so tests never spawn the real CLI (which would make them
+    /// depend on the machine's live Muse subscription).
+    private let museCliProbe: @Sendable ([String: String], Date, Bool) async -> MuseCliSubscriptionReading?
+
+    public init() {
+        museCliProbe = { fields, now, userInitiated in
+            await MetaProviderClient.probeMuseCli(
+                fields: fields,
+                now: now,
+                userInitiated: userInitiated
+            )
+        }
+    }
+
+    init(
+        museCliProbe: @escaping @Sendable ([String: String], Date, Bool) async -> MuseCliSubscriptionReading?
+    ) {
+        self.museCliProbe = museCliProbe
+    }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        try await fetchSnapshot(credentials: credentials, userInitiated: false)
+    }
+
+    public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
         let now = Date()
         let fields = credentials?.extraFields ?? [:]
         let access = resolveMuseAccess(credentials: credentials)
@@ -3743,29 +5991,84 @@ public struct MetaProviderClient: ProviderClient {
         let local = access.flatMap { MuseLocalUsageReader.read(rootURL: $0.url, now: now) }
         let taskWraith = TaskWraithSpendReader.read(provider: .meta, now: now)
 
-        // Web billing scrape: the user signs in inside the embedded browser and
-        // the normalized cookie header is stored in Keychain. This re-reads the
-        // dev.meta.ai/billing page on each refresh, mirroring the Mistral/Ollama
-        // web-session pattern.
+        // Meta's authenticated billing page applies browser-level abuse controls,
+        // so never poll it at the dashboard's cadence. A cached reading remains
+        // useful while local Muse telemetry continues to update in real time.
         let webCookie = fields[SpendProviderCredentialField.metaCookieHeader]
-        let webReading: WebBillingReading? = if let webCookie, !webCookie.isEmpty {
-            await WebBillingClient(
-                baseURL: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!,
-                cookieDomains: ["meta.ai", "meta.com"]
-            ).fetch(
-                cookieHeader: webCookie,
-                now: now,
-                persistCookieHeader: {
-                    await persistImportedCookieHeader(
-                        $0,
-                        providerID: .meta,
-                        field: SpendProviderCredentialField.metaCookieHeader
-                    )
-                }
-            )
+        let hasSubscriptionImport = fields[SpendProviderCredentialField.museCachedAt] != nil
+            || fields[SpendProviderCredentialField.museCachedWeeklyPercent] != nil
+        let webReading: WebBillingReading?
+        if let webCookie, !webCookie.isEmpty, !hasSubscriptionImport {
+            let cache = MetaWebBillingRefreshCache.shared
+            switch await cache.decision(for: webCookie, now: now) {
+            case .cached(let reading):
+                webReading = reading
+            case .fetch:
+                let liveReading = await WebBillingClient(
+                    baseURL: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!,
+                    cookieDomains: ["meta.ai", "meta.com"]
+                ).fetch(
+                    cookieHeader: webCookie,
+                    now: now,
+                    persistCookieHeader: {
+                        await persistImportedCookieHeader(
+                            $0,
+                            providerID: .meta,
+                            field: SpendProviderCredentialField.metaCookieHeader
+                        )
+                    }
+                )
+                webReading = await cache.recordResult(
+                    liveReading,
+                    for: webCookie,
+                    now: now
+                )
+            }
         } else {
-            nil
+            webReading = nil
         }
+
+        // One rendered subscription request fits within the provider timeout.
+        // Avoid an extra billing navigation or CLI probe when this source exists.
+        let museBrowserResult: BrowserMeterResult<MuseSubscriptionWebReading>?
+        if let webCookie, !webCookie.isEmpty, hasSubscriptionImport {
+            let endpoint = BrowserSessionRefreshPolicy.validatedURL(
+                fields[SpendProviderCredentialField.browserSessionURL],
+                fallback: URL(string: "https://dev.meta.ai/usage/?project_id=1514228250391823&team_id=1760015591684812")!
+            )
+            museBrowserResult = await BrowserMeterRefreshStore.shared.read(
+                url: endpoint,
+                sessionID: fields[SpendProviderCredentialField.browserSessionID] ?? webCookie,
+                initial: Self.cachedMuseSubscriptionReading(from: fields),
+                initialAt: ProviderDateParser.parse(fields[SpendProviderCredentialField.museCachedAt]),
+                interval: 60 * 60,
+                failureInterval: 6 * 60 * 60,
+                now: now
+            ) {
+                #if os(macOS)
+                let text = try await ImportedSessionPageReader.read(url: endpoint, cookieHeader: webCookie) {
+                    let reading = MuseSubscriptionWebClient.parse(renderedText: $0, now: now)
+                    return reading?.currentUsedPercent != nil && reading?.weeklyUsedPercent != nil
+                }
+                guard let reading = MuseSubscriptionWebClient.parse(renderedText: text, now: now) else {
+                    throw ProviderFetchError.parsingError("Muse subscription meters unavailable.")
+                }
+                return reading
+                #else
+                throw ProviderFetchError.credentialExpired("Reconnect Muse in the browser on your Mac.")
+                #endif
+            }
+        } else {
+            museBrowserResult = nil
+        }
+        if let failure = museBrowserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+        let museCliReading = museBrowserResult != nil ? nil : await museCliProbe(fields, now, userInitiated)
+        let museSubscription = Self.museSubscriptionMeters(
+            cli: museCliReading,
+            live: museBrowserResult?.value,
+            cached: Self.cachedMuseSubscriptionReading(from: fields),
+            now: now
+        )
 
         let preload = positiveDouble(fields[SpendProviderCredentialField.manualTopUpTotal])
              ?? positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
@@ -3781,9 +6084,11 @@ public struct MetaProviderClient: ProviderClient {
              ?? ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt])
         let resetAt = manualResetAt ?? MetaBillingReset.nextResetDate(from: now)
         let softBudget = ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .meta) ?? 15.0
-        let planName = fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(
-            in: .whitespacesAndNewlines
-         ).nilIfEmpty ?? "API Credits"
+        let planName = museSubscription.planName
+             ?? fields[SpendProviderCredentialField.manualPlanName]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+             ).nilIfEmpty
+             ?? "API Credits"
 
         let observedMonth = observedMonthCostUSD(local: local, taskWraith: taskWraith)
         let remainingAdjustment: MetaRemainingWatermarkStore.Adjustment? = remaining.map { anchored in
@@ -3810,7 +6115,16 @@ public struct MetaProviderClient: ProviderClient {
              ? "Manual remaining minus tracked Muse spend since anchor"
              : nil
 
-        var windows: [QuotaWindow] = []
+        // Subscription meters lead the card: they are the live quota story,
+        // while the credit/spend windows below are billing anchors.
+        var windows: [QuotaWindow] = museSubscription.windows.map { window in
+            guard let museBrowserResult else { return window }
+            return QuotaWindow(
+                label: window.label, windowKind: window.windowKind,
+                used: window.used, total: window.total, resetDate: window.resetDate,
+                unit: window.unit, subtitle: museBrowserResult.sourceDescription
+            )
+        }
         var balances: [QuotaBalance] = []
         var signals: [QuotaSignal] = []
 
@@ -3822,9 +6136,10 @@ public struct MetaProviderClient: ProviderClient {
             windows.append(
                 QuotaWindow(
                     label: "Credit used",
-                    windowKind: .custom,
+                    windowKind: .monthly,
                     used: creditUsed,
                     total: preload,
+                    resetDate: resetAt,
                     unit: currency,
                     subtitle: remainingLocalDecrement > 0
                         ? "Preload minus remaining, auto-advanced by Muse spend"
@@ -3911,8 +6226,160 @@ public struct MetaProviderClient: ProviderClient {
             analyticsBuckets: local?.analyticsBuckets.isEmpty == false
                 ? (local?.analyticsBuckets ?? [])
                 : (taskWraith?.analyticsBuckets ?? []),
-            fetchState: .success
+            fetchState: .success,
+            fetchedAt: museBrowserResult?.fetchedAt ?? now
         )
+    }
+
+    struct MuseSubscriptionMeterAssembly {
+        let windows: [QuotaWindow]
+        let planName: String?
+    }
+
+    /// Builds the subscription meters from the best source available per
+    /// field: the local CLI first, then the live (or cadence-cached) web
+    /// reading, then the values captured by the import sheet — so a partial
+    /// parse from any one source cannot blank a meter.
+    static func museSubscriptionMeters(
+        cli: MuseCliSubscriptionReading?,
+        live: MuseSubscriptionWebReading?,
+        cached: MuseSubscriptionWebReading?,
+        now: Date
+    ) -> MuseSubscriptionMeterAssembly {
+        let currentPercent = cli?.currentUsedPercent
+            ?? live?.currentUsedPercent
+            ?? cached?.currentUsedPercent
+        let weeklyPercent = cli?.weeklyUsedPercent
+            ?? live?.weeklyUsedPercent
+            ?? cached?.weeklyUsedPercent
+        let planName = cli?.planName ?? live?.planName ?? cached?.planName
+
+        let currentFromCli = cli?.currentUsedPercent != nil
+        let weeklyFromCli = cli?.weeklyUsedPercent != nil
+
+        // Each reset belongs to whichever source supplied that meter.
+        let webCurrentReset = live?.currentUsedPercent != nil ? live?.currentResetAt : nil
+        let currentReset = acceptedCurrentReset(
+            currentFromCli
+                ? cli?.currentResetAt
+                : (webCurrentReset ?? cached?.currentResetAt ?? live?.currentResetAt),
+            now: now
+        )
+        let webWeeklyReset = live?.weeklyUsedPercent != nil ? live?.weeklyResetAt : nil
+        let weeklyReset = acceptedWeeklyReset(
+            weeklyFromCli
+                ? cli?.weeklyResetAt
+                : (webWeeklyReset ?? cached?.weeklyResetAt ?? live?.weeklyResetAt),
+            now: now
+        )
+
+        func subtitle(fromCli: Bool, live liveValue: Double?) -> String {
+            if fromCli { return "Muse Code subscription — local CLI" }
+            if liveValue != nil { return "Muse Code subscription — dev.meta.ai/usage" }
+            return "Muse Code subscription — captured at import"
+        }
+
+        var windows: [QuotaWindow] = []
+        if let currentPercent {
+            windows.append(
+                QuotaWindow(
+                    label: "Current usage",
+                    windowKind: .session,
+                    used: currentPercent,
+                    total: 100,
+                    resetDate: currentReset,
+                    unit: "%",
+                    subtitle: subtitle(fromCli: currentFromCli, live: live?.currentUsedPercent)
+                )
+            )
+        }
+        if let weeklyPercent {
+            windows.append(
+                QuotaWindow(
+                    label: "Weekly limit",
+                    windowKind: .weekly,
+                    used: weeklyPercent,
+                    total: 100,
+                    resetDate: weeklyReset,
+                    unit: "%",
+                    subtitle: subtitle(fromCli: weeklyFromCli, live: live?.weeklyUsedPercent)
+                )
+            )
+        }
+        return MuseSubscriptionMeterAssembly(windows: windows, planName: planName)
+    }
+
+    /// The current window rolls in hours; a reset beyond a day is a misparse,
+    /// and an expired one would zero the meter's fraction.
+    private static func acceptedCurrentReset(_ candidate: Date?, now: Date) -> Date? {
+        guard let candidate,
+              candidate > now,
+              candidate <= now.addingTimeInterval(25 * 60 * 60) else {
+            return nil
+        }
+        return candidate
+    }
+
+    /// Runs the local CLI probe behind its own cadence cache. A manual refresh
+    /// re-probes immediately; otherwise the last reading is reused.
+    static func probeMuseCli(
+        fields: [String: String],
+        now: Date,
+        userInitiated: Bool
+    ) async -> MuseCliSubscriptionReading? {
+        #if os(macOS)
+        let cache = MuseCliRefreshCache.shared
+        switch await cache.decision(now: now, userInitiated: userInitiated) {
+        case .cached(let reading):
+            return reading
+        case .fetch:
+            guard let resolved = MuseCliBinaryLocator.resolve(fields: fields) else {
+                print("[MuseCliUsage] No runnable `muse` launcher: grant the Muse CLI folder in Settings")
+                // Records the attempt so a missing CLI backs off rather than
+                // re-resolving on every refresh.
+                return await cache.recordResult(nil, now: now)
+            }
+            print("[MuseCliUsage] Probing subscription meters via \(resolved.url.path)")
+            // The probe blocks on a pty read loop; keep it off the cooperative
+            // executor so it cannot stall other provider refreshes.
+            let reading = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    let value = MuseCliUsageProbe.probe(binaryURL: resolved.url, now: now)
+                    resolved.stop()
+                    continuation.resume(returning: value)
+                }
+            }
+            if let reading {
+                print("[MuseCliUsage] Read current=\(reading.currentUsedPercent.map { "\($0)%" } ?? "—") weekly=\(reading.weeklyUsedPercent.map { "\($0)%" } ?? "—")")
+            }
+            return await cache.recordResult(reading, now: now)
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    /// Weekly resets more than 8 days out are misparses; expired resets would
+    /// zero the meter's fraction, so both render as a meter without a date.
+    private static func acceptedWeeklyReset(_ candidate: Date?, now: Date) -> Date? {
+        guard let candidate,
+              candidate > now,
+              candidate <= now.addingTimeInterval(8 * 24 * 60 * 60) else {
+            return nil
+        }
+        return candidate
+    }
+
+    static func cachedMuseSubscriptionReading(from fields: [String: String]) -> MuseSubscriptionWebReading? {
+        let reading = MuseSubscriptionWebReading(
+            planName: fields[SpendProviderCredentialField.museCachedPlanName]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+            currentUsedPercent: nonnegativePercent(fields[SpendProviderCredentialField.museCachedCurrentPercent]),
+            currentResetAt: ProviderDateParser.parse(fields[SpendProviderCredentialField.museCachedCurrentResetAt]),
+            weeklyUsedPercent: nonnegativePercent(fields[SpendProviderCredentialField.museCachedWeeklyPercent]),
+            weeklyResetAt: ProviderDateParser.parse(fields[SpendProviderCredentialField.museCachedWeeklyResetAt])
+        )
+        return reading.isEmpty ? nil : reading
     }
 
     private func observedMonthCostUSD(

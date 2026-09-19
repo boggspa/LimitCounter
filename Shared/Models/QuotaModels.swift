@@ -143,10 +143,10 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .deepseek: return "#4E6AEE"
         case .cerebras: return "#BB584A"
         case .meta:     return "#0082FB" // Meta Blue
-        case .ollama:   return "#F3F4F6" // Ollama White/Silver
+        case .ollama:   return "#976C52" // Ollama Walnut Brown — low-chroma warm brown for on-device inference. Sits at the equal-contrast point (relative luminance ~0.179, ~4.58:1 against both pure white and pure black), so it stays legible in light and dark appearances. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
         case .openrouter: return "#8B5CF6" // OpenRouter Purple
         case .qwen:     return "#615CED" // Qwen Purple
-        case .mimo:     return "#FF6900" // Xiaomi Orange
+        case .mimo:     return "#008844" // Xiaomi Green
         case .heatmap:  return "#5B8AF5" // App Blue
         }
     }
@@ -239,7 +239,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras:
             return "Cerebras usage import"
         case .meta:
-            return "Meta API credits and Muse spend"
+            return "Meta API credits, Muse spend and subscription"
         case .ollama:
             return "Ollama Cloud session"
         case .openrouter:
@@ -284,7 +284,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras:
             return "Imports an official Cerebras Analytics CSV or a manual balance anchor. Optional local telemetry is displayed as an API-price estimate."
         case .meta:
-            return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Optional Meta console Spend reading anchors a billing-period meter that accumulates Muse spend after that reading; preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
+            return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Grant the local Muse CLI for live Muse Code subscription meters (Current usage and Weekly limit, refreshed every 10 minutes); an imported dev.meta.ai session is the fallback and also anchors billing-period spend. Preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
         case .ollama:
             return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters, or the Free monthly included-usage pool, from ollama.com/settings."
         case .openrouter:
@@ -396,7 +396,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .cerebras:
             return "Reads only the Cerebras CSV or folder you explicitly select. It does not inspect browser sessions or private web APIs."
         case .meta:
-            return "Reads only Muse `session.jsonl` usage fields from a folder you grant. Manual billing anchors are stored in Keychain. Meta has no documented balance API; spend is projected locally."
+            return "Reads Muse `session.jsonl` usage fields from a folder you grant. Subscription meters come from the granted local Muse CLI (run read-only with `--no-session-log`, every 10 minutes). An imported dev.meta.ai session is stored in Keychain and each console surface is read no more than hourly; manual billing anchors are also stored in Keychain. Meta has no documented balance API."
         case .ollama:
             return "Stores your Ollama `__Secure-session` cookie securely in macOS Keychain. Used only to read your usage meters from ollama.com/settings."
         case .openrouter:
@@ -486,9 +486,9 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.x.grok", applicationNames: ["Grok.app"])
             ]
         case .antigravity:
-            return [
-                AppIconCandidate(bundleIdentifier: "com.google.antigravity", applicationNames: ["Antigravity.app"])
-            ]
+            // The installed Antigravity app icon aliases into an unreadable
+            // raster tile at dashboard size. Use the bundled official mark.
+            return []
         case .ollama:
             return [
                 AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),

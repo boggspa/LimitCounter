@@ -128,6 +128,30 @@ private func testMissingInputsAreSuppressed() throws {
     )
 }
 
+private func testMuseCurrentUsageGetsFiveHourPace() throws {
+    let now = Date(timeIntervalSince1970: 1_000_000)
+    // The Muse card's own wording: nothing in the label or subtitle says "5h",
+    // so the duration has to come from the provider.
+    let window = quotaWindow(
+        label: "Current usage",
+        kind: .session,
+        used: 39,
+        resetDate: now.addingTimeInterval(60 * 60),
+        subtitle: "Muse Code subscription — captured at import"
+    )
+
+    let pace = try expectPace(window.pace(providerID: .meta, at: now), "Muse current-usage pace")
+    try expectApproximately(pace.expectedFraction, 0.8, "four of five hours elapsed")
+    try expectApproximately(pace.actualFraction, 0.39, "39% used")
+    try expectEqual(pace.state, .ahead, "well under the guide reads as ahead")
+
+    // The same window still has no pace for a provider with no session length.
+    try expect(
+        window.pace(providerID: .devin, at: now) == nil,
+        "the five-hour default stays scoped to providers that have one"
+    )
+}
+
 private func testSlidingFiveHourInference() throws {
     let now = Date(timeIntervalSince1970: 1_000_000)
     let window = quotaWindow(
@@ -301,6 +325,7 @@ private enum QuotaPaceTestRunner {
         try testDailyOnTrackIsSuppressed()
         try testWeeklyAheadWhenUnderGuide()
         try testMissingInputsAreSuppressed()
+        try testMuseCurrentUsageGetsFiveHourPace()
         try testSlidingFiveHourInference()
         try testCompactStringFormatsBillions()
         try testAnalyticsBucketsRoundTripAndDefaultDecode()

@@ -1208,6 +1208,53 @@ private func testMetaCreditUsedAndDefaultMonthlyReset() throws {
     try expectEqual(parts.day, 1, "Meta reset lands on day 1")
 }
 
+private func testMetaWebBillingRefreshCadenceProtectsBrowserSession() throws {
+    let start = date("2026-08-27T12:00:00Z")
+
+    try expect(
+        MetaWebBillingRefreshCadence.isDue(
+            now: start,
+            lastSuccessfulFetchAt: nil,
+            lastAttemptAt: nil
+        ),
+        "Meta first billing read is due"
+    )
+    try expect(
+        !MetaWebBillingRefreshCadence.isDue(
+            now: start.addingTimeInterval(59 * 60),
+            lastSuccessfulFetchAt: start,
+            lastAttemptAt: start
+        ),
+        "Meta successful billing read is cached for one hour"
+    )
+    try expect(
+        MetaWebBillingRefreshCadence.isDue(
+            now: start.addingTimeInterval(60 * 60),
+            lastSuccessfulFetchAt: start,
+            lastAttemptAt: start
+        ),
+        "Meta successful billing read becomes due after one hour"
+    )
+
+    let failedAttempt = start.addingTimeInterval(61 * 60)
+    try expect(
+        !MetaWebBillingRefreshCadence.isDue(
+            now: failedAttempt.addingTimeInterval(6 * 60 * 60 - 1),
+            lastSuccessfulFetchAt: start,
+            lastAttemptAt: failedAttempt
+        ),
+        "Meta failed billing read waits six hours before retrying"
+    )
+    try expect(
+        MetaWebBillingRefreshCadence.isDue(
+            now: failedAttempt.addingTimeInterval(6 * 60 * 60),
+            lastSuccessfulFetchAt: start,
+            lastAttemptAt: failedAttempt
+        ),
+        "Meta failed billing read retries after six hours"
+    )
+}
+
 private func testMetaRemainingWatermarkAdvancesAndResetsOnMonth() throws {
     let suiteName = "limit-counter-meta-watermark-tests-\(UUID().uuidString)"
     let defaults = try UserDefaults(suiteName: suiteName)
@@ -1719,9 +1766,1030 @@ private func testImportedCookieHeaderMergePreservesAndRotates() throws {
     )
 }
 
+private func testTokenPlanParserReadsRenderedZeroUsage() throws {
+    let qwenText = """
+    Plan Quota
+    Last Updated: 2026-08-25 17:31:03
+    End Time 2026-09-25 17:00:00
+    7-Day Quota
+    0% Used
+    Will reset at 2026-09-02 06:45:00 (UTC+8)
+    0% 50% 90% 100%
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen rendered quota did not parse") }()
+    try expectClose(qwen.quotaUsedPercent ?? -1, 0, "Qwen rendered zero usage")
+    try expectEqual(qwen.periodEnd, date("2026-09-01T22:45:00Z"), "Qwen UTC+8 reset is converted to UTC")
+
+    let mimoText = """
+    Plan usage
+    Lite Monthly Plan
+    Auto-Renewal Monthly
+    Valid until 2026-09-25 23:59:59 (UTC)
+    Current plan usage
+    0 / 4,100,000,000 Used 0.0%
+    """
+    let mimo = try TokenPlanWebClient.parse(renderedText: mimoText)
+        ?? { throw AdditionalProviderTestError.failure("MiMo rendered quota did not parse") }()
+    try expectClose(mimo.quotaUsedPercent ?? -1, 0, "MiMo rendered zero usage")
+    try expectEqual(mimo.planName, "Lite Monthly Plan", "MiMo rendered plan name")
+    try expectEqual(mimo.periodEnd, date("2026-09-25T23:59:59Z"), "MiMo rendered validity")
+}
+
+/// Model Studio moved the 7-day meter's value to the end of the reset row, so
+/// "0% Used" no longer appears and the label is separated from its number by a
+/// timestamp. Both the session import and the background refresh gate on
+/// `quotaUsedPercent != nil`, so this stopped Qwen dead in both.
+/// Fixture transcribed from the console on 2026-09-10.
+private func testTokenPlanParserReadsQwenResetRowLayout() throws {
+    let qwenText = """
+    Standard Plan Active
+    Remaining Days 14 days
+    Auto-Renewal
+    Start Time 2026/08/25 15:01:34
+    End Time 2026/09/25 17:00:00
+    Plan Quota
+    Updated at: 2026-09-10 19:18:20
+    Usage Statistics
+    7-Day Used
+    Will reset at 2026-09-16 10:03:00 (UTC+8) 100%
+    0% 100%
+    Reset
+    Quota Add-on
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen reset-row layout did not parse") }()
+
+    try expectClose(qwen.quotaUsedPercent ?? -1, 100, "meter value, not the bar's axis label")
+    try expectEqual(qwen.periodEnd, date("2026-09-16T02:03:00Z"), "UTC+8 reset converted to UTC")
+    try expectEqual(qwen.planName, "Standard Plan", "plan name")
+    try expectEqual(qwen.remainingDays, 14, "remaining days")
+}
+
+/// A partly-used meter reads its own value, not either axis label.
+private func testTokenPlanParserReadsPartialQwenUsage() throws {
+    let qwenText = """
+    7-Day Used
+    Will reset at 2026-09-16 10:03:00 (UTC+8) 42.5%
+    0% 100%
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen partial usage did not parse") }()
+    try expectClose(qwen.quotaUsedPercent ?? -1, 42.5, "fractional meter value")
+}
+
+/// A zero meter is still three percentages: its own value plus both axis
+/// labels.
+/// The Plan Quota card shows the banked resets beside its Reset button
+/// ("Reset ⓘ 1 available"); the icon renders as its own text node.
+private func testTokenPlanParserReadsQwenResetAvailability() throws {
+    let qwenText = """
+    Plan Quota
+    Updated at: 2026-09-16 05:04:14
+    7-Day Used
+    Will reset at 2026-09-23 10:10:00 (UTC+8) 15.19%
+    0%
+    100%
+    Reset
+    ⓘ
+    1 available
+    Quota Add-on
+    Quota Statistics
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen reset availability did not parse") }()
+    try expectClose(qwen.quotaUsedPercent ?? -1, 15.19, "meter value still reads")
+    try expectEqual(qwen.resetAvailableCount, 1, "one banked reset")
+
+    let none = try TokenPlanWebClient.parseQwen(renderedText: "7-Day Used\nWill reset at 2026-09-23 10:10:00 (UTC+8) 15.19%\nReset\n0 available")
+        ?? { throw AdditionalProviderTestError.failure("zero availability did not parse") }()
+    try expectEqual(none.resetAvailableCount, 0, "zero is a reading too")
+
+    let absent = try TokenPlanWebClient.parseQwen(renderedText: "7-Day Used\nWill reset at 2026-09-23 10:10:00 (UTC+8) 15.19%\nQuota Add-on")
+        ?? { throw AdditionalProviderTestError.failure("meter without the button did not parse") }()
+    try expectEqual(absent.resetAvailableCount, nil, "no button, no reading")
+}
+
+private func testTokenPlanConsoleAPIScansResetAvailability() throws {
+    func envelope(_ payload: String) -> Data {
+        """
+        {"data": {"success": true, "DataV2": {"data": {"data": \(payload)}}}}
+        """.data(using: .utf8)!
+    }
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetAvailableCount(envelope(#"{"remainResetCount": 1, "per1WeekResetTime": 1789400000000}"#)),
+        1,
+        "a reset count key"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetAvailableCount(envelope(#"{"resetInfo": {"availableTimes": 2}, "specCode": "standard"}"#)),
+        2,
+        "nested reset info"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetAvailableCount(envelope(#"{"per1WeekPercentage": 0.15, "per1WeekResetTime": 1789400000000}"#)),
+        nil,
+        "reset timestamps are not counts"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetAvailableCount(#"{"data": {"success": false, "errorCode": "NotLogined"}}"#.data(using: .utf8)!),
+        nil,
+        "a failed envelope yields nothing"
+    )
+}
+
+private func testTokenPlanParserReadsZeroQwenUsage() throws {
+    let qwenText = """
+    7-Day Used
+    Will reset at 2026-09-16 10:03:00 (UTC+8) 0%
+    0% 100%
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen zero usage did not parse") }()
+    try expectClose(qwen.quotaUsedPercent ?? -1, 0, "zero meter value")
+}
+
+/// A page that has not rendered the quota card must stay unparsed, so the
+/// readiness poll keeps waiting instead of importing a number that is not
+/// there.
+private func testTokenPlanParserReportsNoQuotaBeforeTheValueRenders() throws {
+    let qwenText = """
+    Standard Plan Active
+    Remaining Days 14 days
+    Plan Quota
+    Usage Statistics
+    """
+    let reading = TokenPlanWebClient.parseQwen(renderedText: qwenText)
+    try expect(reading?.quotaUsedPercent == nil, "no quota reading before the meter renders")
+}
+
+// MARK: - Token Plan console API
+
+/// Verbatim response from the console gateway on 2026-09-10, captured while the
+/// page displayed 100% used. Note `per1WeekPercentage` is `1.0` for that 100% —
+/// it is a 0-1 fraction, matching how the official CLI renders it
+/// (`percentage * 100`). Reading it as a percentage would show 1%.
+private let qwenConsoleUsageResponse = """
+{
+  "code": "200",
+  "data": {
+    "DataV2": {
+      "ret": ["SUCCESS::x"],
+      "data": {
+        "msg": "Success.",
+        "code": "SUCCESS",
+        "data": { "per1WeekResetTime": 1789524180000, "per1WeekPercentage": 1.0 },
+        "requestId": "affb7200-687d-9720-877b-db61640f82d4",
+        "success": true
+      }
+    },
+    "success": true,
+    "httpStatus": 200,
+    "errorCode": "",
+    "api": "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+    "errorMsg": ""
+  },
+  "httpStatusCode": "200",
+  "requestId": "affb7200-687d-4720-877b-db61640f82d4",
+  "successResponse": true
+}
+"""
+
+private func testTokenPlanConsoleAPIReadsFullQuota() throws {
+    let reading = try TokenPlanConsoleAPIClient.parseUsage(Data(qwenConsoleUsageResponse.utf8))
+        ?? { throw AdditionalProviderTestError.failure("console usage response did not parse") }()
+
+    try expectClose(reading.quotaUsedPercent ?? -1, 100, "1.0 is a fraction: 100% used, not 1%")
+    try expectEqual(reading.periodEnd, date("2026-09-16T02:03:00Z"), "epoch-ms reset converted")
+}
+
+/// A partly-used week must not be rounded away.
+private func testTokenPlanConsoleAPIReadsFractionalQuota() throws {
+    let json = qwenConsoleUsageResponse.replacingOccurrences(of: "\"per1WeekPercentage\": 1.0", with: "\"per1WeekPercentage\": 0.425")
+    let reading = try TokenPlanConsoleAPIClient.parseUsage(Data(json.utf8))
+        ?? { throw AdditionalProviderTestError.failure("fractional usage did not parse") }()
+    try expectClose(reading.quotaUsedPercent ?? -1, 42.5, "0.425 -> 42.5%")
+}
+
+/// The gateway reports an expired console session in the body with HTTP 200, so
+/// it has to be surfaced as a credential problem rather than a parse failure —
+/// otherwise the card asks the user to wait instead of to reconnect.
+private func testTokenPlanConsoleAPIDetectsExpiredSession() throws {
+    let json = """
+    {"code":"200","data":{"success":false,"errorCode":"NotLogined","errorMsg":"","DataV2":{}},"successResponse":false}
+    """
+    do {
+        _ = try TokenPlanConsoleAPIClient.parseUsage(Data(json.utf8))
+        throw AdditionalProviderTestError.failure("expired session should throw")
+    } catch let error as ProviderFetchError {
+        guard case .credentialExpired = error else {
+            throw AdditionalProviderTestError.failure("expected credentialExpired, got \(error)")
+        }
+    }
+}
+
+/// An unrecognised body must not masquerade as a zero quota.
+private func testTokenPlanConsoleAPIReportsNothingForUnknownShape() throws {
+    let reading = try TokenPlanConsoleAPIClient.parseUsage(Data("{\"code\":\"200\"}".utf8))
+    try expect(reading == nil, "unknown shape yields no reading, not 0%")
+}
+
+private func testTokenPlanCachedAndManualZeroUsageProduceMeters() async throws {
+    let cachedCredential = ProviderCredential(
+        extraFields: [
+            SpendProviderCredentialField.tokenPlanCachedUsedPercent: "0",
+            SpendProviderCredentialField.tokenPlanCachedPlanName: "Lite Plan Plan",
+            SpendProviderCredentialField.tokenPlanCachedResetAt: "2026-09-25T23:59:59Z"
+        ]
+    )
+    let cachedSnapshot = try await MimoProviderClient().fetchSnapshot(credentials: cachedCredential)
+    try expectEqual(cachedSnapshot.fetchState, .success, "MiMo cached snapshot succeeds")
+    try expectEqual(cachedSnapshot.planName, "Lite Plan", "Duplicated cached plan suffix is repaired")
+    try expectEqual(cachedSnapshot.windows.count, 1, "MiMo cached snapshot has one quota meter")
+    try expectEqual(cachedSnapshot.windows[0].windowKind, .monthly, "MiMo quota has a monthly pace window")
+    try expectClose(cachedSnapshot.windows[0].used, 0, "MiMo cached zero usage")
+    try expectEqual(
+        cachedSnapshot.windows[0].subtitle,
+        "Captured from the imported browser session",
+        "MiMo cached reading provenance"
+    )
+
+    let manualCredential = ProviderCredential(
+        extraFields: [SpendProviderCredentialField.manualWeeklyUsedPercent: "0"]
+    )
+    let manualSnapshot = try await QwenProviderClient().fetchSnapshot(credentials: manualCredential)
+    try expectEqual(manualSnapshot.fetchState, .success, "Qwen manual zero snapshot succeeds")
+    try expectEqual(manualSnapshot.windows.count, 1, "Qwen manual zero has one quota meter")
+    try expectClose(manualSnapshot.windows[0].used, 0, "Qwen manual zero usage")
+
+    let staleQwenSnapshot = try await QwenProviderClient().fetchSnapshot(
+        credentials: ProviderCredential(
+            extraFields: [
+                SpendProviderCredentialField.tokenPlanCachedUsedPercent: "32",
+                SpendProviderCredentialField.tokenPlanCachedResetAt: "2026-09-25T17:00:00Z"
+            ]
+        )
+    )
+    try expect(
+        staleQwenSnapshot.windows.first?.resetDate == nil,
+        "Qwen ignores cached subscription end date"
+    )
+}
+
+private func testCerebrasCachedWebBalanceSurvivesLiveMiss() async throws {
+    let credential = ProviderCredential(
+        extraFields: [
+            SpendProviderCredentialField.cerebrasCachedBalance: "11.48",
+            SpendProviderCredentialField.cerebrasCachedCurrency: "USD"
+        ]
+    )
+    let snapshot = try await CerebrasProviderClient().fetchSnapshot(credentials: credential)
+
+    try expectEqual(snapshot.fetchState, .success, "Cerebras cached balance snapshot succeeds")
+    try expectEqual(snapshot.balances.first?.label, "Current balance", "Cerebras cached balance label")
+    try expectClose(snapshot.balances.first?.amount ?? -1, 11.48, "Cerebras cached balance amount")
+}
+
+private func testCerebrasWebBillingParserReadsCurrentBalance() throws {
+    let reading = try WebBillingClient.parse(
+        html: "Current balance $11.48 Active subscriptions There are no active subscriptions",
+        now: date("2026-08-28T11:00:00Z")
+    ) ?? { throw AdditionalProviderTestError.failure("Cerebras current balance did not parse") }()
+
+    try expectClose(reading.balance ?? -1, 11.48, "Cerebras current balance")
+    try expectEqual(reading.currency, "USD", "Cerebras current balance currency")
+}
+
+private func testMetaCreditMeterCarriesBillingReset() async throws {
+    let resetAt = "2026-09-01T00:00:00Z"
+    let credential = ProviderCredential(
+        extraFields: [
+            SpendProviderCredentialField.manualTopUpTotal: "15",
+            SpendProviderCredentialField.manualCurrentBalance: "11.19",
+            SpendProviderCredentialField.manualCurrency: "GBP",
+            SpendProviderCredentialField.manualResetAt: resetAt
+        ]
+    )
+    let client = MetaProviderClient(museCliProbe: { _, _, _ in nil })
+    let snapshot = try await client.fetchSnapshot(credentials: credential)
+    let creditWindow = try snapshot.windows.first(where: { $0.label == "Credit used" })
+        ?? { throw AdditionalProviderTestError.failure("Meta credit meter missing") }()
+
+    try expectEqual(creditWindow.windowKind, .monthly, "Meta credit meter has a monthly pace window")
+    try expectEqual(creditWindow.resetDate, date(resetAt), "Meta credit meter carries billing reset")
+    try expect(
+        creditWindow.pace(providerID: .meta, at: date("2026-08-20T00:00:00Z")) != nil,
+        "Meta credit meter surfaces a pace marker"
+    )
+}
+
+private func localDate(
+    year: Int, month: Int, day: Int, hour: Int = 0, minute: Int = 0
+) -> Date {
+    var components = DateComponents()
+    components.year = year
+    components.month = month
+    components.day = day
+    components.hour = hour
+    components.minute = minute
+    return Calendar.current.date(from: components)!
+}
+
+private func testMuseSubscriptionParserReadsUsagePage() throws {
+    let now = localDate(year: 2026, month: 9, day: 1, hour: 12)
+    let renderedText = """
+    Usage
+    Muse Code High Usage subscription
+    Last updated at 10:14
+    Current usage
+    12% used
+    Weekly limit
+    34% used
+    Resets 7 Sep at 01:00
+    Pay as you go
+    API Key: All
+    Model: All
+    26/08/2026 - 01/09/2026
+    £3.84
+    Spend (GBP)
+    7d
+    19.6M
+    Input tokens
+    183.1k
+    Output tokens
+    """
+    let reading = try MuseSubscriptionWebClient.parse(renderedText: renderedText, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Muse usage page should parse") }()
+    try expectEqual(reading.planName, "Muse Code High Usage", "Muse plan name")
+    try expectClose(reading.currentUsedPercent ?? -1, 12, "Muse current usage percent")
+    try expectClose(reading.weeklyUsedPercent ?? -1, 34, "Muse weekly percent")
+    try expectEqual(
+        reading.weeklyResetAt,
+        localDate(year: 2026, month: 9, day: 7, hour: 1),
+        "Muse weekly reset infers the year from the page's local date"
+    )
+}
+
+private func testMuseSubscriptionParserAcceptsValueBeforeLabel() throws {
+    let now = Date()
+    let reading = try MuseSubscriptionWebClient.parse(
+        renderedText: "Muse Code High Usage subscription 3% used Current usage Weekly limit 45 % used Resets in 3 days",
+        now: now
+    ) ?? { throw AdditionalProviderTestError.failure("value-before-label layout should parse") }()
+    try expectClose(reading.currentUsedPercent ?? -1, 3, "value-before-label current percent")
+    try expectClose(reading.weeklyUsedPercent ?? -1, 45, "spaced weekly percent")
+    let expectedReset = now.addingTimeInterval(3 * 24 * 60 * 60)
+    try expect(
+        abs(reading.weeklyResetAt.map { $0.timeIntervalSince(expectedReset) } ?? 999) < 5,
+        "relative reset lands three days out"
+    )
+}
+
+private func testMuseSubscriptionParserRejectsSignedOutAndPAYGOnlyPages() throws {
+    let now = Date()
+    try expect(
+        MuseSubscriptionWebClient.parse(renderedText: "Sign in Email Password Continue", now: now) == nil,
+        "signed-out page must not parse"
+    )
+    try expect(
+        MuseSubscriptionWebClient.parse(renderedText: "Usage Pay as you go £3.84 Spend (GBP)", now: now) == nil,
+        "PAYG-only page must not fabricate subscription meters"
+    )
+}
+
+private func testMuseSubscriptionResetDateParsesVariantsAndRollsYear() throws {
+    let calendar = Calendar.current
+    let decemberNow = localDate(year: 2026, month: 12, day: 30, hour: 12)
+    try expectEqual(
+        MuseSubscriptionWebClient.resetDate(in: "Resets 2 Jan at 01:00", now: decemberNow, calendar: calendar),
+        localDate(year: 2027, month: 1, day: 2, hour: 1),
+        "December reset rolls into the next year"
+    )
+    let septemberNow = localDate(year: 2026, month: 9, day: 1, hour: 12)
+    try expectEqual(
+        MuseSubscriptionWebClient.resetDate(in: "Resets Sep 7 at 1:00 AM", now: septemberNow, calendar: calendar),
+        localDate(year: 2026, month: 9, day: 7, hour: 1),
+        "US month-day order with a 12-hour clock"
+    )
+    try expectEqual(
+        MuseSubscriptionWebClient.resetDate(in: "Resets 7 Sep 2026 at 13:30", now: septemberNow, calendar: calendar),
+        localDate(year: 2026, month: 9, day: 7, hour: 13, minute: 30),
+        "explicit year and 24-hour time"
+    )
+    try expectEqual(
+        MuseSubscriptionWebClient.resetDate(in: "Resets tomorrow at 01:00", now: septemberNow, calendar: calendar),
+        localDate(year: 2026, month: 9, day: 2, hour: 1),
+        "tomorrow with a time"
+    )
+}
+
+private func testMuseSubscriptionParserReadsCurrentWindowClockReset() throws {
+    let now = localDate(year: 2026, month: 9, day: 1, hour: 12)
+    let renderedText = """
+    Usage
+    Muse Code High Usage subscription
+    Current usage
+    12% used
+    Resets at 9:18 PM
+    Weekly limit
+    34% used
+    Resets 7 Sep at 01:00
+    Pay as you go
+    """
+    let reading = try MuseSubscriptionWebClient.parse(renderedText: renderedText, now: now)
+        ?? { throw AdditionalProviderTestError.failure("usage page with both resets should parse") }()
+    try expectEqual(
+        reading.currentResetAt,
+        localDate(year: 2026, month: 9, day: 1, hour: 21, minute: 18),
+        "bare clock time resolves to today when it is still ahead"
+    )
+    try expectEqual(
+        reading.weeklyResetAt,
+        localDate(year: 2026, month: 9, day: 7, hour: 1),
+        "weekly reset is unaffected by the current window's clock time"
+    )
+
+    let lateEvening = localDate(year: 2026, month: 9, day: 1, hour: 22)
+    let rolled = try MuseSubscriptionWebClient.parse(renderedText: renderedText, now: lateEvening)
+        ?? { throw AdditionalProviderTestError.failure("late-evening parse should succeed") }()
+    try expectEqual(
+        rolled.currentResetAt,
+        localDate(year: 2026, month: 9, day: 2, hour: 21, minute: 18),
+        "a clock time already past today rolls to tomorrow"
+    )
+}
+
+private func testMuseSubscriptionWeeklyFallbackIgnoresBareClockTime() throws {
+    let now = localDate(year: 2026, month: 9, day: 1, hour: 12)
+    let reading = try MuseSubscriptionWebClient.parse(
+        renderedText: "Muse Code High Usage subscription Current usage 12% used Resets at 9:18 PM",
+        now: now
+    ) ?? { throw AdditionalProviderTestError.failure("current-only page should parse") }()
+    try expectClose(reading.currentUsedPercent ?? -1, 12, "current percent still reads")
+    try expect(
+        reading.weeklyResetAt == nil,
+        "the whole-page weekly fallback must not adopt the current window's clock time"
+    )
+}
+
+private func testMuseCachedSubscriptionReadingRestoresCurrentReset() throws {
+    let currentReset = localDate(year: 2026, month: 9, day: 1, hour: 21, minute: 18)
+    let weeklyReset = localDate(year: 2026, month: 9, day: 7, hour: 1)
+    let formatter = ISO8601DateFormatter()
+    let fields = [
+        SpendProviderCredentialField.museCachedPlanName: "Muse Code High Usage",
+        SpendProviderCredentialField.museCachedCurrentPercent: "12",
+        SpendProviderCredentialField.museCachedCurrentResetAt: formatter.string(from: currentReset),
+        SpendProviderCredentialField.museCachedWeeklyPercent: "34",
+        SpendProviderCredentialField.museCachedWeeklyResetAt: formatter.string(from: weeklyReset)
+    ]
+    let reading = try MetaProviderClient.cachedMuseSubscriptionReading(from: fields)
+        ?? { throw AdditionalProviderTestError.failure("cached import fields should rehydrate") }()
+    try expectClose(reading.currentUsedPercent ?? -1, 12, "cached current percent")
+    try expectEqual(reading.currentResetAt, currentReset, "cached current reset round-trips")
+    try expectEqual(reading.weeklyResetAt, weeklyReset, "cached weekly reset round-trips")
+
+    // A reset with no meter behind it is still not a usable reading.
+    try expect(
+        MetaProviderClient.cachedMuseSubscriptionReading(
+            from: [SpendProviderCredentialField.museCachedCurrentResetAt: formatter.string(from: currentReset)]
+        ) == nil,
+        "a stored reset alone does not make a reading"
+    )
+}
+
+private func testMuseSubscriptionMetersCarryImportedCurrentReset() throws {
+    let now = Date()
+    let cached = MuseSubscriptionWebReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 12,
+        currentResetAt: now.addingTimeInterval(2 * 60 * 60),
+        weeklyUsedPercent: 34,
+        weeklyResetAt: now.addingTimeInterval(3 * 24 * 60 * 60)
+    )
+    let assembly = MetaProviderClient.museSubscriptionMeters(cli: nil, live: nil, cached: cached, now: now)
+    try expectEqual(assembly.windows.count, 2, "both cached meters render")
+    try expectEqual(
+        assembly.windows[0].resetDate,
+        cached.currentResetAt,
+        "the imported current reset reaches the session meter"
+    )
+
+    // The current window rolls in hours, so an import older than the window
+    // must not show a reset that has already passed.
+    let lapsed = MuseSubscriptionWebReading(
+        planName: nil,
+        currentUsedPercent: 12,
+        currentResetAt: now.addingTimeInterval(-600),
+        weeklyUsedPercent: nil,
+        weeklyResetAt: nil
+    )
+    let lapsedAssembly = MetaProviderClient.museSubscriptionMeters(cli: nil, live: nil, cached: lapsed, now: now)
+    try expect(
+        lapsedAssembly.windows[0].resetDate == nil,
+        "a lapsed imported current reset is dropped"
+    )
+
+    // A CLI reading owns its own reset; a stale cached one must not leak in.
+    let cli = MuseCliSubscriptionReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 40,
+        currentResetAt: nil,
+        weeklyUsedPercent: 55,
+        weeklyResetAt: nil
+    )
+    let cliAssembly = MetaProviderClient.museSubscriptionMeters(cli: cli, live: nil, cached: cached, now: now)
+    try expectClose(cliAssembly.windows[0].used, 40, "CLI current percent wins")
+    try expect(
+        cliAssembly.windows[0].resetDate == nil,
+        "the CLI meter does not borrow the import's reset"
+    )
+}
+
+private func testMuseSubscriptionMetersPreferLiveAndFallBackToCached() throws {
+    let now = Date()
+    let cachedReset = now.addingTimeInterval(3 * 24 * 60 * 60)
+    let live = MuseSubscriptionWebReading(
+        planName: nil,
+        currentUsedPercent: 12,
+        weeklyUsedPercent: nil,
+        weeklyResetAt: nil
+    )
+    let cached = MuseSubscriptionWebReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 90,
+        weeklyUsedPercent: 34,
+        weeklyResetAt: cachedReset
+    )
+    let assembly = MetaProviderClient.museSubscriptionMeters(cli: nil, live: live, cached: cached, now: now)
+    try expectEqual(assembly.planName, "Muse Code High Usage", "plan falls back to cached")
+    try expectEqual(assembly.windows.count, 2, "both meters present")
+    try expectEqual(assembly.windows[0].label, "Current usage", "current meter leads")
+    try expectClose(assembly.windows[0].used, 12, "live current beats cached")
+    try expectEqual(assembly.windows[0].windowKind, .session, "current meter is a session window")
+    try expectClose(assembly.windows[1].used, 34, "weekly falls back to cached")
+    try expectEqual(assembly.windows[1].resetDate, cachedReset, "weekly reset follows the weekly source")
+    try expectEqual(assembly.windows[1].windowKind, .weekly, "weekly meter kind")
+
+    let expired = MuseSubscriptionWebReading(
+        planName: nil,
+        currentUsedPercent: nil,
+        weeklyUsedPercent: 50,
+        weeklyResetAt: now.addingTimeInterval(-3_600)
+    )
+    let expiredAssembly = MetaProviderClient.museSubscriptionMeters(cli: nil, live: expired, cached: nil, now: now)
+    try expectEqual(expiredAssembly.windows.count, 1, "weekly-only reading yields one meter")
+    try expect(
+        expiredAssembly.windows[0].resetDate == nil,
+        "expired reset is dropped so the meter is not zeroed"
+    )
+
+    let farReset = MuseSubscriptionWebReading(
+        planName: nil,
+        currentUsedPercent: nil,
+        weeklyUsedPercent: 50,
+        weeklyResetAt: now.addingTimeInterval(20 * 24 * 60 * 60)
+    )
+    let farAssembly = MetaProviderClient.museSubscriptionMeters(cli: nil, live: farReset, cached: nil, now: now)
+    try expect(
+        farAssembly.windows[0].resetDate == nil,
+        "a 20-day weekly reset is treated as a misparse"
+    )
+
+    let none = MetaProviderClient.museSubscriptionMeters(cli: nil, live: nil, cached: nil, now: now)
+    try expect(none.windows.isEmpty && none.planName == nil, "no readings produce no meters")
+}
+
+private func testMuseSubscriptionRefreshCacheServesHourlyAndSurvivesRestart() async throws {
+    let suiteName = "muse-subscription-cache-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let key = "meta.museSubscriptionRefreshCache.test"
+    let cache = MuseSubscriptionRefreshCache(defaults: defaults, persistenceKey: key)
+    let t0 = Date()
+    let cookie = "session=abc"
+
+    guard case .fetch = await cache.decision(for: cookie, now: t0) else {
+        throw AdditionalProviderTestError.failure("first decision must fetch")
+    }
+
+    let reading = MuseSubscriptionWebReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 12,
+        weeklyUsedPercent: 34,
+        weeklyResetAt: nil
+    )
+    _ = await cache.recordResult(reading, for: cookie, now: t0)
+
+    guard case .cached(let served) = await cache.decision(for: cookie, now: t0.addingTimeInterval(30 * 60)) else {
+        throw AdditionalProviderTestError.failure("within the hour the cache must be served")
+    }
+    try expectEqual(served, reading, "cached reading round-trips")
+
+    guard case .fetch = await cache.decision(for: cookie, now: t0.addingTimeInterval(61 * 60)) else {
+        throw AdditionalProviderTestError.failure("after an hour a live fetch is due")
+    }
+
+    // A failed live fetch keeps the last reading and backs off six hours.
+    let t1 = t0.addingTimeInterval(2 * 60 * 60)
+    let kept = await cache.recordResult(nil, for: cookie, now: t1)
+    try expectEqual(kept, reading, "failed fetch keeps the last reading")
+    guard case .cached(let stillServed) = await cache.decision(for: cookie, now: t1.addingTimeInterval(3 * 60 * 60)) else {
+        throw AdditionalProviderTestError.failure("failure backoff must serve the cache")
+    }
+    try expectEqual(stillServed, reading, "backoff serves the kept reading")
+    guard case .fetch = await cache.decision(for: cookie, now: t1.addingTimeInterval(6 * 60 * 60 + 1)) else {
+        throw AdditionalProviderTestError.failure("after the failure backoff a fetch is due")
+    }
+
+    guard case .fetch = await cache.decision(for: "session=other", now: t0.addingTimeInterval(60)) else {
+        throw AdditionalProviderTestError.failure("a different session must not reuse the cache")
+    }
+
+    let restarted = MuseSubscriptionRefreshCache(defaults: defaults, persistenceKey: key)
+    guard case .cached(let persisted) = await restarted.decision(for: cookie, now: t1.addingTimeInterval(60)) else {
+        throw AdditionalProviderTestError.failure("persisted cache must survive a restart")
+    }
+    try expectEqual(persisted, reading, "persisted reading survives restart")
+}
+
+private func testMetaSnapshotLeadsWithCachedSubscriptionMeters() async throws {
+    let reset = Date().addingTimeInterval(3 * 24 * 60 * 60)
+    let credential = ProviderCredential(
+        extraFields: [
+            SpendProviderCredentialField.museCachedCurrentPercent: "12.5",
+            SpendProviderCredentialField.museCachedWeeklyPercent: "34",
+            SpendProviderCredentialField.museCachedPlanName: "Muse Code High Usage",
+            SpendProviderCredentialField.museCachedWeeklyResetAt: ISO8601DateFormatter().string(from: reset)
+        ]
+    )
+    let client = MetaProviderClient(museCliProbe: { _, _, _ in nil })
+    let snapshot = try await client.fetchSnapshot(credentials: credential)
+    try expectEqual(snapshot.planName, "Muse Code High Usage", "subscription plan leads the card")
+    try expectEqual(snapshot.windows.first?.label, "Current usage", "subscription meters lead the windows")
+    try expectClose(snapshot.windows.first?.used ?? -1, 12.5, "cached current percent")
+    let weekly = try snapshot.windows.first(where: { $0.label == "Weekly limit" })
+        ?? { throw AdditionalProviderTestError.failure("weekly limit meter missing") }()
+    try expectClose(weekly.used, 34, "cached weekly percent")
+    try expect(weekly.resetDate != nil, "weekly reset carried onto the meter")
+}
+
+private func testMuseCliParserReadsCompactedUsageScreen() throws {
+    // Verbatim shape of a partial TUI redraw: cursor positioning instead of
+    // spaces, so the whole panel arrives whitespace-free.
+    let raw = "Subscription·MuseCodeHighUsageCurrent14%used·Resetsat9:18PMWeekly30%used·ResetsSep7at1:00AMasof4:43PM"
+    let now = localDate(year: 2026, month: 9, day: 3, hour: 16, minute: 43)
+    let reading = try MuseCliUsageParser.parse(rawText: raw, now: now)
+        ?? { throw AdditionalProviderTestError.failure("compacted CLI screen should parse") }()
+
+    try expectEqual(reading.planName, "Muse Code High Usage", "CLI plan name is re-spaced")
+    try expectClose(reading.currentUsedPercent ?? -1, 14, "CLI current percent")
+    try expectClose(reading.weeklyUsedPercent ?? -1, 30, "CLI weekly percent")
+    try expectEqual(
+        reading.currentResetAt,
+        localDate(year: 2026, month: 9, day: 3, hour: 21, minute: 18),
+        "current reset resolves to today's 9:18 PM"
+    )
+    try expectEqual(
+        reading.weeklyResetAt,
+        localDate(year: 2026, month: 9, day: 7, hour: 1),
+        "weekly reset resolves to Sep 7 at 1:00 AM"
+    )
+}
+
+private func testMuseCliParserHandlesSpacedRedrawAndAnsi() throws {
+    // A full redraw keeps its spacing and arrives wrapped in ANSI.
+    let raw = "\u{001B}[2J\u{001B}[H  Subscription · \u{001B}[1mMuse Code High Usage\u{001B}[0m\n"
+        + "  Current      7% used · Resets at 11:05 AM\n"
+        + "  Weekly       62% used · Resets Sep 7 at 1:00 AM\n"
+        + "  as of 3:50 PM\n"
+    let now = localDate(year: 2026, month: 9, day: 3, hour: 15, minute: 50)
+    let reading = try MuseCliUsageParser.parse(rawText: raw, now: now)
+        ?? { throw AdditionalProviderTestError.failure("spaced CLI screen should parse") }()
+
+    try expectClose(reading.currentUsedPercent ?? -1, 7, "spaced current percent")
+    try expectClose(reading.weeklyUsedPercent ?? -1, 62, "spaced weekly percent")
+    try expectEqual(reading.planName, "Muse Code High Usage", "plan name survives ANSI")
+    // 11:05 AM has already passed at 3:50 PM, so the reset rolls to tomorrow.
+    try expectEqual(
+        reading.currentResetAt,
+        localDate(year: 2026, month: 9, day: 4, hour: 11, minute: 5),
+        "elapsed current reset rolls to tomorrow"
+    )
+}
+
+private func testMuseCliParserRollsWeeklyResetAcrossYearEnd() throws {
+    let raw = "Subscription·MuseCodeHighUsageCurrent5%used·Resetsat2:00AMWeekly88%used·ResetsJan2at1:00AM"
+    let now = localDate(year: 2026, month: 12, day: 30, hour: 12)
+    let reading = try MuseCliUsageParser.parse(rawText: raw, now: now)
+        ?? { throw AdditionalProviderTestError.failure("year-end CLI screen should parse") }()
+    try expectEqual(
+        reading.weeklyResetAt,
+        localDate(year: 2027, month: 1, day: 2, hour: 1),
+        "December weekly reset rolls into the next year"
+    )
+}
+
+private func testMuseCliParserReadsNewestFrameFromAccumulatedRedraws() throws {
+    // The pty buffer keeps every frame the TUI paints. Reading the first match
+    // would report the oldest percentages and let the plan capture bridge two
+    // frames, so the newest frame must win.
+    let raw = "Subscription·MuseCodeHighUsageCurrent14%used·Resetsat9:18PMWeekly30%used·ResetsSep7at1:00AMasof4:43PM"
+        + "SessionusageInput0Cached0Output0Total0Turns0Subagentsnone"
+        + "Subscription·MuseCodeHighUsageCurrent29%used·Resetsat9:18PMWeekly35%used·ResetsSep7at1:00AMasof5:13PM"
+    let now = localDate(year: 2026, month: 9, day: 3, hour: 17, minute: 13)
+    let reading = try MuseCliUsageParser.parse(rawText: raw, now: now)
+        ?? { throw AdditionalProviderTestError.failure("multi-frame capture should parse") }()
+
+    try expectClose(reading.currentUsedPercent ?? -1, 29, "newest current percent wins")
+    try expectClose(reading.weeklyUsedPercent ?? -1, 35, "newest weekly percent wins")
+    try expectEqual(
+        reading.planName,
+        "Muse Code High Usage",
+        "plan name survives across accumulated frames"
+    )
+}
+
+private func testMuseCliParserRejectsIncompleteScreens() throws {
+    let now = Date()
+    // The status card carries the plan but no meters.
+    try expect(
+        MuseCliUsageParser.parse(
+            rawText: "BILLING  Subscription·MuseCodeHighUsage",
+            now: now
+        ) == nil,
+        "status card without meters must not parse"
+    )
+    try expect(
+        !MuseCliUsageParser.hasSubscriptionScreen(
+            MuseCliUsageParser.compacted("Current 14% used · Resets at 9:18 PM")
+        ),
+        "a half-painted screen is not yet complete"
+    )
+    try expect(
+        MuseCliUsageParser.hasSubscriptionScreen(
+            MuseCliUsageParser.compacted("Weekly 30% used · Resets Sep 7 at 1:00 AM")
+        ),
+        "the weekly meter marks the screen complete"
+    )
+}
+
+private func testMuseSubscriptionMetersPreferCliOverWeb() throws {
+    let now = localDate(year: 2026, month: 9, day: 3, hour: 16)
+    let cli = MuseCliSubscriptionReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 14,
+        currentResetAt: localDate(year: 2026, month: 9, day: 3, hour: 21, minute: 18),
+        weeklyUsedPercent: 30,
+        weeklyResetAt: localDate(year: 2026, month: 9, day: 7, hour: 1)
+    )
+    let web = MuseSubscriptionWebReading(
+        planName: "Stale Plan",
+        currentUsedPercent: 47,
+        weeklyUsedPercent: 17,
+        weeklyResetAt: localDate(year: 2026, month: 9, day: 7, hour: 1)
+    )
+    let assembly = MetaProviderClient.museSubscriptionMeters(
+        cli: cli,
+        live: web,
+        cached: nil,
+        now: now
+    )
+    try expectEqual(assembly.planName, "Muse Code High Usage", "CLI plan wins over web")
+    try expectClose(assembly.windows[0].used, 14, "CLI current percent wins")
+    try expectClose(assembly.windows[1].used, 30, "CLI weekly percent wins")
+    try expectEqual(
+        assembly.windows[0].resetDate,
+        cli.currentResetAt,
+        "CLI supplies the current-window reset the web page lacks"
+    )
+    try expectEqual(
+        assembly.windows[0].subtitle,
+        "Muse Code subscription — local CLI",
+        "CLI-sourced meter is labelled as such"
+    )
+
+    // With no CLI reading the web values still drive the meters.
+    let webOnly = MetaProviderClient.museSubscriptionMeters(
+        cli: nil,
+        live: web,
+        cached: nil,
+        now: now
+    )
+    try expectClose(webOnly.windows[0].used, 47, "web reading remains the fallback")
+    try expect(webOnly.windows[0].resetDate == nil, "web current meter has no reset")
+    try expectEqual(
+        webOnly.windows[0].subtitle,
+        "Muse Code subscription — dev.meta.ai/usage",
+        "web-sourced meter is labelled as such"
+    )
+
+    // A CLI reading that only carries the weekly meter must not blank current.
+    let partialCli = MuseCliSubscriptionReading(
+        planName: nil,
+        currentUsedPercent: nil,
+        currentResetAt: nil,
+        weeklyUsedPercent: 33,
+        weeklyResetAt: nil
+    )
+    let mixed = MetaProviderClient.museSubscriptionMeters(
+        cli: partialCli,
+        live: web,
+        cached: nil,
+        now: now
+    )
+    try expectClose(mixed.windows[0].used, 47, "current falls back to web when CLI omits it")
+    try expectClose(mixed.windows[1].used, 33, "weekly still comes from the CLI")
+}
+
+private func testMetaSnapshotPrefersCliReadingOverCachedImport() async throws {
+    // End-to-end: a CLI reading must win over the values captured at import,
+    // and must carry its current-window reset onto the meter.
+    let currentReset = Date().addingTimeInterval(3 * 60 * 60)
+    let cliReading = MuseCliSubscriptionReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 35,
+        currentResetAt: currentReset,
+        weeklyUsedPercent: 38,
+        weeklyResetAt: Date().addingTimeInterval(3 * 24 * 60 * 60)
+    )
+    let credential = ProviderCredential(
+        extraFields: [
+            SpendProviderCredentialField.museCachedCurrentPercent: "47",
+            SpendProviderCredentialField.museCachedWeeklyPercent: "17",
+            SpendProviderCredentialField.museCachedPlanName: "Muse Code High Usage"
+        ]
+    )
+    let client = MetaProviderClient(museCliProbe: { _, _, _ in cliReading })
+    let snapshot = try await client.fetchSnapshot(credentials: credential)
+
+    let current = try snapshot.windows.first(where: { $0.label == "Current usage" })
+        ?? { throw AdditionalProviderTestError.failure("current meter missing") }()
+    try expectClose(current.used, 35, "CLI current percent beats the imported value")
+    try expectEqual(current.resetDate, currentReset, "CLI current-window reset reaches the meter")
+    try expectEqual(
+        current.subtitle,
+        "Muse Code subscription — local CLI",
+        "the meter is labelled as CLI-sourced"
+    )
+    let weekly = try snapshot.windows.first(where: { $0.label == "Weekly limit" })
+        ?? { throw AdditionalProviderTestError.failure("weekly meter missing") }()
+    try expectClose(weekly.used, 38, "CLI weekly percent beats the imported value")
+}
+
+private func testMuseCliBinaryLocatorResolvesGrantedFolders() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("limit-counter-muse-locator-\(UUID().uuidString)", isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
+    try fileManager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+
+    try expect(
+        MuseCliBinaryLocator.binaryURL(within: binDirectory) == nil,
+        "an empty folder holds no launcher"
+    )
+
+    let launcher = binDirectory.appendingPathComponent("muse")
+    try "#!/bin/sh\n".write(to: launcher, atomically: true, encoding: .utf8)
+    try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcher.path)
+
+    try expectEqual(
+        MuseCliBinaryLocator.binaryURL(within: binDirectory)?.path,
+        launcher.path,
+        "the launcher is found in the granted folder"
+    )
+    // Granting the parent (~/.local) must also work, since `muse` lives in its
+    // `bin` subfolder.
+    try expectEqual(
+        MuseCliBinaryLocator.binaryURL(within: root)?.path,
+        launcher.path,
+        "the launcher is found one level below the granted folder"
+    )
+    // Executability is deliberately NOT part of the check: the sandbox denies
+    // the execute-bit test even for a granted folder, so a present launcher
+    // must still resolve.
+    try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: launcher.path)
+    try expectEqual(
+        MuseCliBinaryLocator.binaryURL(within: binDirectory)?.path,
+        launcher.path,
+        "a present launcher resolves regardless of the execute bit"
+    )
+    // A directory named `muse` is not a launcher.
+    try fileManager.removeItem(at: launcher)
+    try fileManager.createDirectory(at: launcher, withIntermediateDirectories: true)
+    try expect(
+        MuseCliBinaryLocator.binaryURL(within: binDirectory) == nil,
+        "a directory is never accepted as the launcher"
+    )
+}
+
+private func testMuseCliCadenceIsFrequentButCached() throws {
+    let t0 = Date()
+    try expect(
+        MuseCliRefreshCadence.isDue(now: t0, lastSuccessfulFetchAt: nil, lastAttemptAt: nil),
+        "first probe is always due"
+    )
+    try expect(
+        !MuseCliRefreshCadence.isDue(
+            now: t0.addingTimeInterval(5 * 60),
+            lastSuccessfulFetchAt: t0,
+            lastAttemptAt: t0
+        ),
+        "a five-minute-old CLI reading is reused"
+    )
+    try expect(
+        MuseCliRefreshCadence.isDue(
+            now: t0.addingTimeInterval(11 * 60),
+            lastSuccessfulFetchAt: t0,
+            lastAttemptAt: t0
+        ),
+        "the CLI re-probes after ten minutes"
+    )
+    try expect(
+        MuseCliRefreshCadence.isDue(
+            now: t0.addingTimeInterval(60),
+            lastSuccessfulFetchAt: t0,
+            lastAttemptAt: t0,
+            userInitiated: true
+        ),
+        "a manual refresh always re-probes"
+    )
+    // A failed probe backs off harder than a successful one.
+    try expect(
+        !MuseCliRefreshCadence.isDue(
+            now: t0.addingTimeInterval(20 * 60),
+            lastSuccessfulFetchAt: nil,
+            lastAttemptAt: t0
+        ),
+        "a failed probe waits out its backoff"
+    )
+    try expect(
+        MuseCliRefreshCadence.isDue(
+            now: t0.addingTimeInterval(31 * 60),
+            lastSuccessfulFetchAt: nil,
+            lastAttemptAt: t0
+        ),
+        "a failed probe retries after thirty minutes"
+    )
+    // The CLI must stay far more frequent than the console scrape.
+    try expect(
+        MuseCliRefreshCadence.successfulFetchInterval
+            < MetaWebBillingRefreshCadence.successfulFetchInterval,
+        "CLI cadence must beat the rate-limited console cadence"
+    )
+}
+
+private func testMuseCliRefreshCacheKeepsLastReadingAcrossRestart() async throws {
+    let suiteName = "muse-cli-cache-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let key = "meta.museCliRefreshCache.test"
+    let cache = MuseCliRefreshCache(defaults: defaults, persistenceKey: key)
+    let t0 = Date()
+
+    guard case .fetch = await cache.decision(now: t0, userInitiated: false) else {
+        throw AdditionalProviderTestError.failure("first decision must probe")
+    }
+
+    let reading = MuseCliSubscriptionReading(
+        planName: "Muse Code High Usage",
+        currentUsedPercent: 14,
+        currentResetAt: nil,
+        weeklyUsedPercent: 30,
+        weeklyResetAt: nil
+    )
+    _ = await cache.recordResult(reading, now: t0)
+
+    guard case .cached(let served) = await cache.decision(
+        now: t0.addingTimeInterval(4 * 60),
+        userInitiated: false
+    ) else {
+        throw AdditionalProviderTestError.failure("a fresh reading must be served from cache")
+    }
+    try expectEqual(served, reading, "cached CLI reading round-trips")
+
+    // A failed probe keeps the last good reading rather than blanking meters.
+    let kept = await cache.recordResult(nil, now: t0.addingTimeInterval(15 * 60))
+    try expectEqual(kept, reading, "failed probe keeps the last reading")
+
+    let restarted = MuseCliRefreshCache(defaults: defaults, persistenceKey: key)
+    guard case .cached(let persisted) = await restarted.decision(
+        now: t0.addingTimeInterval(16 * 60),
+        userInitiated: false
+    ) else {
+        throw AdditionalProviderTestError.failure("persisted CLI cache must survive a restart")
+    }
+    try expectEqual(persisted, reading, "persisted CLI reading survives restart")
+}
+
 @main
 private enum AdditionalProviderUsageTestRunner {
-    static func main() throws {
+    static func main() async throws {
+        try await testBrowserRefreshTracksNewReadingsAndCooldowns()
+        try await testBrowserRefreshSharesOverlappingRequests()
+        try testBrowserSessionKeepsRotatedCookiesAndOrigin()
         try testCodexSessionCredentialParserSupportsNestedAndDirectAuth()
         try testCodexSessionCredentialReaderFollowsDirectoryRotation()
         try testCodexDirectoryImportStoresPersistentSource()
@@ -1755,6 +2823,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testMuseCostEstimatorMatchesSparkSessionTotals()
         try testMuseSessionUsageReducerCountsProviderAttributionOnce()
         try testMetaCreditUsedAndDefaultMonthlyReset()
+        try testMetaWebBillingRefreshCadenceProtectsBrowserSession()
         try testMetaRemainingWatermarkAdvancesAndResetsOnMonth()
         try testMetaRemainingWatermarkConvertsGBP()
         try testMetaSpendWatermarkAccumulatesLikeMistral()
@@ -1767,6 +2836,145 @@ private enum AdditionalProviderUsageTestRunner {
         try testOpenRouterParsesFreeTier()
         try testOpenRouterParsesRateLimit()
         try testImportedCookieHeaderMergePreservesAndRotates()
+        try testTokenPlanParserReadsRenderedZeroUsage()
+        try testTokenPlanConsoleAPIReadsFullQuota()
+        try testTokenPlanConsoleAPIReadsFractionalQuota()
+        try testTokenPlanConsoleAPIDetectsExpiredSession()
+        try testTokenPlanConsoleAPIReportsNothingForUnknownShape()
+        try testTokenPlanParserReadsQwenResetRowLayout()
+        try testTokenPlanParserReadsPartialQwenUsage()
+        try testTokenPlanParserReadsZeroQwenUsage()
+        try testTokenPlanParserReadsQwenResetAvailability()
+        try testTokenPlanConsoleAPIScansResetAvailability()
+        try testTokenPlanParserReportsNoQuotaBeforeTheValueRenders()
+        try await testTokenPlanCachedAndManualZeroUsageProduceMeters()
+        try await testCerebrasCachedWebBalanceSurvivesLiveMiss()
+        try testCerebrasWebBillingParserReadsCurrentBalance()
+        try await testMetaCreditMeterCarriesBillingReset()
+        try testMuseSubscriptionParserReadsUsagePage()
+        try testMuseSubscriptionParserAcceptsValueBeforeLabel()
+        try testMuseSubscriptionParserRejectsSignedOutAndPAYGOnlyPages()
+        try testMuseSubscriptionResetDateParsesVariantsAndRollsYear()
+        try testMuseSubscriptionParserReadsCurrentWindowClockReset()
+        try testMuseSubscriptionWeeklyFallbackIgnoresBareClockTime()
+        try testMuseCachedSubscriptionReadingRestoresCurrentReset()
+        try testMuseSubscriptionMetersCarryImportedCurrentReset()
+        try testMuseSubscriptionMetersPreferLiveAndFallBackToCached()
+        try testMuseCliParserReadsCompactedUsageScreen()
+        try testMuseCliParserHandlesSpacedRedrawAndAnsi()
+        try testMuseCliParserRollsWeeklyResetAcrossYearEnd()
+        try testMuseCliParserReadsNewestFrameFromAccumulatedRedraws()
+        try testMuseCliParserRejectsIncompleteScreens()
+        try testMuseSubscriptionMetersPreferCliOverWeb()
+        try await testMetaSnapshotPrefersCliReadingOverCachedImport()
+        try testMuseCliBinaryLocatorResolvesGrantedFolders()
+        try testMuseCliCadenceIsFrequentButCached()
+        try await testMuseCliRefreshCacheKeepsLastReadingAcrossRestart()
+        try await testMuseSubscriptionRefreshCacheServesHourlyAndSurvivesRestart()
+        try await testMetaSnapshotLeadsWithCachedSubscriptionMeters()
         print("Additional provider usage tests passed")
+    }
+}
+
+@MainActor
+private func testBrowserRefreshTracksNewReadingsAndCooldowns() async throws {
+    let suite = "browser-meter-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let cache = BrowserMeterRefreshStore(defaults: defaults)
+    let url = URL(string: "https://cloud.cerebras.ai/platform/test/billing")!
+    let start = date("2026-09-05T12:00:00Z")
+    let imported = WebBillingReading(balance: 12, spend: nil, currency: "USD", periodEnd: nil)
+    var requests = 0
+    func read(_ store: BrowserMeterRefreshStore, at now: Date, fail: Bool = false, session: String = "session-a") async -> BrowserMeterResult<WebBillingReading> {
+        await store.read(
+            url: url, sessionID: session, initial: imported, initialAt: start,
+            interval: 300, failureInterval: 900, now: now
+        ) {
+            requests += 1
+            if fail { throw ProviderFetchError.rateLimited }
+            return WebBillingReading(balance: 10, spend: nil, currency: "USD", periodEnd: nil)
+        }
+    }
+    let first = await read(cache, at: start.addingTimeInterval(60))
+    try expectEqual(requests, 0, "a recent browser import does not immediately navigate again")
+    try expectClose(first.value?.balance ?? -1, 12, "first imported balance")
+    let live = await read(cache, at: start.addingTimeInterval(300))
+    try expectEqual(requests, 1, "one new browser read when due")
+    try expectClose(live.value?.balance ?? -1, 10, "updated balance replaces original import")
+    let reread = await read(cache, at: start.addingTimeInterval(360))
+    try expectClose(reread.value?.balance ?? -1, 10, "old import cannot overwrite a newer reading")
+    try expectEqual(reread.fetchedAt, live.fetchedAt, "cache hits must not slide observation time")
+    let failure = await read(cache, at: start.addingTimeInterval(600), fail: true)
+    try expect(failure.failure != nil, "failed refresh exposes its failure")
+    try expectClose(failure.value?.balance ?? -1, 10, "failure retains last successful reading")
+    let restarted = BrowserMeterRefreshStore(defaults: defaults)
+    let persisted = await read(restarted, at: start.addingTimeInterval(1000))
+    try expectEqual(requests, 2, "cooldown survives restart")
+    try expectClose(persisted.value?.balance ?? -1, 10, "latest success survives restart")
+    _ = await read(restarted, at: start.addingTimeInterval(1500))
+    try expectEqual(requests, 3, "failure cooldown eventually permits recovery")
+    let switched = await read(restarted, at: start.addingTimeInterval(1501), fail: true, session: "session-b")
+    try expectClose(switched.value?.balance ?? -1, 12, "another session never gets the prior account's cached balance")
+    let stored = String(data: defaults.data(forKey: BrowserSessionRefreshPolicy.cacheKey(url: url, sessionID: "session-a"))!, encoding: .utf8)!
+    try expect(!stored.contains("session-a"), "cache does not store session material")
+}
+
+@MainActor
+private func testBrowserRefreshSharesOverlappingRequests() async throws {
+    let suite = "browser-overlap-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let cache = BrowserMeterRefreshStore(defaults: defaults)
+    let url = URL(string: "https://dev.meta.ai/usage/")!
+    var calls = 0
+    func read() async -> BrowserMeterResult<WebBillingReading> {
+        await cache.read(
+            url: url, sessionID: "test-cookie", initial: Optional<WebBillingReading>.none,
+            initialAt: nil, interval: 3600, failureInterval: 21600
+        ) {
+            calls += 1
+            try await Task.sleep(for: .milliseconds(30))
+            return WebBillingReading(balance: 1, spend: nil, currency: "GBP", periodEnd: nil)
+        }
+    }
+    let one = Task { @MainActor in await read() }
+    let two = Task { @MainActor in await read() }
+    let a = await one.value
+    let b = await two.value
+    try expectEqual(calls, 1, "concurrent refreshes share one navigation")
+    try expectEqual(a.fetchedAt, b.fetchedAt, "shared reading keeps one timestamp")
+}
+
+private func testBrowserSessionKeepsRotatedCookiesAndOrigin() throws {
+    let qwenHost = "modelstudio.console.alibabacloud.com"
+    try expect(
+        BrowserSessionRefreshPolicy.allowsNavigation(to: URL(string: "https://account.alibabacloud.com/login/login_aliyun.htm")!, dashboardHost: qwenHost),
+        "Qwen can renew the console ticket through its first-party account service"
+    )
+    for blockedHost in ["accounts.google.com", "alibabacloud.com.evil.example"] {
+        try expect(
+            !BrowserSessionRefreshPolicy.allowsNavigation(to: URL(string: "https://\(blockedHost)/login")!, dashboardHost: qwenHost),
+            "external sign-in requires the visible importer"
+        )
+    }
+    let cookie = HTTPCookie(properties: [
+        .domain: ".xiaomimimo.com", .path: "/", .name: "session", .value: "rotated"
+    ])!
+    try expect(
+        !BrowserSessionRefreshPolicy.shouldSeedCookies(existing: [cookie], host: "platform.xiaomimimo.com"),
+        "existing WebKit session wins over the stale imported cookie"
+    )
+    try expect(
+        BrowserSessionRefreshPolicy.shouldSeedCookies(existing: [cookie], host: "cloud.cerebras.ai"),
+        "cookies from another provider do not prevent bootstrapping"
+    )
+    let fallback = URL(string: "https://cloud.cerebras.ai/platform/default/billing")!
+    try expectEqual(
+        BrowserSessionRefreshPolicy.validatedURL("https://cloud.cerebras.ai/platform/new/billing", fallback: fallback).path,
+        "/platform/new/billing", "selected billing account URL is retained"
+    )
+    for badURL in ["https://cloud.cerebras.ai.evil.example/billing", "http://cloud.cerebras.ai/billing", "https://example.com", "https://user:secret@cloud.cerebras.ai/billing"] {
+        try expectEqual(BrowserSessionRefreshPolicy.validatedURL(badURL, fallback: fallback), fallback, "reject foreign or unsafe session URL")
     }
 }

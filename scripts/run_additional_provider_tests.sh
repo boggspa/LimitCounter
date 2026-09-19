@@ -18,6 +18,7 @@ xcrun --sdk macosx swiftc -enable-testing \
   -o "$OUTPUT" \
   -framework Security \
   -framework AppKit \
+  -framework WebKit \
   -framework UniformTypeIdentifiers \
   -lsqlite3
 

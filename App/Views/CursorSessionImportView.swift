@@ -4,7 +4,16 @@ import WebKit
 struct CursorSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = CursorSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -74,7 +83,7 @@ struct CursorSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
             }
             .buttonStyle(.bordered)
 
@@ -114,7 +123,7 @@ struct CursorSessionImportView: View {
                 bookmarkData: nil
             )
             onImport(.success(imported))
-            dismiss()
+            close()
         } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -215,6 +224,19 @@ private extension WKWebView {
             }
         }
     }
+
+    @MainActor
+    func renderedBodyText() async -> String? {
+        await withCheckedContinuation { continuation in
+            evaluateJavaScript("document.body ? document.body.innerText : ''") { value, error in
+                guard error == nil else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: value as? String)
+            }
+        }
+    }
 }
 
 #if os(iOS)
@@ -244,7 +266,16 @@ private struct CursorSessionWebView: NSViewRepresentable {
 struct KimiWebSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = KimiWebSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -286,7 +317,7 @@ struct KimiWebSessionImportView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { close() }
                     .buttonStyle(.bordered)
                 Button {
                     Task { await importCurrentSession() }
@@ -334,7 +365,7 @@ struct KimiWebSessionImportView: View {
                     )
                 )
             )
-            dismiss()
+            close()
         } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -431,13 +462,22 @@ private enum KimiWebSessionImportError: LocalizedError {
 struct OllamaSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = OllamaSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
     @State private var showImportError = false
 
-    private let startURL = URL(string: "https://ollama.com/login")!
+    private let startURL = URL(string: "https://ollama.com/settings")!
 
     var body: some View {
         VStack(spacing: 0) {
@@ -501,7 +541,7 @@ struct OllamaSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
             }
             .buttonStyle(.bordered)
 
@@ -540,7 +580,7 @@ struct OllamaSessionImportView: View {
                 bookmarkData: nil
             )
             onImport(.success(imported))
-            dismiss()
+            close()
         } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -621,7 +661,16 @@ private enum OllamaSessionImportError: LocalizedError {
 struct MistralSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = MistralSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -691,7 +740,7 @@ struct MistralSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
             }
             .buttonStyle(.bordered)
 
@@ -730,7 +779,7 @@ struct MistralSessionImportView: View {
                 bookmarkData: nil
             )
             onImport(.success(imported))
-            dismiss()
+            close()
         } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -808,7 +857,16 @@ private enum MistralSessionImportError: LocalizedError {
 struct MetaWebSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = MetaWebSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -877,7 +935,7 @@ struct MetaWebSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
              }
              .buttonStyle(.bordered)
 
@@ -916,7 +974,7 @@ struct MetaWebSessionImportView: View {
                 bookmarkData: nil
              )
             onImport(.success(imported))
-            dismiss()
+            close()
          } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -1004,12 +1062,261 @@ private enum MetaWebSessionImportError: LocalizedError {
      }
 }
 
+// MARK: - Muse Code Subscription Import View
+
+struct MuseSubscriptionImportView: View {
+    let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
+
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
+    @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
+    @State private var model = MuseSubscriptionImportModel()
+    @State private var isImporting = false
+    @State private var importError: String?
+    @State private var showImportError = false
+
+    /// The user's Meta usage page. The project/team query params are
+     /// preserved so the embedded browser lands on the right usage context.
+    private let startURL = URL(string: "https://dev.meta.ai/usage/?project_id=1514228250391823&team_id=1760015591684812")!
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+
+            CursorSessionWebView(webView: model.webView)
+                .frame(minWidth: 720, minHeight: 560)
+
+            Divider()
+
+            footer
+         }
+         .frame(minWidth: 760, minHeight: 720)
+         .onAppear {
+            model.load(startURL: startURL)
+         }
+         .alert("Could Not Import Session", isPresented: $showImportError) {
+            Button("OK", role: .cancel) {}
+         } message: {
+            Text(importError ?? "No Muse Code subscription meters were found in the embedded browser.")
+         }
+     }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProviderBrandIconView(providerID: .meta, size: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Muse Code subscription session")
+                         .font(.headline.weight(.semibold))
+
+                    Text("Sign in inside the embedded browser, wait for the subscription meters, then import the active dev.meta.ai session into Keychain.")
+                         .font(.subheadline)
+                         .foregroundStyle(.secondary)
+                 }
+
+                Spacer()
+             }
+             .padding(.horizontal, 20)
+             .padding(.top, 18)
+
+            Text("Uses this browser session to read Muse Code Current usage and Weekly limit, at most hourly. If Meta blocks a request, automatic checks pause for six hours.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+                 .padding(.horizontal, 20)
+         }
+         .padding(.bottom, 14)
+     }
+
+    private var footer: some View {
+        HStack {
+            Text("After the Current usage and Weekly limit meters appear, import the session.")
+                 .font(.footnote)
+                 .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("Cancel") {
+                close()
+             }
+             .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    await importCurrentSession()
+                 }
+             } label: {
+                if isImporting {
+                    ProgressView()
+                         .progressViewStyle(.circular)
+                 } else {
+                    Text("Import Session")
+                 }
+             }
+             .buttonStyle(.borderedProminent)
+             .tint(Color(hex: ProviderID.meta.accentColorHex))
+             .disabled(isImporting)
+         }
+         .padding(20)
+     }
+
+    private func importCurrentSession() async {
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            let session = try await model.captureSession()
+            let imported = CredentialImportService.ImportedCredential(
+                accessToken: nil,
+                accountIdentifier: nil,
+                customEndpoint: nil,
+extraFields: museSubscriptionImportExtraFields(
+                    cookieHeader: session.cookieHeader,
+                    reading: session.reading,
+                    url: model.webView.url
+                ),
+                bookmarkData: nil
+             )
+            onImport(.success(imported))
+            close()
+         } catch {
+            importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            showImportError = true
+         }
+     }
+}
+
+@MainActor
+final class MuseSubscriptionImportModel: NSObject, WKUIDelegate {
+    let webView: WKWebView
+    private let popupHost = BrowserSessionPopupHost()
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+     }
+
+    func load(startURL: URL) {
+        guard webView.url == nil else { return }
+        let savedURL = KeychainService.shared.credential(for: .meta)?.extraFields?[SpendProviderCredentialField.browserSessionURL]
+        webView.load(URLRequest(url: BrowserSessionRefreshPolicy.validatedURL(savedURL, fallback: startURL)))
+     }
+
+    func captureSession() async throws -> (cookieHeader: String, reading: MuseSubscriptionWebReading) {
+        let cookieHeader = try await captureCookieHeader()
+        guard let renderedText = await webView.renderedBodyText(),
+              let reading = MuseSubscriptionWebClient.parse(renderedText: renderedText, now: Date()) else {
+            throw MuseSubscriptionImportError.noSubscriptionReading
+        }
+        return (cookieHeader, reading)
+    }
+
+    private func captureCookieHeader() async throws -> String {
+        let cookies = try await webView.allCookies()
+        let relevantCookies = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return domain == "meta.ai" || domain.hasSuffix(".meta.ai")
+                 || domain == "meta.com" || domain.hasSuffix(".meta.com")
+         }
+
+        guard !relevantCookies.isEmpty else {
+            throw MuseSubscriptionImportError.noCookiesFound
+         }
+
+        let header = relevantCookies
+             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+             .map { "\($0.name)=\($0.value)" }
+             .joined(separator: "; ")
+
+        guard !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MuseSubscriptionImportError.noCookiesFound
+         }
+
+        return header
+     }
+
+    func webView(
+         _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+     ) -> WKWebView? {
+        guard navigationAction.targetFrame == nil else { return nil }
+        return popupHost.open(in: webView, configuration: configuration)
+     }
+}
+
+private enum MuseSubscriptionImportError: LocalizedError {
+    case noCookiesFound
+    case noSubscriptionReading
+
+    var errorDescription: String? {
+        switch self {
+        case .noCookiesFound:
+            return "No Meta session cookies were found. Make sure you signed in to dev.meta.ai in the embedded browser first."
+        case .noSubscriptionReading:
+            return "The Meta usage page is signed in, but no Muse Code subscription meters were found. Wait for the Current usage and Weekly limit cards to load, then import again."
+         }
+     }
+}
+
+private func museSubscriptionImportExtraFields(
+    cookieHeader: String,
+    reading: MuseSubscriptionWebReading,
+    url: URL?
+) -> [String: String] {
+    var fields = browserSessionImportFields(url: url).merging([
+        SpendProviderCredentialField.metaCookieHeader: cookieHeader,
+        SpendProviderCredentialField.museCachedAt: ISO8601DateFormatter().string(from: Date())
+    ], uniquingKeysWith: { _, new in new })
+    if let currentPercent = reading.currentUsedPercent {
+        fields[SpendProviderCredentialField.museCachedCurrentPercent] = String(currentPercent)
+    }
+    if let weeklyPercent = reading.weeklyUsedPercent {
+        fields[SpendProviderCredentialField.museCachedWeeklyPercent] = String(weeklyPercent)
+    }
+    if let planName = reading.planName?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !planName.isEmpty {
+        fields[SpendProviderCredentialField.museCachedPlanName] = planName
+    }
+    if let weeklyResetAt = reading.weeklyResetAt {
+        fields[SpendProviderCredentialField.museCachedWeeklyResetAt] = ISO8601DateFormatter().string(from: weeklyResetAt)
+    }
+    // The current window rolls in hours, so this only stays useful until it
+    // lapses; the meter drops the reset rather than showing a past time.
+    if let currentResetAt = reading.currentResetAt {
+        fields[SpendProviderCredentialField.museCachedCurrentResetAt] = ISO8601DateFormatter().string(from: currentResetAt)
+    }
+    return fields
+}
+
 // MARK: - Cerebras Web Session Import View
 
 struct CerebrasWebSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = CerebrasWebSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -1078,7 +1385,7 @@ struct CerebrasWebSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
              }
              .buttonStyle(.bordered)
 
@@ -1106,18 +1413,20 @@ struct CerebrasWebSessionImportView: View {
         defer { isImporting = false }
 
         do {
-            let cookieHeader = try await model.captureCookieHeader()
+            let session = try await model.captureSession()
             let imported = CredentialImportService.ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
                 customEndpoint: nil,
-                extraFields: [
-                     "cerebrasCookieHeader": cookieHeader
-                 ],
+extraFields: cerebrasWebSessionExtraFields(
+                    cookieHeader: session.cookieHeader,
+                    reading: session.reading,
+                    url: model.webView.url
+                ),
                 bookmarkData: nil
              )
             onImport(.success(imported))
-            dismiss()
+            close()
          } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -1128,6 +1437,7 @@ struct CerebrasWebSessionImportView: View {
 @MainActor
 final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
     let webView: WKWebView
+    private let popupHost = BrowserSessionPopupHost()
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -1140,10 +1450,20 @@ final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
-        webView.load(URLRequest(url: startURL))
+        let savedURL = KeychainService.shared.credential(for: .cerebras)?.extraFields?[SpendProviderCredentialField.browserSessionURL]
+        webView.load(URLRequest(url: BrowserSessionRefreshPolicy.validatedURL(savedURL, fallback: startURL)))
      }
 
-    func captureCookieHeader() async throws -> String {
+    func captureSession() async throws -> (cookieHeader: String, reading: WebBillingReading) {
+        let cookieHeader = try await captureCookieHeader()
+        guard let renderedText = await webView.renderedBodyText(),
+              let reading = WebBillingClient.parse(html: renderedText, now: Date()) else {
+            throw CerebrasWebSessionImportError.noBillingReading
+        }
+        return (cookieHeader, reading)
+    }
+
+    private func captureCookieHeader() async throws -> String {
         let cookies = try await webView.allCookies()
         let relevantCookies = cookies.filter { cookie in
             let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
@@ -1172,10 +1492,8 @@ final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
      ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-         }
-        return nil
+        guard navigationAction.targetFrame == nil else { return nil }
+        return popupHost.open(in: webView, configuration: configuration)
      }
 
     static func clearStoredWebsiteData() {
@@ -1194,13 +1512,100 @@ final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
 
 private enum CerebrasWebSessionImportError: LocalizedError {
     case noCookiesFound
+    case noBillingReading
 
     var errorDescription: String? {
         switch self {
         case .noCookiesFound:
             return "No Cerebras session cookies were found. Make sure you signed in to cloud.cerebras.ai in the embedded browser first."
+        case .noBillingReading:
+            return "The Cerebras billing page is signed in, but its current balance has not finished loading. Wait for the balance, then import again."
           }
       }
+}
+
+private func cerebrasWebSessionExtraFields(
+    cookieHeader: String,
+    reading: WebBillingReading,
+    url: URL?
+) -> [String: String] {
+    var fields = browserSessionImportFields(url: url)
+    fields[SpendProviderCredentialField.cerebrasCookieHeader] = cookieHeader
+    fields[SpendProviderCredentialField.cerebrasCachedAt] = ISO8601DateFormatter().string(from: Date())
+    if let balance = reading.balance {
+        fields[SpendProviderCredentialField.cerebrasCachedBalance] = String(balance)
+    }
+    if let spend = reading.spend {
+        fields[SpendProviderCredentialField.cerebrasCachedSpend] = String(spend)
+    }
+    fields[SpendProviderCredentialField.cerebrasCachedCurrency] = reading.currency
+    if let periodEnd = reading.periodEnd {
+        fields[SpendProviderCredentialField.cerebrasCachedResetAt] = ISO8601DateFormatter().string(from: periodEnd)
+    }
+    return fields
+}
+
+private func tokenPlanImportExtraFields(
+    cookieField: String,
+    cookieHeader: String,
+    reading: TokenPlanWebReading,
+    url: URL?
+) -> [String: String] {
+    var fields = browserSessionImportFields(url: url).merging([
+        cookieField: cookieHeader,
+        SpendProviderCredentialField.tokenPlanCachedAt: ISO8601DateFormatter().string(from: Date())
+    ], uniquingKeysWith: { _, new in new })
+    if let usedPercent = reading.quotaUsedPercent {
+        fields[SpendProviderCredentialField.tokenPlanCachedUsedPercent] = String(usedPercent)
+    }
+    if let planName = reading.planName?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !planName.isEmpty {
+        fields[SpendProviderCredentialField.tokenPlanCachedPlanName] = planName
+    }
+    if let periodEnd = reading.periodEnd {
+        fields[SpendProviderCredentialField.tokenPlanCachedResetAt] = ISO8601DateFormatter().string(from: periodEnd)
+    }
+    return fields
+}
+
+/// OAuth popup callbacks need their original opener and WebKit configuration.
+@MainActor
+private final class BrowserSessionPopupHost: NSObject, WKUIDelegate {
+    private var popups: [WKWebView] = []
+
+    func open(in parent: WKWebView, configuration: WKWebViewConfiguration) -> WKWebView {
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.uiDelegate = self
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        parent.addSubview(popup)
+        NSLayoutConstraint.activate([
+            popup.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+            popup.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+            popup.topAnchor.constraint(equalTo: parent.topAnchor),
+            popup.bottomAnchor.constraint(equalTo: parent.bottomAnchor)
+        ])
+        popups.append(popup)
+        return popup
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard navigationAction.targetFrame == nil else { return nil }
+        return open(in: webView, configuration: configuration)
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        webView.removeFromSuperview()
+        popups.removeAll { $0 === webView }
+    }
+}
+
+private func browserSessionImportFields(url: URL?) -> [String: String] {
+    var fields = [SpendProviderCredentialField.browserSessionID: UUID().uuidString]
+    if let url, url.scheme == "https" {
+        fields[SpendProviderCredentialField.browserSessionURL] = url.absoluteString
+    }
+    return fields
 }
 
 // MARK: - Qwen Token Plan Web Session Import View
@@ -1208,7 +1613,16 @@ private enum CerebrasWebSessionImportError: LocalizedError {
 struct QwenWebSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = QwenWebSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -1275,7 +1689,7 @@ struct QwenWebSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
               }
               .buttonStyle(.bordered)
 
@@ -1303,18 +1717,21 @@ struct QwenWebSessionImportView: View {
         defer { isImporting = false }
 
         do {
-            let cookieHeader = try await model.captureCookieHeader()
+            let session = try await model.captureSession()
             let imported = CredentialImportService.ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
                 customEndpoint: nil,
-                extraFields: [
-                      "qwenCookieHeader": cookieHeader
-                  ],
+extraFields: tokenPlanImportExtraFields(
+                    cookieField: SpendProviderCredentialField.qwenCookieHeader,
+                    cookieHeader: session.cookieHeader,
+                    reading: session.reading,
+                    url: model.webView.url
+                ),
                 bookmarkData: nil
               )
             onImport(.success(imported))
-            dismiss()
+            close()
           } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -1325,6 +1742,7 @@ struct QwenWebSessionImportView: View {
 @MainActor
 final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
     let webView: WKWebView
+    private let popupHost = BrowserSessionPopupHost()
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -1337,8 +1755,19 @@ final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
-        webView.load(URLRequest(url: startURL))
+        let savedURL = KeychainService.shared.credential(for: .qwen)?.extraFields?[SpendProviderCredentialField.browserSessionURL]
+        webView.load(URLRequest(url: BrowserSessionRefreshPolicy.validatedURL(savedURL, fallback: startURL)))
       }
+
+    func captureSession() async throws -> (cookieHeader: String, reading: TokenPlanWebReading) {
+        let cookieHeader = try await captureCookieHeader()
+        guard let renderedText = await webView.renderedBodyText(),
+              let reading = TokenPlanWebClient.parseQwen(renderedText: renderedText),
+              reading.quotaUsedPercent != nil else {
+            throw QwenWebSessionImportError.noQuotaReading
+        }
+        return (cookieHeader, reading)
+    }
 
     func captureCookieHeader() async throws -> String {
         let cookies = try await webView.allCookies()
@@ -1370,10 +1799,8 @@ final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
       ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-          }
-        return nil
+        guard navigationAction.targetFrame == nil else { return nil }
+        return popupHost.open(in: webView, configuration: configuration)
       }
 
     static func clearStoredWebsiteData() {
@@ -1393,11 +1820,14 @@ final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
 
 private enum QwenWebSessionImportError: LocalizedError {
     case noCookiesFound
+    case noQuotaReading
 
     var errorDescription: String? {
         switch self {
         case .noCookiesFound:
             return "No Qwen session cookies were found. Make sure you signed in to the Model Studio console in the embedded browser first."
+        case .noQuotaReading:
+            return "The Qwen page is signed in, but its 7-day quota has not finished loading. Wait for the quota meter, then import again."
           }
       }
 }
@@ -1407,7 +1837,16 @@ private enum QwenWebSessionImportError: LocalizedError {
 struct MimoWebSessionImportView: View {
     let onImport: (Result<CredentialImportService.ImportedCredential, Error>) -> Void
 
+    /// Set when this view is hosted as a page inside the setup sheet. There,
+    /// `dismiss` would tear down the whole sheet instead of returning to the
+    /// provider's form, so the host supplies its own way back.
+    var onClose: (() -> Void)?
+
     @Environment(\.dismiss) private var dismiss
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var model = MimoWebSessionImportModel()
     @State private var isImporting = false
     @State private var importError: String?
@@ -1474,7 +1913,7 @@ struct MimoWebSessionImportView: View {
             Spacer()
 
             Button("Cancel") {
-                dismiss()
+                close()
               }
               .buttonStyle(.bordered)
 
@@ -1502,18 +1941,21 @@ struct MimoWebSessionImportView: View {
         defer { isImporting = false }
 
         do {
-            let cookieHeader = try await model.captureCookieHeader()
+            let session = try await model.captureSession()
             let imported = CredentialImportService.ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
                 customEndpoint: nil,
-                extraFields: [
-                      "mimoCookieHeader": cookieHeader
-                  ],
+extraFields: tokenPlanImportExtraFields(
+                    cookieField: SpendProviderCredentialField.mimoCookieHeader,
+                    cookieHeader: session.cookieHeader,
+                    reading: session.reading,
+                    url: model.webView.url
+                ),
                 bookmarkData: nil
               )
             onImport(.success(imported))
-            dismiss()
+            close()
           } catch {
             importError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             showImportError = true
@@ -1524,6 +1966,7 @@ struct MimoWebSessionImportView: View {
 @MainActor
 final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
     let webView: WKWebView
+    private let popupHost = BrowserSessionPopupHost()
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -1536,8 +1979,19 @@ final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
-        webView.load(URLRequest(url: startURL))
+        let savedURL = KeychainService.shared.credential(for: .mimo)?.extraFields?[SpendProviderCredentialField.browserSessionURL]
+        webView.load(URLRequest(url: BrowserSessionRefreshPolicy.validatedURL(savedURL, fallback: startURL)))
       }
+
+    func captureSession() async throws -> (cookieHeader: String, reading: TokenPlanWebReading) {
+        let cookieHeader = try await captureCookieHeader()
+        guard let renderedText = await webView.renderedBodyText(),
+              let reading = TokenPlanWebClient.parse(renderedText: renderedText),
+              reading.quotaUsedPercent != nil else {
+            throw MimoWebSessionImportError.noQuotaReading
+        }
+        return (cookieHeader, reading)
+    }
 
     func captureCookieHeader() async throws -> String {
         let cookies = try await webView.allCookies()
@@ -1568,10 +2022,8 @@ final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
       ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-          }
-        return nil
+        guard navigationAction.targetFrame == nil else { return nil }
+        return popupHost.open(in: webView, configuration: configuration)
       }
 
     static func clearStoredWebsiteData() {
@@ -1590,11 +2042,14 @@ final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
 
 private enum MimoWebSessionImportError: LocalizedError {
     case noCookiesFound
+    case noQuotaReading
 
     var errorDescription: String? {
         switch self {
         case .noCookiesFound:
             return "No MiMo session cookies were found. Make sure you signed in to platform.xiaomimimo.com in the embedded browser first."
+        case .noQuotaReading:
+            return "The MiMo page is signed in, but its plan quota has not finished loading. Wait for the usage meter, then import again."
           }
       }
 }
