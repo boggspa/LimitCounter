@@ -138,7 +138,7 @@ private func testClaudeFableWindowFromWeeklyScopedLimit() throws {
 
     try expect(limit.isFableWeeklyLimit, "weekly_scoped Claude limit should map to Fable")
     try expect(window != nil, "Fable limit should create a quota window")
-    try expectEqual(window?.label, "Fable", "Fable scoped label")
+    try expectEqual(window?.label, "🪐 Fable", "Fable scoped label")
     try expectEqual(window?.used, 0, "Fable scoped utilization")
     try expectEqual(window?.resetDate, reset, "Fable scoped reset")
     try expectEqual(window?.subtitle, "You haven't used Fable yet", "Fable zero-use subtitle")
@@ -389,8 +389,8 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     try expectEqual(extraFields[ClaudeOAuthCredentialPolicy.keychainAccessEnabledKey], nil, "disabled Claude Code keychain fallback flag should not be persisted")
 
     try expect(
-        !ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: true, userInitiated: false),
-        "background refresh must never read Claude Code's keychain item"
+        ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: true, userInitiated: false),
+        "opted-in background refresh can reuse an existing Keychain grant"
     )
     try expect(
         !ClaudeOAuthCredentialPolicy.allowsClaudeCodeKeychainAccess(enabled: false, userInitiated: true),
@@ -401,12 +401,18 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
         "an opted-in manual refresh may recover from Claude Code's keychain item"
     )
 
-    try expect(
-        ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
+    guard let backgroundBudget = ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
             enabled: true,
             userInitiated: false
-        ) == nil,
-        "background refresh must not receive a Claude Code keychain read budget"
+        ) else {
+        throw TestError.failure("background recovery needs a silent read budget")
+    }
+    try expect(backgroundBudget.authenticationContext.interactionNotAllowed, "background recovery cannot prompt")
+    try expect(backgroundBudget.claimRead(), "silent recovery gets one read")
+    try expect(!backgroundBudget.claimRead(), "silent recovery cannot loop")
+    try expect(
+        !ProviderFetchError.rateLimited.shouldRecoverClaudeOAuthFromKeychain,
+        "rate limiting must not trigger Keychain authorization or token recovery"
     )
     guard let manualRefreshBudget = ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
         enabled: true,
@@ -414,6 +420,7 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     ) else {
         throw TestError.failure("opted-in manual refresh should receive a Claude Code keychain read budget")
     }
+    try expect(!manualRefreshBudget.authenticationContext.interactionNotAllowed, "manual recovery may authorize access")
     try expect(
         manualRefreshBudget.claimRead(),
         "the first Claude Code keychain read in a manual refresh should be allowed"
@@ -511,6 +518,317 @@ private func testClaudeHeatmapHistoryPreservesUnscannedBuckets() throws {
     )
 }
 
+// MARK: - AGBench event merging
+
+/// TaskWraith drives the `claude` CLI, so a run it records is the same run the
+/// transcript scan already bucketed. Concatenating the two lists counted that
+/// usage twice.
+private func testClaudeAGBenchRunsDoNotDoubleCountTranscriptUsage() throws {
+    let now = makeDate("2026-05-16T12:00:00Z")
+    let bucketStart = makeDate("2026-05-16T04:00:00Z")
+    let transcriptBuckets = [
+        UsageEvent(timestamp: bucketStart, tokens: 1_000, model: "Claude", type: .bucket)
+    ]
+    // The same run, as TaskWraith reports it: two raw per-run rows inside that
+    // bucket, together no larger than what the transcript already saw.
+    let agbenchEvents = [
+        UsageEvent(timestamp: bucketStart.addingTimeInterval(60), tokens: 400, model: "claude-opus-5"),
+        UsageEvent(timestamp: bucketStart.addingTimeInterval(120), tokens: 300, model: "claude-opus-5")
+    ]
+
+    let merged = ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: transcriptBuckets, now: now, calendar: utcCalendar())
+
+    try expectEqual(merged.count, 1, "AGBench rows fold into the existing bucket")
+    try expectEqual(merged[0].tokens, 1_000, "transcript total wins; runs are not added on top")
+    try expect(merged.allSatisfy { $0.type == .bucket }, "no raw per-run events survive the merge")
+}
+
+/// A run whose temporary workspace was cleaned up leaves no transcript, so
+/// TaskWraith is the only remaining record of it and must still count.
+private func testClaudeAGBenchRecoversRunsMissingFromTranscripts() throws {
+    let now = makeDate("2026-05-16T12:00:00Z")
+    let scannedBucket = makeDate("2026-05-16T04:00:00Z")
+    let unscannedBucket = makeDate("2026-05-16T08:00:00Z")
+    let transcriptBuckets = [
+        UsageEvent(timestamp: scannedBucket, tokens: 1_000, model: "Claude", type: .bucket)
+    ]
+    let agbenchEvents = [
+        UsageEvent(timestamp: unscannedBucket.addingTimeInterval(30), tokens: 250, model: "claude-opus-5")
+    ]
+
+    let merged = ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: transcriptBuckets, now: now, calendar: utcCalendar())
+
+    try expectEqual(merged.count, 2, "a bucket the transcript scan never saw is added")
+    try expectEqual(
+        merged.first { $0.timestamp == unscannedBucket }?.tokens,
+        250,
+        "AGBench-only usage is preserved"
+    )
+}
+
+/// The regression that inflated the 30-day total to 187B: every refresh
+/// appended the same AGBench rows again, and because `UsageEvent` mints a fresh
+/// `id` per construction nothing ever recognised them as repeats.
+private func testClaudeAGBenchMergeIsIdempotentAcrossRefreshes() throws {
+    let now = makeDate("2026-05-16T12:00:00Z")
+    let bucketStart = makeDate("2026-05-16T04:00:00Z")
+    let agbenchEvents = [
+        UsageEvent(timestamp: bucketStart.addingTimeInterval(60), tokens: 400, model: "claude-opus-5")
+    ]
+
+    var events: [UsageEvent] = []
+    for _ in 0..<44 {
+        // Each refresh re-reads usage.json, so the rows arrive as brand-new
+        // values with brand-new ids every time.
+        let reread = agbenchEvents.map {
+            UsageEvent(timestamp: $0.timestamp, tokens: $0.tokens, model: $0.model, type: $0.type)
+        }
+        events = ClaudeHeatmapEventHistory.mergingAGBench(reread, into: events, now: now, calendar: utcCalendar())
+    }
+
+    try expectEqual(events.count, 1, "44 refreshes must not grow the event list")
+    try expectEqual(events[0].tokens, 400, "44 refreshes must not multiply the token total")
+}
+
+// MARK: - Cross-snapshot event de-duplication
+
+/// `codexTelemetry` republishes the `openai` snapshot's Codex events verbatim,
+/// sharing their ids.
+private func testDeduplicatorCollapsesEventsSharedAcrossProviders() throws {
+    let shared = UsageEvent(timestamp: makeDate("2026-05-16T04:00:00Z"), tokens: 500, model: "Codex", type: .telemetry)
+    let snapshots = [
+        QuotaSnapshot(providerID: .openai, displayName: "OpenAI", events: [shared]),
+        QuotaSnapshot(providerID: .codexTelemetry, displayName: "Codex", events: [shared])
+    ]
+
+    let events = UsageEventDeduplicator.flatten(snapshots)
+
+    try expectEqual(events.count, 1, "the same event under two providers counts once")
+    try expectEqual(events.map(\.tokens).compactMap { $0 }.reduce(0, +), 500, "token total is not doubled")
+}
+
+/// The id-based filter cannot see content repeats, because every copy carries a
+/// fresh `id`. Claude had reached 44 copies of each run this way; Kimi, OpenAI
+/// and Meta were accumulating the same way more slowly.
+private func testDeduplicatorCollapsesContentRepeatsWithinAProvider() throws {
+    let timestamp = makeDate("2026-05-16T04:00:00Z")
+    let copies = (0..<44).map { _ in
+        UsageEvent(timestamp: timestamp, tokens: 1_000, model: "claude-opus-5")
+    }
+    let snapshots = [QuotaSnapshot(providerID: .claude, displayName: "Claude", events: copies)]
+
+    let events = UsageEventDeduplicator.flatten(snapshots)
+
+    try expectEqual(events.count, 1, "44 content-identical copies count once")
+    try expectEqual(events[0].tokens, 1_000, "token total reflects one run, not 44")
+}
+
+/// The content key must not reach across providers: two providers genuinely
+/// billing the same amount in the same second are two real events.
+private func testDeduplicatorKeepsMatchingEventsFromDifferentProviders() throws {
+    let timestamp = makeDate("2026-05-16T04:00:00Z")
+    let snapshots = [
+        QuotaSnapshot(
+            providerID: .grok,
+            displayName: "Grok",
+            events: [UsageEvent(timestamp: timestamp, tokens: 100, model: "grok")]
+        ),
+        QuotaSnapshot(
+            providerID: .deepseek,
+            displayName: "DeepSeek",
+            events: [UsageEvent(timestamp: timestamp, tokens: 100, model: "grok")]
+        )
+    ]
+
+    let events = UsageEventDeduplicator.flatten(snapshots)
+
+    try expectEqual(events.count, 2, "identical payloads from two providers both count")
+    try expectEqual(events.compactMap(\.tokens).reduce(0, +), 200, "neither provider is swallowed")
+}
+
+/// Distinct usage inside one provider must survive: same second, different
+/// totals.
+private func testDeduplicatorKeepsDistinctEventsInTheSameSecond() throws {
+    let timestamp = makeDate("2026-05-16T04:00:00Z")
+    let snapshots = [
+        QuotaSnapshot(
+            providerID: .claude,
+            displayName: "Claude",
+            events: [
+                UsageEvent(timestamp: timestamp, tokens: 100, model: "claude-opus-5"),
+                UsageEvent(timestamp: timestamp, tokens: 250, model: "claude-opus-5")
+            ]
+        )
+    ]
+
+    let events = UsageEventDeduplicator.flatten(snapshots)
+
+    try expectEqual(events.count, 2, "different token totals are different events")
+    try expectEqual(events.compactMap(\.tokens).reduce(0, +), 350, "both are counted")
+}
+
+// MARK: - OAuth credential renewal
+
+private func makeClaudeCredential(
+    accessToken: String = "access-1",
+    refreshToken: String? = "refresh-1",
+    expiresInHours: Double = 8
+) -> ClaudeOAuthCredentials {
+    let expiry = Date().addingTimeInterval(expiresInHours * 3600).timeIntervalSince1970 * 1000
+    var raw: [String: Any] = [
+        "accessToken": accessToken,
+        "expiresAt": NSNumber(value: Int64(expiry)),
+        "scopes": ["user:profile", "user:inference"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x"
+    ]
+    if let refreshToken { raw["refreshToken"] = refreshToken }
+    return ClaudeOAuthCredentials(
+        accessToken: accessToken,
+        refreshToken: refreshToken,
+        expiresAtMillis: expiry,
+        scopes: ["user:profile", "user:inference"],
+        rawOAuthDict: raw
+    )
+}
+
+private func testClaudeRefreshGrantAdoptsRotatedToken() throws {
+    let base = makeClaudeCredential(expiresInHours: 0.2)
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let body = """
+    {"access_token":"access-2","refresh_token":"refresh-2","expires_in":28800,
+     "scope":"user:profile user:inference user:sessions:claude_code"}
+    """.data(using: .utf8)!
+
+    let renewed = try ClaudeOAuthRefreshClient.credentials(
+        fromRefreshResponse: body,
+        status: 200,
+        base: base,
+        now: now
+    )
+
+    try expectEqual(renewed.accessToken, "access-2", "adopts the new access token")
+    try expectEqual(renewed.refreshToken, "refresh-2", "adopts a rotated refresh token")
+    try expectEqual(renewed.expiresAt, now.addingTimeInterval(28800), "expiry comes from expires_in")
+    try expect(renewed.scopes.contains("user:profile"), "keeps the scope /api/oauth/usage needs")
+
+    // The credential is written back into Claude Code's own keychain item, so
+    // every field the CLI stored has to survive the round trip.
+    try expectEqual(renewed.rawOAuthDict["subscriptionType"] as? String, "max", "preserves subscriptionType")
+    try expectEqual(renewed.rawOAuthDict["rateLimitTier"] as? String, "default_claude_max_20x", "preserves rateLimitTier")
+    try expectEqual(renewed.rawOAuthDict["refreshToken"] as? String, "refresh-2", "raw dict carries the rotated token")
+    try expectEqual(
+        (renewed.rawOAuthDict["expiresAt"] as? NSNumber)?.int64Value,
+        Int64(now.addingTimeInterval(28800).timeIntervalSince1970 * 1000),
+        "raw dict stores millisecond expiry like the CLI does"
+    )
+}
+
+private func testClaudeRefreshGrantKeepsTokenWhenServerDoesNotRotate() throws {
+    let base = makeClaudeCredential()
+    let body = #"{"access_token":"access-2","expires_in":28800}"#.data(using: .utf8)!
+    let renewed = try ClaudeOAuthRefreshClient.credentials(
+        fromRefreshResponse: body,
+        status: 200,
+        base: base
+    )
+    try expectEqual(renewed.refreshToken, "refresh-1", "an omitted refresh_token means the old one still works")
+    try expect(renewed.scopes.contains("user:profile"), "falls back to the stored scopes")
+}
+
+private func testClaudeRefreshFailuresAreClassified() throws {
+    let base = makeClaudeCredential()
+    for status in [400, 401, 403] {
+        do {
+            _ = try ClaudeOAuthRefreshClient.credentials(
+                fromRefreshResponse: Data(), status: status, base: base
+            )
+            throw TestError.failure("HTTP \(status) should not yield a credential")
+        } catch let error as ClaudeOAuthRefreshClient.RefreshError {
+            try expect(error.isTerminal, "HTTP \(status) is a dead refresh token, not a retry")
+        }
+    }
+
+    do {
+        _ = try ClaudeOAuthRefreshClient.credentials(
+            fromRefreshResponse: Data(), status: 503, base: base
+        )
+        throw TestError.failure("HTTP 503 should not yield a credential")
+    } catch let error as ClaudeOAuthRefreshClient.RefreshError {
+        try expect(!error.isTerminal, "a 503 is transient and must be retried")
+    }
+
+    // The token endpoint rate-limits without a Retry-After header, so a 429
+    // must be both retryable and slower to retry than an ordinary blip.
+    let rateLimited = ClaudeOAuthRefreshClient.RefreshError.rejected(status: 429)
+    try expect(!rateLimited.isTerminal, "a 429 never means the refresh token is dead")
+    try expect(rateLimited.retryDelay > ClaudeOAuthRefreshClient.RefreshError.malformedResponse.retryDelay,
+               "a 429 backs off for longer than a transient parse failure")
+
+    do {
+        _ = try ClaudeOAuthRefreshClient.credentials(
+            fromRefreshResponse: Data("not json".utf8), status: 200, base: base
+        )
+        throw TestError.failure("garbage body should not yield a credential")
+    } catch let error as ClaudeOAuthRefreshClient.RefreshError {
+        try expect(!error.isTerminal, "an unparseable body is transient")
+    }
+}
+
+private func testClaudeRefreshRequestRequiresARefreshToken() throws {
+    let withoutToken = makeClaudeCredential(refreshToken: nil)
+    do {
+        _ = try ClaudeOAuthRefreshClient.refreshRequest(for: withoutToken)
+        throw TestError.failure("a credential with no refresh token cannot be renewed")
+    } catch let error as ClaudeOAuthRefreshClient.RefreshError {
+        try expect(error.isTerminal, "a missing refresh token is terminal")
+    }
+
+    let request = try ClaudeOAuthRefreshClient.refreshRequest(for: makeClaudeCredential())
+    try expectEqual(request.httpMethod, "POST", "refresh is a POST")
+    try expectEqual(request.url, ClaudeOAuthRefreshClient.tokenEndpoint, "targets the CLI's token endpoint")
+    let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+    try expectEqual(body?["grant_type"] as? String, "refresh_token", "uses the refresh grant")
+    try expectEqual(body?["refresh_token"] as? String, "refresh-1", "sends the stored refresh token")
+    try expectEqual(
+        body?["client_id"] as? String,
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "reuses Claude Code's client id so the credential stays interchangeable"
+    )
+    try expect(
+        (body?["scope"] as? String)?.contains("user:profile") == true,
+        "requests the scope /api/oauth/usage needs"
+    )
+}
+
+private func testClaudeCredentialExpiryDrivesCacheRefresh() throws {
+    // Our copy of Claude Code's token is a cache, not a credential we can
+    // renew: the only move once it ages is to read the CLI's item again.
+    let fresh = makeClaudeCredential(expiresInHours: 8)
+    try expect(!fresh.needsRefresh(buffer: 10 * 60), "a token with 8h left needs no re-read")
+
+    let due = makeClaudeCredential(expiresInHours: 0.1)
+    try expect(due.needsRefresh(buffer: 10 * 60), "inside the last ten minutes we look at the CLI's item again")
+    try expect(!due.needsRefresh(buffer: 60), "but the cached token is still usable meanwhile")
+}
+
+private func testClaudeMirrorNeverStoresTheRefreshToken() throws {
+    // Limit Counter does not renew the credential — Claude Code does. Keeping
+    // a copy of the refresh token would buy nothing and would hand a future
+    // code path the means to renew the CLI's lineage behind its back, which is
+    // what led to writing the CLI's keychain item and to macOS asking for the
+    // login password on every `security find-generic-password` the CLI runs.
+    let adopted = makeClaudeCredential(refreshToken: "refresh-1", expiresInHours: 8)
+    try expect(adopted.refreshToken != nil, "Claude Code's own item carries a refresh token")
+
+    let mirrored = adopted.mirrorPayload
+    try expect(mirrored["refreshToken"] == nil, "the mirror drops the refresh token")
+    try expectEqual(mirrored["accessToken"] as? String, "access-1", "the mirror keeps the access token")
+    try expectEqual(mirrored["subscriptionType"] as? String, "max", "plan metadata survives mirroring")
+    try expectEqual(mirrored["rateLimitTier"] as? String, "default_claude_max_20x", "tier metadata survives mirroring")
+    try expect(mirrored["expiresAt"] is NSNumber, "expiry is stored in Claude Code's integer-millisecond format")
+}
+
 @main
 private enum ClaudeUsageTestRunner {
     static func main() throws {
@@ -526,9 +844,37 @@ private enum ClaudeUsageTestRunner {
         try testClaudeOAuthCacheRejectsTranscriptSnapshots()
         try testClaudeOAuthCachePersistsQuotaOnlyAcrossInstances()
         try testClaudeCodeKeychainFallbackIsOptIn()
+        try testClaudeRateLimitCooldownDoesNotRequestKeychain()
         try testClaudeJSONLReaderStreamsAcrossChunkBoundaries()
         try testClaudeJSONLReaderBoundsOversizedTranscriptsToTail()
         try testClaudeHeatmapHistoryPreservesUnscannedBuckets()
+        try testClaudeAGBenchRunsDoNotDoubleCountTranscriptUsage()
+        try testClaudeAGBenchRecoversRunsMissingFromTranscripts()
+        try testClaudeAGBenchMergeIsIdempotentAcrossRefreshes()
+        try testDeduplicatorCollapsesEventsSharedAcrossProviders()
+        try testDeduplicatorCollapsesContentRepeatsWithinAProvider()
+        try testDeduplicatorKeepsMatchingEventsFromDifferentProviders()
+        try testDeduplicatorKeepsDistinctEventsInTheSameSecond()
+        try testClaudeRefreshGrantAdoptsRotatedToken()
+        try testClaudeRefreshGrantKeepsTokenWhenServerDoesNotRotate()
+        try testClaudeRefreshFailuresAreClassified()
+        try testClaudeRefreshRequestRequiresARefreshToken()
+        try testClaudeCredentialExpiryDrivesCacheRefresh()
+        try testClaudeMirrorNeverStoresTheRefreshToken()
         print("Claude usage tests passed")
     }
+}
+
+private func testClaudeRateLimitCooldownDoesNotRequestKeychain() throws {
+    let suiteName = "claude-retry-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let cache = ClaudeOAuthResponseCache(defaults: defaults, persistenceKey: "test", legacySnapshotLoader: { nil })
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    cache.deferRequests(retryAfter: "600", now: now)
+    try expect(cache.isBackingOff(now: now.addingTimeInterval(599)), "honor vendor Retry-After")
+    try expect(!cache.isBackingOff(now: now.addingTimeInterval(600)), "cooldown eventually expires")
+    let restarted = ClaudeOAuthResponseCache(defaults: defaults, persistenceKey: "test", legacySnapshotLoader: { nil })
+    try expect(restarted.isBackingOff(now: now), "restarting must not bypass cooldown")
+    try expect(!ProviderFetchError.rateLimited.shouldRecoverClaudeOAuthFromKeychain, "429 never triggers reauthorization")
 }

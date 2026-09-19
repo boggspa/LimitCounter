@@ -1,5 +1,7 @@
 import Foundation
 import Security
+import LocalAuthentication
+import OSLog
 import SQLite3
 #if os(macOS)
 import Darwin
@@ -8255,7 +8257,7 @@ enum ClaudeOAuthModelWindowMapper {
 
     static func fableQuotaWindow(from window: ClaudeOAuthWindow?) -> QuotaWindow? {
         quotaWindow(
-            label: "Fable",
+            label: "🪐 Fable",
             subtitle: fableSubtitle(for: window?.utilization),
             from: window
         )
@@ -8442,6 +8444,22 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
             ?? .standard
         self.persistenceKey = persistenceKey
         self.legacySnapshotLoader = legacySnapshotLoader
+    }
+
+    func isBackingOff(now: Date = Date()) -> Bool {
+        guard let retryAt = defaults.object(forKey: persistenceKey + ".retryAfter") as? Date else { return false }
+        return retryAt > now
+    }
+
+    func deferRequests(retryAfter: String?, now: Date = Date()) {
+        let seconds = retryAfter.flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss z"
+        let retryDate = retryAfter.flatMap { formatter.date(from: $0) }
+        let delay = max(120, seconds ?? retryDate?.timeIntervalSince(now) ?? 300)
+        defaults.set(now.addingTimeInterval(delay), forKey: persistenceKey + ".retryAfter")
     }
 
     func fresh(now: Date = Date()) -> QuotaSnapshot? {
@@ -8708,7 +8726,7 @@ private final class ClaudeModelLimitDiagnostics: @unchecked Sendable {
 /// `fetchOAuthQuota` for that gate.
 private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> ClaudePlanInfo? {
     guard allowKeychainLookup,
-          let (creds, _) = ClaudeKeychainStore.readBest(claudeCodeReadBudget: nil) else {
+          let creds = ClaudeKeychainStore.readBackup() else {
         return nil
     }
     let raw = creds.rawOAuthDict
@@ -8719,11 +8737,38 @@ private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> Cla
     )
 }
 
+/// Claude OAuth lifecycle logging.
+///
+/// `print` goes nowhere once the app is launched from Finder, which is exactly
+/// the situation where credential renewal fails, so these paths log through
+/// OSLog instead. Read them back with:
+///
+///     log show --last 1d --predicate 'subsystem == "com.chrisizatt.LLMUsageCounter"'
+///
+/// Never pass token material to these — messages are logged `.public` so they
+/// survive redaction.
+nonisolated enum ClaudeOAuthLog {
+    private static let logger = Logger(
+        subsystem: "com.chrisizatt.LLMUsageCounter",
+        category: "claude-oauth"
+    )
+
+    static func info(_ message: String) {
+        logger.info("\(message, privacy: .public)")
+        print("[ClaudeOAuth] \(message)")
+    }
+
+    static func error(_ message: String) {
+        logger.error("\(message, privacy: .public)")
+        print("[ClaudeOAuth] \(message)")
+    }
+}
+
 /// Holds the parsed payload of Claude Code's keychain entry. We carry the raw
 /// `claudeAiOauth` dictionary alongside the typed fields so the access-token
 /// mirror can retain non-secret metadata (subscriptionType, rateLimitTier,
 /// scopes, etc.).
-private nonisolated struct ClaudeOAuthCredentials {
+nonisolated struct ClaudeOAuthCredentials {
     let accessToken: String
     let refreshToken: String?
     /// `expiresAt` from the keychain — milliseconds since the Unix epoch.
@@ -8743,6 +8788,55 @@ private nonisolated struct ClaudeOAuthCredentials {
     func needsRefresh(buffer: TimeInterval) -> Bool {
         guard let expiresAt else { return false }
         return Date().addingTimeInterval(buffer) >= expiresAt
+    }
+
+    /// The `claudeAiOauth` dictionary Limit Counter stores in its own keychain
+    /// item.
+    ///
+    /// Every metadata key Claude Code wrote is carried through, but the
+    /// refresh token is deliberately dropped. Claude Code owns renewal, so a
+    /// second copy of the long-lived secret buys nothing — and leaving one
+    /// around is what let an earlier build renew the shared lineage and write
+    /// the result back into the CLI's keychain item.
+    var mirrorPayload: [String: Any] {
+        var dict = rawOAuthDict
+        dict["accessToken"] = accessToken
+        dict.removeValue(forKey: "refreshToken")
+        if let expiresAtMillis {
+            // Match Claude Code's storage format: integer milliseconds.
+            dict["expiresAt"] = NSNumber(value: Int64(expiresAtMillis))
+        }
+        return dict
+    }
+
+    /// Builds the credential a refresh grant produced, keeping every metadata
+    /// key Claude Code stored alongside the tokens (subscriptionType,
+    /// rateLimitTier and anything a newer CLI adds) so the item we write back
+    /// stays a drop-in replacement for the CLI's own.
+    func applyingRefreshedTokens(
+        accessToken: String,
+        refreshToken: String?,
+        expiresAt: Date,
+        scopes: [String]?
+    ) -> ClaudeOAuthCredentials {
+        var raw = rawOAuthDict
+        raw["accessToken"] = accessToken
+        if let refreshToken {
+            raw["refreshToken"] = refreshToken
+        }
+        let millis = expiresAt.timeIntervalSince1970 * 1000
+        raw["expiresAt"] = NSNumber(value: Int64(millis))
+        let resolvedScopes = (scopes?.isEmpty == false) ? scopes! : self.scopes
+        if !resolvedScopes.isEmpty {
+            raw["scopes"] = resolvedScopes
+        }
+        return ClaudeOAuthCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken ?? self.refreshToken,
+            expiresAtMillis: millis,
+            scopes: resolvedScopes,
+            rawOAuthDict: raw
+        )
     }
 }
 
@@ -8775,7 +8869,7 @@ enum ClaudeOAuthCredentialPolicy {
     }
 
     static func allowsClaudeCodeKeychainAccess(enabled: Bool, userInitiated: Bool) -> Bool {
-        enabled && userInitiated
+        enabled
     }
 
     static func makeClaudeCodeKeychainReadBudget(
@@ -8788,7 +8882,7 @@ enum ClaudeOAuthCredentialPolicy {
         ) else {
             return nil
         }
-        return ClaudeCodeKeychainReadBudget()
+        return ClaudeCodeKeychainReadBudget(allowsInteraction: userInitiated)
     }
 }
 
@@ -8796,8 +8890,19 @@ enum ClaudeOAuthCredentialPolicy {
 /// Keychain item. Every path to Claude Code's item must claim this budget
 /// before calling SecItemCopyMatching.
 nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
+    let allowsInteraction: Bool
     private let lock = NSLock()
     private var isAvailable = true
+
+    init(allowsInteraction: Bool = false) {
+        self.allowsInteraction = allowsInteraction
+    }
+
+    var authenticationContext: LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = !allowsInteraction
+        return context
+    }
 
     func claimRead() -> Bool {
         lock.lock()
@@ -8813,86 +8918,50 @@ nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
 ///   1. Claude Code CLI's own entry  (service "Claude Code-credentials")
 ///   2. Our backup entry             (service "...ClaudeOAuthMirror")
 ///
-/// Limit Counter only writes its own backup entry. Claude Code owns and
-/// refreshes its item independently, and writing it from the background can
-/// trigger repeat macOS password prompts.
+/// Limit Counter only ever *reads* entry 1, and only writes entry 2. That
+/// asymmetry is load-bearing: a cross-app write to Claude Code's item resets
+/// its keychain grant, and the CLI reads that item by shelling out to
+/// `security find-generic-password` several times a minute — so every one of
+/// those reads then puts up a "security wants to access key" password prompt
+/// until the user runs /login and the CLI recreates the item.
 private nonisolated enum ClaudeKeychainStore {
     static let claudeCodeService = "Claude Code-credentials"
     static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
 
     private static var account: String { NSUserName() }
 
-    private static func readClaudeCode() -> ClaudeOAuthCredentials? { read(service: claudeCodeService) }
     static func readBackup() -> ClaudeOAuthCredentials? { read(service: backupService) }
 
-    /// Returns the best available credential.
+    /// Returns Claude Code's current credential and refreshes our cache of it.
     ///
-    /// **Reads the mirror first** and only falls back to Claude Code
-    /// CLI's keychain entry when our mirror is empty. This avoids the
-    /// macOS permission prompt that fires every time the CLI rewrites
-    /// its own `Claude Code-credentials` entry (which it does roughly
-    /// hourly when its OAuth token refreshes): the keychain ACL on
-    /// that item is content-bound, so any rewrite by another process
-    /// invalidates our trust list and macOS prompts again on next
-    /// read.
+    /// The mirror is nothing more than a cache of what the CLI last held; it
+    /// spares us a cross-app read on every dashboard tick. Claude Code mints
+    /// and renews the credential and stays its only writer, so once the cache
+    /// nears expiry the only way forward is to read the CLI's item again.
     ///
-    /// Once we've successfully read the CLI entry once (one prompt),
-    /// we copy its access token and plan metadata into our own mirror
-    /// so steady-state reads do not touch the CLI's entry. Claude Code
-    /// remains the sole owner of refresh-token rotation; Limit Counter
-    /// re-reads the CLI entry through the explicit recovery path.
-    static func readBest(claudeCodeReadBudget: ClaudeCodeKeychainReadBudget?) -> (ClaudeOAuthCredentials, source: String)? {
-        if let backup = readBackup() {
-            // Migrate mirrors created by older builds, which retained Claude
-            // Code's rotating refresh token. `write` strips it from backups.
-            if backup.refreshToken != nil {
-                _ = write(backup, service: backupService)
-            }
-            return (backup, backupService)
-        }
-
-        guard let claudeCodeReadBudget,
-              claudeCodeReadBudget.claimRead() else {
-            return nil
-        }
-
-        // Mirror missing (first launch, or user cleared keychain) —
-        // claim this refresh cycle's only cross-app read before falling
-        // back to the CLI entry. Immediately mirror a successful result.
-        if let cc = readClaudeCode() {
-            if write(cc, service: backupService) {
-                print("[ClaudeKeychain] Mirrored Claude Code credentials to backup store — future reads will avoid CLI entry")
-            } else {
-                print("[ClaudeKeychain] Failed to persist Claude Code credential mirror; a later manual refresh may need authorization again")
-            }
-            return (cc, claudeCodeService)
-        }
-
-        return nil
-    }
-
-    /// Escape hatch for when the mirrored access token is rejected or near
-    /// expiry. This can prompt, but it is only used by the explicit recovery
-    /// path rather than during steady-state reads.
-    static func readClaudeCodeAsFallback(
-        using readBudget: ClaudeCodeKeychainReadBudget
-    ) -> ClaudeOAuthCredentials? {
+    /// Background reads cannot prompt — the budget sets
+    /// `interactionNotAllowed` unless the user asked for this directly.
+    static func readClaudeCode(using readBudget: ClaudeCodeKeychainReadBudget) -> ClaudeOAuthCredentials? {
         guard readBudget.claimRead(),
-              let cc = readClaudeCode() else {
+              let cc = read(service: claudeCodeService, authenticationContext: readBudget.authenticationContext) else {
             return nil
         }
-        if !write(cc, service: backupService) {
-            print("[ClaudeKeychain] Failed to persist recovered Claude Code credential mirror")
+        if !writeBackup(cc) {
+            ClaudeOAuthLog.error("Read Claude Code's credential but could not cache it; the next cycle will read the CLI's item again")
         }
         return cc
     }
 
-    private static func read(service: String) -> ClaudeOAuthCredentials? {
+    private static func read(
+        service: String,
+        authenticationContext: LAContext = ClaudeCodeKeychainReadBudget().authenticationContext
+    ) -> ClaudeOAuthCredentials? {
         let query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String:  true,
+            kSecUseAuthenticationContext as String: authenticationContext,
             kSecMatchLimit as String:  kSecMatchLimitOne
         ]
         var item: AnyObject?
@@ -8914,38 +8983,36 @@ private nonisolated enum ClaudeKeychainStore {
         )
     }
 
-    /// Writes the credentials back to the named service. Returns true on success.
+    /// Writes the credential to **our own** mirror item, dropping the refresh
+    /// token on the way in. Returns true on success.
+    ///
+    /// Two deliberate restrictions are baked into the signature:
+    ///
+    /// * The service is not a parameter. Limit Counter must never write
+    ///   Claude Code's item: a cross-app write resets that item's keychain
+    ///   grant, and the CLI — which shells out to `security
+    ///   find-generic-password` several times a minute — then has to ask for
+    ///   the login keychain password on every one of those reads.
+    /// * The refresh token is stripped. Claude Code owns renewal, so a second
+    ///   copy of the long-lived secret buys nothing and would give a future
+    ///   code path something to renew with, which is how the two copies of
+    ///   the lineage started fighting in the first place.
     @discardableResult
-    static func write(_ creds: ClaudeOAuthCredentials, service: String) -> Bool {
-        // Re-serialize: preserve unknown keys and override the access-token
-        // metadata we mirror. Never retain Claude Code's rotating refresh
-        // token in Limit Counter's backup keychain item.
-        var oauthDict = creds.rawOAuthDict
-        oauthDict["accessToken"] = creds.accessToken
-        if service == backupService {
-            oauthDict.removeValue(forKey: "refreshToken")
-        } else if let refreshToken = creds.refreshToken {
-            oauthDict["refreshToken"] = refreshToken
-        }
-        if let ms = creds.expiresAtMillis {
-            // Match Claude Code's storage format: integer milliseconds.
-            oauthDict["expiresAt"] = NSNumber(value: Int64(ms))
-        }
-
-        let payload: [String: Any] = ["claudeAiOauth": oauthDict]
+    static func writeBackup(_ creds: ClaudeOAuthCredentials) -> Bool {
+        let payload: [String: Any] = ["claudeAiOauth": creds.mirrorPayload]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-            print("[ClaudeKeychainStore] Failed to serialize credential mirror for \(service)")
+            print("[ClaudeKeychainStore] Failed to serialize the credential mirror")
             return false
         }
 
         let query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrService as String: backupService,
+            kSecAttrAccount as String: account,
+            kSecUseAuthenticationContext as String: ClaudeCodeKeychainReadBudget().authenticationContext
         ]
 
-        // Try update first; if the item doesn't exist (only true for our
-        // backup service on first write), add it.
+        // Try update first; if the item doesn't exist, add it.
         let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
         if updateStatus == errSecSuccess {
             return true
@@ -8957,21 +9024,168 @@ private nonisolated enum ClaudeKeychainStore {
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
                 let detail = SecCopyErrorMessageString(addStatus, nil) as String? ?? "Unknown Keychain error"
-                print("[ClaudeKeychainStore] SecItemAdd for \(service) failed: OSStatus \(addStatus) (\(detail))")
+                print("[ClaudeKeychainStore] SecItemAdd for the mirror failed: OSStatus \(addStatus) (\(detail))")
                 return false
             }
             return true
         }
         let detail = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "Unknown Keychain error"
-        print("[ClaudeKeychainStore] SecItemUpdate for \(service) failed: OSStatus \(updateStatus) (\(detail))")
+        print("[ClaudeKeychainStore] SecItemUpdate for the mirror failed: OSStatus \(updateStatus) (\(detail))")
         return false
     }
 }
 
-/// Resolves Anthropic OAuth access tokens without participating in Claude
-/// Code's rotating refresh-token lineage. Claude Code is the sole refresh
-/// client; Limit Counter only mirrors its current access token when the user
-/// explicitly enables keychain recovery.
+/// The refresh grant Claude Code uses, kept here but **deliberately not wired
+/// up**.
+///
+/// Limit Counter used to renew the credential itself so the meters survived
+/// stretches where the CLI never ran. That shared one refresh-token lineage
+/// between two processes, and handing the result back to Claude Code meant
+/// writing the CLI's keychain item — which reset its keychain grant and left
+/// the CLI asking for the login password on every read. Renewal now belongs
+/// to the CLI alone; `ClaudeOAuthTokenManager` only reads.
+///
+/// What remains is the endpoint, client id and scope set, which were
+/// expensive to establish and are covered by tests. Nothing in the app calls
+/// `refresh(_:)`, and nothing should without solving the lineage problem
+/// first.
+nonisolated enum ClaudeOAuthRefreshClient {
+    /// Claude Code's public OAuth client id. Reusing it would keep anything we
+    /// mint interchangeable with the CLI's own credential.
+    static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    static let tokenEndpoint = URL(string: "https://platform.claude.com/v1/oauth/token")!
+
+    /// The scope set Claude Code signs in with. `user:profile` is the one
+    /// `/api/oauth/usage` requires — a token minted without it (as
+    /// `claude setup-token` does, which is inference-only) cannot read the
+    /// quota meters at all.
+    static let scopes = [
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload"
+    ]
+
+    enum RefreshError: Error, CustomStringConvertible {
+        case noRefreshToken
+        case rejected(status: Int)
+        case malformedResponse
+        case transport(Error)
+
+        var description: String {
+            switch self {
+            case .noRefreshToken:      return "no refresh token stored"
+            case .rejected(let status): return "token endpoint returned HTTP \(status)"
+            case .malformedResponse:   return "token endpoint returned an unparseable body"
+            case .transport(let error): return "network error: \(error.localizedDescription)"
+            }
+        }
+
+        /// A rejected refresh token is terminal — retrying cannot fix it, and
+        /// the user has to sign in again in Claude Code.
+        var isTerminal: Bool {
+            switch self {
+            case .noRefreshToken: return true
+            case .rejected(let status): return status == 400 || status == 401 || status == 403
+            case .malformedResponse, .transport: return false
+            }
+        }
+
+        /// How long to wait before trying again. The token endpoint rate-limits
+        /// without sending `Retry-After`, so a 429 gets its own longer pause
+        /// rather than the generic transient one.
+        var retryDelay: TimeInterval {
+            switch self {
+            case .rejected(let status) where status == 429: return 15 * 60
+            default: return 5 * 60
+            }
+        }
+    }
+
+    static func refresh(_ credentials: ClaudeOAuthCredentials) async throws -> ClaudeOAuthCredentials {
+        let request = try refreshRequest(for: credentials)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw RefreshError.transport(error)
+        }
+
+        return try Self.credentials(
+            fromRefreshResponse: data,
+            status: (response as? HTTPURLResponse)?.statusCode ?? 0,
+            base: credentials
+        )
+    }
+
+    static func refreshRequest(for credentials: ClaudeOAuthCredentials) throws -> URLRequest {
+        guard let refreshToken = credentials.refreshToken, !refreshToken.isEmpty else {
+            throw RefreshError.noRefreshToken
+        }
+
+        var request = URLRequest(url: tokenEndpoint, timeoutInterval: 30)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": clientID,
+            "scope": scopes.joined(separator: " ")
+        ])
+        return request
+    }
+
+    static func credentials(
+        fromRefreshResponse data: Data,
+        status: Int,
+        base: ClaudeOAuthCredentials,
+        now: Date = Date()
+    ) throws -> ClaudeOAuthCredentials {
+        guard status == 200 else {
+            throw RefreshError.rejected(status: status)
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = json["access_token"] as? String,
+              !accessToken.isEmpty,
+              let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue else {
+            throw RefreshError.malformedResponse
+        }
+
+        // The endpoint omits `refresh_token` when it does not rotate; keeping
+        // the existing one then leaves both stores valid.
+        let rotated = json["refresh_token"] as? String
+        let grantedScopes = (json["scope"] as? String)?
+            .split(separator: " ")
+            .map(String.init)
+
+        return base.applyingRefreshedTokens(
+            accessToken: accessToken,
+            refreshToken: rotated ?? base.refreshToken,
+            expiresAt: now.addingTimeInterval(expiresIn),
+            scopes: grantedScopes
+        )
+    }
+}
+
+/// Resolves Anthropic OAuth access tokens.
+///
+/// Claude Code owns this credential outright: it mints the eight-hour tokens
+/// and it is the only thing that renews them. Limit Counter reads the CLI's
+/// keychain item, caches what it finds, and does nothing else. It never writes
+/// that item and never runs the refresh grant on the CLI's lineage.
+///
+/// Both of those used to happen and both broke the CLI. A cross-app write
+/// resets the item's keychain grant, after which Claude Code's own
+/// `security find-generic-password` — which it runs several times a minute —
+/// asks for the login keychain password on every single read. Renewing the
+/// shared lineage was the other half of the trap: a rotated refresh token
+/// leaves the CLI holding a dead one.
+///
+/// The price is that the meters go quiet once Claude Code has been idle for
+/// longer than a token lifetime. Running the CLI brings them straight back.
 private enum ClaudeOAuthTokenResolution {
     case token(String)
     case unavailable
@@ -8981,78 +9195,85 @@ private enum ClaudeOAuthTokenResolution {
 private actor ClaudeOAuthTokenManager {
     static let shared = ClaudeOAuthTokenManager()
 
-    /// Re-read Claude Code's current credential this far ahead of expiry when
-    /// the user explicitly enabled keychain recovery.
-    private let refreshBuffer: TimeInterval = 5 * 60     // 5 min
+    /// Read Claude Code's item again once our cached copy is this close to
+    /// expiry. The CLI renews a few minutes before its own token lapses, so
+    /// looking again inside the last ten minutes usually finds the fresh one.
+    private let cacheBuffer: TimeInterval = 10 * 60
 
-    /// Returns the mirrored access token and, when permitted, replaces a
-    /// near-expiry mirror with Claude Code's current access token.
-    func currentAccessTokenFromKeychain(
-        readBudget: ClaudeCodeKeychainReadBudget?
-    ) -> ClaudeOAuthTokenResolution {
-        guard let (creds, source) = ClaudeKeychainStore.readBest(
-            claudeCodeReadBudget: readBudget
-        ) else {
-            return .unavailable
-        }
+    /// A credential inside this window is too close to the edge to hand to a
+    /// network call at all.
+    private let unusableBuffer: TimeInterval = 60
 
-        if !creds.needsRefresh(buffer: refreshBuffer) {
-            return .token(creds.accessToken)
-        }
+    /// Background reads are throttled: the dashboard refreshes every 15-60s
+    /// and there is nothing to gain from asking securityd that often.
+    private var lastSilentAttemptAt: Date?
 
-        if let readBudget,
-           source != ClaudeKeychainStore.claudeCodeService,
-           let current = recoverFromClaudeCodeKeychain(
-               rejectedToken: nil,
-               reason: "mirrored access token near expiry",
-               readBudget: readBudget
-           ) {
-            return .token(current)
+    private func permittedBudget(_ budget: ClaudeCodeKeychainReadBudget?) -> ClaudeCodeKeychainReadBudget? {
+        guard let budget else { return nil }
+        if !budget.allowsInteraction {
+            let now = Date()
+            if let lastSilentAttemptAt, now.timeIntervalSince(lastSilentAttemptAt) < 120 { return nil }
+            lastSilentAttemptAt = now
         }
-
-        print("[ClaudeOAuth] Access token near expiry (source: \(source)); Claude Code owns token refresh")
-        if creds.needsRefresh(buffer: 0) {
-            return .requiresUserInitiatedRecovery
-        }
-        return .token(creds.accessToken)
+        return budget
     }
 
-    /// Recovery path for when our mirrored OAuth token was invalidated or
-    /// endpoint-throttled after Claude Code rewrote its own keychain item.
-    /// The one-shot budget ensures no refresh cycle can prompt more than once.
+    /// Returns a usable access token, re-reading Claude Code's item whenever
+    /// our cached copy is within `cacheBuffer` of expiry.
+    func currentAccessTokenFromKeychain(
+        readBudget: ClaudeCodeKeychainReadBudget?
+    ) async -> ClaudeOAuthTokenResolution {
+        let cached = ClaudeKeychainStore.readBackup()
+
+        // Steady state: the cache still has real time left, so this costs
+        // neither cross-app access nor a round trip.
+        if let cached, !cached.needsRefresh(buffer: cacheBuffer) {
+            return .token(cached.accessToken)
+        }
+
+        let recoveryEnabled = readBudget != nil
+
+        if let budget = permittedBudget(readBudget),
+           let fromCLI = ClaudeKeychainStore.readClaudeCode(using: budget) {
+            if !fromCLI.needsRefresh(buffer: unusableBuffer) {
+                return .token(fromCLI.accessToken)
+            }
+            // Claude Code's own token has lapsed, so the CLI has not run in
+            // over eight hours. Only running it can mint another one.
+            ClaudeOAuthLog.info("Claude Code's stored token has expired; only the CLI can renew it — run Claude Code to bring the meters back")
+            return .requiresUserInitiatedRecovery
+        }
+
+        // No fresh read was available — no grant, or the throttle held us
+        // back. A cached token that has not actually expired is still worth
+        // sending; the API call will say for certain whether it is dead.
+        if let cached, !cached.needsRefresh(buffer: unusableBuffer) {
+            return .token(cached.accessToken)
+        }
+
+        return recoveryEnabled ? .requiresUserInitiatedRecovery : .unavailable
+    }
+
+    /// Recovery path for when the token we sent was rejected mid-flight:
+    /// Claude Code may have renewed underneath us since we last cached.
     func accessTokenAfterOAuthFailure(
         rejectedToken: String?,
         reason: String,
         readBudget: ClaudeCodeKeychainReadBudget?
-    ) -> String? {
-        guard let readBudget else {
+    ) async -> String? {
+        guard let budget = permittedBudget(readBudget),
+              let fromCLI = ClaudeKeychainStore.readClaudeCode(using: budget),
+              fromCLI.accessToken != rejectedToken else {
             return nil
         }
-
-        return recoverFromClaudeCodeKeychain(
-            rejectedToken: rejectedToken,
-            reason: reason,
-            readBudget: readBudget
-        )
+        ClaudeOAuthLog.info("\(reason) — retrying with Claude Code's current keychain token")
+        return fromCLI.accessToken
     }
 
-    private func recoverFromClaudeCodeKeychain(
-        rejectedToken: String?,
-        reason: String,
-        readBudget: ClaudeCodeKeychainReadBudget
-    ) -> String? {
-        guard let fallback = ClaudeKeychainStore.readClaudeCodeAsFallback(
-            using: readBudget
-        ) else {
-            return nil
-        }
-
-        if let rejectedToken, fallback.accessToken == rejectedToken {
-            return nil
-        }
-
-        print("[ClaudeOAuth] \(reason) — retrying with current Claude Code keychain token")
-        return fallback.accessToken
+    /// Clears the silent-read throttle so an explicit user action gets a real
+    /// attempt rather than being skipped.
+    func resetReadThrottle() {
+        lastSilentAttemptAt = nil
     }
 }
 
@@ -9077,8 +9298,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     ) async throws -> QuotaSnapshot {
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
-        //   2. Limit Counter's mirrored OAuth token, if available
-        //   3. Claude Code's own keychain item, only on an opted-in manual refresh
+        //   2. Our cached copy of Claude Code's OAuth token, while it is fresh
+        //   3. A re-read of Claude Code's keychain item (silent in background)
         //   4. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
         let claudeCodeKeychainFallbackEnabled = ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: credentials)
@@ -9092,6 +9313,11 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         var requiresUserInitiatedKeychainRecovery = false
 
         if oauthToken == nil {
+            // An explicit refresh is the user asking us to try properly, so
+            // it lifts the throttle that spaces out background reads.
+            if userInitiated {
+                await ClaudeOAuthTokenManager.shared.resetReadThrottle()
+            }
             let resolution = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
                 readBudget: claudeCodeReadBudget
             )
@@ -9103,6 +9329,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             case .unavailable:
                 break
             }
+            // Recovering from a rejected token means reading Claude Code's
+            // item again, so it needs the same opt-in the first read did.
             tokenAllowsKeychainRecovery = oauthToken != nil && claudeCodeReadBudget != nil
             tokenAllowsKeychainPlanLookup = oauthToken != nil
         }
@@ -9111,8 +9339,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         }
         if oauthToken == nil, requiresUserInitiatedKeychainRecovery {
             let message = userInitiated
-                ? "Claude Code authorization could not be refreshed. Re-authenticate Claude Code, then refresh again."
-                : "Claude Code authorization needs a user-initiated refresh before Limit Counter can read the updated token."
+                ? "No usable Claude Code sign-in. Run Claude Code (or /login if it asks), then refresh again."
+                : "Claude Code's sign-in has expired. Only the CLI can renew it — run Claude Code, then refresh."
             throw ProviderFetchError.credentialExpired(message)
         }
         if let token = oauthToken, !token.isEmpty {
@@ -9123,6 +9351,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                 // every 15-60s; renewing the cache on read would keep old
                 // OAuth meter values alive indefinitely.
                 return cached
+            }
+            if ClaudeOAuthResponseCache.shared.isBackingOff() {
+                throw ProviderFetchError.rateLimited
             }
             print("[ClaudeProvider] OAuth token found — fetching live quota")
             do {
@@ -9152,11 +9383,19 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                     }
                 }
 
+                if case .invalidCredential = effectiveError {
+                    throw ProviderFetchError.credentialExpired(
+                        "Claude Code session expired. Only the CLI renews it — run Claude Code, then refresh manually (the first refresh may ask you to authorize Keychain access)."
+                    )
+                }
                 if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
                     print("[ClaudeProvider] OAuth fetch failure (\(effectiveError)) — serving last successful OAuth snapshot to preserve meters")
                     let events = await eventsForOAuthEnrichment(credentials: credentials)
                     let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
-                    return mergeEvents(into: stale, events: events + agbenchEvents)
+                    return mergeEvents(
+                into: stale,
+                events: ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: events)
+            )
                 }
 
                 if let localSnapshot = await loadLocalSnapshotIfAvailable(
@@ -9175,7 +9414,10 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             print("[ClaudeProvider] OAuth token unavailable — serving last successful OAuth snapshot to preserve meters")
             let events = await eventsForOAuthEnrichment(credentials: credentials)
             let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
-            return mergeEvents(into: stale, events: events + agbenchEvents)
+            return mergeEvents(
+                into: stale,
+                events: ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: events)
+            )
         }
 
         // Fall back to local JSONL transcript parsing.
@@ -9184,7 +9426,10 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         // symmetric with the OAuth path above.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
         guard !agbenchEvents.isEmpty else { return localSnapshot }
-        return mergeEvents(into: localSnapshot, events: localSnapshot.events + agbenchEvents)
+        return mergeEvents(
+            into: localSnapshot,
+            events: ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: localSnapshot.events)
+        )
     }
 
     private func fetchOAuthSnapshotAndMerge(
@@ -9212,7 +9457,10 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         // Plus AGBench's unified usage.json for any Claude runs driven
         // through TaskWraith. No-op without the bookmark.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
-        let merged = mergeEvents(into: oauthSnapshot, events: events + agbenchEvents)
+        let merged = mergeEvents(
+            into: oauthSnapshot,
+            events: ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: events)
+        )
         ClaudeOAuthResponseCache.shared.store(merged)
         return merged
     }
@@ -9390,7 +9638,12 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         return QuotaSnapshotStore.shared.loadSnapshots()
             .first { $0.providerID == .claude && $0.fetchState == .success }?
             .events
-            .filter { $0.timestamp >= horizon } ?? []
+            // Buckets only. Older builds appended raw per-run `.message` events
+            // here on every refresh, so a persisted list can still hold tens of
+            // thousands of duplicates; re-reading them would carry that
+            // inflation forward for ever. Buckets are keyed by wall-clock start,
+            // so they survive the round trip without accumulating.
+            .filter { $0.type == .bucket && $0.timestamp >= horizon } ?? []
     }
 
     /// Returns a copy of `snapshot` with `events` attached. All other fields
@@ -9500,7 +9753,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             switch http.statusCode {
             case 200: break
             case 401, 403: throw ProviderFetchError.invalidCredential
-            case 429: throw ProviderFetchError.rateLimited
+            case 429:
+                ClaudeOAuthResponseCache.shared.deferRequests(retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
+                throw ProviderFetchError.rateLimited
             default: throw ProviderFetchError.parsingError("HTTP \(http.statusCode)")
             }
         }
@@ -9672,13 +9927,32 @@ struct ClaudeHeatmapEventBucketer {
         calendar: Calendar = .current,
         retentionDays: Int = defaultRetentionDays
     ) -> [UsageEvent] {
+        bucketing(
+            records.map {
+                UsageEvent(timestamp: $0.timestamp, tokens: $0.tokens, model: "Claude", type: .bucket)
+            },
+            now: now,
+            calendar: calendar,
+            retentionDays: retentionDays
+        )
+    }
+
+    /// Folds arbitrary usage events onto the same 2-hour grid the transcript
+    /// scan produces, so a second source of Claude usage can be merged against
+    /// that scan *by key* rather than concatenated onto it.
+    static func bucketing(
+        _ events: [UsageEvent],
+        now: Date = Date(),
+        calendar: Calendar = .current,
+        retentionDays: Int = defaultRetentionDays
+    ) -> [UsageEvent] {
         let horizon = now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
         var tokenTotals: [ClaudeHeatmapBucketKey: Double] = [:]
         var bucketStarts: [ClaudeHeatmapBucketKey: Date] = [:]
 
-        for record in records where record.timestamp >= horizon {
-            let key = ClaudeHeatmapBucketKey(date: record.timestamp, calendar: calendar)
-            tokenTotals[key, default: 0] += record.tokens
+        for event in events where event.timestamp >= horizon {
+            let key = ClaudeHeatmapBucketKey(date: event.timestamp, calendar: calendar)
+            tokenTotals[key, default: 0] += event.tokens ?? 0
             bucketStarts[key] = key.bucketStart(calendar: calendar)
         }
 
@@ -9722,6 +9996,31 @@ struct ClaudeHeatmapEventHistory {
         }
 
         return eventsByBucket.values.sorted { $0.timestamp > $1.timestamp }
+    }
+
+    /// Folds TaskWraith's `usage.json` rows into an existing bucket list.
+    ///
+    /// TaskWraith drives the `claude` CLI, so the runs it reports are the same
+    /// runs the transcript scan already counted — appending one list to the
+    /// other counts that usage twice, and because `UsageEvent` mints a fresh
+    /// `id` per construction the copies never compare equal, so re-appending on
+    /// every refresh grew the list without bound (it had reached 44 copies of
+    /// every row). Bucketing both sides onto one grid and keeping the larger
+    /// side per bucket adds nothing where the transcript already saw the run,
+    /// still recovers runs whose transcript was cleaned up along with its
+    /// temporary workspace, and is idempotent across refreshes.
+    static func mergingAGBench(
+        _ agbenchEvents: [UsageEvent],
+        into events: [UsageEvent],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [UsageEvent] {
+        guard !agbenchEvents.isEmpty else { return events }
+        return merged(
+            current: ClaudeHeatmapEventBucketer.bucketing(agbenchEvents, now: now, calendar: calendar),
+            previous: events,
+            now: now
+        )
     }
 }
 
@@ -10403,12 +10702,12 @@ public enum ProviderFetchError: LocalizedError {
     }
 }
 
-private extension ProviderFetchError {
+extension ProviderFetchError {
     var shouldRecoverClaudeOAuthFromKeychain: Bool {
         switch self {
-        case .invalidCredential, .rateLimited:
+        case .invalidCredential:
             return true
-        case .notConfigured, .credentialExpired, .networkError, .parsingError, .unknown:
+        case .notConfigured, .credentialExpired, .networkError, .parsingError, .rateLimited, .unknown:
             return false
         }
     }
