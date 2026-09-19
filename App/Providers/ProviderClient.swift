@@ -11217,22 +11217,30 @@ public struct OllamaProviderClient: ProviderClient {
 // MARK: - OpenRouter Provider Client
 
 /// OpenRouter API response structures for the /api/v1/auth/key endpoint
-private struct OpenRouterKeyResponse: Codable {
-    let id: String
-    let name: String?
-    let created: Int?
-    let usage: OpenRouterUsage?
-    let limit: Int?
+/// See: https://openrouter.ai/api/v1/auth/key
+struct OpenRouterKeyResponse: Codable {
+    let data: OpenRouterKeyData?
 }
 
-private struct OpenRouterUsage: Codable {
-    let totalTokens: Int?
-    let totalCostUSD: Double?
-    let promptTokens: Int?
-    let completionTokens: Int?
-    let promptCostUSD: Double?
-    let completionCostUSD: Double?
+struct OpenRouterKeyData: Codable {
+    let label: String?
+    let usage: Double?        // Total USD spent
+    let limit: Double?        // USD limit (null = unlimited)
+    let isFreeTier: Bool?
+    let rateLimit: OpenRouterRateLimit?
+
+    enum CodingKeys: String, CodingKey {
+        case label
+        case usage
+        case limit
+        case isFreeTier = "is_free_tier"
+        case rateLimit = "rate_limit"
+    }
+}
+
+struct OpenRouterRateLimit: Codable {
     let requests: Int?
+    let interval: String?
 }
 
 public struct OpenRouterProviderClient: ProviderClient {
@@ -11285,10 +11293,8 @@ public struct OpenRouterProviderClient: ProviderClient {
         do {
             keyResponse = try JSONDecoder().decode(OpenRouterKeyResponse.self, from: data)
         } catch {
-            // Try to parse as a simple error message or fallback to string parsing
             if let responseString = String(data: data, encoding: .utf8) {
                 print("[OpenRouter] Raw response: \(responseString)")
-                // Check if it's an error response
                 if responseString.contains("error") || responseString.contains("Error") {
                     throw ProviderFetchError.parsingError("OpenRouter error: \(responseString)")
                 }
@@ -11296,122 +11302,92 @@ public struct OpenRouterProviderClient: ProviderClient {
             throw ProviderFetchError.parsingError("OpenRouter returned unparseable data")
         }
 
+        guard let keyData = keyResponse.data else {
+            throw ProviderFetchError.parsingError("OpenRouter response missing 'data' field")
+        }
+
         let now = Date()
-        let usage = keyResponse.usage
-        let limit = keyResponse.limit
+        let usageUSD = keyData.usage ?? 0
+        let limitUSD = keyData.limit
 
         var windows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
         var stats: [QuotaStat] = []
+        var signals: [QuotaSignal] = []
 
-        // Build usage windows based on available data
-        if let totalCostUSD = usage?.totalCostUSD, totalCostUSD > 0 {
-            windows.append(
-                QuotaWindow(
-                    label: "Total spend",
-                    windowKind: .monthly,
-                    used: totalCostUSD,
-                    total: limit.map { Double($0) },
-                    resetDate: nil,
-                    unit: "USD",
-                    subtitle: "Official OpenRouter API"
-                )
+        // Build spend window
+        windows.append(
+            QuotaWindow(
+                label: "Total spend",
+                windowKind: .monthly,
+                used: usageUSD,
+                total: limitUSD,
+                resetDate: nil,
+                unit: "USD",
+                subtitle: "Official OpenRouter API"
             )
-        }
-
-        if let totalTokens = usage?.totalTokens, totalTokens > 0 {
-            windows.append(
-                QuotaWindow(
-                    label: "Total tokens",
-                    windowKind: .monthly,
-                    used: Double(totalTokens),
-                    total: nil,
-                    resetDate: nil,
-                    unit: "tokens",
-                    subtitle: "Official OpenRouter API"
-                )
-            )
-        }
-
-        if let requests = usage?.requests, requests > 0 {
-            windows.append(
-                QuotaWindow(
-                    label: "Total requests",
-                    windowKind: .monthly,
-                    used: Double(requests),
-                    total: nil,
-                    resetDate: nil,
-                    unit: "requests",
-                    subtitle: "Official OpenRouter API"
-                )
-            )
-        }
+        )
 
         // Build balances
-        if let limit = limit {
-            let limitDouble = Double(limit)
-            if let totalCostUSD = usage?.totalCostUSD {
-                let remaining = max(0, limitDouble - totalCostUSD)
-                balances.append(
-                    QuotaBalance(
-                        label: "Remaining budget",
-                        amount: remaining,
-                        unit: "USD",
-                        subtitle: "Limit minus spend"
-                    )
-                )
-            }
+        if let limitUSD = limitUSD {
+            let remaining = max(0, limitUSD - usageUSD)
             balances.append(
                 QuotaBalance(
-                    label: "Monthly limit",
-                    amount: limitDouble,
+                    label: "Remaining budget",
+                    amount: remaining,
+                    unit: "USD",
+                    subtitle: "Limit minus spend"
+                )
+            )
+            balances.append(
+                QuotaBalance(
+                    label: "Credit limit",
+                    amount: limitUSD,
                     unit: "USD",
                     subtitle: "Configured budget"
                 )
             )
-        }
-
-        // Build stats
-        if let promptTokens = usage?.promptTokens, let completionTokens = usage?.completionTokens {
-            stats.append(
-                QuotaStat(
-                    label: "Prompt tokens",
-                    value: Double(promptTokens),
-                    unit: "tokens",
-                    subtitle: "Input tokens"
-                )
-            )
-            stats.append(
-                QuotaStat(
-                    label: "Completion tokens",
-                    value: Double(completionTokens),
-                    unit: "tokens",
-                    subtitle: "Output tokens"
+        } else {
+            // Unlimited budget
+            balances.append(
+                QuotaBalance(
+                    label: "Credit limit",
+                    amount: 0,
+                    unit: "USD",
+                    subtitle: "Unlimited"
                 )
             )
         }
 
-        if let promptCostUSD = usage?.promptCostUSD, let completionCostUSD = usage?.completionCostUSD {
+        // Build rate limit stat if available
+        if let rateLimit = keyData.rateLimit, let requests = rateLimit.requests, let interval = rateLimit.interval {
             stats.append(
                 QuotaStat(
-                    label: "Prompt cost",
-                    value: promptCostUSD,
-                    unit: "USD",
-                    subtitle: "Input cost"
+                    label: "Rate limit",
+                    value: Double(requests),
+                    unit: "req / \(interval)",
+                    subtitle: "API rate limit"
                 )
             )
-            stats.append(
-                QuotaStat(
-                    label: "Completion cost",
-                    value: completionCostUSD,
-                    unit: "USD",
-                    subtitle: "Output cost"
+        }
+
+        // Add free tier signal if applicable
+        if keyData.isFreeTier == true {
+            signals.append(
+                QuotaSignal(
+                    kind: .unexpectedRecovery,
+                    title: "Free tier",
+                    message: "This key is on the OpenRouter free tier",
+                    severity: .info
                 )
             )
         }
 
         // Determine plan name
-        let planName: String? = keyResponse.name?.isEmpty == false ? keyResponse.name : "OpenRouter API"
+        // Sanitize label to avoid displaying API keys - use "API Credits" if label contains key material
+        let safeLabel = keyData.label?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let isLikelyAPIKey = safeLabel?.hasPrefix("sk-") == true || safeLabel?.hasPrefix("sk-or-") == true
+        let planName: String? = (isLikelyAPIKey || safeLabel?.isEmpty == true) ? "API Credits" : safeLabel
 
         return QuotaSnapshot(
             providerID: .openrouter,
@@ -11420,7 +11396,7 @@ public struct OpenRouterProviderClient: ProviderClient {
             windows: windows,
             stats: stats,
             balances: balances,
-            signals: [],
+            signals: signals,
             events: [],
             analyticsBuckets: [],
             fetchState: .success,
