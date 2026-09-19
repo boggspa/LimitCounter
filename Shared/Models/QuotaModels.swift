@@ -723,6 +723,12 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
+    /// Best-effort length of this window's period, from its label, subtitle
+    /// and kind. Shared by pace tracking and reset detection.
+    public func inferredPeriodDuration(providerID: ProviderID? = nil) -> TimeInterval? {
+        inferredPaceDuration(providerID: providerID)
+    }
+
     private func inferredPaceDuration(providerID: ProviderID?) -> TimeInterval? {
         let descriptor = "\(label) \(subtitle ?? "")".lowercased()
 
@@ -740,7 +746,12 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
 
         switch windowKind {
         case .session:
-            if descriptor.contains("session") || providerID == .openai || providerID == .claude {
+            // Meta's only session window is Muse Code's rolling current-usage
+            // meter, which shares the five-hour shape Codex and Claude use.
+            if descriptor.contains("session")
+                || providerID == .openai
+                || providerID == .claude
+                || providerID == .meta {
                 return 5 * 60 * 60
             }
             return nil
@@ -824,6 +835,179 @@ public enum QuotaSignalKind: String, Codable, Hashable {
     case scheduledReset
 }
 
+/// What kind of usage-limit reset a signal (or ledger entry) describes.
+///
+/// `QuotaSignalKind` stays a two-case enum so snapshots published to CloudKit
+/// keep decoding on older iOS builds; this finer classification rides along
+/// as an optional field that older decoders simply ignore.
+public enum QuotaResetKind: String, Codable, Hashable, CaseIterable {
+    /// The window's own reset time passed and the meter started over.
+    case scheduled
+    /// One window came back early, out of sequence — a provider gift, or a
+    /// banked reset redeemed on a provider that does not report credits.
+    case gifted
+    /// Several windows of the same provider reset together: the "we've reset
+    /// everyone's limits" celebration pattern.
+    case providerWide
+    /// A banked (earned) reset credit was consumed and the window restarted.
+    case bankedRedeemed
+    /// A banked reset credit is available to redeem.
+    case bankedAvailable
+
+    /// Whether this kind describes a reset that actually happened (as opposed
+    /// to one that is merely available).
+    public var isResetEvent: Bool {
+        self != .bankedAvailable
+    }
+
+    /// Resets the user did not schedule or trigger themselves count toward the
+    /// "N resets · 7d" tally and earn a celebration.
+    public var isIndependentReset: Bool {
+        switch self {
+        case .gifted, .providerWide:
+            return true
+        case .scheduled, .bankedRedeemed, .bankedAvailable:
+            return false
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .scheduled: return "Scheduled reset"
+        case .gifted: return "Gifted reset"
+        case .providerWide: return "Provider-wide reset"
+        case .bankedRedeemed: return "Banked reset redeemed"
+        case .bankedAvailable: return "Reset available"
+        }
+    }
+
+    public var systemImageName: String {
+        switch self {
+        case .scheduled: return "arrow.clockwise.circle"
+        case .gifted: return "gift"
+        case .providerWide: return "party.popper"
+        case .bankedRedeemed: return "checkmark.seal"
+        case .bankedAvailable: return "ticket"
+        }
+    }
+}
+
+// MARK: - Banked Reset Credits
+
+/// A provider-issued usage-limit reset the user can redeem ("banked").
+public struct QuotaResetCredit: Codable, Identifiable, Equatable, Hashable {
+    public let id: String
+    public let status: String?
+    public let grantedAt: Date?
+    public let expiresAt: Date?
+    public let title: String?
+    public let note: String?
+
+    public init(
+        id: String,
+        status: String? = nil,
+        grantedAt: Date? = nil,
+        expiresAt: Date? = nil,
+        title: String? = nil,
+        note: String? = nil
+    ) {
+        self.id = id
+        self.status = status
+        self.grantedAt = grantedAt
+        self.expiresAt = expiresAt
+        self.title = title
+        self.note = note
+    }
+
+    public var isAvailable: Bool {
+        guard let status = status?.lowercased() else { return true }
+        return status == "available" || status == "active" || status == "redeemable"
+    }
+}
+
+public enum QuotaResetCreditEventKind: String, Codable, Hashable {
+    case granted
+    case used
+    case expired
+}
+
+/// One entry of a provider's own reset-credit history ("Reset received",
+/// "Reset used").
+public struct QuotaResetCreditEvent: Codable, Identifiable, Equatable, Hashable {
+    public let id: String
+    public let kind: QuotaResetCreditEventKind
+    public let occurredAt: Date
+
+    public init(id: String, kind: QuotaResetCreditEventKind, occurredAt: Date) {
+        self.id = id
+        self.kind = kind
+        self.occurredAt = occurredAt
+    }
+}
+
+/// Provider-reported state of banked usage-limit resets. Codex reports this
+/// directly; Qwen's console shows the available count on its plan page.
+public struct QuotaResetCreditSummary: Codable, Equatable, Hashable {
+    public let availableCount: Int
+    public let earnedCount: Int?
+    public let credits: [QuotaResetCredit]
+    public let history: [QuotaResetCreditEvent]
+    public let redeemHint: String?
+    public let observedAt: Date
+
+    public init(
+        availableCount: Int,
+        earnedCount: Int? = nil,
+        credits: [QuotaResetCredit] = [],
+        history: [QuotaResetCreditEvent] = [],
+        redeemHint: String? = nil,
+        observedAt: Date = Date()
+    ) {
+        self.availableCount = max(0, availableCount)
+        self.earnedCount = earnedCount
+        self.credits = credits
+        self.history = history
+        self.redeemHint = redeemHint
+        self.observedAt = observedAt
+    }
+
+    /// Soonest expiry among the credits that can still be redeemed.
+    public var nearestExpiry: Date? {
+        credits.filter(\.isAvailable).compactMap(\.expiresAt).min()
+    }
+
+    public var hasAvailableReset: Bool {
+        availableCount > 0
+    }
+
+    /// "1 reset banked · expires in 2h".
+    public func statusLine(at now: Date = Date()) -> String? {
+        guard availableCount > 0 else { return nil }
+        let count = availableCount == 1 ? "1 reset banked" : "\(availableCount) resets banked"
+        guard let expiry = nearestExpiry else { return count }
+        let remaining = expiry.timeIntervalSince(now)
+        if remaining <= 0 {
+            return "\(count) · expiring"
+        }
+        return "\(count) · expires in \(compactDurationString(remaining))"
+    }
+}
+
+/// "2h 05m", "3d 4h", "45m".
+public func compactDurationString(_ interval: TimeInterval) -> String {
+    let totalMinutes = max(Int(interval / 60), 0)
+    let days = totalMinutes / (24 * 60)
+    let hours = (totalMinutes % (24 * 60)) / 60
+    let minutes = totalMinutes % 60
+    if days > 0 {
+        return hours > 0 ? "\(days)d \(hours)h" : "\(days)d"
+    }
+    if hours > 0 {
+        return minutes > 0 ? "\(hours)h \(String(format: "%02d", minutes))m" : "\(hours)h"
+    }
+    return "\(max(minutes, 1))m"
+}
+
 public enum QuotaSignalSeverity: String, Codable, Hashable {
     case info
     case warning
@@ -839,6 +1023,9 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
     public let confidence: Double?
     public let windowLabel: String?
     public let detectedAt: Date
+    /// Finer reset classification; nil for signals that are not about resets
+    /// or that came from a build predating the classification.
+    public let resetKind: QuotaResetKind?
 
     public var confidenceText: String? {
         guard let confidence else { return nil }
@@ -853,7 +1040,8 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
         severity: QuotaSignalSeverity,
         confidence: Double? = nil,
         windowLabel: String? = nil,
-        detectedAt: Date = Date()
+        detectedAt: Date = Date(),
+        resetKind: QuotaResetKind? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -863,6 +1051,24 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
         self.confidence = confidence
         self.windowLabel = windowLabel
         self.detectedAt = detectedAt
+        self.resetKind = resetKind
+    }
+}
+
+/// Content-based identity for a `QuotaSignal`, used to spot the same signal
+/// arriving from two sources. `QuotaSignal`'s own `Hashable` conformance
+/// includes `id` and `detectedAt`, so it treats re-reports as distinct.
+struct QuotaSignalIdentity: Hashable {
+    let kind: QuotaSignalKind
+    let windowLabel: String?
+    let title: String
+    let message: String
+
+    init(_ signal: QuotaSignal) {
+        kind = signal.kind
+        windowLabel = signal.windowLabel
+        title = signal.title
+        message = signal.message
     }
 }
 
@@ -1427,6 +1633,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let analyticsBuckets: [UsageAnalyticsBucket]
     public let fetchState: ProviderFetchState
     public let fetchedAt: Date
+    /// Provider-reported banked usage-limit resets, when the provider exposes them.
+    public let resetCredits: QuotaResetCreditSummary?
 
     public var displayPlanName: String? {
         guard let name = planName, !name.isEmpty else { return nil }
@@ -1562,8 +1770,37 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             events: events,
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            resetCredits: resetCredits
         )
+    }
+
+    /// Unions the signals a provider attached to this snapshot with signals
+    /// the app's own cross-snapshot detector derived for the same provider.
+    ///
+    /// The two sources describe different things and both are legitimate: a
+    /// provider signal reports something about the fetch that produced *this*
+    /// snapshot (a stale local cache, a plan notice), while a detected signal
+    /// reports a change observed *between* fetches. `withSignals` replaces,
+    /// which silently discarded everything the provider supplied, so callers
+    /// holding both lists must use this instead.
+    ///
+    /// Provider signals keep their original order and come first; detected
+    /// signals are appended in the order given. A detected signal matching a
+    /// provider signal on kind, window label, title and message is dropped as
+    /// a duplicate — `QuotaSignal` is `Hashable` but carries a fresh `id` and
+    /// its own `detectedAt`, so identity has to be compared on content.
+    public func mergingSignals(_ detectedSignals: [QuotaSignal]) -> QuotaSnapshot {
+        guard !detectedSignals.isEmpty else { return self }
+        guard !signals.isEmpty else { return withSignals(detectedSignals) }
+
+        var identities = Set(signals.map(QuotaSignalIdentity.init))
+        var combined = signals
+        for signal in detectedSignals where identities.insert(QuotaSignalIdentity(signal)).inserted {
+            combined.append(signal)
+        }
+
+        return withSignals(combined)
     }
 
     public func withWindows(_ newWindows: [QuotaWindow]) -> QuotaSnapshot {
@@ -1579,7 +1816,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             events: events,
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            resetCredits: resetCredits
         )
     }
 
@@ -1596,7 +1834,26 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             events: newEvents,
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            resetCredits: resetCredits
+        )
+    }
+
+    public func withResetCredits(_ credits: QuotaResetCreditSummary?) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: id,
+            providerID: providerID,
+            displayName: displayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: events,
+            analyticsBuckets: analyticsBuckets,
+            fetchState: fetchState,
+            fetchedAt: fetchedAt,
+            resetCredits: credits
         )
     }
 
@@ -1613,6 +1870,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         case analyticsBuckets
         case fetchState
         case fetchedAt
+        case resetCredits
     }
 
     public init(
@@ -1627,7 +1885,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         events: [UsageEvent] = [],
         analyticsBuckets: [UsageAnalyticsBucket] = [],
         fetchState: ProviderFetchState = .success,
-        fetchedAt: Date = Date()
+        fetchedAt: Date = Date(),
+        resetCredits: QuotaResetCreditSummary? = nil
     ) {
         self.id = id
         self.providerID = providerID
@@ -1641,6 +1900,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         self.analyticsBuckets = analyticsBuckets
         self.fetchState = fetchState
         self.fetchedAt = fetchedAt
+        self.resetCredits = resetCredits
     }
 
     public init(from decoder: Decoder) throws {
@@ -1665,6 +1925,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         }
 
         fetchedAt = try container.decodeIfPresent(Date.self, forKey: .fetchedAt) ?? Date()
+        resetCredits = try? container.decodeIfPresent(QuotaResetCreditSummary.self, forKey: .resetCredits)
     }
 }
 

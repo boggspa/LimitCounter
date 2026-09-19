@@ -1748,7 +1748,8 @@ private func enrichEventsWithHistory(
         signals: snapshot.signals,
         events: combined,
         fetchState: snapshot.fetchState,
-        fetchedAt: snapshot.fetchedAt
+        fetchedAt: snapshot.fetchedAt,
+        resetCredits: snapshot.resetCredits
     )
 }
 
