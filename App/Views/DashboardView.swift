@@ -171,7 +171,7 @@ struct DashboardView: View {
         }
         #else
         GeometryReader { proxy in
-            if layoutModeStore.mode == .compact {
+            if layoutModeStore.mode.isCompact {
                 compactDashboardShell
             } else if shouldUseIPadDashboard(size: proxy.size) {
                 iPadDashboardShell(size: proxy.size)
@@ -919,7 +919,7 @@ struct DashboardView: View {
 
     private func dashboardCardLazyStack(isDesktop: Bool) -> some View {
         LazyVStack(spacing: isDesktop ? 12 : 10) {
-            if layoutModeStore.mode == .compact {
+            if layoutModeStore.mode.isCompact {
                 compactLayoutBody(isDesktop: isDesktop)
             } else if dashboardCards.isEmpty {
                 GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
@@ -953,13 +953,17 @@ struct DashboardView: View {
                 compactHeatmapCard
             }
 
-            CompactDashboardCardView(
-                snapshots: snapshots,
-                sevenDayResetCounts: appState.sevenDayResetCounts,
-                reorderableProviderIDs: reorderableProviderIDs,
-                draggedProviderID: $draggedProviderID,
-                orderStore: orderStore
-            )
+            if layoutModeStore.mode == .compactPeriod {
+                PeriodCompactDashboardCardView(snapshots: snapshots)
+            } else {
+                CompactDashboardCardView(
+                    snapshots: snapshots,
+                    sevenDayResetCounts: appState.sevenDayResetCounts,
+                    reorderableProviderIDs: reorderableProviderIDs,
+                    draggedProviderID: $draggedProviderID,
+                    orderStore: orderStore
+                )
+            }
 
             if showsHeatmap && !heatmapLeads {
                 compactHeatmapCard
@@ -1085,22 +1089,7 @@ struct DashboardView: View {
                 .frame(width: 1, height: 18)
                 .padding(.vertical, 6)
 
-            controlPillButton(
-                accessibilityLabel: layoutModeStore.mode == .compact
-                    ? "Switch to standard layout"
-                    : "Switch to compact layout"
-            ) {
-                layoutModeStore.toggle()
-            } label: {
-                // SF symbols: `rectangle.compress.vertical` while in
-                // standard mode (the action would compress), and
-                // `rectangle.expand.vertical` while in compact mode
-                // (the action would expand).
-                Image(systemName: layoutModeStore.mode == .compact
-                      ? "rectangle.expand.vertical"
-                      : "rectangle.compress.vertical")
-                    .foregroundStyle(layoutModeStore.mode == .compact ? ProGlassTheme.accent : .white)
-            }
+            compactLayoutMenu
 
             #if os(iOS)
             Rectangle()
@@ -1138,6 +1127,52 @@ struct DashboardView: View {
         .background(
             GlassPanel(style: .hud, accent: ProGlassTheme.accent, shape: Capsule(style: .continuous))
         )
+    }
+
+    /// The compact-layout control: a three-way picker between compact
+    /// off, the provider-grouped ("Standard") compact card, and the
+    /// period-grouped ("Period") one. Rendered as a menu rather than a
+    /// toggle so all three styles are one click away.
+    private var compactLayoutMenu: some View {
+        Menu {
+            // Plain buttons rather than a `Picker`: a button action only
+            // ever runs on a real click, so the stored layout can't be
+            // rewritten as a side effect of the menu being built.
+            Section("Compact layout") {
+                ForEach(DashboardLayoutMode.allCases, id: \.self) { mode in
+                    Button {
+                        layoutModeStore.setMode(mode)
+                    } label: {
+                        Label(
+                            mode.pickerTitle,
+                            systemImage: layoutModeStore.mode == mode ? "checkmark" : mode.pickerIconName
+                        )
+                    }
+                }
+            }
+        } label: {
+            // SF symbols: `rectangle.compress.vertical` while compact is
+            // off (the action would compress), `rectangle.expand.vertical`
+            // in the provider-grouped style (the action would expand), and
+            // a clock for the period-grouped style.
+            Image(systemName: compactLayoutIconName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(layoutModeStore.mode.isCompact ? ProGlassTheme.accent : .white)
+                .frame(width: 34, height: 30)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("Compact layout: \(layoutModeStore.mode.pickerTitle)")
+    }
+
+    private var compactLayoutIconName: String {
+        switch layoutModeStore.mode {
+        case .standard: return "rectangle.compress.vertical"
+        case .compact: return "rectangle.expand.vertical"
+        case .compactPeriod: return "clock.arrow.circlepath"
+        }
     }
 
     private func controlPillButton<Label: View>(
@@ -1823,20 +1858,131 @@ struct CompactDashboardCardView: View {
                     fraction: window.fractionUsed,
                     accentColor: accent,
                     height: 4,
-                    pace: window.pace(providerID: nil)
+                    pace: window.pace(providerID: providerID),
+                    segmentCount: window.segmentCount(for: providerID)
                 )
             }
         }
     }
 
     private func percentageText(for window: QuotaWindow, providerID: ProviderID) -> String {
-        if window.isCurrencyMetric {
-            return window.leadingValueText(for: providerID)
+        compactMeterValueText(for: window, providerID: providerID)
+    }
+}
+
+/// Trailing value for a compact meter row: currency meters show the
+/// amount, capped meters the percentage, and uncapped meters whatever
+/// raw total the provider reported.
+private func compactMeterValueText(for window: QuotaWindow, providerID: ProviderID) -> String {
+    if window.isCurrencyMetric {
+        return window.leadingValueText(for: providerID)
+    }
+    if window.hasExplicitLimit {
+        return "\(window.percentageUsed)%"
+    }
+    return window.leadingValueText
+}
+
+/// Compact layout, "Period" style: the same stacked meter rows as
+/// `CompactDashboardCardView`, but regrouped under the reset period they
+/// belong to (5H / Daily / Weekly / Monthly + API) instead of under
+/// their provider. Rows keep the provider accent on the bar, and name
+/// their provider inline since there is no per-provider header.
+struct PeriodCompactDashboardCardView: View {
+    let snapshots: [QuotaSnapshot]
+
+    private var sections: [QuotaPeriodSection] {
+        QuotaPeriodSection.sections(from: snapshots)
+    }
+
+    var body: some View {
+        let orderedSections = sections
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(orderedSections) { section in
+                sectionBlock(section)
+                if section.id != orderedSections.last?.id {
+                    Divider().overlay(Color.white.opacity(0.08))
+                }
+            }
         }
-        if window.hasExplicitLimit {
-            return "\(window.percentageUsed)%"
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
+    }
+
+    @ViewBuilder
+    private func sectionBlock(_ section: QuotaPeriodSection) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(section.group.title)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.primary)
+
+                Spacer(minLength: 4)
+
+                Text(section.rows.count == 1 ? "1 meter" : "\(section.rows.count) meters")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            .padding(.bottom, 1)
+
+            ForEach(section.rows) { row in
+                meterRow(row)
+            }
         }
-        return window.leadingValueText
+    }
+
+    @ViewBuilder
+    private func meterRow(_ row: QuotaPeriodRow) -> some View {
+        let accent = Color(hex: row.providerID.accentColorHex)
+
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                ProviderBrandIconView(providerID: row.providerID, size: 13)
+                    .frame(width: 16, height: 16)
+
+                Text(row.label)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+
+                Spacer(minLength: 6)
+
+                if let window = row.window {
+                    if let resetDate = window.resetDate {
+                        Text("Resets \(resetDate.absoluteResetString)")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Text(compactMeterValueText(for: window, providerID: row.providerID))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(usageColor(for: window.fractionUsed, accentColor: accent))
+                        .lineLimit(1)
+                        .monospacedDigit()
+                        .frame(minWidth: 38, alignment: .trailing)
+                } else {
+                    Text("No usage data yet")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+
+            if let window = row.window, window.hasExplicitLimit {
+                QuotaProgressBar(
+                    fraction: window.fractionUsed,
+                    accentColor: accent,
+                    height: 4,
+                    pace: window.pace(providerID: row.providerID),
+                    segmentCount: window.segmentCount(for: row.providerID)
+                )
+            }
+        }
     }
 }
 

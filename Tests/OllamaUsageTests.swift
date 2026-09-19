@@ -308,6 +308,8 @@ private func testOllamaFreeAccountParsesMonthlyIncludedUsage() throws {
     try expectClose(monthly.used, 12.8, "Free usage percent")
     try expectEqual(monthly.resetDate, fetchedAt.addingTimeInterval(3 * 7 * 86_400), "Free monthly reset from weeks countdown")
     try expectEqual(monthly.subtitle, "Resets in 3w", "Free monthly subtitle")
+    try expectEqual(monthly.periodGroup(for: .ollama), .monthlyAndAPI, "Free usage lands in the monthly period")
+    try expectEqual(monthly.segmentCount(for: .ollama), 4, "Free usage uses a monthly segment count")
     try expect(snapshot.windows.allSatisfy { $0.windowKind != .session && $0.windowKind != .weekly }, "Free page must not invent session or weekly meters")
 }
 

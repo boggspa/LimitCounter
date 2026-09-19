@@ -769,6 +769,233 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
             return nil
         }
     }
+
+    public func segmentCount(for providerID: ProviderID?) -> Int? {
+        guard let providerID = providerID else { return nil }
+        
+        let descriptor = label.lowercased()
+        
+        switch providerID {
+        case .openai, .chatgpt, .openaiAPI:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") || descriptor.contains("luna") { return 7 }
+        case .claude:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") || descriptor.contains("fable") { return 7 }
+        case .gemini:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") { return 7 }
+        case .kimi:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") { return 7 }
+            if descriptor.contains("monthly") { return 4 }
+        case .antigravity:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") { return 7 }
+        case .mistral:
+            if descriptor.contains("api") || descriptor.contains("vibe") { return 4 }
+        case .cursor:
+            if descriptor.contains("plan") || descriptor.contains("auto") || descriptor.contains("api") { return 4 }
+        case .grok:
+            if descriptor.contains("weekly") { return 7 }
+        case .ollama:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") { return 7 }
+            if descriptor.contains("free") || descriptor.contains("included") || descriptor.contains("month") { return 4 }
+        case .devin:
+            if descriptor.contains("daily") { return 6 }
+            if descriptor.contains("weekly") { return 7 }
+        case .mimo:
+            if descriptor.contains("monthly") || descriptor.contains("plan") { return 4 }
+        case .qwen:
+            if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
+            if descriptor.contains("weekly") || descriptor.contains("7-day") { return 7 }
+        case .meta:
+            if descriptor.contains("weekly") { return 7 }
+            if descriptor.contains("credit") || descriptor.contains("monthly") { return 4 }
+        case .deepseek, .cerebras, .openrouter:
+            if descriptor.contains("credit") || descriptor.contains("monthly") { return 4 }
+        default:
+            return nil
+        }
+        
+        return nil
+    }
+}
+
+// MARK: - Period Grouping
+
+/// The buckets the "Period" compact layout stacks meters into.
+///
+/// Providers name the same reset cadence a dozen different ways —
+/// Claude calls its five-hour window "Session", Ollama "Session usage",
+/// Meta "Current usage", Kimi just "5H" — so the grouping keys off the
+/// window label first and falls back to `QuotaWindowKind` only when the
+/// label carries no period word.
+public enum QuotaPeriodGroup: String, Codable, CaseIterable, Identifiable, Hashable {
+    case fiveHour
+    case daily
+    case weekly
+    case monthlyAndAPI
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .fiveHour: return "5H"
+        case .daily: return "Daily"
+        case .weekly: return "Weekly"
+        case .monthlyAndAPI: return "Monthly + API"
+        }
+    }
+}
+
+public extension QuotaWindow {
+    /// Which period bucket this meter belongs in.
+    ///
+    /// `providerID` only matters for windows whose kind is `.custom`:
+    /// Gemini CLI models its per-model free-tier caps that way even
+    /// though they reset daily, while the spend providers (DeepSeek,
+    /// Cerebras) use `.custom` for rolling credit balances.
+    func periodGroup(for providerID: ProviderID? = nil) -> QuotaPeriodGroup {
+        let descriptor = label.lowercased()
+
+        if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") {
+            return .fiveHour
+        }
+        if descriptor.contains("7d") || descriptor.contains("7-day") || descriptor.contains("7 day")
+            || descriptor.contains("week") {
+            return .weekly
+        }
+        if descriptor.contains("24h") || descriptor.contains("24-hour") || descriptor.contains("daily") {
+            return .daily
+        }
+        if descriptor.contains("30d") || descriptor.contains("monthly") || descriptor.contains("month") {
+            return .monthlyAndAPI
+        }
+
+        switch windowKind {
+        case .session:
+            return .fiveHour
+        case .daily:
+            return .daily
+        case .weekly:
+            return .weekly
+        case .monthly, .yearly, .sliding, .project:
+            return .monthlyAndAPI
+        case .custom:
+            return providerID == .gemini ? .daily : .monthlyAndAPI
+        }
+    }
+}
+
+/// One meter row in the period layout. `window` is nil for a provider
+/// that has no meters yet — it still gets a row so the user can see the
+/// provider is connected but idle (OpenRouter, a freshly added key).
+public struct QuotaPeriodRow: Identifiable, Equatable, Hashable {
+    public let id: UUID
+    public let providerID: ProviderID
+    public let label: String
+    public let window: QuotaWindow?
+
+    public init(id: UUID, providerID: ProviderID, label: String, window: QuotaWindow?) {
+        self.id = id
+        self.providerID = providerID
+        self.label = label
+        self.window = window
+    }
+}
+
+public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
+    public let group: QuotaPeriodGroup
+    public let rows: [QuotaPeriodRow]
+
+    public var id: String { group.rawValue }
+
+    public init(group: QuotaPeriodGroup, rows: [QuotaPeriodRow]) {
+        self.group = group
+        self.rows = rows
+    }
+
+    /// Regroups already-ordered snapshots by reset period.
+    ///
+    /// Snapshots arrive in dashboard order, so within a period the rows
+    /// keep the provider order the user dragged into place, and within a
+    /// provider they keep the order the client emitted the windows in.
+    /// Empty sections are dropped; providers with no meters land at the
+    /// bottom of the last section.
+    public static func sections(from snapshots: [QuotaSnapshot]) -> [QuotaPeriodSection] {
+        var rowsByGroup: [QuotaPeriodGroup: [QuotaPeriodRow]] = [:]
+        var idleRows: [QuotaPeriodRow] = []
+
+        for snapshot in snapshots {
+            let windows = snapshot.summaryWindows
+            guard !windows.isEmpty else {
+                idleRows.append(
+                    QuotaPeriodRow(
+                        id: snapshot.id,
+                        providerID: snapshot.providerID,
+                        label: snapshot.displayName,
+                        window: nil
+                    )
+                )
+                continue
+            }
+
+            for window in windows {
+                let row = QuotaPeriodRow(
+                    id: window.id,
+                    providerID: snapshot.providerID,
+                    label: snapshot.periodRowLabel(for: window),
+                    window: window
+                )
+                rowsByGroup[window.periodGroup(for: snapshot.providerID), default: []].append(row)
+            }
+        }
+
+        var sections = QuotaPeriodGroup.allCases.compactMap { group -> QuotaPeriodSection? in
+            guard let rows = rowsByGroup[group], !rows.isEmpty else { return nil }
+            return QuotaPeriodSection(group: group, rows: rows)
+        }
+
+        guard !idleRows.isEmpty else { return sections }
+
+        if let last = sections.indices.last {
+            sections[last] = QuotaPeriodSection(
+                group: sections[last].group,
+                rows: sections[last].rows + idleRows
+            )
+        } else {
+            sections = [QuotaPeriodSection(group: .monthlyAndAPI, rows: idleRows)]
+        }
+        return sections
+    }
+}
+
+public extension QuotaSnapshot {
+    /// Row label for the period layout, which has no per-provider header
+    /// to lean on: the provider name is prefixed to the window label,
+    /// with any overlap between the two collapsed so "MiMo Token Plan" +
+    /// "Plan Quota" reads "MiMo Token Plan Quota" rather than repeating
+    /// "Plan".
+    func periodRowLabel(for window: QuotaWindow) -> String {
+        let providerWords = displayName.split(separator: " ").map(String.init)
+        let labelWords = window.label.split(separator: " ").map(String.init)
+
+        guard !labelWords.isEmpty else { return displayName }
+        guard !providerWords.isEmpty else { return window.label }
+
+        func lowered(_ words: [String]) -> [String] { words.map { $0.lowercased() } }
+
+        var overlap = 0
+        for count in stride(from: min(providerWords.count, labelWords.count), through: 1, by: -1)
+        where lowered(Array(providerWords.suffix(count))) == lowered(Array(labelWords.prefix(count))) {
+            overlap = count
+            break
+        }
+
+        return (providerWords + labelWords.dropFirst(overlap)).joined(separator: " ")
+    }
 }
 
 // MARK: - Supplemental Stats

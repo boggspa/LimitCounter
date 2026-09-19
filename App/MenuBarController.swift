@@ -329,7 +329,8 @@ private struct MenuBarOverviewRow: View {
                         fraction: window.fractionUsed,
                         accentColor: accent,
                         height: 4,
-                        pace: window.pace(providerID: snapshot.providerID)
+                        pace: window.pace(providerID: snapshot.providerID),
+                        segmentCount: window.segmentCount(for: snapshot.providerID)
                     )
                 } else if let intelligence {
                     HStack(spacing: 4) {
@@ -568,7 +569,7 @@ private struct MiniQuotaWindowRow: View {
             }
 
             if window.hasExplicitLimit {
-                QuotaProgressBar(fraction: window.fractionUsed, accentColor: accent, height: 5, pace: pace)
+                QuotaProgressBar(fraction: window.fractionUsed, accentColor: accent, height: 5, pace: pace, segmentCount: window.segmentCount(for: providerID))
             }
 
             HStack {

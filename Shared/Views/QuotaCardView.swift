@@ -876,7 +876,8 @@ public struct QuotaWindowRow: View {
                 QuotaProgressBar(
                     fraction: window.fractionUsed,
                     accentColor: accentColor,
-                    pace: pace
+                    pace: pace,
+                    segmentCount: window.segmentCount(for: providerID)
                 )
             }
 
@@ -1000,13 +1001,15 @@ public struct QuotaProgressBar: View {
     let fraction: Double
     let accentColor: Color
     let pace: QuotaPace?
+    let segmentCount: Int?
     var height: CGFloat = 8
 
-    public init(fraction: Double, accentColor: Color, height: CGFloat = 8, pace: QuotaPace? = nil) {
+    public init(fraction: Double, accentColor: Color, height: CGFloat = 8, pace: QuotaPace? = nil, segmentCount: Int? = nil) {
         self.fraction = fraction
         self.accentColor = accentColor
         self.height = height
         self.pace = pace
+        self.segmentCount = segmentCount
     }
 
     public var body: some View {
@@ -1057,6 +1060,18 @@ public struct QuotaProgressBar: View {
                                 )
                                 .frame(width: fillWidth, height: height * 0.46)
                         }
+                }
+
+                if let count = segmentCount, count > 1 {
+                    ForEach(1..<count, id: \.self) { i in
+                        let divisionFraction = Double(i) / Double(count)
+                        let markerX = geo.size.width * divisionFraction
+                        
+                        Rectangle()
+                            .fill(Color.white.opacity(0.5))
+                            .frame(width: 1.5, height: height)
+                            .offset(x: markerX - 0.75)
+                    }
                 }
 
                 if let pace, pace.shouldSurface {
@@ -1151,7 +1166,8 @@ public struct QuotaCardSmallView: View {
                     fraction: window.fractionUsed,
                     accentColor: accent,
                     height: 3.5,
-                    pace: window.pace(providerID: snapshot.providerID)
+                    pace: window.pace(providerID: snapshot.providerID),
+                    segmentCount: window.segmentCount(for: snapshot.providerID)
                 )
             } else if compactResetText(for: window) == nil {
                 Text(window.measurementSummary)

@@ -482,8 +482,43 @@ public final class ProviderVisibilityStore: ObservableObject {
 /// flows through the App Group container and is visible to widgets if
 /// they ever need to react to it.
 public enum DashboardLayoutMode: String, Codable, CaseIterable {
+    /// Compact off — the standard per-provider card list.
     case standard
+    /// Compact, meters grouped under their provider (the original
+    /// compact layout).
     case compact
+    /// Compact, meters regrouped under their reset period (5H, Daily,
+    /// Weekly, Monthly + API) with providers interleaved.
+    case compactPeriod
+
+    /// True for every mode that folds the per-provider cards into the
+    /// single stacked-meter card.
+    public var isCompact: Bool { self != .standard }
+
+    /// Titles/subtitles/icons for the dashboard's compact-style picker.
+    public var pickerTitle: String {
+        switch self {
+        case .standard: return "Off"
+        case .compact: return "Standard"
+        case .compactPeriod: return "Period"
+        }
+    }
+
+    public var pickerSubtitle: String {
+        switch self {
+        case .standard: return "Full provider cards"
+        case .compact: return "Meters grouped by provider"
+        case .compactPeriod: return "Meters grouped by reset period"
+        }
+    }
+
+    public var pickerIconName: String {
+        switch self {
+        case .standard: return "rectangle.expand.vertical"
+        case .compact: return "rectangle.compress.vertical"
+        case .compactPeriod: return "clock.arrow.circlepath"
+        }
+    }
 }
 
 public final class DashboardLayoutModeStore: ObservableObject {
@@ -509,8 +544,11 @@ public final class DashboardLayoutModeStore: ObservableObject {
         defaults.set(newMode.rawValue, forKey: modeKey)
     }
 
+    /// Flips between "compact off" and the last compact style the user
+    /// picked — kept so callers that only want an on/off switch (menu
+    /// bar, keyboard shortcuts) don't have to know about the styles.
     public func toggle() {
-        setMode(mode == .standard ? .compact : .standard)
+        setMode(mode.isCompact ? .standard : .compact)
     }
 }
 

@@ -237,7 +237,8 @@ public struct QuotaWidgetEntryView: View {
                     fraction: metric.window.fractionUsed,
                     accentColor: Color(hex: metric.snapshot.providerID.accentColorHex),
                     height: 3,
-                    pace: metric.window.pace(providerID: metric.snapshot.providerID)
+                    pace: metric.window.pace(providerID: metric.snapshot.providerID),
+                    segmentCount: metric.window.segmentCount(for: metric.snapshot.providerID)
                 )
             }
         }
@@ -620,7 +621,8 @@ public struct LargeSingleProviderView: View {
                     fraction: window.fractionUsed,
                     accentColor: accent,
                     height: 8,
-                    pace: window.pace(providerID: snapshot.providerID)
+                    pace: window.pace(providerID: snapshot.providerID),
+                    segmentCount: window.segmentCount(for: snapshot.providerID)
                 )
             }
 
@@ -1260,6 +1262,7 @@ public struct LockScreenMeterStackRow: Identifiable, Hashable {
     public let fraction: Double
     public let accentHex: String
     public let pace: QuotaPace?
+    public let segmentCount: Int?
 }
 
 private struct LockScreenMeterStackRowView: View {
@@ -1304,7 +1307,8 @@ private struct LockScreenMeterStackRowView: View {
                     fraction: row.fraction,
                     accentColor: accent,
                     height: 2.2,
-                    pace: row.pace
+                    pace: row.pace,
+                    segmentCount: row.segmentCount
                 )
                 .widgetAccentable(true)
             }
@@ -1399,7 +1403,8 @@ private enum LockScreenMeterStackSelector {
             valueText: window.leadingValueText,
             fraction: window.fractionUsed,
             accentHex: snapshot.providerID.accentColorHex,
-            pace: window.pace(providerID: snapshot.providerID, at: date)
+            pace: window.pace(providerID: snapshot.providerID, at: date),
+            segmentCount: window.segmentCount(for: snapshot.providerID)
         )
     }
 
@@ -1755,6 +1760,7 @@ public struct SelectQuotaTrioMeterRow: Identifiable, Hashable {
     public let resetDate: Date?
     public let hasExplicitLimit: Bool
     public let pace: QuotaPace?
+    public let segmentCount: Int?
 }
 
 /// Entry payload for the trio widget — a pre-built array of stack rows.
@@ -1869,7 +1875,8 @@ private enum SelectQuotaTrioRowBuilder {
             accentHex: snapshot.providerID.accentColorHex,
             resetDate: window.resetDate,
             hasExplicitLimit: window.hasExplicitLimit,
-            pace: window.pace(providerID: snapshot.providerID, at: date)
+            pace: window.pace(providerID: snapshot.providerID, at: date),
+            segmentCount: window.segmentCount(for: snapshot.providerID)
         )
     }
 }
@@ -1964,7 +1971,8 @@ private struct SelectQuotaTrioMeterRowView: View {
                         fraction: row.fraction,
                         accentColor: accent,
                         height: 3,
-                        pace: row.pace
+                        pace: row.pace,
+                        segmentCount: row.segmentCount
                     )
                     .widgetAccentable(true)
                 }
