@@ -6445,7 +6445,7 @@ private enum DevinLocalStateReader {
         
         // Bind for the IN clause
         for key in keys {
-            key.withCString { cString in
+            _ = key.withCString { cString in
                 sqlite3_bind_text(statement, bindIndex, cString, -1, transientDestructor)
             }
             bindIndex += 1
@@ -6453,7 +6453,7 @@ private enum DevinLocalStateReader {
         
         // Bind for the ORDER BY CASE clause
         for key in keys {
-            key.withCString { cString in
+            _ = key.withCString { cString in
                 sqlite3_bind_text(statement, bindIndex, cString, -1, transientDestructor)
             }
             bindIndex += 1
