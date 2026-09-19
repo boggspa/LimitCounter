@@ -187,6 +187,36 @@ private func testOllamaIgnoresJunkPercentagesInMarkup() throws {
     )
 }
 
+private func testOllamaReadsResetTextSplitByMarkup() throws {
+    let suiteName = "limit-counter-ollama-split-reset-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fetchedAt = date("2026-08-28T10:00:00Z")
+    let html = """
+    <html><body><main>
+      <section>
+        <h2>Session usage</h2>
+        <p>0% used</p>
+        <p>Resets in <span>3</span> hours.</p>
+      </section>
+      <section>
+        <h2>Weekly usage</h2>
+        <p>4.6% used</p>
+        <p>Resets in <span>2</span> days.</p>
+      </section>
+      <h3>Models used</h3>
+    </main></body></html>
+    """
+
+    let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
+    let weekly = try snapshot.windows.first(where: { $0.windowKind == .weekly })
+        ?? { throw OllamaTestError.failure("Missing Ollama weekly window") }()
+
+    try expectClose(weekly.used, 4.6, "Ollama split markup weekly percent")
+    try expectEqual(weekly.resetDate, fetchedAt.addingTimeInterval(2 * 86_400), "Ollama split markup weekly reset")
+}
+
 private func testOllamaWeeklyResetStoreKeepsEpisodeDateStable() throws {
     let suiteName = "limit-counter-ollama-reset-store-\(UUID().uuidString)"
     let defaults = try isolatedDefaults(suiteName)
@@ -398,6 +428,7 @@ private enum OllamaUsageTestRunner {
         try testOllamaWeeklyBannerAttachesResetToWeeklyWindow()
         try testOllamaReorderedLandmarksDoNotTrap()
         try testOllamaIgnoresJunkPercentagesInMarkup()
+        try testOllamaReadsResetTextSplitByMarkup()
         try testOllamaWeeklyResetStoreKeepsEpisodeDateStable()
         try testOllamaFreeAccountParsesMonthlyIncludedUsage()
         try testOllamaFreePageWithLoginLinkStillParses()

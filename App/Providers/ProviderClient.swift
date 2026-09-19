@@ -10568,16 +10568,28 @@ public struct OllamaProviderClient: ProviderClient {
         var windows: [QuotaWindow] = []
 
         let (sessionChunk, weeklyChunk, includedChunk) = extractSections(from: html)
+        let renderedText = normalizedRenderedText(from: html)
+        let (renderedSessionChunk, renderedWeeklyChunk, renderedIncludedChunk) = extractSections(from: renderedText)
         // The weekly-limit banner sits between the two usage headings, so it is
         // detected once against the whole usage region and attributed to the
         // weekly window rather than whichever chunk it happens to land in.
-        let banner = parseWeeklyLimitBanner(in: (sessionChunk ?? "") + (weeklyChunk ?? ""), now: fetchedAt)
+        let banner = parseWeeklyLimitBanner(
+            in: (sessionChunk ?? "") + (weeklyChunk ?? ""),
+            now: fetchedAt
+        ) ?? parseWeeklyLimitBanner(
+            in: (renderedSessionChunk ?? "") + (renderedWeeklyChunk ?? ""),
+            now: fetchedAt
+        )
 
         if let sessionChunk {
             let cleanedChunk = banner == nil ? sessionChunk : removingWeeklyBannerPhrases(from: sessionChunk)
-            if let sessionMetric = parseMetricFromChunk(cleanedChunk, isWeekly: false, now: fetchedAt) {
-                var resetDate = sessionMetric.resetDate
-                var resetDescription = sessionMetric.resetDescription
+            let sessionMetric = parseMetricFromChunk(cleanedChunk, isWeekly: false, now: fetchedAt)
+            let renderedSessionMetric = renderedSessionChunk.flatMap {
+                parseMetricFromChunk($0, isWeekly: false, now: fetchedAt)
+            }
+            if let sessionMetric = sessionMetric ?? renderedSessionMetric {
+                var resetDate = sessionMetric.resetDate ?? renderedSessionMetric?.resetDate
+                var resetDescription = sessionMetric.resetDescription ?? renderedSessionMetric?.resetDescription
                 if banner != nil, let candidate = resetDate, candidate.timeIntervalSince(fetchedAt) >= 86_400 {
                     resetDate = nil
                     resetDescription = nil
@@ -10598,9 +10610,14 @@ public struct OllamaProviderClient: ProviderClient {
 
         if let weeklyChunk {
             let weeklyMetric = parseMetricFromChunk(weeklyChunk, isWeekly: true, now: fetchedAt)
-            if let percent = weeklyMetric?.percent ?? (banner == nil ? nil : 100) {
-                var resetDate = weeklyMetric?.resetDate
-                var subtitle = weeklyMetric?.resetDescription ?? "Weekly rolling window"
+            let renderedWeeklyMetric = renderedWeeklyChunk.flatMap {
+                parseMetricFromChunk($0, isWeekly: true, now: fetchedAt)
+            }
+            if let percent = weeklyMetric?.percent ?? renderedWeeklyMetric?.percent ?? (banner == nil ? nil : 100) {
+                var resetDate = weeklyMetric?.resetDate ?? renderedWeeklyMetric?.resetDate
+                var subtitle = weeklyMetric?.resetDescription
+                    ?? renderedWeeklyMetric?.resetDescription
+                    ?? "Weekly rolling window"
                 if let banner {
                     resetDate = banner.resumeDate ?? resetDate
                     subtitle = "Weekly limit reached"
@@ -10622,12 +10639,17 @@ public struct OllamaProviderClient: ProviderClient {
             }
         }
 
-
         let parsedPaidMeter = windows.contains { $0.windowKind == .session || $0.windowKind == .weekly }
         if !parsedPaidMeter, let includedChunk {
-            if let includedMetric = parseMetricFromChunk(includedChunk, isWeekly: false, now: fetchedAt) {
-                var resetDate = includedMetric.resetDate
-                let subtitle = includedMetric.resetDescription ?? "Monthly included usage"
+            let includedMetric = parseMetricFromChunk(includedChunk, isWeekly: false, now: fetchedAt)
+            let renderedIncludedMetric = renderedIncludedChunk.flatMap {
+                parseMetricFromChunk($0, isWeekly: false, now: fetchedAt)
+            }
+            if let includedMetric = includedMetric ?? renderedIncludedMetric {
+                var resetDate = includedMetric.resetDate ?? renderedIncludedMetric?.resetDate
+                let subtitle = includedMetric.resetDescription
+                    ?? renderedIncludedMetric?.resetDescription
+                    ?? "Monthly included usage"
                 if let candidate = resetDate {
                     resetDate = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
                         candidate: candidate,
@@ -10659,7 +10681,7 @@ public struct OllamaProviderClient: ProviderClient {
         return QuotaSnapshot(
             providerID: .ollama,
             displayName: "Ollama",
-            planName: extractOllamaPlanName(from: html),
+            planName: extractOllamaPlanName(from: html, renderedText: renderedText),
             windows: windows,
             stats: [],
             balances: [],
@@ -10703,7 +10725,6 @@ public struct OllamaProviderClient: ProviderClient {
         if let iRange = includedRange {
             includedChunk = forwardChunk(from: iRange.lowerBound)
         }
-
         return (sessionChunk, weeklyChunk, includedChunk)
     }
 
@@ -10714,10 +10735,11 @@ public struct OllamaProviderClient: ProviderClient {
             || rangeOfUsageHeading("Free usage", in: html) != nil
     }
 
-    private func extractOllamaPlanName(from html: String) -> String? {
+    private func extractOllamaPlanName(from html: String, renderedText: String) -> String? {
+        let source = renderedText.isEmpty ? html : renderedText
         guard let groups = firstMatchGroups(
-            in: html,
-            pattern: #"(?:Included usage|Cloud usage)[\s\S]{0,120}?(Free|Pro|Plus|Max|Team|Enterprise)\b"#
+            in: source,
+            pattern: #"(?:Included usage|Cloud usage)\s+(Free|Pro|Plus|Max|Team|Enterprise)\b"#
         ), let name = groups.first else {
             return nil
         }
@@ -10756,6 +10778,23 @@ public struct OllamaProviderClient: ProviderClient {
         return true
     }
 
+    private func normalizedRenderedText(from html: String) -> String {
+        var text = html
+        for pattern in [#"<!--[\s\S]*?-->"#, #"<[^>]+>"#] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = regex.stringByReplacingMatches(in: text, range: range, withTemplate: " ")
+        }
+        text = text
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&middot;", with: " ")
+        guard let whitespace = try? NSRegularExpression(pattern: #"\s+"#) else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return whitespace.stringByReplacingMatches(in: text, range: range, withTemplate: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private func parseWeeklyLimitBanner(in usageRegion: String, now: Date) -> WeeklyLimitBanner? {
         var resumeDate: Date? = nil
