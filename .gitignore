@@ -21,3 +21,6 @@ dist/
 .claude/
 .cursor/
 .cache/
+
+# Local release/test scratch: ad-hoc builds, pipeline logs, module caches
+scratch/
