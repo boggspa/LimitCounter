@@ -222,6 +222,32 @@ private func headerMetadataLine(plan: String?, updatedAt: Date) -> some View {
     }
 }
 
+/// "1 reset banked · expires in 2h" — a provider-reported reset the user can
+/// redeem. Shown wherever the provider's meters are, so an expiring reset is
+/// never a surprise.
+struct BankedResetPill: View {
+    let text: String
+    let accent: Color
+    let compact: Bool
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "ticket")
+                .font(.system(size: compact ? 8 : 9, weight: .bold))
+            Text(text)
+                .font(.system(size: compact ? 9 : 10, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .foregroundStyle(accent)
+        .padding(.horizontal, compact ? 5 : 6)
+        .padding(.vertical, compact ? 1 : 2)
+        .background(accent.opacity(0.16), in: Capsule(style: .continuous))
+        .accessibilityLabel("Usage limit reset banked: \(text)")
+    }
+}
+
 // MARK: - Quota Card (full app size)
 
 public struct QuotaCardView: View {
@@ -282,6 +308,11 @@ public struct QuotaCardView: View {
                 ProviderCardTitleText(title: snapshot.displayName, accentColor: accentColor)
 
                 headerMetadataLine(plan: snapshot.planName, updatedAt: snapshot.fetchedAt)
+
+                if let banked = snapshot.resetCredits, banked.hasAvailableReset {
+                    BankedResetPill(text: banked.statusLine() ?? "Reset banked", accent: accentColor, compact: false)
+                        .padding(.top, 3)
+                }
             }
 
             Spacer()

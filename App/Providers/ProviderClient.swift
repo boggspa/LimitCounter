@@ -5273,14 +5273,23 @@ public struct CodexSessionProviderClient: ProviderClient {
             print("[CodexSessionProvider] Response body (first 500 chars): \(responseBody.prefix(500))")
         }
 
+        let payload: CodexUsagePayload
         do {
-            let payload = try decoder.decode(CodexUsagePayload.self, from: data)
+            payload = try decoder.decode(CodexUsagePayload.self, from: data)
             print("[CodexSessionProvider] Decoded payload - primary: \(payload.primaryWindow != nil), secondary: \(payload.secondaryWindow != nil)")
-            return normalize(payload: payload, accountID: accountID)
         } catch {
             print("[CodexSessionProvider] Decode error: \(error)")
             throw ProviderFetchError.parsingError("Unable to decode Codex usage: \(error.localizedDescription)")
         }
+
+        // The banked "usage limit resets" behind the Codex app's panel ride on
+        // two sibling endpoints; the usage payload only carries the count.
+        let resetCredits = await CodexResetCreditsFetcher(session: session).summary(
+            usageCount: payload.resetCredits?.availableCount,
+            accessToken: accessToken,
+            accountID: accountID
+        )
+        return normalize(payload: payload, accountID: accountID).withResetCredits(resetCredits)
     }
 
     private func makeRequest(accessToken: String, accountID: String) -> URLRequest {
@@ -5298,9 +5307,21 @@ public struct CodexSessionProviderClient: ProviderClient {
         var additionalWindows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
 
-        // The API's primary/secondary positions are not semantic. In the
-        // current quota shape, the account-wide weekly allowance arrives as
-        // primary_window; older payloads placed the same duration second.
+        // The API's primary/secondary positions are not semantic. The
+        // account-wide 5-hour allowance is available on Plus and lower plans,
+        // while Pro intentionally receives only a weekly window.
+        if shouldDisplayAggregateFiveHourLimit(planType: payload.planType),
+           let fiveHour = aggregateFiveHourWindow(in: payload) {
+            aggregateWindows.append(
+                quotaWindow(
+                    from: fiveHour,
+                    label: "5H",
+                    windowKind: .session,
+                    subtitle: "5-hour rolling window"
+                )
+            )
+        }
+
         if let weekly = aggregateWeeklyWindow(in: payload) {
             aggregateWindows.append(
                 quotaWindow(
@@ -5316,33 +5337,48 @@ public struct CodexSessionProviderClient: ProviderClient {
             guard let rateLimit = additionalLimit.rateLimit else { continue }
             let name = additionalLimit.displayName
 
-            guard isCodexSparkLimit(name) else { continue }
+            switch additionalLimitKind(for: name) {
+            case .spark:
+                // Surface the 5-hour "Extra limits" window above the weekly meter so
+                // the short rolling allowance is visible first.
+                if let fiveHour = fiveHourWindow(in: rateLimit) {
+                    additionalWindows.append(
+                        quotaWindow(
+                            from: fiveHour,
+                            label: "⚡ Spark 5H",
+                            windowKind: .session,
+                            subtitle: "5-hour rolling window"
+                        )
+                    )
+                }
 
-            // Surface the 5-hour "Extra limits" window above the weekly meter so
-            // the short rolling allowance is visible first.
-            if let fiveHour = fiveHourWindow(in: rateLimit) {
-                additionalWindows.append(
-                    quotaWindow(
-                        from: fiveHour,
-                        label: "\(name) 5H",
-                        windowKind: .session,
-                        subtitle: "5-hour rolling window"
-                     )
-                 )
-             }
+                if let weekly = weeklyWindow(in: rateLimit) {
+                    additionalWindows.append(
+                        quotaWindow(
+                            from: weekly,
+                            label: "⚡ Spark Weekly",
+                            windowKind: .weekly,
+                            subtitle: "7-day usage limit"
+                        )
+                    )
+                }
 
-            if let weekly = weeklyWindow(in: rateLimit) {
+            case .lunaReserve:
+                guard let weekly = weeklyWindow(in: rateLimit) else { continue }
                 additionalWindows.append(
                     quotaWindow(
                         from: weekly,
-                        label: "\(name) Weekly",
+                        label: "🌙 Luna Reserve Weekly",
                         windowKind: .weekly,
-                        subtitle: "7-day usage limit"
-                     )
-                 )
-             }
+                        subtitle: "Separate 7-day Luna Reserve allowance"
+                    )
+                )
 
-         }
+            case nil:
+                continue
+            }
+
+        }
 
         if let credits = payload.credits,
            let balance = credits.balance {
@@ -5388,15 +5424,43 @@ public struct CodexSessionProviderClient: ProviderClient {
         )
     }
 
-    private func isCodexSparkLimit(_ name: String) -> Bool {
+    private enum CodexAdditionalLimitKind {
+        case spark
+        case lunaReserve
+    }
+
+    private func additionalLimitKind(for name: String) -> CodexAdditionalLimitKind? {
         let normalizedName = name.lowercased().filter { $0.isLetter || $0.isNumber }
-        return normalizedName.contains("53codexspark")
+        if normalizedName.contains("53codexspark") {
+            return .spark
+        }
+        if normalizedName.contains("gptreserve") || normalizedName.contains("lunareserve") {
+            return .lunaReserve
+        }
+        return nil
     }
 
     private func aggregateWeeklyWindow(in payload: CodexUsagePayload) -> CodexWindow? {
         [payload.primaryWindow, payload.secondaryWindow]
             .compactMap { $0 }
             .first { $0.limitWindowSeconds >= 6 * 24 * 60 * 60 }
+    }
+
+    private func aggregateFiveHourWindow(in payload: CodexUsagePayload) -> CodexWindow? {
+        [payload.primaryWindow, payload.secondaryWindow]
+            .compactMap { $0 }
+            .first { (4 * 60 * 60 ... 6 * 60 * 60).contains($0.limitWindowSeconds) }
+    }
+
+    private func shouldDisplayAggregateFiveHourLimit(planType: String?) -> Bool {
+        guard let planType = planType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !planType.isEmpty else {
+            return false
+        }
+        return planType == "free"
+            || planType == "go"
+            || planType == "plus"
+            || planType.contains("plus")
     }
 
     private func weeklyWindow(in rateLimit: CodexRateLimit) -> CodexWindow? {
@@ -5442,12 +5506,14 @@ private struct CodexUsagePayload: Decodable {
     let additionalRateLimits: [CodexAdditionalRateLimit]
     let credits: CodexCredits?
     let planType: String?
+    let resetCredits: CodexResetCreditsSummaryPayload?
 
     enum CodingKeys: String, CodingKey {
         case rateLimit = "rate_limit"
         case additionalRateLimits = "additional_rate_limits"
         case credits
         case planType = "plan_type"
+        case resetCredits = "rate_limit_reset_credits"
     }
 
     var primaryWindow: CodexWindow? { rateLimit?.primaryWindow }
@@ -5459,6 +5525,213 @@ private struct CodexUsagePayload: Decodable {
         additionalRateLimits = try container.decodeIfPresent([CodexAdditionalRateLimit].self, forKey: .additionalRateLimits) ?? []
         credits = try container.decodeIfPresent(CodexCredits.self, forKey: .credits)
         planType = try container.decodeIfPresent(String.self, forKey: .planType)
+        resetCredits = try? container.decodeIfPresent(CodexResetCreditsSummaryPayload.self, forKey: .resetCredits)
+    }
+}
+
+/// `rate_limit_reset_credits` on the usage payload: just the counts.
+private struct CodexResetCreditsSummaryPayload: Decodable {
+    let availableCount: Int?
+    let applicableAvailableCount: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case availableCount = "available_count"
+        case applicableAvailableCount = "applicable_available_count"
+    }
+}
+
+// MARK: - Codex banked reset credits
+
+/// Parses the two endpoints behind the Codex app's "Usage limit resets"
+/// panel.
+///
+/// `GET /wham/rate-limit-reset-credits` lists the credits themselves
+/// (`{credits: [{id, reset_type, status, granted_at, expires_at, title,
+/// description}], available_count, total_earned_count, ...}`) and
+/// `GET /wham/rate-limit-reset-credits/history` the granted/used events
+/// (`{events: [{id, kind, occurred_at}], window_start, as_of, next_cursor}`)
+/// for the last thirty days. Both are read with `JSONSerialization` so an
+/// extra or renamed field never blanks the meter.
+nonisolated enum CodexResetCreditsParser {
+    struct Details: Equatable {
+        let credits: [QuotaResetCredit]
+        let availableCount: Int
+        let earnedCount: Int?
+    }
+
+    static func parseDetails(_ data: Data) throws -> Details {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderFetchError.parsingError("Codex reset credits were not a JSON object.")
+        }
+        let credits = (root["credits"] as? [[String: Any]] ?? []).compactMap { item -> QuotaResetCredit? in
+            guard let id = string(item["id"] ?? item["credit_id"]) else { return nil }
+            return QuotaResetCredit(
+                id: id,
+                status: string(item["status"]),
+                grantedAt: parseDate(string(item["granted_at"] ?? item["created_at"])),
+                expiresAt: parseDate(string(item["expires_at"])),
+                title: string(item["title"]),
+                note: string(item["description"]) ?? string(item["reset_type"])
+            )
+        }
+        let availableCount = integer(root["available_count"])
+            ?? credits.filter(\.isAvailable).count
+        return Details(
+            credits: credits,
+            availableCount: availableCount,
+            earnedCount: integer(root["total_earned_count"])
+        )
+    }
+
+    static func parseHistory(_ data: Data) throws -> [QuotaResetCreditEvent] {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderFetchError.parsingError("Codex reset history was not a JSON object.")
+        }
+        let events = (root["events"] as? [[String: Any]] ?? []).compactMap { item -> QuotaResetCreditEvent? in
+            guard let id = string(item["id"]),
+                  let rawKind = string(item["kind"])?.lowercased(),
+                  let occurredAt = parseDate(string(item["occurred_at"])) else {
+                return nil
+            }
+            let kind: QuotaResetCreditEventKind
+            switch rawKind {
+            case "granted", "received", "earned":
+                kind = .granted
+            case "used", "redeemed", "consumed":
+                kind = .used
+            case "expired":
+                kind = .expired
+            default:
+                return nil
+            }
+            return QuotaResetCreditEvent(id: id, kind: kind, occurredAt: occurredAt)
+        }
+        return events.sorted { $0.occurredAt > $1.occurredAt }
+    }
+
+    static func parseDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        if let date = plain.date(from: value) { return date }
+        if let seconds = Double(value) {
+            return Date(timeIntervalSince1970: seconds > 1_000_000_000_000 ? seconds / 1000 : seconds)
+        }
+        return nil
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let number = value as? NSNumber { return number.stringValue }
+        return nil
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let text = value as? String { return Int(text) }
+        return nil
+    }
+}
+
+/// Fetches the banked reset credits alongside each Codex usage refresh,
+/// re-reading the detail endpoints only when the count changed or the last
+/// read is half an hour old.
+struct CodexResetCreditsFetcher {
+    static let redeemHint = "Redeem it in the Codex app (Settings → Usage & billing) or with /usage in the Codex CLI."
+
+    private static let cacheKey = "codex.resetCredits.cache.v1"
+    private static let refreshInterval: TimeInterval = 30 * 60
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+
+    private let session: URLSession
+    private let detailsURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
+    private let historyURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/history")!
+
+    init(session: URLSession) {
+        self.session = session
+    }
+
+    func summary(
+        usageCount: Int?,
+        accessToken: String,
+        accountID: String,
+        now: Date = Date()
+    ) async -> QuotaResetCreditSummary? {
+        let cached = Self.loadCache()
+        let needsRefresh: Bool
+        if let cached {
+            needsRefresh = (usageCount != nil && usageCount != cached.availableCount)
+                || now.timeIntervalSince(cached.observedAt) >= Self.refreshInterval
+        } else {
+            needsRefresh = true
+        }
+
+        guard needsRefresh else { return cached }
+
+        async let detailsData = fetch(detailsURL, accessToken: accessToken, accountID: accountID)
+        async let historyData = fetch(historyURL, accessToken: accessToken, accountID: accountID)
+        let details = await detailsData.flatMap { try? CodexResetCreditsParser.parseDetails($0) }
+        let history = await historyData.flatMap { try? CodexResetCreditsParser.parseHistory($0) }
+
+        guard details != nil || history != nil || usageCount != nil || cached != nil else {
+            return nil
+        }
+
+        let fetchedSomething = details != nil || history != nil
+        let summary = QuotaResetCreditSummary(
+            availableCount: details?.availableCount ?? usageCount ?? cached?.availableCount ?? 0,
+            earnedCount: details?.earnedCount ?? cached?.earnedCount,
+            credits: details?.credits ?? cached?.credits ?? [],
+            history: history ?? cached?.history ?? [],
+            redeemHint: Self.redeemHint,
+            observedAt: fetchedSomething ? now : (cached?.observedAt ?? now)
+        )
+        if fetchedSomething {
+            Self.saveCache(summary)
+        }
+        print("[CodexSessionProvider] Reset credits: \(summary.availableCount) available, \(summary.history.count) history events (details: \(details != nil), history: \(history != nil))")
+        return summary
+    }
+
+    private func fetch(_ url: URL, accessToken: String, accountID: String) async -> Data? {
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse else {
+            return nil
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            print("[CodexSessionProvider] Reset credits endpoint \(url.lastPathComponent) returned HTTP \(http.statusCode)")
+            return nil
+        }
+        return data
+    }
+
+    private static var defaults: UserDefaults {
+        UserDefaults(suiteName: appGroupID) ?? .standard
+    }
+
+    private static func loadCache() -> QuotaResetCreditSummary? {
+        guard let data = defaults.data(forKey: cacheKey) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(QuotaResetCreditSummary.self, from: data)
+    }
+
+    private static func saveCache(_ summary: QuotaResetCreditSummary) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(summary) else { return }
+        defaults.set(data, forKey: cacheKey)
     }
 }
 

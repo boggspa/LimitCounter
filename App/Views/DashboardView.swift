@@ -1765,6 +1765,10 @@ struct CompactDashboardCardView: View {
 
                 Spacer(minLength: 4)
 
+                if let banked = snapshot.resetCredits, banked.hasAvailableReset {
+                    BankedResetPill(text: banked.statusLine() ?? "Reset banked", accent: accent, compact: true)
+                }
+
                 Text(resetCount == 1 ? "1 reset · 7d" : "\(resetCount) resets · 7d")
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .foregroundStyle(resetCount > 0 ? accent : Color.secondary)

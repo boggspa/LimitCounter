@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ProviderDetailView: View {
     let snapshot: QuotaSnapshot
+    @ObservedObject private var resetLedger = QuotaResetLedgerStore.shared
 
     private var accent: Color { Color(hex: snapshot.providerID.accentColorHex) }
 
@@ -29,6 +30,10 @@ struct ProviderDetailView: View {
 
                         if !snapshot.windows.isEmpty {
                             windowsSection
+                        }
+
+                        if snapshot.resetCredits != nil || !resetHistoryRows.isEmpty {
+                            resetsSection
                         }
 
                         if !snapshot.analyticsBuckets.isEmpty {
@@ -100,6 +105,128 @@ struct ProviderDetailView: View {
                 value: $0.valueText,
                 subtitle: $0.subtitle ?? $0.resetDate.map { "Resets \($0.countdownString)" }
             )
+        }
+    }
+
+    // MARK: - Usage limit resets
+
+    /// One row of the resets list: the provider's own history ("Reset
+    /// received", "Reset used") merged with the resets the app confirmed.
+    private struct ResetHistoryRow: Identifiable {
+        let id: String
+        let title: String
+        let detail: String?
+        let date: Date
+        let systemImage: String
+    }
+
+    private var resetHistoryRows: [ResetHistoryRow] {
+        let cutoff = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+        var rows: [ResetHistoryRow] = []
+
+        let providerHistory = snapshot.resetCredits?.history ?? []
+        for event in providerHistory where event.occurredAt >= cutoff {
+            let title: String
+            let image: String
+            switch event.kind {
+            case .granted:
+                title = "Reset received"
+                image = "ticket"
+            case .used:
+                title = "Reset used"
+                image = "checkmark.seal"
+            case .expired:
+                title = "Reset expired"
+                image = "clock.badge.xmark"
+            }
+            rows.append(ResetHistoryRow(id: "provider|\(event.id)", title: title, detail: nil, date: event.occurredAt, systemImage: image))
+        }
+
+        for event in resetLedger.events(for: snapshot.providerID) where event.occurredAt >= cutoff {
+            guard event.kind != .scheduled else { continue }
+            // The provider's own "Reset used" entry already covers a redeemed credit.
+            if event.kind == .bankedRedeemed, event.windowLabel == nil, !providerHistory.isEmpty { continue }
+            rows.append(
+                ResetHistoryRow(
+                    id: "ledger|\(event.id)",
+                    title: event.kind.title,
+                    detail: event.summary,
+                    date: event.occurredAt,
+                    systemImage: event.kind.systemImageName
+                )
+            )
+        }
+
+        return rows.sorted { $0.date > $1.date }
+    }
+
+    private var resetsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Usage Limit Resets")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+
+            GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let credits = snapshot.resetCredits {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: credits.hasAvailableReset ? "ticket.fill" : "ticket")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(credits.hasAvailableReset ? accent : Color.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(credits.statusLine() ?? "No resets banked")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(credits.hasAvailableReset ? accent : Color.primary)
+                                if let earned = credits.earnedCount, earned > 0 {
+                                    Text(earned == 1 ? "1 reset earned in the last 30 days" : "\(earned) resets earned in the last 30 days")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if credits.hasAvailableReset, let hint = credits.redeemHint {
+                                    Text(hint)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        if !resetHistoryRows.isEmpty {
+                            Divider().overlay(Color.white.opacity(0.08))
+                        }
+                    }
+
+                    if resetHistoryRows.isEmpty {
+                        Text("No resets in the last 30 days")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(resetHistoryRows.prefix(12)) { row in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: row.systemImage)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(accent)
+                                    .frame(width: 14)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(row.title)
+                                        .font(.caption.weight(.medium))
+                                    if let detail = row.detail, !detail.isEmpty {
+                                        Text(detail)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                }
+                                Spacer(minLength: 8)
+                                Text(row.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .monospacedDigit()
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

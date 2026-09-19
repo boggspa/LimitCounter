@@ -10,6 +10,13 @@ SwiftUI prototype for a cross-platform quota tracker covering Codex, Claude, Dev
 - The Codex provider now has a real session-backed adapter that reads ChatGPT-plan 5-hour and 7-day usage from the same private usage surface used by Codex clients. OpenAI API has a separate official Admin API provider for project rate limits, 30-day token/request/cost analytics, projected monthly spend, per-provider budget thresholds, spike callouts, and top-model drivers. Claude, Devin, and Cursor still use mock adapters while their real integrations are designed.
 - A Codex Telemetry provider can read local Codex log folders and turn structured event logs into activity counts and token summaries.
 
+## Usage Limit Resets
+
+Providers hand out two kinds of out-of-schedule resets, and the app tracks both.
+
+- **Banked resets** are credits the user redeems themselves. Codex reports them directly (`wham/usage` carries `rate_limit_reset_credits`; `wham/rate-limit-reset-credits` lists the credits and `…/history` the granted/used events behind the Codex app's "Usage limit resets" panel). Qwen shows the count on its Plan Quota card ("Reset ⓘ 1 available"), which the app reads every half hour. A banked reset shows as a pill on the provider card, a "Reset available" alert (repeated once when it is about to expire), and a "Reset used" entry in the provider detail view once redeemed.
+- **Gifted resets** are the celebratory ones ("we've reset everyone's weekly limits"). `QuotaResetDetector` (`Shared/Models/QuotaResetDetector.swift`) infers them from successive meter readings: a drop is held as *pending* until the next reading confirms it, reset-date drift on a rolling window never counts on its own, a five-hour window only resets early alongside a sibling window or a consumed credit, several windows dropping together become one *provider-wide* reset, and each window reports at most one inferred reset per day. Confirmed resets land in a 60-day ledger, feed the "N resets · 7d" tally, and play the celebration.
+
 ## Safety Boundary
 
 This project is intentionally designed around credentials the user explicitly provides.
