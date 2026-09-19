@@ -10,13 +10,17 @@
 		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
 		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
+		2F295D61BD7917AC646050CB /* ProviderSetupPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 426990F3B946E045978B05CF /* ProviderSetupPolicy.swift */; };
 		35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		53D0D4FE81308907359D330E /* Limit Counter Widget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5A7E2A5B4CC14C9AA58D915F /* CloudKitSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C938E723B134DAAACF68821 /* CloudKitSync.swift */; };
+		6042BC1E11766ED57640C35D /* ProviderSetupRail.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAB7B2E575F99511047F53E0 /* ProviderSetupRail.swift */; };
+		694CB19FF67224BECD991042 /* ProviderSetupModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60D62F476C55C73A29C4D5F3 /* ProviderSetupModel.swift */; };
 		760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */; };
 		823855AA90207DEE5462F15A /* QuotaTimelineProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */; };
 		8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */; };
 		A090A16CD728E819CEAB1C12 /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
+		A2276EF2147C77FC2081EE2A /* ProviderSetupCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = 939F535484B8F04B64834EC0 /* ProviderSetupCanvas.swift */; };
 		A51F1D7A8D634C6DA9E9D6C5 /* CursorSessionImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */; };
 		A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C38142DE1DDB3110221F8CF /* DashboardView.swift */; };
 		AA65955C07EB3790F62BC8CC /* QuotaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */; };
@@ -27,8 +31,10 @@
 		C54B4765A7CC70B9189CAA3D /* TelemetryParseCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */; };
 		C5890563D5868124AC951D99 /* AIUsageTrackerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */; };
 		D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */; };
+		D9DCA9F5A79BF9D4D56CDAAE /* ProviderSetupPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 318D0D0ED844E72B91AFEAF0 /* ProviderSetupPresenter.swift */; };
 		DD5B5E4FABB1AA1A8D5E4B64 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78232D955058B7DEEE4A12CF /* Foundation.framework */; };
 		DDD693B6BE87A2E553B057AA /* SyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82D69C00C45CEED72F493637 /* SyncCoordinator.swift */; };
+		E12CEF318D69D31596283C5A /* ProviderSetupSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5DE38028C16CC359C0E10ED /* ProviderSetupSheet.swift */; };
 		E5F58CBAF2274B5E6338D4D1 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
 		EAFB87C29D9F037A4DC1A183 /* AppStateStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */; };
 		EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */; };
@@ -38,9 +44,10 @@
 		EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */; };
 		F0B3D2D3B9D94B0DA94D17F1 /* CodexTelemetryProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */; };
 		F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */; };
+		F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
+		F9DF3457A4B87B2347A864E3 /* QuotaResetDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A412D664FC277AE00924A744 /* QuotaResetDetector.swift */; };
 		FA1100010000000000000001 /* AntigravityProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200010000000000000001 /* AntigravityProviderClient.swift */; };
 		FA1100020000000000000002 /* SpendProviderClients.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000002 /* SpendProviderClients.swift */; };
-		F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -74,11 +81,14 @@
 		1D0D6C4C3162AFCE8932D9AA /* Limit Counter Widget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "Limit Counter Widget.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
 		21B2BE24658E5CB7FD1AC3CA /* LLMActivityHeatmapView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LLMActivityHeatmapView.swift; path = Shared/Views/LLMActivityHeatmapView.swift; sourceTree = SOURCE_ROOT; };
 		30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = TelemetryParseCache.swift; path = Shared/Storage/TelemetryParseCache.swift; sourceTree = SOURCE_ROOT; };
+		318D0D0ED844E72B91AFEAF0 /* ProviderSetupPresenter.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupPresenter.swift; path = App/Views/ProviderSetup/ProviderSetupPresenter.swift; sourceTree = SOURCE_ROOT; };
 		388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaTimelineProvider.swift; path = Widget/QuotaTimelineProvider.swift; sourceTree = SOURCE_ROOT; };
 		3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaCardView.swift; path = Shared/Views/QuotaCardView.swift; sourceTree = SOURCE_ROOT; };
+		426990F3B946E045978B05CF /* ProviderSetupPolicy.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupPolicy.swift; path = App/Providers/ProviderSetupPolicy.swift; sourceTree = SOURCE_ROOT; };
 		453A356B3DC03856FB7C92E8 /* AIUsageTrackerApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AIUsageTrackerApp.swift; path = App/AIUsageTrackerApp.swift; sourceTree = SOURCE_ROOT; };
 		47B21C6EE756C027946DD210 /* AIUsageWidgetExtension-Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; name = "AIUsageWidgetExtension-Info.plist"; path = "Widget/AIUsageWidgetExtension-Info.plist"; sourceTree = SOURCE_ROOT; };
 		52ECCBB7247196B57F543B01 /* MenuBarController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MenuBarController.swift; path = App/MenuBarController.swift; sourceTree = SOURCE_ROOT; };
+		60D62F476C55C73A29C4D5F3 /* ProviderSetupModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupModel.swift; path = App/Views/ProviderSetup/ProviderSetupModel.swift; sourceTree = SOURCE_ROOT; };
 		6497EE5E8894C69C0C3FED10 /* AIUsageWidgetExtension.iOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.iOS.entitlements; path = Widget/AIUsageWidgetExtension.iOS.entitlements; sourceTree = SOURCE_ROOT; };
 		6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CursorSessionImportView.swift; path = App/Views/CursorSessionImportView.swift; sourceTree = SOURCE_ROOT; };
 		6C938E723B134DAAACF68821 /* CloudKitSync.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudKitSync.swift; path = App/CloudKitSync.swift; sourceTree = SOURCE_ROOT; };
@@ -86,21 +96,25 @@
 		78232D955058B7DEEE4A12CF /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		82D69C00C45CEED72F493637 /* SyncCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SyncCoordinator.swift; path = App/SyncCoordinator.swift; sourceTree = SOURCE_ROOT; };
 		8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CodexTelemetryProviderClient.swift; path = App/Providers/CodexTelemetryProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		939F535484B8F04B64834EC0 /* ProviderSetupCanvas.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupCanvas.swift; path = App/Views/ProviderSetup/ProviderSetupCanvas.swift; sourceTree = SOURCE_ROOT; };
 		9C38142DE1DDB3110221F8CF /* DashboardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = DashboardView.swift; path = App/Views/DashboardView.swift; sourceTree = SOURCE_ROOT; };
+		A412D664FC277AE00924A744 /* QuotaResetDetector.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaResetDetector.swift; path = Shared/Models/QuotaResetDetector.swift; sourceTree = SOURCE_ROOT; };
 		A42BC5382F9140180096DECB /* Limit Counter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Limit Counter.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A5DE38028C16CC359C0E10ED /* ProviderSetupSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupSheet.swift; path = App/Views/ProviderSetup/ProviderSetupSheet.swift; sourceTree = SOURCE_ROOT; };
 		A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderDetailView.swift; path = App/Views/ProviderDetailView.swift; sourceTree = SOURCE_ROOT; };
 		AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderClient.swift; path = App/Providers/ProviderClient.swift; sourceTree = SOURCE_ROOT; };
-		FA1200010000000000000001 /* AntigravityProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AntigravityProviderClient.swift; path = App/Providers/AntigravityProviderClient.swift; sourceTree = SOURCE_ROOT; };
-		FA1200020000000000000002 /* SpendProviderClients.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SpendProviderClients.swift; path = App/Providers/SpendProviderClients.swift; sourceTree = SOURCE_ROOT; };
 		B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GlassChrome.swift; path = Shared/Views/GlassChrome.swift; sourceTree = SOURCE_ROOT; };
 		B75A2D0107FB420C76D5FFD1 /* AppStateStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AppStateStore.swift; path = App/AppStateStore.swift; sourceTree = SOURCE_ROOT; };
 		C7D74721EA3E8C99B51CF09D /* MockData.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MockData.swift; path = Shared/Models/MockData.swift; sourceTree = SOURCE_ROOT; };
 		CE2EC55F94D5A01B32C9E844 /* KeychainService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = KeychainService.swift; path = App/Keychain/KeychainService.swift; sourceTree = SOURCE_ROOT; };
+		DAB7B2E575F99511047F53E0 /* ProviderSetupRail.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupRail.swift; path = App/Views/ProviderSetup/ProviderSetupRail.swift; sourceTree = SOURCE_ROOT; };
 		EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaModels.swift; path = Shared/Models/QuotaModels.swift; sourceTree = SOURCE_ROOT; };
 		EEAA000100000000000000F1 /* CloudAlertPayload.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = CloudAlertPayload.swift; path = Shared/Models/CloudAlertPayload.swift; sourceTree = SOURCE_ROOT; };
 		EEAA000200000000000000F2 /* AlertNotificationContent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AlertNotificationContent.swift; path = Shared/Notifications/AlertNotificationContent.swift; sourceTree = SOURCE_ROOT; };
 		EEAA000300000000000000F3 /* LocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LocalNotificationPublisher.swift; path = App/LocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
 		EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MacLocalNotificationPublisher.swift; path = App/MacLocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
+		FA1200010000000000000001 /* AntigravityProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AntigravityProviderClient.swift; path = App/Providers/AntigravityProviderClient.swift; sourceTree = SOURCE_ROOT; };
+		FA1200020000000000000002 /* SpendProviderClients.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SpendProviderClients.swift; path = App/Providers/SpendProviderClients.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -194,6 +208,7 @@
 				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
 				FA1200010000000000000001 /* AntigravityProviderClient.swift */,
 				FA1200020000000000000002 /* SpendProviderClients.swift */,
+				426990F3B946E045978B05CF /* ProviderSetupPolicy.swift */,
 			);
 			path = Providers;
 			sourceTree = "<group>";
@@ -227,6 +242,7 @@
 				9C38142DE1DDB3110221F8CF /* DashboardView.swift */,
 				A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */,
 				781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */,
+				E785A420F73F9BFA69080D0E /* ProviderSetup */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -257,8 +273,22 @@
 				C7D74721EA3E8C99B51CF09D /* MockData.swift */,
 				EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */,
 				EEAA000100000000000000F1 /* CloudAlertPayload.swift */,
+				A412D664FC277AE00924A744 /* QuotaResetDetector.swift */,
 			);
 			path = Models;
+			sourceTree = "<group>";
+		};
+		E785A420F73F9BFA69080D0E /* ProviderSetup */ = {
+			isa = PBXGroup;
+			children = (
+				939F535484B8F04B64834EC0 /* ProviderSetupCanvas.swift */,
+				60D62F476C55C73A29C4D5F3 /* ProviderSetupModel.swift */,
+				DAB7B2E575F99511047F53E0 /* ProviderSetupRail.swift */,
+				A5DE38028C16CC359C0E10ED /* ProviderSetupSheet.swift */,
+				318D0D0ED844E72B91AFEAF0 /* ProviderSetupPresenter.swift */,
+			);
+			name = ProviderSetup;
+			path = ProviderSetup;
 			sourceTree = "<group>";
 		};
 		EE99000100000000000000A1 /* Notifications */ = {
@@ -426,6 +456,13 @@
 				EEBB000300000000000000B3 /* LocalNotificationPublisher.swift in Sources */,
 				EEBB000400000000000000B4 /* MacLocalNotificationPublisher.swift in Sources */,
 				C54B4765A7CC70B9189CAA3D /* TelemetryParseCache.swift in Sources */,
+				2F295D61BD7917AC646050CB /* ProviderSetupPolicy.swift in Sources */,
+				A2276EF2147C77FC2081EE2A /* ProviderSetupCanvas.swift in Sources */,
+				694CB19FF67224BECD991042 /* ProviderSetupModel.swift in Sources */,
+				6042BC1E11766ED57640C35D /* ProviderSetupRail.swift in Sources */,
+				E12CEF318D69D31596283C5A /* ProviderSetupSheet.swift in Sources */,
+				D9DCA9F5A79BF9D4D56CDAAE /* ProviderSetupPresenter.swift in Sources */,
+				F9DF3457A4B87B2347A864E3 /* QuotaResetDetector.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

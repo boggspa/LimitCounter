@@ -50,6 +50,7 @@ additions = [
   [['App', 'Providers'],   'App/Providers/*.swift',   [target]],
   [['App', 'Keychain'],    'App/Keychain/*.swift',    [target]],
   [['App', 'Views'],       'App/Views/*.swift',       [target]],
+  [['App', 'Views', 'ProviderSetup'], 'App/Views/ProviderSetup/*.swift', [target]],
 ]
 
 root_group = proj.main_group

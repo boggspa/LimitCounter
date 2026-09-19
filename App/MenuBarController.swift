@@ -266,7 +266,7 @@ private struct MenuBarPopoverView: View {
             .buttonStyle(.glass)
 
             Button {
-                SettingsWindowManager.shared.showSettingsWindow()
+                ProviderSetupPresenter.shared.present()
             } label: {
                 Label("Settings", systemImage: "gearshape")
             }

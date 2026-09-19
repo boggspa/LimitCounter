@@ -10,9 +10,16 @@ struct DashboardView: View {
     @StateObject private var orderStore = ProviderCardOrderStore.shared
     @StateObject private var layoutModeStore = DashboardLayoutModeStore.shared
     @State private var showSettings = false
+    #if os(macOS)
+    @StateObject private var setupModel = ProviderSetupModel()
+    @ObservedObject private var setupPresenter = ProviderSetupPresenter.shared
+    #endif
     @State private var draggedProviderID: ProviderID?
     @State private var navigationPath = NavigationPath()
     @AppStorage("dashboardRefreshIntervalSeconds") private var dashboardRefreshIntervalSeconds: Int = 60
+    #if os(iOS)
+    @State private var screenshotSaveAlert: ScreenshotSaveAlert?
+    #endif
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
@@ -57,6 +64,47 @@ struct DashboardView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
+        #if os(macOS)
+        .sheet(isPresented: $setupPresenter.isPresented) {
+            ProviderSetupSheet(
+                model: setupModel,
+                onRefresh: { Task { await appState.refresh(userInitiated: true) } },
+                lastSyncDate: appState.lastSyncDate,
+                onClose: { setupPresenter.isPresented = false }
+            )
+            .environmentObject(appState)
+            .preferredColorScheme(.dark)
+        }
+        .onChange(of: setupPresenter.isPresented) { isPresented in
+            // The menu-bar popover reaches the presenter directly, so it never
+            // passes through `openSettings()`.
+            if isPresented { setupModel.load(syncErrors: appState.syncErrors) }
+        }
+        #endif
+        #if os(iOS)
+        .alert(
+            screenshotSaveAlert?.title ?? "Screenshot",
+            isPresented: Binding(
+                get: { screenshotSaveAlert != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        screenshotSaveAlert = nil
+                    }
+                }
+            )
+        ) {
+            if screenshotSaveAlert?.offersSettings == true {
+                Button("Open Settings") {
+                    openAppSettings()
+                }
+            }
+            Button("OK", role: .cancel) {
+                screenshotSaveAlert = nil
+            }
+        } message: {
+            Text(screenshotSaveAlert?.message ?? "")
+        }
+        #endif
         .onChange(of: appState.pendingDeepLinkProviderID) { newValue in
             guard let providerID = newValue else { return }
             if let route = routeForProvider(providerID) {
@@ -91,7 +139,14 @@ struct DashboardView: View {
 
     private func openSettings() {
         #if os(macOS)
-        SettingsWindowManager.shared.showSettingsWindow()
+        // Load before presenting, not in the sheet's `onAppear`: otherwise the
+        // rail's first render sees an empty health map, every row builds itself
+        // as "Not set up", and the accessibility labels stay that way even
+        // after the visuals correct themselves a frame later.
+        setupModel.load(syncErrors: appState.syncErrors)
+        // One surface on macOS: providers and preferences are both pages in the
+        // setup sheet, so there is no settings window to raise any more.
+        setupPresenter.present()
         #else
         showSettings = true
         #endif
@@ -1637,68 +1692,6 @@ extension View {
     }
 }
 
-// MARK: - macOS Settings Window Manager
-
-#if os(macOS)
-import AppKit
-
-/// Manages a floating settings window on macOS
-class SettingsWindowManager: NSObject {
-    static let shared = SettingsWindowManager()
-    private var window: NSWindow?
-
-    func showSettingsWindow() {
-        if let existingWindow = window {
-            existingWindow.makeKeyAndOrderFront(nil)
-            NSApplication.shared.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let hostingController = NSHostingController(
-            rootView: SettingsView()
-                .frame(minWidth: 320, minHeight: 380)
-        )
-
-        let window = NSWindow(
-            contentViewController: hostingController
-        )
-        window.title = "Settings"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.isOpaque = false
-        window.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 0.34)
-        window.titlebarAppearsTransparent = true
-        window.toolbarStyle = .unifiedCompact
-        window.minSize = NSSize(width: 320, height: 380)
-        window.setFrameAutosaveName("SettingsWindow")
-
-        // Center on screen
-        if let screen = NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            let windowFrame = window.frame
-            let x = screenFrame.midX - windowFrame.width / 2
-            let y = screenFrame.midY - windowFrame.height / 2
-            window.setFrameOrigin(NSPoint(x: x, y: y))
-        }
-
-        window.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
-
-        self.window = window
-        window.delegate = self
-    }
-
-    func closeSettingsWindow() {
-        window?.close()
-        window = nil
-    }
-}
-
-extension SettingsWindowManager: NSWindowDelegate {
-    func windowWillClose(_ notification: Notification) {
-        window = nil
-    }
-}
-#endif
 
 // MARK: - Compact Layout
 
