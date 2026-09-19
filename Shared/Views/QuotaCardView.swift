@@ -907,6 +907,9 @@ struct SnapshotSignalNotice: View {
     }
 
     private var iconName: String {
+        if let resetKind = signal.resetKind {
+            return resetKind.systemImageName
+        }
         switch signal.kind {
         case .unexpectedRecovery:
             return "sparkles.rectangle.stack"

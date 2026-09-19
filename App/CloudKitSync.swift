@@ -25,6 +25,7 @@ private struct CloudAlertDescriptor {
     let signature: String
     let windowLabel: String?
     let kind: CloudAlertKind
+    var resetKind: QuotaResetKind? = nil
 }
 
 struct CloudSyncOperationDebugState: Codable, Equatable {
@@ -256,7 +257,8 @@ final class CloudKitSyncService {
                                     signature: alertDescriptor.signature,
                                     createdAt: createdAt,
                                     windowLabel: alertDescriptor.windowLabel,
-                                    kind: alertDescriptor.kind
+                                    kind: alertDescriptor.kind,
+                                    resetKind: alertDescriptor.resetKind
                                 )
                             )
                         } catch {
@@ -395,6 +397,7 @@ final class CloudKitSyncService {
         let fieldLabel = (fields["windowLabel"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let fieldKind = (fields["kind"] as? String).flatMap(CloudAlertKind.init(rawValue:))
+        let fieldResetKind = (fields["resetKind"] as? String).flatMap(QuotaResetKind.init(rawValue:))
         return CloudAlertPayload(
             providerID: providerID,
             title: title,
@@ -402,7 +405,8 @@ final class CloudKitSyncService {
             signature: signature,
             createdAt: createdAt,
             windowLabel: fieldLabel?.isEmpty == false ? fieldLabel : parsed.windowLabel,
-            kind: fieldKind ?? parsed.kind
+            kind: fieldKind ?? parsed.kind,
+            resetKind: fieldResetKind ?? parsed.resetKind
         )
     }
 
@@ -489,6 +493,9 @@ final class CloudKitSyncService {
         record["body"] = descriptor.body as NSString
         record["signature"] = descriptor.signature as NSString
         record["kind"] = descriptor.kind.rawValue as NSString
+        if let resetKind = descriptor.resetKind {
+            record["resetKind"] = resetKind.rawValue as NSString
+        }
         if let windowLabel = descriptor.windowLabel, !windowLabel.isEmpty {
             record["windowLabel"] = windowLabel as NSString
         }
@@ -562,7 +569,8 @@ final class CloudKitSyncService {
             events: events,
             analyticsBuckets: analyticsBuckets,
             fetchState: snapshot.fetchState,
-            fetchedAt: snapshot.fetchedAt
+            fetchedAt: snapshot.fetchedAt,
+            resetCredits: snapshot.resetCredits
         )
     }
 
@@ -688,6 +696,15 @@ final class CloudKitSyncService {
             ($0.kind.rawValue, $0.windowLabel ?? "", $0.title) < ($1.kind.rawValue, $1.windowLabel ?? "", $1.title)
         }
         for signal in sortedSignals {
+            // `detectedAt` is deliberately absent. It records when a signal was
+            // observed, not what it says, and a provider that re-derives its
+            // signals on every fetch would otherwise change this hash every
+            // cycle — republishing the status record and waking every other
+            // device over APNs for a reading that had not changed. Two signals
+            // matching on everything below are the same signal by every
+            // user-visible measure. Notifications are unaffected: the alert
+            // record has its own signature, and that one does carry the
+            // timestamp.
             parts.append(
                 [
                     "signal",
@@ -696,8 +713,19 @@ final class CloudKitSyncService {
                     signal.title,
                     signal.message,
                     signal.severity.rawValue,
-                    signal.confidence.map { formatMetric($0) } ?? "",
-                    String(Int(signal.detectedAt.timeIntervalSince1970))
+                    signal.confidence.map { formatMetric($0) } ?? ""
+                ].joined(separator: "|")
+            )
+        }
+
+        if let credits = snapshot.resetCredits {
+            parts.append(
+                [
+                    "resetCredits",
+                    String(credits.availableCount),
+                    credits.earnedCount.map(String.init) ?? "",
+                    credits.nearestExpiry.map { String(Int($0.timeIntervalSince1970)) } ?? "",
+                    String(credits.history.count)
                 ].joined(separator: "|")
             )
         }
@@ -747,7 +775,8 @@ final class CloudKitSyncService {
                 body: resetAlert.body,
                 signature: resetAlert.signature,
                 windowLabel: resetAlert.windowLabel,
-                kind: resetAlert.kind
+                kind: resetAlert.kind,
+                resetKind: resetAlert.resetKind
             )
         }
 

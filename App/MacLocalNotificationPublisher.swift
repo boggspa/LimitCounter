@@ -32,6 +32,9 @@ final class MacLocalNotificationPublisher {
 
     private func post(_ alert: CloudAlertPayload) async {
         guard alert.providerID != .heatmap, alert.providerID != .codexTelemetry else { return }
+        // Belt and braces: the builder no longer emits scheduled resets, but a
+        // payload published by an older build can still arrive from CloudKit.
+        guard alert.isAnnounceable else { return }
 
         var posted = (defaults.array(forKey: postedSignaturesKey) as? [String]) ?? []
         guard !posted.contains(alert.signature) else { return }

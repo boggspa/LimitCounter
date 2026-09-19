@@ -366,7 +366,7 @@ final class AppStateStore: ObservableObject {
         let dismissed = Set(loadDismissedUsageAlertSignatures())
         let now = Date()
         var merged = usageAlerts.filter {
-            $0.kind.isUsageReset
+            $0.isAnnounceable
                 && !dismissed.contains($0.signature)
                 && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
         }
@@ -374,7 +374,7 @@ final class AppStateStore: ObservableObject {
 
         let freshAlerts = alerts
             .filter {
-                $0.kind.isUsageReset
+                $0.isAnnounceable
                     && !dismissed.contains($0.signature)
                     && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
             }
@@ -416,7 +416,7 @@ final class AppStateStore: ObservableObject {
         let now = Date()
         return decoded
             .filter {
-                $0.kind.isUsageReset
+                $0.isAnnounceable
                     && !dismissed.contains($0.signature)
                     && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
             }

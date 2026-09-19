@@ -1139,16 +1139,7 @@ private struct UsageAlertToastView: View {
     }
 
     private var badgeTitle: String {
-        switch alert.kind {
-        case .scheduledReset:
-            return "Quota reset"
-        case .unexpectedRecovery:
-            return "Early quota reset"
-        case .threshold:
-            return "Limit"
-        case .error:
-            return "Sync"
-        }
+        alert.badgeTitle
     }
 
     var body: some View {
