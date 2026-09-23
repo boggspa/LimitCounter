@@ -1106,8 +1106,50 @@ private struct GrokCLIUsageAccess {
 
         return candidates
             .filter { $0.lastPathComponent.hasPrefix("grok-") }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .sorted { lhs, rhs in
+                let lhsRank = grokDownloadRank(lhs.lastPathComponent)
+                let rhsRank = grokDownloadRank(rhs.lastPathComponent)
+                if lhsRank != rhsRank { return isNewerVersion(lhsRank, than: rhsRank) }
+                return lhs.lastPathComponent > rhs.lastPathComponent
+            }
             .first { fileManager.isExecutableFile(atPath: $0.path) }
+    }
+
+    /// Sort key for a Grok download name, newest first.
+    ///
+    /// Comparing the names as strings picks the wrong binary as soon as a
+    /// version reaches two digits: `grok-1.0.9` outranks `grok-1.0.40`
+    /// lexically, so a stale CLI would be preferred indefinitely and the user
+    /// would see it as the provider simply not improving. Splitting the dotted
+    /// version into numbers fixes that, and keeping the name as a tiebreak
+    /// preserves the old ordering for names that carry no version at all.
+    ///
+    /// The names also carry an architecture (`…-macos-aarch64`), which this
+    /// deliberately does not yet consider: a universal binary running its
+    /// x86_64 slice should prefer the x86_64 download, but there is no Intel
+    /// build to be wrong for until the deployment-target decision lands.
+    private static func grokDownloadRank(_ name: String) -> [Int] {
+        // Anchored to the digits immediately after the "grok-" prefix. An
+        // unanchored digit run matches the "64" in "…-macos-aarch64", which
+        // would rank an unversioned download above every real one.
+        let afterPrefix = name.hasPrefix("grok-") ? String(name.dropFirst("grok-".count)) : name
+        guard let range = afterPrefix.range(of: #"\A\d+(?:\.\d+)*"#, options: .regularExpression) else {
+            return []
+        }
+        return afterPrefix[range].split(separator: ".").compactMap { Int($0) }
+    }
+
+    /// Whether `lhs` is a newer version than `rhs`.
+    ///
+    /// `[Int]` is not `Comparable` in Swift, so the element-wise walk has to be
+    /// written out. Differing component counts fall through to the length
+    /// check, which makes "1.2.3" newer than "1.2" and puts a name carrying no
+    /// version at all below every versioned one.
+    private static func isNewerVersion(_ lhs: [Int], than rhs: [Int]) -> Bool {
+        for (lhsPart, rhsPart) in zip(lhs, rhs) where lhsPart != rhsPart {
+            return lhsPart > rhsPart
+        }
+        return lhs.count > rhs.count
     }
 
     private static func detectedHomeDirectory() -> URL? {
