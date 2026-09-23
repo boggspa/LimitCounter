@@ -10843,6 +10843,15 @@ public struct OllamaProviderClient: ProviderClient {
         let resetDescription: String?
     }
 
+    /// A dollar-denominated monthly meter ("$0 of $60 used") shown on newer
+    /// paid Ollama settings pages in place of the legacy percent meters.
+    private struct ExtractedDollarMetric {
+        let used: Double
+        let total: Double
+        let resetDate: Date?
+        let resetDescription: String?
+    }
+
     private struct WeeklyLimitBanner {
         let resumeDate: Date?
     }
@@ -10858,9 +10867,9 @@ public struct OllamaProviderClient: ProviderClient {
 
         var windows: [QuotaWindow] = []
 
-        let (sessionChunk, weeklyChunk, includedChunk) = extractSections(from: html)
+        let (sessionChunk, weeklyChunk, includedChunk, monthlyChunk) = extractSections(from: html)
         let renderedText = normalizedRenderedText(from: html)
-        let (renderedSessionChunk, renderedWeeklyChunk, renderedIncludedChunk) = extractSections(from: renderedText)
+        let (renderedSessionChunk, renderedWeeklyChunk, renderedIncludedChunk, renderedMonthlyChunk) = extractSections(from: renderedText)
         // The weekly-limit banner sits between the two usage headings, so it is
         // detected once against the whole usage region and attributed to the
         // weekly window rather than whichever chunk it happens to land in.
@@ -10871,6 +10880,37 @@ public struct OllamaProviderClient: ProviderClient {
             in: (renderedSessionChunk ?? "") + (renderedWeeklyChunk ?? ""),
             now: fetchedAt
         )
+
+        // Newer paid pages ("Included usage Pro") replace the legacy percent
+        // meters with a single monthly dollar budget: "Monthly usage
+        // $0 of $60 used". Parse it first so it wins over any stale
+        // Session/Weekly percent meters, which remain the fallback for
+        // pages that still expose them.
+        let monthlyDollarMetric = (monthlyChunk.flatMap { parseMonthlyDollarMetric(from: $0, now: fetchedAt) })
+            ?? (renderedMonthlyChunk.flatMap { parseMonthlyDollarMetric(from: $0, now: fetchedAt) })
+            ?? (includedChunk.flatMap { parseMonthlyDollarMetric(from: $0, now: fetchedAt) })
+            ?? (renderedIncludedChunk.flatMap { parseMonthlyDollarMetric(from: $0, now: fetchedAt) })
+        if let monthlyDollarMetric {
+            var resetDate = monthlyDollarMetric.resetDate
+            if let candidate = resetDate {
+                resetDate = OllamaWeeklyResetStore.stabilizedMonthlyResetDate(
+                    candidate: candidate,
+                    now: fetchedAt,
+                    defaults: defaults
+                )
+            }
+            windows.append(
+                QuotaWindow(
+                    label: "Monthly usage",
+                    windowKind: .monthly,
+                    used: monthlyDollarMetric.used,
+                    total: monthlyDollarMetric.total,
+                    resetDate: resetDate,
+                    unit: "USD",
+                    subtitle: monthlyDollarMetric.resetDescription ?? "Monthly included usage"
+                )
+            )
+        }
 
         if let sessionChunk {
             let cleanedChunk = banner == nil ? sessionChunk : removingWeeklyBannerPhrases(from: sessionChunk)
@@ -10930,8 +10970,9 @@ public struct OllamaProviderClient: ProviderClient {
             }
         }
 
+        let hasMonthlyDollarMeter = windows.contains { $0.windowKind == .monthly }
         let parsedPaidMeter = windows.contains { $0.windowKind == .session || $0.windowKind == .weekly }
-        if !parsedPaidMeter, let includedChunk {
+        if !parsedPaidMeter, !hasMonthlyDollarMeter, let includedChunk {
             let includedMetric = parseMetricFromChunk(includedChunk, isWeekly: false, now: fetchedAt)
             let renderedIncludedMetric = renderedIncludedChunk.flatMap {
                 parseMetricFromChunk($0, isWeekly: false, now: fetchedAt)
@@ -10966,7 +11007,7 @@ public struct OllamaProviderClient: ProviderClient {
             if html.contains("Sign in") || html.contains("Log in") {
                 throw ProviderFetchError.credentialExpired("Ollama session cookie expired. Please update in settings.")
             }
-            throw ProviderFetchError.parsingError("Could not find Session, Weekly, or Free usage on ollama.com/settings")
+            throw ProviderFetchError.parsingError("Could not find Session, Weekly, Free, or Monthly usage on ollama.com/settings")
         }
 
         return QuotaSnapshot(
@@ -10983,11 +11024,12 @@ public struct OllamaProviderClient: ProviderClient {
         )
     }
 
-    private func extractSections(from html: String) -> (session: String?, weekly: String?, included: String?) {
+    private func extractSections(from html: String) -> (session: String?, weekly: String?, included: String?, monthly: String?) {
         let sessionRange = rangeOfUsageHeading("Session usage", in: html)
         let weeklyRange = rangeOfUsageHeading("Weekly usage", in: html)
         let includedRange = rangeOfUsageHeading("Included usage", in: html)
             ?? rangeOfUsageHeading("Free usage", in: html)
+        let monthlyRange = rangeOfUsageHeading("Monthly usage", in: html)
 
         func forwardChunk(from start: String.Index) -> String {
             var end = html.index(start, offsetBy: min(1000, html.distance(from: start, to: html.endIndex)))
@@ -11000,6 +11042,7 @@ public struct OllamaProviderClient: ProviderClient {
         var sessionChunk: String? = nil
         var weeklyChunk: String? = nil
         var includedChunk: String? = nil
+        var monthlyChunk: String? = nil
 
         if let sRange = sessionRange {
             if let wRange = weeklyRange, wRange.lowerBound > sRange.lowerBound {
@@ -11016,13 +11059,17 @@ public struct OllamaProviderClient: ProviderClient {
         if let iRange = includedRange {
             includedChunk = forwardChunk(from: iRange.lowerBound)
         }
-        return (sessionChunk, weeklyChunk, includedChunk)
+        if let mRange = monthlyRange {
+            monthlyChunk = forwardChunk(from: mRange.lowerBound)
+        }
+        return (sessionChunk, weeklyChunk, includedChunk, monthlyChunk)
     }
 
     private func looksLikeSignedInOllamaSettings(_ html: String) -> Bool {
         html.localizedCaseInsensitiveContains("Session usage")
             || html.localizedCaseInsensitiveContains("Weekly usage")
             || html.localizedCaseInsensitiveContains("Included usage")
+            || html.localizedCaseInsensitiveContains("Monthly usage")
             || rangeOfUsageHeading("Free usage", in: html) != nil
     }
 
@@ -11118,27 +11165,34 @@ public struct OllamaProviderClient: ProviderClient {
         return cleaned
     }
 
-    private func parseMetricFromChunk(_ chunk: String, isWeekly: Bool, now: Date) -> ExtractedMetric? {
-        var percent: Double? = nil
-
-        if isWeekly && (chunk.localizedCaseInsensitiveContains("Limit reached") || chunk.localizedCaseInsensitiveContains("100% used")) {
-            percent = 100.0
-        } else if let ariaNow = firstMatch(in: chunk, pattern: #"aria-valuenow="([0-9]+(?:\.[0-9]+)?)""#) {
-            percent = Double(ariaNow)
-        } else if let ariaMatch = firstMatch(in: chunk, pattern: #"aria-label="[^"]*?([0-9]+(?:\.[0-9]+)?)\s*%[^"]*""#) {
-            percent = Double(ariaMatch)
-        } else if let widthStr = firstMatch(in: chunk, pattern: #"(?<![-\w])width:\s*([0-9]+(?:\.[0-9]+)?)\s*%"#) {
-            percent = Double(widthStr)
-        } else if let pctStr = firstMatch(in: chunk, pattern: #"([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#) {
-            percent = Double(pctStr)
-        } else if let pctStr = firstMatch(in: String(chunk.prefix(300)), pattern: #"(?<=[>\s])([0-9]+(?:\.[0-9]+)?)\s*%"#) {
-            // Last resort: a bare percentage, and only near the usage heading
-            // the chunk starts with — never from deep, unrelated markup.
-            percent = Double(pctStr)
+    /// Parses a dollar-denominated monthly budget such as "$0 of $60 used"
+    /// (with optional thousands separators) plus an optional reset countdown.
+    private func parseMonthlyDollarMetric(from chunk: String, now: Date) -> ExtractedDollarMetric? {
+        guard let groups = firstMatchGroups(
+            in: chunk,
+            pattern: #"\$([0-9][0-9,.]*)\s*of\s*\$([0-9][0-9,.]*)"#
+        ),
+        groups.count == 2,
+        let used = Double(groups[0].replacingOccurrences(of: ",", with: "")),
+        let total = Double(groups[1].replacingOccurrences(of: ",", with: "")),
+        total > 0,
+        used >= 0
+        else {
+            return nil
         }
 
-        guard let percent else { return nil }
+        let countdown = parseResetCountdown(in: chunk, now: now)
+        return ExtractedDollarMetric(
+            used: min(used, total),
+            total: total,
+            resetDate: countdown.date,
+            resetDescription: countdown.description
+        )
+    }
 
+    /// Extracts a relative reset countdown ("Resets in 3 days") into an
+    /// absolute date and the compact subtitle the meter displays.
+    private func parseResetCountdown(in chunk: String, now: Date) -> (date: Date?, description: String?) {
         var resetDate: Date? = nil
         var resetDesc: String? = nil
 
@@ -11174,10 +11228,36 @@ public struct OllamaProviderClient: ProviderClient {
             }
         }
 
+        return (resetDate, resetDesc)
+    }
+
+    private func parseMetricFromChunk(_ chunk: String, isWeekly: Bool, now: Date) -> ExtractedMetric? {
+        var percent: Double? = nil
+
+        if isWeekly && (chunk.localizedCaseInsensitiveContains("Limit reached") || chunk.localizedCaseInsensitiveContains("100% used")) {
+            percent = 100.0
+        } else if let ariaNow = firstMatch(in: chunk, pattern: #"aria-valuenow="([0-9]+(?:\.[0-9]+)?)""#) {
+            percent = Double(ariaNow)
+        } else if let ariaMatch = firstMatch(in: chunk, pattern: #"aria-label="[^"]*?([0-9]+(?:\.[0-9]+)?)\s*%[^"]*""#) {
+            percent = Double(ariaMatch)
+        } else if let widthStr = firstMatch(in: chunk, pattern: #"(?<![-\w])width:\s*([0-9]+(?:\.[0-9]+)?)\s*%"#) {
+            percent = Double(widthStr)
+        } else if let pctStr = firstMatch(in: chunk, pattern: #"([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#) {
+            percent = Double(pctStr)
+        } else if let pctStr = firstMatch(in: String(chunk.prefix(300)), pattern: #"(?<=[>\s])([0-9]+(?:\.[0-9]+)?)\s*%"#) {
+            // Last resort: a bare percentage, and only near the usage heading
+            // the chunk starts with — never from deep, unrelated markup.
+            percent = Double(pctStr)
+        }
+
+        guard let percent else { return nil }
+
+        let countdown = parseResetCountdown(in: chunk, now: now)
+
         return ExtractedMetric(
             percent: min(max(percent, 0), 100),
-            resetDate: resetDate,
-            resetDescription: resetDesc
+            resetDate: countdown.date,
+            resetDescription: countdown.description
         )
     }
 

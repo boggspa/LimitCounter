@@ -370,7 +370,7 @@ private func testOllamaProPageDoesNotInventFreeMonthlyMeter() throws {
     let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
     try expectEqual(snapshot.windows.count, 2, "Pro page keeps session and weekly meters")
     try expectEqual(snapshot.planName, "Pro", "Pro plan badge")
-    try expect(snapshot.windows.allSatisfy { $0.windowKind != .monthly }, "Pro page must not invent a Free monthly meter")
+    try expect(snapshot.windows.allSatisfy { $0.label != "Free usage" }, "Pro page must not invent a Free monthly meter")
     let session = try snapshot.windows.first(where: { $0.windowKind == .session })
         ?? { throw OllamaTestError.failure("Missing Ollama session window") }()
     let weekly = try snapshot.windows.first(where: { $0.windowKind == .weekly })
@@ -380,6 +380,44 @@ private func testOllamaProPageDoesNotInventFreeMonthlyMeter() throws {
     try expectEqual(session.subtitle, "Resets in 47m", "Pro session minutes subtitle")
     try expectClose(weekly.used, 64.2, "Pro weekly percent")
     try expectEqual(weekly.subtitle, "Resets in 11h", "Pro weekly subtitle")
+}
+
+private func testOllamaNewProPageParsesMonthlyDollarBudget() throws {
+    let suiteName = "limit-counter-ollama-new-pro-\(UUID().uuidString)"
+    let defaults = try isolatedDefaults(suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fetchedAt = date("2026-09-13T13:12:00Z")
+    let html = """
+    <html><body>
+    <main>
+      <h2>Included usage</h2>
+      <span>Pro</span>
+      <section>
+        <h2>Monthly usage</h2>
+        <p>$0 of $60 used</p>
+        <div role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="60"></div>
+        <p>Resets in 3 days.</p>
+      </section>
+      <h3>Models used this month</h3>
+    </main>
+    </body></html>
+    """
+
+    let snapshot = try parseOllama(html, fetchedAt: fetchedAt, defaults: defaults)
+    try expectEqual(snapshot.windows.count, 1, "New Pro page yields a single monthly dollar meter")
+    try expectEqual(snapshot.planName, "Pro", "New Pro plan badge")
+    let monthly = try snapshot.windows.first(where: { $0.windowKind == .monthly })
+        ?? { throw OllamaTestError.failure("Missing Ollama monthly dollar window") }()
+    try expectEqual(monthly.label, "Monthly usage", "Monthly dollar meter label")
+    try expectClose(monthly.used, 0, "Monthly dollar used")
+    try expectClose(monthly.total ?? -1, 60, "Monthly dollar total")
+    try expectEqual(monthly.unit, "USD", "Monthly dollar unit")
+    try expectEqual(monthly.resetDate, fetchedAt.addingTimeInterval(3 * 86_400), "Monthly dollar reset")
+    try expectEqual(monthly.subtitle, "Resets in 3d", "Monthly dollar subtitle")
+    try expectEqual(monthly.periodGroup(for: .ollama), .monthlyAndAPI, "Monthly dollar lands in the monthly period")
+    try expectEqual(monthly.segmentCount(for: .ollama), 4, "Monthly dollar uses a monthly segment count")
+    try expect(snapshot.windows.allSatisfy { $0.windowKind != .session && $0.windowKind != .weekly }, "New Pro page must not invent session or weekly meters")
 }
 
 private func testOllamaMonthlyResetStoreKeepsEpisodeDateStable() throws {
@@ -435,6 +473,7 @@ private enum OllamaUsageTestRunner {
         try testOllamaFreeAccountParsesMonthlyIncludedUsage()
         try testOllamaFreePageWithLoginLinkStillParses()
         try testOllamaProPageDoesNotInventFreeMonthlyMeter()
+        try testOllamaNewProPageParsesMonthlyDollarBudget()
         try testOllamaMonthlyResetStoreKeepsEpisodeDateStable()
         print("Ollama usage tests passed")
     }

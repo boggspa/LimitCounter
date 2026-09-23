@@ -286,7 +286,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .meta:
             return "Projects Muse session spend from a granted `~/.local/share/muse` folder using catalog rates (TaskWraith-compatible). Grant the local Muse CLI for live Muse Code subscription meters (Current usage and Weekly limit, refreshed every 10 minutes); an imported dev.meta.ai session is the fallback and also anchors billing-period spend. Preload/remaining still derive credit used. Soft monthly budget defaults to $15 and resets on the 1st."
         case .ollama:
-            return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters, or the Free monthly included-usage pool, from ollama.com/settings."
+            return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters, or the monthly included-usage dollar budget ($X of $Y), from ollama.com/settings."
         case .openrouter:
             return "Uses an OpenRouter API key to read usage tracking and spend from the official `https://openrouter.ai/api/v1/auth/key` endpoint."
         case .qwen:
