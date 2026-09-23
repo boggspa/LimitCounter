@@ -503,6 +503,29 @@ public extension View {
     }
 }
 
+/// Button chrome for surfaces that sit on the glass cards.
+///
+/// `.glass` is a macOS 26 button style with no earlier equivalent, so it has to
+/// be reached through a runtime branch — and the branch has to be real rather
+/// than an `@available` annotation on a type that gets built unconditionally,
+/// because a post-26 symbol is weak-imported at a lower deployment target and
+/// binds to NULL at runtime instead of failing to link.
+///
+/// The pre-26 fallback is deliberately the plain system bordered style. It is
+/// the honest substitute rather than a good one: nothing before 26 can sample
+/// what is behind a button, so a chrome that matches the frosted cards around it
+/// is a design problem, not a one-line default. It is isolated here so that
+/// problem has exactly one place to be solved.
+public extension View {
+    @ViewBuilder
+    func glassButtonStyle() -> some View {
+        if #available(macOS 26.0, iOS 26.0, *) {
+            buttonStyle(.glass)
+        } else {
+            buttonStyle(.bordered)
+        }
+    }
+}
 /// Choice of backing material for the Liquid Glass card.
 ///
 /// **`.none`** is the recommended default when the parent surface

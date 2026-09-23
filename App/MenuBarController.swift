@@ -142,7 +142,7 @@ private struct MenuBarPopoverView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .frame(width: 30, height: 30)
             }
-            .buttonStyle(.glass)
+            .glassButtonStyle()
             .help("Pin overview panel")
         }
         .padding(.horizontal, 12)
@@ -226,7 +226,7 @@ private struct MenuBarPopoverView: View {
                             .font(.system(size: 12, weight: .semibold))
                             .frame(width: 28, height: 28)
                     }
-                    .buttonStyle(.glass)
+                    .glassButtonStyle()
                     .help("Pin provider panel")
                 }
 
@@ -263,14 +263,14 @@ private struct MenuBarPopoverView: View {
             } label: {
                 Label("Refresh", systemImage: appState.isSyncing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
             }
-            .buttonStyle(.glass)
+            .glassButtonStyle()
 
             Button {
                 ProviderSetupPresenter.shared.present()
             } label: {
                 Label("Settings", systemImage: "gearshape")
             }
-            .buttonStyle(.glass)
+            .glassButtonStyle()
 
             Button {
                 appState.isHeadlessMode.toggle()
@@ -278,7 +278,7 @@ private struct MenuBarPopoverView: View {
                 Image(systemName: appState.isHeadlessMode ? "eye.slash.fill" : "eye.fill")
                     .frame(width: 28, height: 28)
             }
-            .buttonStyle(.glass)
+            .glassButtonStyle()
             .help("Toggle headless mode")
         }
         .font(.caption.weight(.semibold))
