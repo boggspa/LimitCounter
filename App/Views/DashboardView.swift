@@ -159,7 +159,7 @@ struct DashboardView: View {
             #if os(macOS)
             // Keep the traffic lights clear and let only the unused portion
             // of this bar move the window; the control pill stays clickable.
-            Color.clear.frame(width: 110)
+            Color.clear.frame(width: 110, height: 32)
                 .allowsHitTesting(false)
             Color.clear
                 .frame(maxWidth: .infinity)
@@ -181,7 +181,7 @@ struct DashboardView: View {
                 desktopDashboardShell
                     .overlay(alignment: .top) {
                         HStack(spacing: 0) {
-                            Color.clear.frame(width: 110)
+                            Color.clear.frame(width: 110, height: 24)
                                 .allowsHitTesting(false)
                             Color.clear
                                 .frame(height: 24)
