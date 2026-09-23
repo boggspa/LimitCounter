@@ -224,6 +224,41 @@ private func testEmptyDashboardProducesNoSections() throws {
     try expect(QuotaPeriodSection.sections(from: []).isEmpty, "no snapshots means no sections")
 }
 
+/// A row's identity has to survive a refresh. `QuotaWindow.id` is a fresh UUID
+/// on every fetch, so keying a `ForEach` on it rebuilds every row whenever a
+/// provider is re-read — invisible until something is being dragged, at which
+/// point the gesture is torn down mid-flight. It would also stop a dragged rank
+/// from being recognised on the next pass.
+private func testRowIdentitySurvivesARefresh() throws {
+    func rows() -> [QuotaPeriodRow] {
+        QuotaPeriodSection.sections(from: [
+            snapshot(.qwen, "Qwen Token Plan", [window("Monthly Usage", .monthly)]),
+            snapshot(.claude, "Claude", [window("5H", .session), window("Weekly", .weekly)]),
+            snapshot(.openrouter, "OpenRouter", [])
+        ]).flatMap(\.rows)
+    }
+
+    let first = rows()
+    try expectEqual(rows().map(\.id), first.map(\.id), "the same meters keep the same row ids across a refresh")
+    try expectEqual(Set(first.map(\.id)).count, first.count, "row ids are unique within one pass")
+
+    let idle = try first.first(where: { $0.window == nil })
+        ?? { throw PeriodGroupingTestError.failure("missing idle row") }()
+    try expectEqual(idle.id, "idle|openrouter", "an idle provider keeps a stable row id of its own")
+
+    // A meter that starts reporting a different period is a different meter and
+    // must not inherit the old row's identity, or it would inherit its rank too.
+    let qwenBefore = try first.first(where: { $0.providerID == .qwen })
+        ?? { throw PeriodGroupingTestError.failure("missing qwen row") }()
+    let qwenAfter = QuotaPeriodSection.sections(from: [
+        snapshot(.qwen, "Qwen Token Plan", [window("7-Day Quota", .weekly)])
+    ]).flatMap(\.rows)
+    try expect(
+        !qwenAfter.map(\.id).contains(qwenBefore.id),
+        "a meter that changes what it reports gets a new identity"
+    )
+}
+
 // MARK: - Layout mode
 
 private func testLayoutModeCompactFlags() throws {
@@ -248,6 +283,7 @@ private enum QuotaPeriodGroupingTestRunner {
         try testIdleOnlyDashboardFallsBackToTheAPISection()
         try testEmptyDashboardProducesNoSections()
         try testLayoutModeCompactFlags()
+        try testRowIdentitySurvivesARefresh()
         print("Quota period grouping tests passed")
     }
 }

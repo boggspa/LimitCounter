@@ -852,6 +852,24 @@ public enum QuotaPeriodGroup: String, Codable, CaseIterable, Identifiable, Hasha
 }
 
 public extension QuotaWindow {
+    /// An identity for this meter that survives a refresh.
+    ///
+    /// `id` is a fresh `UUID` every time a provider is read, so it cannot carry
+    /// anything the user chose — a dragged rank would reset on the next sync,
+    /// and a `ForEach` keyed on it rebuilds every row on every refresh. Label,
+    /// window kind and unit are what actually distinguish one meter from
+    /// another, which is the same triple `QuotaResetDetector.WindowKey` keys its
+    /// ledger on; the provider goes in front so two providers' identically
+    /// named meters stay distinct when they share a list.
+    func stableIdentity(for providerID: ProviderID) -> String {
+        [
+            providerID.rawValue,
+            label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            windowKind.rawValue,
+            unit.lowercased()
+        ].joined(separator: "|")
+    }
+
     /// Which period bucket this meter belongs in.
     ///
     /// `providerID` only matters for windows whose kind is `.custom`:
@@ -894,12 +912,15 @@ public extension QuotaWindow {
 /// that has no meters yet — it still gets a row so the user can see the
 /// provider is connected but idle (OpenRouter, a freshly added key).
 public struct QuotaPeriodRow: Identifiable, Equatable, Hashable {
-    public let id: UUID
+    /// Stable across refreshes, unlike the window's own `id`. A `ForEach`
+    /// keyed on a fresh UUID rebuilds every row whenever a provider refreshes,
+    /// which is invisible until something is being dragged — then it cancels.
+    public let id: String
     public let providerID: ProviderID
     public let label: String
     public let window: QuotaWindow?
 
-    public init(id: UUID, providerID: ProviderID, label: String, window: QuotaWindow?) {
+    public init(id: String, providerID: ProviderID, label: String, window: QuotaWindow?) {
         self.id = id
         self.providerID = providerID
         self.label = label
@@ -934,7 +955,7 @@ public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
             guard !windows.isEmpty else {
                 idleRows.append(
                     QuotaPeriodRow(
-                        id: snapshot.id,
+                        id: "idle|\(snapshot.providerID.rawValue)",
                         providerID: snapshot.providerID,
                         label: snapshot.displayName,
                         window: nil
@@ -945,7 +966,7 @@ public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
 
             for window in windows {
                 let row = QuotaPeriodRow(
-                    id: window.id,
+                    id: window.stableIdentity(for: snapshot.providerID),
                     providerID: snapshot.providerID,
                     label: snapshot.periodRowLabel(for: window),
                     window: window

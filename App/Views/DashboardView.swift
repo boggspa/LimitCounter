@@ -961,7 +961,6 @@ struct DashboardView: View {
             } else {
                 CompactDashboardCardView(
                     snapshots: snapshots,
-                    sevenDayResetCounts: appState.sevenDayResetCounts,
                     reorderableProviderIDs: reorderableProviderIDs,
                     draggedProviderID: $draggedProviderID,
                     orderStore: orderStore
@@ -1793,6 +1792,108 @@ extension View {
     }
 }
 
+/// A compact meter row paired with an identity that survives a refresh.
+///
+/// `QuotaWindow.id` is a fresh UUID every time a provider is read, and
+/// `ForEach` needs a KeyPath rather than a closure, so the stable key is
+/// carried beside the window instead of being derived inside the loop. Keying
+/// on the per-fetch UUID would rebuild every row on every refresh, which is
+/// invisible right up until it tears down a drag mid-gesture.
+private struct OrderedMeter: Identifiable {
+    let id: String
+    let window: QuotaWindow
+}
+
+private struct MeterDropDelegate: DropDelegate {
+    let targetKey: String
+    let scope: String
+    let reorderableKeys: [String]
+    @Binding var draggedMeterKey: String?
+    @Binding var draggedMeterScope: String?
+    let orderStore: MeterOrderStore
+
+    func dropEntered(info: DropInfo) {
+        guard
+            let draggedMeterKey,
+            draggedMeterScope == scope,
+            draggedMeterKey != targetKey,
+            reorderableKeys.contains(draggedMeterKey),
+            reorderableKeys.contains(targetKey)
+        else {
+            return
+        }
+
+        withAnimation(.easeInOut(duration: 0.18)) {
+            orderStore.move(draggedMeterKey, toward: targetKey, scope: scope, natural: reorderableKeys)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard draggedMeterScope == scope else { return nil }
+        return DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggedMeterKey = nil
+        draggedMeterScope = nil
+        return true
+    }
+}
+
+/// Drag-to-reorder plumbing for compact meter rows. The saved order and
+/// the active drag are scoped so rows cannot move between providers or periods.
+private struct MeterReorderModifier: ViewModifier {
+    let meterKey: String
+    let scope: String
+    let reorderableKeys: [String]
+    @Binding var draggedMeterKey: String?
+    @Binding var draggedMeterScope: String?
+    let orderStore: MeterOrderStore
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(draggedMeterScope == scope && draggedMeterKey == meterKey ? 0.5 : 1)
+            .onDrag {
+                draggedMeterKey = meterKey
+                draggedMeterScope = scope
+                return NSItemProvider(object: meterKey as NSString)
+            }
+            .onDrop(
+                of: [UTType.text],
+                delegate: MeterDropDelegate(
+                    targetKey: meterKey,
+                    scope: scope,
+                    reorderableKeys: reorderableKeys,
+                    draggedMeterKey: $draggedMeterKey,
+                    draggedMeterScope: $draggedMeterScope,
+                    orderStore: orderStore
+                )
+            )
+    }
+}
+
+extension View {
+    fileprivate func meterReorderable(
+        meterKey: String,
+        scope: String,
+        reorderableKeys: [String],
+        draggedMeterKey: Binding<String?>,
+        draggedMeterScope: Binding<String?>,
+        orderStore: MeterOrderStore
+    ) -> some View {
+        modifier(
+            MeterReorderModifier(
+                meterKey: meterKey,
+                scope: scope,
+                reorderableKeys: reorderableKeys,
+                draggedMeterKey: draggedMeterKey,
+                draggedMeterScope: draggedMeterScope,
+                orderStore: orderStore
+            )
+        )
+    }
+}
+
 
 // MARK: - Compact Layout
 
@@ -1810,10 +1911,12 @@ extension View {
 /// rolling "in 2h 44m" phrasing would re-flow as numbers wobble.
 struct CompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
-    let sevenDayResetCounts: [ProviderID: Int]
     let reorderableProviderIDs: Set<ProviderID>
     @Binding var draggedProviderID: ProviderID?
     let orderStore: ProviderCardOrderStore
+    @ObservedObject private var meterOrderStore = MeterOrderStore.shared
+    @State private var draggedMeterKey: String?
+    @State private var draggedMeterScope: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1839,8 +1942,15 @@ struct CompactDashboardCardView: View {
     @ViewBuilder
     private func providerBlock(_ snapshot: QuotaSnapshot) -> some View {
         let accent = Color(hex: snapshot.providerID.accentColorHex)
-        let windows = snapshot.summaryWindows
-        let resetCount = sevenDayResetCounts[snapshot.providerID, default: 0]
+        let scope = MeterOrderStore.scopeForProvider(snapshot.providerID)
+        let naturalMeters = snapshot.summaryWindows.map {
+            OrderedMeter(
+                id: MeterOrderStore.key(providerID: snapshot.providerID, window: $0),
+                window: $0
+            )
+        }
+        let meterKeys = naturalMeters.map(\.id)
+        let meters = meterOrderStore.ordered(naturalMeters, scope: scope, key: \.id)
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -1862,27 +1972,28 @@ struct CompactDashboardCardView: View {
                 if let banked = snapshot.resetCredits, banked.hasAvailableReset {
                     BankedResetPill(text: banked.statusLine() ?? "Reset banked", accent: accent, compact: true)
                 }
-
-                Text(resetCount == 1 ? "1 reset · 7d" : "\(resetCount) resets · 7d")
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(resetCount > 0 ? accent : Color.secondary)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .accessibilityLabel("\(resetCount) quota resets in the last 7 days")
             }
             .padding(.bottom, 1)
 
-            if windows.isEmpty {
+            if meters.isEmpty {
                 Text("No usage data yet")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(windows) { window in
+                ForEach(meters) { meter in
                     compactMeterRow(
-                        window: window,
+                        window: meter.window,
                         accent: accent,
                         providerID: snapshot.providerID
+                    )
+                    .contentShape(Rectangle())
+                    .meterReorderable(
+                        meterKey: meter.id,
+                        scope: scope,
+                        reorderableKeys: meterKeys,
+                        draggedMeterKey: $draggedMeterKey,
+                        draggedMeterScope: $draggedMeterScope,
+                        orderStore: meterOrderStore
                     )
                 }
             }
@@ -1956,6 +2067,9 @@ private func compactMeterValueText(for window: QuotaWindow, providerID: Provider
 /// their provider inline since there is no per-provider header.
 struct PeriodCompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
+    @ObservedObject private var meterOrderStore = MeterOrderStore.shared
+    @State private var draggedMeterKey: String?
+    @State private var draggedMeterScope: String?
 
     private var sections: [QuotaPeriodSection] {
         QuotaPeriodSection.sections(from: snapshots)
@@ -1978,6 +2092,23 @@ struct PeriodCompactDashboardCardView: View {
 
     @ViewBuilder
     private func sectionBlock(_ section: QuotaPeriodSection) -> some View {
+        let scope = MeterOrderStore.scopeForPeriod(section.group)
+        let naturalMeterRows = section.rows.filter { $0.window != nil }
+        let meterKeys = naturalMeterRows.compactMap { row -> String? in
+            guard let window = row.window else { return nil }
+            return MeterOrderStore.key(providerID: row.providerID, window: window)
+        }
+        let orderedMeterRows = meterOrderStore.ordered(
+            naturalMeterRows,
+            scope: scope,
+            key: { row in
+                guard let window = row.window else { return "" }
+                return MeterOrderStore.key(providerID: row.providerID, window: window)
+            }
+        )
+        let idleRows = section.rows.filter { $0.window == nil }
+        let rows = orderedMeterRows + idleRows
+
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(section.group.title)
@@ -1994,8 +2125,22 @@ struct PeriodCompactDashboardCardView: View {
             }
             .padding(.bottom, 1)
 
-            ForEach(section.rows) { row in
-                meterRow(row)
+            ForEach(rows) { row in
+                if let window = row.window {
+                    let meterKey = MeterOrderStore.key(providerID: row.providerID, window: window)
+                    meterRow(row)
+                        .contentShape(Rectangle())
+                        .meterReorderable(
+                            meterKey: meterKey,
+                            scope: scope,
+                            reorderableKeys: meterKeys,
+                            draggedMeterKey: $draggedMeterKey,
+                            draggedMeterScope: $draggedMeterScope,
+                            orderStore: meterOrderStore
+                        )
+                } else {
+                    meterRow(row)
+                }
             }
         }
     }

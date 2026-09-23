@@ -686,6 +686,148 @@ public final class ProviderCardOrderStore: ObservableObject {
     ]
 }
 
+/// Remembers the order the user dragged individual usage *meters* into, inside
+/// the two compact dashboard layouts.
+///
+/// `ProviderCardOrderStore` orders whole provider cards; this orders the quota
+/// windows within one compact block, which is a different question — a user who
+/// wants their weekly meter above their five-hour one is not saying anything
+/// about which provider comes first.
+///
+/// Orders are namespaced by *scope* rather than stored as one flat list. The
+/// same meter appears in both compact layouts, and in "Period" it sits beside
+/// other providers' meters rather than beside its own, so a rank that makes
+/// sense in one is meaningless in the other. Sharing a list would let a drag in
+/// one layout silently scramble the other.
+@MainActor
+public final class MeterOrderStore: ObservableObject {
+    public static let shared = MeterOrderStore()
+
+    private let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private let orderedMetersKey = "dashboardMeterOrder"
+    private let defaultsOverride: UserDefaults?
+
+    @Published private var ordersByScope: [String: [String]]
+
+    private var defaults: UserDefaults {
+        if let defaultsOverride { return defaultsOverride }
+        return UserDefaults(suiteName: appGroupID) ?? .standard
+    }
+
+    public convenience init(defaults: UserDefaults) {
+        self.init(defaultsProvider: defaults)
+    }
+
+    private init(defaultsProvider: UserDefaults? = nil) {
+        self.defaultsOverride = defaultsProvider
+        let resolvedDefaults = defaultsProvider ?? (UserDefaults(suiteName: appGroupID) ?? .standard)
+        let stored = resolvedDefaults.dictionary(forKey: orderedMetersKey) as? [String: [String]] ?? [:]
+        self.ordersByScope = stored
+    }
+
+    /// Stable identity for one meter row.
+    ///
+    /// The rank has to survive a refresh, and `QuotaWindow.id` is a fresh
+    /// `UUID` every time a provider is read, so the identity comes from the
+    /// window itself rather than from its id.
+    public nonisolated static func key(providerID: ProviderID, window: QuotaWindow) -> String {
+        window.stableIdentity(for: providerID)
+    }
+
+    /// Scope for the "Standard" compact layout, where meters are grouped under
+    /// their own provider and can only be reordered among their siblings.
+    public nonisolated static func scopeForProvider(_ providerID: ProviderID) -> String {
+        "provider:\(providerID.rawValue)"
+    }
+
+    /// Scope for the "Period" compact layout, where meters from every provider
+    /// are grouped under their reset period instead.
+    public nonisolated static func scopeForPeriod(_ group: QuotaPeriodGroup) -> String {
+        "period:\(group.rawValue)"
+    }
+
+    /// The caller's natural order, rearranged by the ranks the user dragged in.
+    ///
+    /// Saved keys that are no longer on screen are ignored rather than
+    /// resurrected, and keys that have never been seen are appended in their
+    /// natural order. That second half is what keeps a meter a provider adds
+    /// later — or one that only appears once a session is connected — from
+    /// vanishing because it has no saved rank.
+    public func ordered<T>(_ natural: [T], scope: String, key: (T) -> String) -> [T] {
+        let saved = ordersByScope[scope] ?? []
+        guard !saved.isEmpty else { return natural }
+
+        let byKey = Dictionary(natural.map { (key($0), $0) }, uniquingKeysWith: { first, _ in first })
+        var reordered: [T] = saved.compactMap { byKey[$0] }
+        let placed = Set(saved)
+        reordered.append(contentsOf: natural.filter { !placed.contains(key($0)) })
+        return reordered
+    }
+
+    /// Moves `key` next to `target` within `scope`, picking the side that
+    /// matches the drag direction: dragged downwards it lands *after* the row
+    /// it was dropped on, dragged upwards it lands *before* it.
+    ///
+    /// `natural` is the caller's *default* order — the meters it is showing
+    /// before `ordered` rearranges them, not the rearranged result. Passing the
+    /// displayed order instead would make every comparison below a tautology
+    /// and pin ranks that were only ever relative to a previous drag.
+    ///
+    /// It also bounds the write: a stale saved rank for a meter that is no
+    /// longer reported cannot be carried forward, and an unknown key or target
+    /// is a no-op rather than an insertion at the end.
+    public func move(_ key: String, toward target: String, scope: String, natural: [String]) {
+        guard key != target, natural.contains(key), natural.contains(target) else { return }
+
+        // Start from the default order with the user's ranks applied, so the
+        // saved list never accumulates meters that have since disappeared.
+        var updated = ordered(natural, scope: scope, key: { $0 })
+        guard
+            let sourceIndex = updated.firstIndex(of: key),
+            let targetIndex = updated.firstIndex(of: target)
+        else {
+            return
+        }
+
+        let isMovingDown = sourceIndex < targetIndex
+        updated.remove(at: sourceIndex)
+        guard let landingIndex = updated.firstIndex(of: target) else { return }
+        let insertionIndex = isMovingDown ? updated.index(after: landingIndex) : landingIndex
+        updated.insert(key, at: insertionIndex)
+
+        guard updated != natural else {
+            // The drag produced the default order, so there is nothing worth
+            // storing — and pruning here keeps a scope that was merely
+            // looked at from being written at all.
+            if ordersByScope[scope] != nil {
+                ordersByScope[scope] = nil
+                save()
+            }
+            return
+        }
+        guard ordersByScope[scope] != updated else { return }
+        ordersByScope[scope] = updated
+        save()
+    }
+
+    /// Restores the default order for one scope, leaving every other scope and
+    /// the provider-card order alone.
+    public func reset(scope: String) {
+        guard ordersByScope.removeValue(forKey: scope) != nil else { return }
+        save()
+    }
+
+    private func save() {
+        // Drop the key entirely once every scope has been pruned, so a
+        // dashboard the user has stopped rearranging leaves nothing behind.
+        if ordersByScope.isEmpty {
+            defaults.removeObject(forKey: orderedMetersKey)
+        } else {
+            defaults.set(ordersByScope, forKey: orderedMetersKey)
+        }
+    }
+}
+
 @MainActor
 public final class ProviderCardDisclosureStore: ObservableObject {
     public static let shared = ProviderCardDisclosureStore()
