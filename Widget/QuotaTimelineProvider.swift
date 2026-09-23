@@ -1453,9 +1453,19 @@ private enum LockScreenMeterStackSelector {
 }
 #endif
 
-// MARK: - Control Center Support (iOS 18+)
+// MARK: - Control Center Support (iOS 18+ / macOS 26+)
 
-@available(iOS 18.0, macOS 15.0, *)
+// ControlWidget, ControlWidgetConfiguration, StaticControlConfiguration,
+// ControlWidgetButton and ControlCenter are all `@available(iOS 18.0,
+// macOS 26.0, *)` — Control Center did not reach the Mac until 26. These four
+// guards used to say `macOS 15.0`, copying the iOS number across, which read as
+// correct only because a 26.0 deployment target makes every macOS-26 symbol
+// unconditionally available and so stops the compiler checking. Lower the floor
+// and the annotation is what stands between this file and nineteen errors, and
+// at runtime a weak-imported symbol binds to NULL rather than failing to link —
+// so the number has to be the real one.
+
+@available(iOS 18.0, macOS 26.0, *)
 public struct AIUsageControl: ControlWidget {
     public static let kind = "AIUsageControl"
 
@@ -1473,7 +1483,7 @@ public struct AIUsageControl: ControlWidget {
     }
 }
 
-@available(iOS 18.0, macOS 15.0, *)
+@available(iOS 18.0, macOS 26.0, *)
 public struct AIUsageRefreshControl: ControlWidget {
     public static let kind = "AIUsageRefreshControl"
 
@@ -1517,7 +1527,7 @@ public struct RefreshAIUsageIntent: AppIntent {
 
     public func perform() async throws -> some IntentResult {
         WidgetCenter.shared.reloadAllTimelines()
-        if #available(iOS 18.0, macOS 15.0, *) {
+        if #available(iOS 18.0, macOS 26.0, *) {
             ControlCenter.shared.reloadAllControls()
         }
         return .result(dialog: "Limit Counter refreshed")
@@ -2017,7 +2027,7 @@ public struct AIUsageTrackerWidgetBundle: WidgetBundle {
         AIUsageLockScreenMetersWidget()
         AIUsageLockScreenTrioWidget()
         #endif
-        if #available(iOS 18.0, macOS 15.0, *) {
+        if #available(iOS 18.0, macOS 26.0, *) {
             AIUsageControl()
             AIUsageRefreshControl()
         }
