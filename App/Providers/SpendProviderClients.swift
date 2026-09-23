@@ -3001,7 +3001,11 @@ public struct CerebrasProviderClient: ProviderClient {
         if let webCookie, !webCookie.isEmpty {
             let endpoint = BrowserSessionRefreshPolicy.validatedURL(
                 fields[SpendProviderCredentialField.browserSessionURL],
-                fallback: URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!
+                // Org-agnostic on purpose: the fallback used to embed the
+                // maintainer's own org id, so a user without an override was
+                // pointed at someone else's account. `validatedURL` matches on
+                // host only, so an override saved before this change still wins.
+                fallback: URL(string: "https://cloud.cerebras.ai/platform/billing")!
             )
             browserResult = await BrowserMeterRefreshStore.shared.read(
                 url: endpoint,
@@ -6324,13 +6328,19 @@ public struct MetaProviderClient: UserInitiatedProviderClient {
             case .fetch:
                 let liveReading = await WebBillingClient(
                     // Honour the user's own configured URL like every other
-                    // browser-meter site does. This one went straight at the
-                    // fallback, so a Meta user who had not set an override was
+                    // browser-meter site does. This one went straight at a
+                    // fallback that embedded the maintainer's project and team
+                    // ids, so a Meta user who had not set an override was
                     // navigated — carrying their own session cookies — to the
                     // maintainer's project billing page rather than their own.
+                    // The fallback is now the bare console page and lets Meta
+                    // resolve the signed-in account; if that page turns out not
+                    // to select a project on its own, the read fails visibly and
+                    // the user sets an override, which beats silently reading
+                    // somebody else's.
                     baseURL: BrowserSessionRefreshPolicy.validatedURL(
                         fields[SpendProviderCredentialField.browserSessionURL],
-                        fallback: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!
+                        fallback: URL(string: "https://dev.meta.ai/billing/")!
                     ),
                     cookieDomains: ["meta.ai", "meta.com"]
                 ).fetch(
@@ -6360,7 +6370,8 @@ public struct MetaProviderClient: UserInitiatedProviderClient {
         if let webCookie, !webCookie.isEmpty, hasSubscriptionImport {
             let endpoint = BrowserSessionRefreshPolicy.validatedURL(
                 fields[SpendProviderCredentialField.browserSessionURL],
-                fallback: URL(string: "https://dev.meta.ai/usage/?project_id=1514228250391823&team_id=1760015591684812")!
+                // Bare console page, as above: no maintainer project or team id.
+                fallback: URL(string: "https://dev.meta.ai/usage/")!
             )
             museBrowserResult = await BrowserMeterRefreshStore.shared.read(
                 url: endpoint,

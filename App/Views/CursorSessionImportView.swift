@@ -874,7 +874,7 @@ struct MetaWebSessionImportView: View {
 
     /// The user's Meta billing page. The project/team query params are
      /// preserved so the embedded browser lands on the right billing context.
-    private let startURL = URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!
+    private let startURL = URL(string: "https://dev.meta.ai/billing/")!
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1084,7 +1084,7 @@ struct MuseSubscriptionImportView: View {
 
     /// The user's Meta usage page. The project/team query params are
      /// preserved so the embedded browser lands on the right usage context.
-    private let startURL = URL(string: "https://dev.meta.ai/usage/?project_id=1514228250391823&team_id=1760015591684812")!
+    private let startURL = URL(string: "https://dev.meta.ai/usage/")!
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1324,7 +1324,7 @@ struct CerebrasWebSessionImportView: View {
 
     /// The user's Cerebras billing page. The org id is preserved so the
      /// embedded browser lands on the right billing context.
-    private let startURL = URL(string: "https://cloud.cerebras.ai/platform/org_eep8yff8mhr6k42k3v23fmy3/billing")!
+    private let startURL = URL(string: "https://cloud.cerebras.ai/platform/billing")!
 
     var body: some View {
         VStack(spacing: 0) {
