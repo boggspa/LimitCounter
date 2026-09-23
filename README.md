@@ -52,8 +52,46 @@ The app reads the local SQLite log store and local text logs only. OpenAI’s OT
 1. On macOS, `ProviderClient` fetches provider-specific usage data from local sources the user controls.
 2. `SyncCoordinator` normalizes results into `QuotaSnapshot`.
 3. `QuotaSnapshotStore` writes sanitized snapshots to App Group `UserDefaults` for the local app and widget.
-4. `CloudKitSyncService` publishes the latest normalized snapshots to CloudKit so iPhone can act as a viewer.
+4. `CloudKitSyncService` publishes the latest normalized snapshots to the user's own iCloud private database so iPhone can act as a viewer. See *iCloud sync* below for what that does and does not include.
 5. On iOS, the app reads the last synced CloudKit state, caches it locally, and renders the same snapshot model.
+
+## iCloud sync
+
+Stated plainly, including the parts that are limitations rather than features.
+
+**Where it goes.** Your own iCloud private database, in the container
+`iCloud.com.chrisizatt.LLMUsageCounter` (`CloudKitSync.swift` uses
+`container.privateCloudDatabase` and nothing else — no public or shared database,
+no `CKShare`). There is no maintainer-operated server anywhere in the app, and
+the maintainer cannot read what you sync.
+
+**What is uploaded.** One record per provider, holding the normalized snapshot:
+provider, display name, plan name, meter values and totals, reset dates, fetch
+timestamps, a status hash, a payload version, and any alert title/body text. No
+credentials of any kind — no API keys, OAuth tokens, cookies or session headers,
+and no raw provider API responses. Those stay in the macOS Keychain, which the
+widget extension has no entitlement to reach.
+
+**Push notifications.** Alert text can reach the iOS viewer through Apple Push
+Notification service. The macOS app carries no `aps-environment` entitlement, so
+its alerts are raised locally and never transit APNs.
+
+**Deletion — a real limitation.** The app only ever writes. Both of its CloudKit
+operations pass `recordIDsToDelete: []`, so nothing in the app deletes a record.
+Removing a provider, clearing the local cache, or deleting your credentials does
+*not* remove what has already been synced; those records stay in your iCloud
+until you delete them yourself through iCloud's own storage management. There is
+no in-app deletion path.
+
+**Opt-out — a real limitation.** There is no switch. Sync runs whenever
+`container.accountStatus()` reports an iCloud account is available, which is the
+only gate in the code. To stop it, turn off iCloud for this app in System
+Settings, or sign out of iCloud. Settings exposes sync *diagnostics* and a
+subscription reinstall, not a disable control.
+
+Both limitations are documented rather than fixed here on purpose: closing them
+means adding a deletion path and an opt-out toggle, which is product work, not a
+wording change.
 
 ## Next Steps
 
