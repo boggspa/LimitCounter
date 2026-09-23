@@ -55,7 +55,9 @@ private func snapshot(
 /// live snapshot cache. The label wins over the window kind because
 /// providers disagree wildly on both: Claude's five-hour meter is
 /// labelled "Session" with kind `.session`, Kimi's is labelled "5H" with
-/// kind `.sliding`, and Qwen's weekly plan is "7-Day Quota".
+/// kind `.sliding`, and Qwen names its meter after the plan's period —
+/// "7-Day Quota" on a rolling weekly plan, "Monthly Usage" on the monthly
+/// Standard plan that replaced it.
 private func testRealWorldWindowsLandInTheRightPeriod() throws {
     let cases: [(ProviderID, QuotaWindow, QuotaPeriodGroup)] = [
         (.claude, window("Session", .session), .fiveHour),
@@ -84,6 +86,7 @@ private func testRealWorldWindowsLandInTheRightPeriod() throws {
         (.devin, window("Weekly quota (Chris Izatt)", .weekly), .weekly),
         (.mimo, window("Plan Quota", .monthly), .monthlyAndAPI),
         (.qwen, window("7-Day Quota", .weekly), .weekly),
+        (.qwen, window("Monthly Usage", .monthly), .monthlyAndAPI),
         (.meta, window("Current usage", .session), .fiveHour),
         (.meta, window("Weekly limit", .weekly), .weekly),
         (.deepseek, window("Credit used", .custom, used: 13.23, total: 20), .monthlyAndAPI),

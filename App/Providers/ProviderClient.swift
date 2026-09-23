@@ -10703,6 +10703,20 @@ extension ProviderFetchError {
             return false
         }
     }
+
+    /// True when the failure means "these credentials no longer work" rather
+    /// than "the response did not parse". The browser meter store persists
+    /// failures as text, so the kind has to be recoverable from the error
+    /// before it is flattened, or a dead session gets reported as a layout
+    /// change the user cannot act on.
+    var isCredentialFailure: Bool {
+        switch self {
+        case .credentialExpired, .invalidCredential:
+            return true
+        case .notConfigured, .networkError, .parsingError, .rateLimited, .unknown:
+            return false
+        }
+    }
 }
 
 // MARK: - Ollama Cloud Provider Client

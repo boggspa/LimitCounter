@@ -1261,7 +1261,7 @@ struct ProviderCredentialView: View {
                      }
                   } else if providerID == .qwen {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Sign into Alibaba Cloud Model Studio in the embedded browser to automatically track your Qwen token plan 7-day quota, or enter a manual weekly-percent anchor below:")
+                        Text("Sign into Alibaba Cloud Model Studio in the embedded browser to automatically track your Qwen token plan quota, or enter a manual percent anchor below:")
                               .font(.caption)
                               .foregroundStyle(.secondary)
                               .fixedSize(horizontal: false, vertical: true)
@@ -1587,7 +1587,7 @@ struct ProviderCredentialView: View {
                     .fixedSize(horizontal: false, vertical: true)
              } else if providerID == .qwen || providerID == .mimo {
                 TextField(
-                    "Weekly quota used (%)",
+                    "Quota used (%)",
                     text: extraFieldBinding(SpendProviderCredentialField.manualWeeklyUsedPercent)
                  )
                 TextField(

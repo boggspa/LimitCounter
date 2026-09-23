@@ -30,6 +30,12 @@ private func date(_ value: String) -> Date {
     ISO8601DateFormatter().date(from: value)!
 }
 
+/// The other direction, for fixtures that have to stay relative to the clock.
+/// A hard-coded "far future" date drifts into range as time passes and quietly
+/// turns a passing test into a failing one.
+private func isoString(_ value: Date) -> String {
+    ISO8601DateFormatter().string(from: value)
+}
 private func testCodexSessionCredentialParserSupportsNestedAndDirectAuth() throws {
     let nested = CodexSessionCredentialParser.parse([
         "tokens": [
@@ -1923,6 +1929,114 @@ private func testTokenPlanParserReportsNoQuotaBeforeTheValueRenders() throws {
     try expect(reading?.quotaUsedPercent == nil, "no quota reading before the meter renders")
 }
 
+/// Model Studio moved the Standard plan from a 7-day rolling quota to a monthly
+/// one. The card's layout is unchanged — only its heading and the reset date
+/// differ — so the period has to be read from the heading. Fixture transcribed
+/// from the console on 2026-09-22.
+private func testTokenPlanParserReadsQwenMonthlyMeter() throws {
+    let qwenText = """
+    Standard Plan Active
+    Auto-Renewal
+    Start Time 2026-08-26 00:00:00
+    End Time 2026-09-26 00:00:00
+    Plan Quota
+    Updated at: 2026-09-22 22:34:02
+    Usage Statistics
+    Monthly Usage
+    Will reset at 2026-09-26 00:00:00 (UTC+8) 0%
+    0%
+    100%
+    Reset
+    Quota Add-on
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen monthly meter did not parse") }()
+
+    try expectClose(qwen.quotaUsedPercent ?? -1, 0, "meter value, not the bar's axis label")
+    try expectEqual(qwen.meterPeriod, .monthly, "the heading says the meter is monthly")
+    try expectEqual(qwen.periodEnd, date("2026-09-25T16:00:00Z"), "UTC+8 monthly reset converted to UTC")
+    try expectEqual(qwen.planName, "Standard Plan", "plan name")
+
+    // A heading and its noun rendered as separate text nodes still count.
+    let split = try TokenPlanWebClient.parseQwen(renderedText: "Monthly\nUsed\nWill reset at 2026-09-26 00:00:00 (UTC+8) 7%")
+        ?? { throw AdditionalProviderTestError.failure("split monthly heading did not parse") }()
+    try expectEqual(split.meterPeriod, .monthly, "a heading split across two lines still reads")
+    try expectClose(split.quotaUsedPercent ?? -1, 7, "split heading keeps its value")
+}
+
+/// The old weekly card must keep reporting weekly, or every account still on a
+/// rolling 7-day plan would be relabelled by the new monthly default.
+private func testTokenPlanParserKeepsQwenWeeklyMeterPeriod() throws {
+    let qwenText = """
+    Plan Quota
+    7-Day Used
+    Will reset at 2026-09-16 10:03:00 (UTC+8) 42.5%
+    0% 100%
+    """
+    let qwen = try TokenPlanWebClient.parseQwen(renderedText: qwenText)
+        ?? { throw AdditionalProviderTestError.failure("Qwen weekly meter did not parse") }()
+    try expectEqual(qwen.meterPeriod, .weekly, "the heading says the meter is weekly")
+    try expectClose(qwen.quotaUsedPercent ?? -1, 42.5, "weekly value unchanged")
+}
+
+/// The period must come from the meter's own heading, and "Month" appears all
+/// over a billing console.
+///
+/// Every case below goes through `parseQwen`, which flattens the card onto one
+/// line exactly as the production callers do. That flattening is the whole
+/// difficulty: afterwards a "Billing Month" row three blocks up sits directly
+/// beside an "Usage Statistics" heading, so proximity is worthless and only the
+/// order of the words against the reset row carries any information. Testing
+/// `meterPeriod(in:)` with hand-written newlines in it would pass while the
+/// shipping parser got it wrong.
+private func testTokenPlanParserDoesNotReadPeriodFromUnrelatedText() throws {
+    func period(_ text: String) throws -> TokenPlanMeterPeriod? {
+        TokenPlanWebClient.parseQwen(renderedText: text)?.meterPeriod
+    }
+
+    try expectEqual(
+        try period("""
+        Standard Monthly Plan Active
+        Remaining Days 14 days
+        Plan Quota
+        7-Day Used
+        Will reset at 2026-09-16 10:03:00 (UTC+8) 12%
+        """),
+        .weekly,
+        "a tier named for a month does not make the meter monthly"
+    )
+
+    try expectEqual(
+        try period("""
+        Billing Month
+        Usage Statistics
+        7-Day Used
+        Will reset at 2026-09-16 10:03:00 (UTC+8) 12%
+        """),
+        .weekly,
+        "a billing row elsewhere on the card cannot claim the reset row"
+    )
+
+    try expectEqual(
+        try period("""
+        Plan Quota
+        Updated at: 2026-09-22 22:34:02
+        Usage Statistics
+        Will reset at 2026-09-26 00:00:00 (UTC+8) 3%
+        """),
+        nil,
+        "no period word anywhere, so no period is claimed and the provider default applies"
+    )
+
+    // `innerText` keeps `&nbsp;` as U+00A0, and the heading is markup that can
+    // produce one. Called directly because the flattener would replace it.
+    try expectEqual(
+        TokenPlanWebClient.meterPeriod(in: "Monthly\u{00A0}Usage"),
+        .monthly,
+        "a non-breaking space inside the heading still reads"
+    )
+}
+
 // MARK: - Token Plan console API
 
 /// Verbatim response from the console gateway on 2026-09-10, captured while the
@@ -1971,6 +2085,109 @@ private func testTokenPlanConsoleAPIReadsFractionalQuota() throws {
     try expectClose(reading.quotaUsedPercent ?? -1, 42.5, "0.425 -> 42.5%")
 }
 
+/// The Standard plan's monthly meter, on the same response and the same
+/// envelope. The weekly pair is *absent* rather than zero — that is exactly how
+/// the console decides which meter to draw (`typeof per1WeekPercentage ===
+/// 'number'`), so the app has to decide the same way. Field names and units
+/// confirmed against the console's own `app-tokenplan` bundle.
+private let qwenConsoleMonthlyUsageResponse = """
+{
+  "code": "200",
+  "data": {
+    "DataV2": {
+      "ret": ["SUCCESS::x"],
+      "data": {
+        "msg": "Success.",
+        "code": "SUCCESS",
+        "data": { "per1MonthResetTime": 1790352000000, "per1MonthPercentage": 0.0 },
+        "requestId": "b1a2c3d4",
+        "success": true
+      }
+    },
+    "success": true,
+    "httpStatus": 200,
+    "errorCode": "",
+    "api": "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+    "errorMsg": ""
+  },
+  "httpStatusCode": "200",
+  "requestId": "b1a2c3d4",
+  "successResponse": true
+}
+"""
+
+private func testTokenPlanConsoleAPIReadsMonthlyQuota() throws {
+    let reading = try TokenPlanConsoleAPIClient.parseUsage(Data(qwenConsoleMonthlyUsageResponse.utf8))
+        ?? { throw AdditionalProviderTestError.failure("console monthly usage response did not parse") }()
+
+    try expectClose(reading.quotaUsedPercent ?? -1, 0, "0.0 is a fraction: 0% used, not a miss")
+    try expectEqual(reading.meterPeriod, .monthly, "a monthly-only payload is a monthly meter")
+    try expectEqual(reading.periodEnd, date("2026-09-25T16:00:00Z"), "epoch-ms monthly reset converted")
+
+    let used = qwenConsoleMonthlyUsageResponse
+        .replacingOccurrences(of: "\"per1MonthPercentage\": 0.0", with: "\"per1MonthPercentage\": 0.425")
+    let partUsed = try TokenPlanConsoleAPIClient.parseUsage(Data(used.utf8))
+        ?? { throw AdditionalProviderTestError.failure("fractional monthly usage did not parse") }()
+    try expectClose(partUsed.quotaUsedPercent ?? -1, 42.5, "0.425 -> 42.5%")
+    try expectEqual(partUsed.meterPeriod, .monthly, "still monthly")
+}
+
+/// A response can carry both periods, and a weekly timestamp can outlive the
+/// weekly plan. Picking by "whichever key is present" would file a monthly
+/// account under Weekly and then reject its reset as too far off.
+private func testTokenPlanConsoleAPIPrefersWeeklyOnlyWhenItReportsOne() throws {
+    func envelope(_ payload: String) -> Data {
+        """
+        {"data": {"success": true, "DataV2": {"data": {"data": \(payload)}}}}
+        """.data(using: .utf8)!
+    }
+
+    let both = try TokenPlanConsoleAPIClient.parseUsage(envelope(
+        #"{"per1WeekPercentage": 0.25, "per1WeekResetTime": 1789524180000, "per1MonthPercentage": 0.9, "per1MonthResetTime": 1790352000000}"#
+    )) ?? { throw AdditionalProviderTestError.failure("both-period payload did not parse") }()
+    try expectEqual(both.meterPeriod, .weekly, "the console renders the weekly meter when it reports one")
+    try expectClose(both.quotaUsedPercent ?? -1, 25, "and the weekly percentage goes with it")
+    try expectEqual(both.periodEnd, date("2026-09-16T02:03:00Z"), "as does the weekly reset")
+
+    let staleWeek = try TokenPlanConsoleAPIClient.parseUsage(envelope(
+        #"{"per1WeekResetTime": 1789524180000, "per1MonthPercentage": 0.4, "per1MonthResetTime": 1790352000000}"#
+    )) ?? { throw AdditionalProviderTestError.failure("stale weekly reset payload did not parse") }()
+    try expectEqual(staleWeek.meterPeriod, .monthly, "a leftover weekly timestamp cannot drag a monthly account back to weekly")
+    try expectClose(staleWeek.quotaUsedPercent ?? -1, 40, "the monthly percentage is the one rendered")
+    try expectEqual(staleWeek.periodEnd, date("2026-09-25T16:00:00Z"), "and the monthly reset goes with it")
+}
+
+/// The Plan Quota card's "{n} available" badge counts the reset-card list. The
+/// subscription record has no such field, which is why the count came back
+/// empty and the banked-reset pill never appeared.
+private func testTokenPlanConsoleAPIReadsResetCardList() throws {
+    func envelope(_ payload: String) -> Data {
+        """
+        {"data": {"success": true, "DataV2": {"data": {"data": \(payload)}}}}
+        """.data(using: .utf8)!
+    }
+
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetCardCount(envelope(#"{"result": [{"id": "a"}, {"id": "b"}]}"#)),
+        2,
+        "two cards, two banked resets"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetCardCount(envelope(#"{"result": []}"#)),
+        0,
+        "an empty list is a real zero, not a miss"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetCardCount(envelope(#"{"per1MonthPercentage": 0.1}"#)),
+        nil,
+        "no list, no count"
+    )
+    try expectEqual(
+        TokenPlanConsoleAPIClient.parseResetCardCount(#"{"data": {"success": false, "errorCode": "NotLogined"}}"#.data(using: .utf8)!),
+        nil,
+        "a failed envelope yields nothing"
+    )
+}
 /// The gateway reports an expired console session in the body with HTTP 200, so
 /// it has to be surfaced as a credential problem rather than a parse failure —
 /// otherwise the card asks the user to wait instead of to reconnect.
@@ -2026,14 +2243,171 @@ private func testTokenPlanCachedAndManualZeroUsageProduceMeters() async throws {
         credentials: ProviderCredential(
             extraFields: [
                 SpendProviderCredentialField.tokenPlanCachedUsedPercent: "32",
-                SpendProviderCredentialField.tokenPlanCachedResetAt: "2026-09-25T17:00:00Z"
+                SpendProviderCredentialField.tokenPlanCachedResetAt: isoString(Date().addingTimeInterval(400 * 86_400))
             ]
         )
     )
     try expect(
         staleQwenSnapshot.windows.first?.resetDate == nil,
-        "Qwen ignores cached subscription end date"
+        "Qwen ignores a cached subscription end date"
     )
+
+    // The other side of the same acceptance window. A monthly boundary is up to
+    // a month away, so the eight-day cap built for a weekly meter used to drop
+    // it and the card showed no reset at all. Both fixtures are relative to now:
+    // a hard-coded "far future" date drifts into range and rots the test.
+    let monthlyQwenSnapshot = try await QwenProviderClient().fetchSnapshot(
+        credentials: ProviderCredential(
+            extraFields: [
+                SpendProviderCredentialField.tokenPlanCachedUsedPercent: "32",
+                SpendProviderCredentialField.tokenPlanCachedResetAt: isoString(Date().addingTimeInterval(21 * 86_400))
+            ]
+        )
+    )
+    try expect(
+        monthlyQwenSnapshot.windows.first?.resetDate != nil,
+        "Qwen keeps a monthly reset three weeks out"
+    )
+    try expectEqual(
+        monthlyQwenSnapshot.windows.first?.label,
+        "Monthly Usage",
+        "a cached Qwen reading still lands on the monthly meter"
+    )
+}
+
+/// The meter has to reach the Monthly bucket, not Weekly. The grouping keys off
+/// the label first and the window kind second, so the two have to agree — and a
+/// monthly meter filed under Weekly also draws seven segments for a four-week
+/// span.
+private func testQwenMonthlyMeterLandsInMonthlyPeriod() async throws {
+    let snapshot = try await QwenProviderClient().fetchSnapshot(
+        credentials: ProviderCredential(
+            extraFields: [SpendProviderCredentialField.manualWeeklyUsedPercent: "12"]
+        )
+    )
+    try expectEqual(snapshot.windows.count, 1, "Qwen has one quota meter")
+    let window = snapshot.windows[0]
+    try expectEqual(window.label, "Monthly Usage", "the Standard plan's meter is labelled monthly")
+    try expectEqual(window.windowKind, .monthly, "and keyed monthly")
+    try expectEqual(window.periodGroup(for: .qwen), .monthlyAndAPI, "so it lands in the Monthly + API bucket")
+    try expectEqual(window.segmentCount(for: .qwen), 4, "and draws four segments, not seven")
+
+    try expect(
+        TokenPlanMeterPeriod.monthly.maximumResetLeadTime > TokenPlanMeterPeriod.weekly.maximumResetLeadTime,
+        "a monthly reset may sit further out than a weekly one"
+    )
+}
+
+/// The other side of the same lookup: an account still on a rolling week keeps
+/// the old label, the old bucket and the old eight-day horizon. This is what
+/// stops the new monthly default from relabelling a plan that never moved, and
+/// it exercises the recorded-period field end to end — import writes it, the
+/// cached reading returns it, and the snapshot labels the meter from it.
+private func testQwenWeeklyAccountKeepsWeeklyMeter() async throws {
+    let snapshot = try await QwenProviderClient().fetchSnapshot(
+        credentials: ProviderCredential(
+            extraFields: [
+                SpendProviderCredentialField.tokenPlanCachedUsedPercent: "18",
+                SpendProviderCredentialField.tokenPlanCachedMeterPeriod: TokenPlanMeterPeriod.weekly.rawValue,
+                SpendProviderCredentialField.tokenPlanCachedResetAt: isoString(Date().addingTimeInterval(21 * 86_400))
+            ]
+        )
+    )
+    try expectEqual(snapshot.windows.count, 1, "Qwen has one quota meter")
+    let window = snapshot.windows[0]
+    try expectEqual(window.label, "7-Day Quota", "a recorded weekly period keeps the weekly label")
+    try expectEqual(window.windowKind, .weekly, "and the weekly window kind")
+    try expectEqual(window.periodGroup(for: .qwen), .weekly, "so it stays in the Weekly bucket")
+    try expectEqual(window.segmentCount(for: .qwen), 7, "and draws seven segments")
+    try expect(
+        window.resetDate == nil,
+        "a reset three weeks out is beyond a weekly meter's horizon"
+    )
+}
+
+/// Both sources can miss, and the *kind* of error has to decide which verdict
+/// the user sees — not the order the sources happened to run in. Reversing this
+/// is the original bug: the API's rejection was thrown from inside the fetch, so
+/// the scrape never ran and a readable page was reported as a parse error.
+private func testTokenPlanFailureChoicePrefersCredentialErrors() throws {
+    let apiCredential = ProviderFetchError.credentialExpired("Qwen console session expired.")
+    let apiParse = ProviderFetchError.parsingError("Model Studio console API error: Throttled")
+    let scrapeParse = ProviderFetchError.parsingError("No token-plan meters found.")
+    let scrapeCredential = ProviderFetchError.credentialExpired("Browser sign-in expired.")
+
+    func isCredential(_ error: Error) -> Bool {
+        (error as? ProviderFetchError)?.isCredentialFailure == true
+    }
+
+    try expect(
+        isCredential(TokenPlanFailureChoice.preferred(scrape: scrapeParse, api: apiCredential)),
+        "a credential rejection from the API rescues a vague parse failure from the page"
+    )
+    try expectEqual(
+        TokenPlanFailureChoice.preferred(scrape: scrapeCredential, api: apiParse).localizedDescription,
+        scrapeCredential.localizedDescription,
+        "the page's own credential verdict beats the API's parse error"
+    )
+    try expectEqual(
+        TokenPlanFailureChoice.preferred(scrape: scrapeCredential, api: apiCredential).localizedDescription,
+        scrapeCredential.localizedDescription,
+        "when both are credential errors the more specific page verdict wins"
+    )
+    try expectEqual(
+        TokenPlanFailureChoice.preferred(scrape: scrapeParse, api: apiParse).localizedDescription,
+        scrapeParse.localizedDescription,
+        "with no credential error anywhere the page's own error is reported"
+    )
+    try expectEqual(
+        TokenPlanFailureChoice.preferred(scrape: scrapeParse, api: nil).localizedDescription,
+        scrapeParse.localizedDescription,
+        "no API attempt, no API verdict"
+    )
+}
+
+/// The classification above only works if the kind survives being persisted: the
+/// store keeps failures as text in UserDefaults, across restarts.
+@MainActor
+private func testBrowserRefreshStoreRecordsCredentialFailureKind() async throws {
+    let suite = "browser-meter-credential-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let cache = BrowserMeterRefreshStore(defaults: defaults)
+    let url = URL(string: "https://modelstudio.console.alibabacloud.com/token-plan")!
+
+    let expired = await cache.read(
+        url: url, sessionID: "cookie-a", initial: Optional<TokenPlanWebReading>.none,
+        initialAt: nil, interval: 300, failureInterval: 900
+    ) {
+        throw ProviderFetchError.credentialExpired("Qwen console session expired.")
+    }
+    guard case .credentialExpired = expired.failureError else {
+        throw AdditionalProviderTestError.failure("a rejected session must stay a credential error, got \(String(describing: expired.failureError))")
+    }
+
+    let unparsed = await cache.read(
+        url: url, sessionID: "cookie-b", initial: Optional<TokenPlanWebReading>.none,
+        initialAt: nil, interval: 300, failureInterval: 900
+    ) {
+        throw ProviderFetchError.parsingError("No token-plan meters found.")
+    }
+    guard case .parsingError(let message) = unparsed.failureError else {
+        throw AdditionalProviderTestError.failure("a page that did not parse must stay a parse error")
+    }
+    try expectEqual(message, "No token-plan meters found.", "the prefix is applied once, not twice")
+
+    // Still inside the failure cooldown, so this returns the stored entry
+    // without calling the closure — proving the kind was written to disk.
+    let restarted = BrowserMeterRefreshStore(defaults: defaults)
+    let persisted = await restarted.read(
+        url: url, sessionID: "cookie-a", initial: Optional<TokenPlanWebReading>.none,
+        initialAt: nil, interval: 300, failureInterval: 900
+    ) {
+        throw ProviderFetchError.parsingError("must not be called during the cooldown")
+    }
+    guard case .credentialExpired = persisted.failureError else {
+        throw AdditionalProviderTestError.failure("the credential kind must survive a restart")
+    }
 }
 
 private func testCerebrasCachedWebBalanceSurvivesLiveMiss() async throws {
@@ -2847,7 +3221,18 @@ private enum AdditionalProviderUsageTestRunner {
         try testTokenPlanParserReadsQwenResetAvailability()
         try testTokenPlanConsoleAPIScansResetAvailability()
         try testTokenPlanParserReportsNoQuotaBeforeTheValueRenders()
+        try testTokenPlanParserReadsQwenMonthlyMeter()
+        try testTokenPlanParserKeepsQwenWeeklyMeterPeriod()
+        try testTokenPlanParserDoesNotReadPeriodFromUnrelatedText()
+        try testTokenPlanConsoleAPIReadsMonthlyQuota()
+        try testTokenPlanConsoleAPIPrefersWeeklyOnlyWhenItReportsOne()
+        try testTokenPlanConsoleAPIReadsResetCardList()
+        try testBrowserMeterFailureKeepsCredentialKind()
+        try testTokenPlanFailureChoicePrefersCredentialErrors()
+        try await testBrowserRefreshStoreRecordsCredentialFailureKind()
         try await testTokenPlanCachedAndManualZeroUsageProduceMeters()
+        try await testQwenMonthlyMeterLandsInMonthlyPeriod()
+        try await testQwenWeeklyAccountKeepsWeeklyMeter()
         try await testCerebrasCachedWebBalanceSurvivesLiveMiss()
         try testCerebrasWebBillingParserReadsCurrentBalance()
         try await testMetaCreditMeterCarriesBillingReset()
@@ -2944,6 +3329,67 @@ private func testBrowserRefreshSharesOverlappingRequests() async throws {
     let b = await two.value
     try expectEqual(calls, 1, "concurrent refreshes share one navigation")
     try expectEqual(a.fetchedAt, b.fetchedAt, "shared reading keeps one timestamp")
+}
+
+/// The store persists failures as text, so the kind has to travel with it. A
+/// rejected Qwen session used to reach the card as "Parse error: Qwen console
+/// session expired", which tells the user to wait for a page layout that is
+/// perfectly fine instead of reconnecting.
+private func testBrowserMeterFailureKeepsCredentialKind() throws {
+    let expired = BrowserMeterResult<TokenPlanWebReading>(
+        value: nil,
+        fetchedAt: nil,
+        failure: "Qwen console session expired. Reconnect the browser session.",
+        failureIsCredential: true
+    )
+    guard case .credentialExpired = expired.failureError else {
+        throw AdditionalProviderTestError.failure("a rejected session must stay a credential error, got \(String(describing: expired.failureError))")
+    }
+
+    let unparsed = BrowserMeterResult<TokenPlanWebReading>(
+        value: nil,
+        fetchedAt: nil,
+        failure: "No token-plan meters found.",
+        failureIsCredential: false
+    )
+    guard case .parsingError = unparsed.failureError else {
+        throw AdditionalProviderTestError.failure("a page that did not parse must stay a parse error")
+    }
+    try expectEqual(
+        unparsed.failureError?.localizedDescription,
+        "Parse error: No token-plan meters found.",
+        "the prefix is applied once"
+    )
+
+    // `failure` holds a localized description, so a parse error stored by an
+    // older build already carries the prefix.
+    let alreadyPrefixed = BrowserMeterResult<TokenPlanWebReading>(
+        value: nil,
+        fetchedAt: nil,
+        failure: "Parse error: No token-plan meters found.",
+        failureIsCredential: false
+    )
+    try expectEqual(
+        alreadyPrefixed.failureError?.localizedDescription,
+        "Parse error: No token-plan meters found.",
+        "a stored description that already carries the prefix is not wrapped twice"
+    )
+
+    let fine = BrowserMeterResult<TokenPlanWebReading>(
+        value: nil,
+        fetchedAt: nil,
+        failure: nil,
+        failureIsCredential: false
+    )
+    try expect(fine.failureError == nil, "no failure, no error")
+
+    // The classification has to come from the error itself, not from a phrase
+    // in its message.
+    try expect(ProviderFetchError.credentialExpired("anything").isCredentialFailure, "credentialExpired is a credential failure")
+    try expect(ProviderFetchError.invalidCredential.isCredentialFailure, "invalidCredential is a credential failure")
+    try expect(!ProviderFetchError.parsingError("anything").isCredentialFailure, "a parse error is not")
+    try expect(!ProviderFetchError.rateLimited.isCredentialFailure, "a rate limit is not")
+    try expect(!ProviderFetchError.notConfigured.isCredentialFailure, "an unconfigured provider is not")
 }
 
 private func testBrowserSessionKeepsRotatedCookiesAndOrigin() throws {

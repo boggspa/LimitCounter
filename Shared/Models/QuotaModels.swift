@@ -290,7 +290,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .openrouter:
             return "Uses an OpenRouter API key to read usage tracking and spend from the official `https://openrouter.ai/api/v1/auth/key` endpoint."
         case .qwen:
-            return "Uses an imported Alibaba Cloud Model Studio web session to read the personal token plan 7-day quota meter, plan metadata, and renewal date. A manual weekly-percent anchor is used when no session is imported."
+            return "Uses an imported Alibaba Cloud Model Studio web session to read the personal token plan quota meter (monthly on current Standard plans, 7-day on older ones), plan metadata, and reset date. A manual percent anchor is used when no session is imported."
         case .mimo:
             return "Uses an imported Xiaomi MiMo console web session to read the plan quota meter and renewal metadata from platform.xiaomimimo.com."
         case .heatmap:
@@ -810,6 +810,7 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
         case .qwen:
             if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
             if descriptor.contains("weekly") || descriptor.contains("7-day") { return 7 }
+            if descriptor.contains("month") { return 4 }
         case .meta:
             if descriptor.contains("weekly") { return 7 }
             if descriptor.contains("credit") || descriptor.contains("monthly") { return 4 }

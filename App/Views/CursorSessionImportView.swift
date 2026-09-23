@@ -1565,6 +1565,9 @@ private func tokenPlanImportExtraFields(
     if let periodEnd = reading.periodEnd {
         fields[SpendProviderCredentialField.tokenPlanCachedResetAt] = ISO8601DateFormatter().string(from: periodEnd)
     }
+    if let meterPeriod = reading.meterPeriod {
+        fields[SpendProviderCredentialField.tokenPlanCachedMeterPeriod] = meterPeriod.rawValue
+    }
     return fields
 }
 
@@ -1672,7 +1675,7 @@ struct QwenWebSessionImportView: View {
               .padding(.horizontal, 20)
               .padding(.top, 18)
 
-            Text("We only capture cookies from this embedded Qwen session. The session is saved to macOS Keychain to read your token plan 7-day quota meter from the Model Studio console.")
+            Text("We only capture cookies from this embedded Qwen session. The session is saved to macOS Keychain to read your token plan quota meter from the Model Studio console.")
                   .font(.footnote)
                   .foregroundStyle(.secondary)
                   .padding(.horizontal, 20)
@@ -1827,7 +1830,7 @@ private enum QwenWebSessionImportError: LocalizedError {
         case .noCookiesFound:
             return "No Qwen session cookies were found. Make sure you signed in to the Model Studio console in the embedded browser first."
         case .noQuotaReading:
-            return "The Qwen page is signed in, but its 7-day quota has not finished loading. Wait for the quota meter, then import again."
+            return "The Qwen page is signed in, but its quota meter has not finished loading. Wait for the quota meter, then import again."
           }
       }
 }

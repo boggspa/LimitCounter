@@ -40,6 +40,9 @@ enum SpendProviderCredentialField {
     static let tokenPlanCachedPlanName = "tokenPlanCachedPlanName"
     static let tokenPlanCachedResetAt = "tokenPlanCachedResetAt"
     static let tokenPlanCachedAt = "tokenPlanCachedAt"
+    /// The period the meter reported at import time, so a cached reading keeps
+    /// its label and its reset window instead of reverting to the default.
+    static let tokenPlanCachedMeterPeriod = "tokenPlanCachedMeterPeriod"
 }
 
 private enum ProviderDateParser {
@@ -1399,11 +1402,32 @@ nonisolated struct BrowserMeterResult<Value: Codable & Sendable>: Sendable {
     let value: Value?
     let fetchedAt: Date?
     let failure: String?
+    /// Whether `failure` was a rejected credential rather than a page that
+    /// loaded but did not parse. The store persists failures as text, so the
+    /// kind has to travel with it or every session problem gets reported as a
+    /// parse error.
+    let failureIsCredential: Bool
 
     var sourceDescription: String {
         guard let fetchedAt else { return failure ?? "Browser reading unavailable" }
         let stamp = ISO8601DateFormatter().string(from: fetchedAt)
         return failure.map { "Last browser reading \(stamp). \($0)" } ?? "Browser reading \(stamp)"
+    }
+
+    /// The stored failure, re-thrown as the kind of error it actually was.
+    /// A rejected session has to reach the user as a credential problem so the
+    /// card asks them to reconnect; labelling it a parse error implies the page
+    /// layout changed and there is nothing to do but wait.
+    var failureError: ProviderFetchError? {
+        guard let failure else { return nil }
+        if failureIsCredential { return ProviderFetchError.credentialExpired(failure) }
+        // `failure` holds a localized description, so a parsing error already
+        // carries the prefix and wrapping it again would read
+        // "Parse error: Parse error: …".
+        let prefix = "Parse error: "
+        return ProviderFetchError.parsingError(
+            failure.hasPrefix(prefix) ? String(failure.dropFirst(prefix.count)) : failure
+        )
     }
 }
 
@@ -1453,6 +1477,8 @@ final class BrowserMeterRefreshStore {
         var fetchedAt: Date?
         var nextAttemptAt: Date
         var failure: String?
+        /// Optional so entries cached before the kind was recorded still decode.
+        var failureIsCredential: Bool?
     }
     private let defaults: UserDefaults
     private var inFlight: [String: Task<Entry, Never>] = [:]
@@ -1476,12 +1502,13 @@ final class BrowserMeterRefreshStore {
             BrowserMeterResult(
                 value: entry.value.flatMap { try? JSONDecoder().decode(Value.self, from: $0) },
                 fetchedAt: entry.fetchedAt,
-                failure: entry.failure
+                failure: entry.failure,
+                failureIsCredential: entry.failureIsCredential ?? false
             )
         }
         if let task = inFlight[key] { return result(await task.value) }
         var entry = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Entry.self, from: $0) }
-            ?? Entry(value: nil, fetchedAt: nil, nextAttemptAt: .distantPast, failure: nil)
+            ?? Entry(value: nil, fetchedAt: nil, nextAttemptAt: .distantPast, failure: nil, failureIsCredential: nil)
         if let initial, let initialAt, initialAt > (entry.fetchedAt ?? .distantPast) {
             entry.value = try? JSONEncoder().encode(initial)
             entry.fetchedAt = initialAt
@@ -1500,8 +1527,10 @@ final class BrowserMeterRefreshStore {
                 next.fetchedAt = now
                 next.nextAttemptAt = now.addingTimeInterval(interval)
                 next.failure = nil
+                next.failureIsCredential = nil
             } catch {
                 next.failure = error.localizedDescription
+                next.failureIsCredential = (error as? ProviderFetchError)?.isCredentialFailure ?? false
             }
             defaults.set(try? JSONEncoder().encode(next), forKey: key)
             return next
@@ -2999,7 +3028,7 @@ public struct CerebrasProviderClient: ProviderClient {
         } else {
             browserResult = nil
         }
-        if let failure = browserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+        if let failure = browserResult?.failureError { throw failure }
         let webReading = browserResult?.value ?? cachedCerebrasWebBillingReading(from: fields)
 
         let purchased = positiveDouble(credentials?.normalizedAccountIdentifier)
@@ -3927,10 +3956,50 @@ enum MetaRemainingWatermarkStore {
 
 // MARK: - Token Plan web metering (Qwen Model Studio / Xiaomi MiMo)
 
+/// The rolling period a token-plan console's single quota meter covers.
+///
+/// Model Studio moved its Standard plan from a 7-day rolling quota to a
+/// monthly one, and serves both vintages from the same Plan Quota card with
+/// the same layout — only the heading and the reset date differ. The period
+/// therefore has to be read rather than assumed, because it decides the
+/// meter's label, which period bucket it lands in, and how far ahead its
+/// reset may legitimately fall.
+public enum TokenPlanMeterPeriod: String, Sendable, Codable, Equatable {
+    case weekly
+    case monthly
+
+    /// How far ahead a reset for this period can fall and still be believed.
+    ///
+    /// The bound is a guard against a subscription *end* date — potentially
+    /// years out — being mistaken for the next usage reset, so it sits just
+    /// past one full period rather than at a round number.
+    var maximumResetLeadTime: TimeInterval {
+        switch self {
+        case .weekly:  return 8 * 24 * 60 * 60
+        case .monthly: return 40 * 24 * 60 * 60
+        }
+    }
+}
+
+/// How a token-plan meter is presented for one period. The label drives both
+/// the card's wording and the period bucket it is grouped into, so the two
+/// have to agree — a meter labelled "Monthly" but keyed `.weekly` would be
+/// filed under Weekly.
+public struct TokenPlanWindow: Equatable {
+    public let label: String
+    public let kind: QuotaWindowKind
+
+    public init(label: String, kind: QuotaWindowKind) {
+        self.label = label
+        self.kind = kind
+    }
+}
+
 /// A percent-based plan-quota reading scraped from a token-plan dashboard.
-/// These consoles render "7-Day Quota — N% Used" style meters rather than
-/// currency balances, so the generic WebBillingClient currency parser does
-/// not apply.
+/// These consoles render "Monthly Usage — N% Used" style meters rather than
+/// currency balances, so the generic WebBillingClient currency parser does not
+/// apply. `meterPeriod` says which rolling window the meter covers, because the
+/// same card layout serves both a 7-day and a monthly plan.
 public nonisolated struct TokenPlanWebReading: Sendable, Codable {
     public let quotaUsedPercent: Double?
     public let planName: String?
@@ -3939,19 +4008,24 @@ public nonisolated struct TokenPlanWebReading: Sendable, Codable {
     /// Banked usage-limit resets the console offers to redeem ("Reset ⓘ 1
     /// available"); nil when the source did not show the figure.
     public let resetAvailableCount: Int?
+    /// The period the meter itself reports, or nil when the source gave no
+    /// signal — callers then fall back to the provider's default.
+    public let meterPeriod: TokenPlanMeterPeriod?
 
     public init(
         quotaUsedPercent: Double?,
         planName: String?,
         remainingDays: Int?,
         periodEnd: Date?,
-        resetAvailableCount: Int? = nil
+        resetAvailableCount: Int? = nil,
+        meterPeriod: TokenPlanMeterPeriod? = nil
     ) {
         self.quotaUsedPercent = quotaUsedPercent
         self.planName = planName
         self.remainingDays = remainingDays
         self.periodEnd = periodEnd
         self.resetAvailableCount = resetAvailableCount
+        self.meterPeriod = meterPeriod
     }
 
     public var isEmpty: Bool {
@@ -4077,13 +4151,15 @@ public struct TokenPlanWebClient: Sendable {
             ?? periodEnd(in: payloadText, resetDatePolicy: resetDatePolicy)
         let resetAvailableCount = resetAvailableCount(in: renderedText)
             ?? resetAvailableCount(in: payloadText)
+        let meterPeriod = meterPeriod(in: renderedText)
 
         let reading = TokenPlanWebReading(
             quotaUsedPercent: quotaUsedPercent.flatMap { (0...100).contains($0) ? $0 : nil },
             planName: planName,
             remainingDays: remainingDays,
             periodEnd: periodEnd,
-            resetAvailableCount: resetAvailableCount
+            resetAvailableCount: resetAvailableCount,
+            meterPeriod: meterPeriod
         )
         return reading.isEmpty ? nil : reading
     }
@@ -4097,7 +4173,90 @@ public struct TokenPlanWebClient: Sendable {
             .flatMap(Int.init)
     }
 
-    /// Reads Model Studio's 7-day meter.
+    /// Reads the period from the meter's own heading.
+    ///
+    /// Only the rendered text is consulted, never the script payload. The
+    /// payload carries the console's whole i18n table, which names both meters,
+    /// so it could only ever answer "monthly" and would drown out the heading
+    /// actually on screen.
+    static func meterPeriod(in text: String) -> TokenPlanMeterPeriod? {
+        // The heading that owns the reset row is authoritative; see below.
+        if let anchored = anchoredMeterPeriod(in: text) { return anchored }
+        // Otherwise fall back to any heading, monthly first. Monthly is the
+        // current Standard plan, and a false monthly is the cheap mistake: a
+        // false *weekly* also narrows the accepted reset window to eight days
+        // and silently drops a monthly boundary.
+        if anyMatch(monthlyHeadingRegexes, in: text) { return .monthly }
+        if anyMatch(weeklyHeadingRegexes, in: text) { return .weekly }
+        return nil
+    }
+
+    /// The period named by the heading immediately before the meter's reset row.
+    ///
+    /// `normalizedRenderedText` flattens the whole card onto a single line, so
+    /// proximity proves nothing on its own — after flattening, every word is
+    /// next to every other and a "Billing Month" row three blocks up sits
+    /// directly beside an "Usage Statistics" heading. Order still proves
+    /// something, though: the heading is the last thing before "Will reset at",
+    /// and this pattern has to reach that row crossing nothing but whitespace,
+    /// so an earlier "Month" cannot claim it and the word that can is the one
+    /// the meter is actually wearing.
+    private static func anchoredMeterPeriod(in text: String) -> TokenPlanMeterPeriod? {
+        guard let heading = firstMatch(pattern: anchoredPeriodPattern, in: text) else { return nil }
+        return heading.lowercased().hasPrefix("month") ? .monthly : .weekly
+    }
+
+    private static let anchoredPeriodPattern =
+        "(Month(?:ly)?|(?:7|Seven)[\\s-]*Days?|Week(?:ly)?|30[\\s-]*Days?)"
+        + "\\s*(?:Usage|Used|Quota|Limit|Allowance)?\\s*Will\\s+reset\\s+at"
+
+    /// The meter's heading, which is the only text on the Plan Quota card that
+    /// names its period — the reset row, the progress bar and the percent are
+    /// identical for both.
+    ///
+    /// These are the fallback for a card whose reset row did not render. The
+    /// noun is what keeps a "Standard Monthly Plan" tier out of it — "Plan" is
+    /// not one. The gap covers U+00A0 as well as spaces and tabs, because
+    /// `innerText` keeps `&nbsp;` and the heading is markup that can produce
+    /// one; it deliberately excludes line breaks so a heading cannot reach the
+    /// next block when this runs against text that has *not* been flattened.
+    private static func headingRegexes(_ phrases: [String]) -> [NSRegularExpression] {
+        let noun = "(?:Usage|Used|Quota|Limit|Allowance)\\b"
+        let gap = "[ \t\u{00A0}]"
+        let dayGap = "[- \t\u{00A0}]"
+        // A literal that failed to compile would silently disable detection,
+        // so the heading tests below double as a check on these patterns.
+        return phrases.compactMap { phrase in
+            let pattern = phrase
+                .replacingOccurrences(of: "{noun}", with: noun)
+                .replacingOccurrences(of: "{gap}", with: gap)
+                .replacingOccurrences(of: "{dayGap}", with: dayGap)
+            return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+        }
+    }
+
+    private static let monthlyHeadingRegexes = headingRegexes([
+        "\\bMonth(?:ly)?{gap}*{noun}",
+        "\\b(?:30|Thirty){dayGap}*Days?{gap}*{noun}"
+    ])
+
+    private static let weeklyHeadingRegexes = headingRegexes([
+        "\\b(?:7|Seven){dayGap}*Days?{gap}*{noun}",
+        "\\bWeek(?:ly)?{gap}*{noun}"
+    ])
+
+    /// Whether any of `regexes` matches somewhere in `text`.
+    ///
+    /// `firstMatch(pattern:in:)` cannot answer this: it returns nil whenever
+    /// its capture group did not participate in the match, so a heading with an
+    /// optional noun would read as no match at all.
+    private static func anyMatch(_ regexes: [NSRegularExpression], in text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regexes.contains { $0.firstMatch(in: text, options: [], range: range) != nil }
+    }
+
+    /// Reads Model Studio's plan-quota meter.
     ///
     /// The meter used to render its value against its label ("0% Used"), which
     /// the two patterns above match. It now renders that value at the far end
@@ -4106,6 +4265,11 @@ public struct TokenPlanWebClient: Sendable {
     /// of those patterns stop at the first digit of the timestamp, so the meter
     /// stopped parsing and neither the session import nor the background
     /// refresh could see a quota at all.
+    ///
+    /// The monthly meter the Standard plan moved to renders identically apart
+    /// from its heading — "Monthly Usage … Will reset at 2026-09-26 00:00:00
+    /// (UTC+8) 0%" — so this pattern serves both and only `meterPeriod(in:)`
+    /// has to tell them apart.
     ///
     /// Anchoring on the reset row steps over the timestamp while staying
     /// specific to the row that owns the number. Barring `%` from the gap stops
@@ -4224,10 +4388,17 @@ public struct QwenProviderClient: ProviderClient {
             dashboardURL: URL(string: "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan&productCode=p_efm#/efm/subscription/token-plan/personal")!,
             cookieField: SpendProviderCredentialField.qwenCookieHeader,
             resetDatePolicy: .usageResetOnly,
-            windowLabel: "7-Day Quota",
-            windowKind: .weekly,
+            // The Standard plan's quota is monthly now, so that is the default;
+            // an account still on the old rolling window is detected and
+            // labelled from the console instead.
+            windowLabel: "Monthly Usage",
+            windowKind: .monthly,
             defaultPlanName: "Token Plan",
-            consoleUsageAPI: .qwenPersonalUsage
+            consoleUsageAPI: .qwenPersonalUsage,
+            periodWindows: [
+                .monthly: TokenPlanWindow(label: "Monthly Usage", kind: .monthly),
+                .weekly: TokenPlanWindow(label: "7-Day Quota", kind: .weekly)
+            ]
         )
     }
 }
@@ -4251,8 +4422,6 @@ public struct MimoProviderClient: ProviderClient {
     }
 }
 
-/// Shared assembly for percent-based token-plan consoles: web scrape first,
-/// then the manual weekly-percent anchor entered in Settings.
 /// Coordinates for one Model Studio console-gateway API.
 ///
 /// The console reaches its own backend through a CLI gateway that takes the
@@ -4284,14 +4453,47 @@ struct TokenPlanConsoleAPI {
         referer: "https://modelstudio.console.alibabacloud.com/"
     )
 
+    /// The banked reset cards the Plan Quota card's "{n} available" badge
+    /// counts. The badge is the length of this list, not a field on the
+    /// subscription record, so this is the authoritative source for it.
+    static let qwenPersonalResetCards = TokenPlanConsoleAPI(
+        host: "bailian-singapore-cs.alibabacloud.com",
+        action: "IntlBroadScopeAspnGateway",
+        region: "ap-southeast-1",
+        api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list",
+        referer: "https://modelstudio.console.alibabacloud.com/"
+    )
+
     var subscriptionSibling: TokenPlanConsoleAPI? {
         api == Self.qwenPersonalUsage.api ? Self.qwenPersonalSubscription : nil
+    }
+
+    /// The reset-card list sits beside the usage API the same way.
+    var resetCardSibling: TokenPlanConsoleAPI? {
+        api == Self.qwenPersonalUsage.api ? Self.qwenPersonalResetCards : nil
+    }
+}
+
+/// Chooses which failure to report when both token-plan sources missed.
+///
+/// The kind decides, not the order the sources ran in. A rejected credential is
+/// the more useful verdict because the user can act on it, so it wins whichever
+/// side it came from; when neither side has one, the page's own error is more
+/// specific, since the page is what the user is being asked to look at. Getting
+/// this backwards is the bug this replaced: the API's credential rejection used
+/// to be thrown from inside the fetch, so the scrape never ran and a readable
+/// page was reported as "Parse error: Qwen console session expired".
+enum TokenPlanFailureChoice {
+    static func preferred(scrape: Error, api: Error?) -> Error {
+        if (scrape as? ProviderFetchError)?.isCredentialFailure == true { return scrape }
+        if let api, (api as? ProviderFetchError)?.isCredentialFailure == true { return api }
+        return scrape
     }
 }
 
 /// Reads the Token Plan quota as data instead of scraping the rendered console.
 ///
-/// The console draws its 7-day meter from this API, and the same session cookie
+/// The console draws its quota meter from this API, and the same session cookie
 /// the app already imports authenticates it. Scraping the page for the same
 /// number was fragile in a way that could not be fixed by better patterns: the
 /// value's position relative to the progress bar's "0% / 100%" axis labels is
@@ -4299,10 +4501,11 @@ struct TokenPlanConsoleAPI {
 /// would accept an axis label the moment it painted — reporting a confident 0%
 /// against a page showing 100%. This returns the figure the console itself uses.
 enum TokenPlanConsoleAPIClient {
-    /// `per1WeekPercentage` is a 0-1 fraction, not a percentage: the official
-    /// CLI renders it as `percentage * 100`, and this account read `1.0` while
-    /// the console displayed 100%. `per1WeekResetTime` is epoch milliseconds and
-    /// matched the reset already on file exactly.
+    /// The `*Percentage` fields are 0-1 fractions, not percentages: the console
+    /// renders them as `percentage * 100`, and this account read `1.0` while the
+    /// page displayed 100%. The `*ResetTime` fields are epoch milliseconds.
+    /// Standard plans report the `per1Month*` pair; older weekly plans report
+    /// `per1Week*`. Both live on the same response.
     static func usageReading(
         _ config: TokenPlanConsoleAPI = .qwenPersonalUsage,
         cookieHeader: String
@@ -4321,6 +4524,16 @@ enum TokenPlanConsoleAPIClient {
     ) async throws -> Int? {
         guard let data = try await requestData(config, cookieHeader: cookieHeader) else { return nil }
         return parseResetAvailableCount(data)
+    }
+
+    /// Counts the banked resets from the console's own reset-card list, which
+    /// is where its "{n} available" badge actually comes from.
+    static func resetCardCount(
+        _ config: TokenPlanConsoleAPI = .qwenPersonalResetCards,
+        cookieHeader: String
+    ) async throws -> Int? {
+        guard let data = try await requestData(config, cookieHeader: cookieHeader) else { return nil }
+        return parseResetCardCount(data)
     }
 
     static func parseResetAvailableCount(_ data: Data) -> Int? {
@@ -4448,8 +4661,19 @@ enum TokenPlanConsoleAPIClient {
               let body = dataV2["data"] as? [String: Any],
               let payload = body["data"] as? [String: Any] else { return nil }
 
-        let fraction = numericValue(payload["per1WeekPercentage"])
-        let resetMilliseconds = numericValue(payload["per1WeekResetTime"])
+        // One response carries every period the plan has ever used, and the
+        // console renders exactly one of them: the weekly pair when
+        // `per1WeekPercentage` is a number, the monthly pair otherwise. Mirror
+        // that rather than preferring whichever key is present, so a reset
+        // timestamp left behind by an older plan shape cannot drag a monthly
+        // account back onto the weekly meter — and so the app and the page
+        // can never disagree about which figure is being shown.
+        let weeklyFraction = numericValue(payload["per1WeekPercentage"])
+        let period: TokenPlanMeterPeriod = weeklyFraction != nil ? .weekly : .monthly
+        let fraction = weeklyFraction ?? numericValue(payload["per1MonthPercentage"])
+        let resetMilliseconds = numericValue(
+            payload[period == .weekly ? "per1WeekResetTime" : "per1MonthResetTime"]
+        )
 
         let usedPercent = fraction.map { min(max($0 * 100, 0), 100) }
         let periodEnd = resetMilliseconds.map { Date(timeIntervalSince1970: $0 / 1000) }
@@ -4459,8 +4683,29 @@ enum TokenPlanConsoleAPIClient {
             quotaUsedPercent: usedPercent,
             planName: nil,
             remainingDays: nil,
-            periodEnd: periodEnd
+            periodEnd: periodEnd,
+            meterPeriod: period
         )
+    }
+
+    /// Counts the banked resets the console's "{n} available" badge is drawn
+    /// from. The badge is the length of the `result` array on `reset-card/list`
+    /// — not a field on the subscription record — so a missing or renamed
+    /// count there is expected rather than a parse failure.
+    static func parseResetCardCount(_ data: Data) -> Int? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let envelope = root["data"] as? [String: Any] else { return nil }
+        if let succeeded = envelope["success"] as? Bool, !succeeded { return nil }
+        guard let dataV2 = envelope["DataV2"] as? [String: Any],
+              let body = dataV2["data"] as? [String: Any] else { return nil }
+        let payload = (body["data"] as? [String: Any]) ?? body
+        if let cards = payload["result"] as? [Any] { return cards.count }
+        if let cards = body["result"] as? [Any] { return cards.count }
+        if let cards = payload["result"] as? [String: Any], let total = numericValue(cards["total"]) {
+            return Int(total)
+        }
+        print("[TokenPlanConsoleAPI] reset-card payload keys: \(payload.keys.sorted())")
+        return nil
     }
 
     private static func numericValue(_ value: Any?) -> Double? {
@@ -4486,6 +4731,9 @@ enum TokenPlanConsoleAPIClient {
     }
 }
 
+/// Shared assembly for percent-based token-plan consoles: the console's own API
+/// first, then the rendered page, then the manual percent anchor entered in
+/// Settings.
 private func tokenPlanSnapshot(
     providerID: ProviderID,
     credentials: ProviderCredential?,
@@ -4495,14 +4743,21 @@ private func tokenPlanSnapshot(
     windowLabel: String,
     windowKind: QuotaWindowKind,
     defaultPlanName: String,
-    consoleUsageAPI: TokenPlanConsoleAPI? = nil
+    consoleUsageAPI: TokenPlanConsoleAPI? = nil,
+    /// Per-period presentation, consulted when the console reports which
+    /// period its meter covers. Empty means the meter keeps `windowLabel` and
+    /// `windowKind` whatever the console says — the right behaviour for a
+    /// console with only one period, and what MiMo relies on.
+    periodWindows: [TokenPlanMeterPeriod: TokenPlanWindow] = [:]
 ) async throws -> QuotaSnapshot {
     let now = Date()
     let fields = credentials?.extraFields ?? [:]
     let webCookie = fields[cookieField]
+    let defaultMeterPeriod: TokenPlanMeterPeriod = windowKind == .monthly ? .monthly : .weekly
     let cachedReading = cachedTokenPlanReading(
         from: fields,
         resetDatePolicy: resetDatePolicy,
+        defaultMeterPeriod: defaultMeterPeriod,
         now: now
     )
     let endpoint = BrowserSessionRefreshPolicy.validatedURL(fields[SpendProviderCredentialField.browserSessionURL], fallback: dashboardURL)
@@ -4519,52 +4774,86 @@ private func tokenPlanSnapshot(
         ) {
             // Prefer the console's own API. It returns the same figure the
             // page renders, without depending on where the meter's value sits
-            // in the rendered text. The scrape below stays as a fallback for
-            // sessions or regions the API rejects.
-            if let consoleUsageAPI,
-               let apiReading = try await TokenPlanConsoleAPIClient.usageReading(
-                   consoleUsageAPI,
-                   cookieHeader: webCookie
-               ) {
-                // The API carries the quota and its reset, not the plan
-                // metadata, so keep whatever the last page read established.
-                // The banked reset count is read separately, and rarely.
-                let resetAvailableCount = await TokenPlanResetAvailabilityReader.availableCount(
-                    providerID: providerID,
-                    pageURL: endpoint,
-                    cookieHeader: webCookie,
-                    subscriptionAPI: consoleUsageAPI.subscriptionSibling,
-                    now: now
-                )
-                return TokenPlanWebReading(
-                    quotaUsedPercent: apiReading.quotaUsedPercent,
-                    planName: cachedReading?.planName,
-                    remainingDays: cachedReading?.remainingDays,
-                    periodEnd: apiReading.periodEnd ?? cachedReading?.periodEnd,
-                    resetAvailableCount: resetAvailableCount
-                )
+            // in the rendered text.
+            //
+            // A rejection here must not be fatal, though. The gateway drops
+            // the imported cookie long before the browser session it was
+            // taken from does, and throwing used to end the fetch outright —
+            // so the scrape below never ran and a page that still read fine
+            // surfaced as "Parse error: Qwen console session expired". The
+            // API's verdict is kept and rethrown only if the scrape fails too.
+            var apiFailure: Error?
+            if let consoleUsageAPI {
+                do {
+                    if let apiReading = try await TokenPlanConsoleAPIClient.usageReading(
+                        consoleUsageAPI,
+                        cookieHeader: webCookie
+                    ) {
+                        // The API carries the quota and its reset, not the
+                        // plan metadata, so keep whatever the last page read
+                        // established. The banked reset count is read
+                        // separately, and rarely.
+                        let resetAvailableCount = await TokenPlanResetAvailabilityReader.availableCount(
+                            providerID: providerID,
+                            pageURL: endpoint,
+                            cookieHeader: webCookie,
+                            subscriptionAPI: consoleUsageAPI.subscriptionSibling,
+                            resetCardAPI: consoleUsageAPI.resetCardSibling,
+                            now: now
+                        )
+                        return TokenPlanWebReading(
+                            quotaUsedPercent: apiReading.quotaUsedPercent,
+                            planName: cachedReading?.planName,
+                            remainingDays: cachedReading?.remainingDays,
+                            periodEnd: apiReading.periodEnd ?? cachedReading?.periodEnd,
+                            resetAvailableCount: resetAvailableCount,
+                            meterPeriod: apiReading.meterPeriod ?? cachedReading?.meterPeriod
+                        )
+                    }
+                    // A nil reading is not a failure worth rethrowing: the API
+                    // simply had nothing to say, and the scrape is the better
+                    // source.
+                } catch {
+                    apiFailure = error
+                    print("[TokenPlanConsoleAPI] usage read failed, falling back to the rendered page: \(error.localizedDescription)")
+                }
             }
 
-            #if os(macOS)
-            let text = try await ImportedSessionPageReader.read(url: endpoint, cookieHeader: webCookie) {
-                TokenPlanWebClient.parse(html: $0, resetDatePolicy: resetDatePolicy)?.quotaUsedPercent != nil
+            do {
+                #if os(macOS)
+                let text = try await ImportedSessionPageReader.read(url: endpoint, cookieHeader: webCookie) {
+                    TokenPlanWebClient.parse(html: $0, resetDatePolicy: resetDatePolicy)?.quotaUsedPercent != nil
+                }
+                guard let reading = TokenPlanWebClient.parse(html: text, resetDatePolicy: resetDatePolicy) else {
+                    throw ProviderFetchError.parsingError("No token-plan meters found.")
+                }
+                return reading
+                #else
+                guard let reading = await TokenPlanWebClient(baseURL: endpoint, resetDatePolicy: resetDatePolicy).fetch(cookieHeader: webCookie) else {
+                    throw ProviderFetchError.credentialExpired("Reconnect the browser session on your Mac.")
+                }
+                return reading
+                #endif
+            } catch {
+                throw TokenPlanFailureChoice.preferred(scrape: error, api: apiFailure)
             }
-            guard let reading = TokenPlanWebClient.parse(html: text, resetDatePolicy: resetDatePolicy) else {
-                throw ProviderFetchError.parsingError("No token-plan meters found.")
-            }
-            return reading
-            #else
-            guard let reading = await TokenPlanWebClient(baseURL: endpoint, resetDatePolicy: resetDatePolicy).fetch(cookieHeader: webCookie) else {
-                throw ProviderFetchError.credentialExpired("Reconnect the browser session on your Mac.")
-            }
-            return reading
-            #endif
         }
     } else {
         browserResult = nil
     }
-    if let failure = browserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+    if let failure = browserResult?.failureError { throw failure }
     let webReading = browserResult?.value
+
+    // The period is read from the console rather than assumed. Model Studio
+    // serves both its old 7-day meter and its current monthly one from the
+    // same Plan Quota card, and the two belong in different period buckets —
+    // a monthly meter filed under Weekly also gets its reset rejected, because
+    // next month's boundary is further out than a weekly reset may be.
+    let meterPeriod = webReading?.meterPeriod
+        ?? cachedReading?.meterPeriod
+        ?? defaultMeterPeriod
+    let meterWindow = periodWindows[meterPeriod]
+        ?? TokenPlanWindow(label: windowLabel, kind: windowKind)
 
     let usedPercent = webReading?.quotaUsedPercent
         ?? cachedReading?.quotaUsedPercent
@@ -4576,14 +4865,17 @@ private func tokenPlanSnapshot(
     let resetAt = acceptedTokenPlanResetDate(
         webReading?.periodEnd,
         policy: resetDatePolicy,
+        meterPeriod: meterPeriod,
         now: now
     ) ?? acceptedTokenPlanResetDate(
         cachedReading?.periodEnd,
         policy: resetDatePolicy,
+        meterPeriod: meterPeriod,
         now: now
     ) ?? acceptedTokenPlanResetDate(
         ProviderDateParser.parse(fields[SpendProviderCredentialField.manualResetAt]),
         policy: resetDatePolicy,
+        meterPeriod: meterPeriod,
         now: now
     )
 
@@ -4592,8 +4884,8 @@ private func tokenPlanSnapshot(
     if let usedPercent {
         windows.append(
             QuotaWindow(
-                label: windowLabel,
-                windowKind: windowKind,
+                label: meterWindow.label,
+                windowKind: meterWindow.kind,
                 used: usedPercent,
                 total: 100,
                 resetDate: resetAt,
@@ -4650,8 +4942,9 @@ private func tokenPlanSnapshot(
 
 /// Reads the banked reset count Model Studio shows on its Plan Quota card
 /// ("Reset ⓘ 1 available") at a slower cadence than the meter itself: the
-/// subscription API first, then the rendered page. A successful read is
-/// good for half an hour, a miss is retried after ten minutes.
+/// reset-card list first, then the subscription record, then the rendered
+/// page. A successful read is good for half an hour, a miss is retried after
+/// ten minutes.
 enum TokenPlanResetAvailabilityReader {
     private static let refreshInterval: TimeInterval = 30 * 60
     private static let retryInterval: TimeInterval = 10 * 60
@@ -4667,6 +4960,7 @@ enum TokenPlanResetAvailabilityReader {
         pageURL: URL,
         cookieHeader: String,
         subscriptionAPI: TokenPlanConsoleAPI?,
+        resetCardAPI: TokenPlanConsoleAPI? = nil,
         now: Date = Date()
     ) async -> Int? {
         let key = "\(providerID.rawValue).resetAvailability.v1"
@@ -4682,7 +4976,19 @@ enum TokenPlanResetAvailabilityReader {
         }
 
         var count: Int?
-        if let subscriptionAPI {
+        // The badge counts the reset-card list, so ask for that first. The
+        // subscription scan stays as a fallback because its field name was
+        // never confirmed against the live payload.
+        if let resetCardAPI {
+            let cards = try? await TokenPlanConsoleAPIClient.resetCardCount(resetCardAPI, cookieHeader: cookieHeader)
+            // Only a positive count is trusted. This endpoint's request shape
+            // has not been confirmed against a live capture, so an empty list
+            // may mean "no params" rather than "no banked resets" — and a
+            // confident zero would skip the two sources that do work and hide
+            // the pill for the next half hour.
+            count = (cards ?? 0) > 0 ? cards : nil
+        }
+        if count == nil, let subscriptionAPI {
             count = try? await TokenPlanConsoleAPIClient.resetAvailableCount(subscriptionAPI, cookieHeader: cookieHeader)
         }
         #if os(macOS)
@@ -4708,22 +5014,33 @@ enum TokenPlanResetAvailabilityReader {
 private func cachedTokenPlanReading(
     from fields: [String: String],
     resetDatePolicy: TokenPlanResetDatePolicy,
+    defaultMeterPeriod: TokenPlanMeterPeriod,
     now: Date
 ) -> TokenPlanWebReading? {
     let usedPercent = nonnegativePercent(fields[SpendProviderCredentialField.tokenPlanCachedUsedPercent])
     let planName = normalizedTokenPlanName(
         fields[SpendProviderCredentialField.tokenPlanCachedPlanName]
     )
+    // The recorded period, if the import saw one. A reading cached before the
+    // period was recorded keeps nil rather than being stamped with the
+    // provider's default: that default can change — Qwen's just did — and a
+    // fabricated period is indistinguishable from an observed one downstream.
+    // The reset window below still falls back to the default, because capping a
+    // monthly plan's cached reset at eight days would silently drop it.
+    let recordedPeriod = fields[SpendProviderCredentialField.tokenPlanCachedMeterPeriod]
+        .flatMap(TokenPlanMeterPeriod.init(rawValue:))
     let periodEnd = acceptedTokenPlanResetDate(
         ProviderDateParser.parse(fields[SpendProviderCredentialField.tokenPlanCachedResetAt]),
         policy: resetDatePolicy,
+        meterPeriod: recordedPeriod ?? defaultMeterPeriod,
         now: now
     )
     let reading = TokenPlanWebReading(
         quotaUsedPercent: usedPercent,
         planName: planName,
         remainingDays: nil,
-        periodEnd: periodEnd
+        periodEnd: periodEnd,
+        meterPeriod: recordedPeriod
     )
     return reading.isEmpty ? nil : reading
 }
@@ -4731,12 +5048,13 @@ private func cachedTokenPlanReading(
 private func acceptedTokenPlanResetDate(
     _ candidate: Date?,
     policy: TokenPlanResetDatePolicy,
+    meterPeriod: TokenPlanMeterPeriod,
     now: Date
 ) -> Date? {
     guard let candidate else { return nil }
     guard policy == .usageResetOnly else { return candidate }
-    let maximumWeeklyReset = now.addingTimeInterval(8 * 24 * 60 * 60)
-    return candidate > now && candidate <= maximumWeeklyReset ? candidate : nil
+    let latestBelievableReset = now.addingTimeInterval(meterPeriod.maximumResetLeadTime)
+    return candidate > now && candidate <= latestBelievableReset ? candidate : nil
 }
 
 private func normalizedTokenPlanName(_ value: String?) -> String? {
@@ -6061,7 +6379,7 @@ public struct MetaProviderClient: UserInitiatedProviderClient {
         } else {
             museBrowserResult = nil
         }
-        if let failure = museBrowserResult?.failure { throw ProviderFetchError.parsingError(failure) }
+        if let failure = museBrowserResult?.failureError { throw failure }
         let museCliReading = museBrowserResult != nil ? nil : await museCliProbe(fields, now, userInitiated)
         let museSubscription = Self.museSubscriptionMeters(
             cli: museCliReading,
