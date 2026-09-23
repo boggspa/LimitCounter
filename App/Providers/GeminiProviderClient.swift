@@ -637,7 +637,16 @@ private struct GeminiLocalStateReader {
                 QuotaSignal(
                     kind: .unexpectedRecovery,
                     title: "Active Google Account",
-                    message: "Using Gemini CLI session for \(email).",
+                    // Not the address. `QuotaSignal` is not a local-only type:
+                    // it rides inside `QuotaSnapshot.signals` into the App Group
+                    // cache the widget reads and into the CloudKit payload, so an
+                    // email interpolated here left the machine. What actually
+                    // changes the user's expectations is which ceiling set
+                    // applies, and the workspace test already derives that from
+                    // the address without repeating it.
+                    message: isLikelyWorkspaceEmail(email)
+                        ? "Using a Gemini CLI session signed in to a Google Workspace account, so Workspace ceilings apply."
+                        : "Using a Gemini CLI session signed in to a personal Google account, so Google Account ceilings apply.",
                     severity: .info,
                     detectedAt: now
                 )

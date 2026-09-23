@@ -3228,6 +3228,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testTokenPlanConsoleAPIPrefersWeeklyOnlyWhenItReportsOne()
         try testTokenPlanConsoleAPIReadsResetCardList()
         try testBrowserMeterFailureKeepsCredentialKind()
+        try testQuotaSignalMessagesCarryNoAccountIdentifier()
         try testTokenPlanFailureChoicePrefersCredentialErrors()
         try await testBrowserRefreshStoreRecordsCredentialFailureKind()
         try await testTokenPlanCachedAndManualZeroUsageProduceMeters()
@@ -3390,6 +3391,46 @@ private func testBrowserMeterFailureKeepsCredentialKind() throws {
     try expect(!ProviderFetchError.parsingError("anything").isCredentialFailure, "a parse error is not")
     try expect(!ProviderFetchError.rateLimited.isCredentialFailure, "a rate limit is not")
     try expect(!ProviderFetchError.notConfigured.isCredentialFailure, "an unconfigured provider is not")
+}
+
+/// Regression guard for the two signals that used to interpolate an account
+/// email into `QuotaSignal.message`.
+///
+/// That message is not local. It rides inside `QuotaSnapshot.signals` into the
+/// App Group cache the widget reads and into the CloudKit payload, so both
+/// addresses were leaving the machine while the README promised that only
+/// normalized snapshots were written to the shared cache. They were the only
+/// personal identifiers that did.
+///
+/// This is deliberately a blunt scan of the two known sites and not a claim that
+/// free text is sanitized anywhere — there is no sanitizer, and adding one would
+/// be the wrong fix. It exists so that putting an address back in either place
+/// fails a test instead of failing a privacy review.
+private func testQuotaSignalMessagesCarryNoAccountIdentifier() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let sources = [
+        "App/Providers/GeminiProviderClient.swift",
+        "App/Providers/ProviderClient.swift"
+    ]
+    let forbidden = ["\\(email)", "\\(cachedEmail)", "\\(activeEmail)", "\\(userEmail)", "\\(accountEmail)"]
+
+    for relative in sources {
+        let text = try String(
+            contentsOf: repoRoot.appendingPathComponent(relative),
+            encoding: .utf8
+        )
+        for (index, line) in text.split(separator: "\n").enumerated() {
+            guard line.contains("message:") else { continue }
+            for interpolation in forbidden {
+                try expect(
+                    !line.contains(interpolation),
+                    "\(relative):\(index + 1) interpolates an account identifier into a signal message, which is cached in the App Group and uploaded to CloudKit"
+                )
+            }
+        }
+    }
 }
 
 private func testBrowserSessionKeepsRotatedCookiesAndOrigin() throws {

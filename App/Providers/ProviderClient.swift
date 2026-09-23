@@ -7653,7 +7653,12 @@ public struct CursorProviderClient: ProviderClient {
                 QuotaSignal(
                     kind: .unexpectedRecovery,
                     title: "Local Cursor account detected",
-                    message: "Using locally cached Cursor account metadata for \(cachedEmail).",
+                    // Not the address: this signal is cached in the App Group
+                    // and uploaded in the CloudKit payload, so the email would
+                    // leave the machine. The membership tier the same local
+                    // state reports has its own signal below and is the part
+                    // worth showing.
+                    message: "Using locally cached Cursor account metadata.",
                     severity: .info,
                     detectedAt: now
                 )
