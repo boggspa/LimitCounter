@@ -17,7 +17,6 @@ struct DashboardView: View {
     @StateObject private var setupModel = ProviderSetupModel()
     @ObservedObject private var setupPresenter = ProviderSetupPresenter.shared
     #endif
-    @State private var draggedProviderID: ProviderID?
     @State private var navigationPath = NavigationPath()
     @AppStorage("dashboardRefreshIntervalSeconds") private var dashboardRefreshIntervalSeconds: Int = 60
     #if os(iOS)
@@ -156,8 +155,20 @@ struct DashboardView: View {
     }
 
     private var dashboardTopBar: some View {
-        HStack {
+        HStack(spacing: 0) {
+            #if os(macOS)
+            // Keep the traffic lights clear and let only the unused portion
+            // of this bar move the window; the control pill stays clickable.
+            Color.clear.frame(width: 110)
+                .allowsHitTesting(false)
+            Color.clear
+                .frame(maxWidth: .infinity)
+                .frame(height: 32)
+                .contentShape(Rectangle())
+                .gesture(WindowDragGesture())
+            #else
             Spacer(minLength: 0)
+            #endif
             sharedControlPill
         }
     }
@@ -168,6 +179,16 @@ struct DashboardView: View {
         GeometryReader { proxy in
             if proxy.size.width >= 720 && proxy.size.height >= 500 {
                 desktopDashboardShell
+                    .overlay(alignment: .top) {
+                        HStack(spacing: 0) {
+                            Color.clear.frame(width: 110)
+                                .allowsHitTesting(false)
+                            Color.clear
+                                .frame(height: 24)
+                                .contentShape(Rectangle())
+                                .gesture(WindowDragGesture())
+                        }
+                    }
             } else {
                 compactDashboardShell
             }
@@ -962,7 +983,6 @@ struct DashboardView: View {
                 CompactDashboardCardView(
                     snapshots: snapshots,
                     reorderableProviderIDs: reorderableProviderIDs,
-                    draggedProviderID: $draggedProviderID,
                     orderStore: orderStore
                 )
             }
@@ -978,7 +998,6 @@ struct DashboardView: View {
             .dashboardReorderable(
                 providerID: .heatmap,
                 reorderableProviderIDs: reorderableProviderIDs,
-                draggedProviderID: $draggedProviderID,
                 orderStore: orderStore
             )
     }
@@ -1023,7 +1042,6 @@ struct DashboardView: View {
         .dashboardReorderable(
             providerID: item.orderProviderID,
             reorderableProviderIDs: reorderableProviderIDs,
-            draggedProviderID: $draggedProviderID,
             orderStore: orderStore
         )
     }
@@ -1716,32 +1734,49 @@ private enum DashboardRoute: Hashable {
     case codexCombined(usageSnapshot: QuotaSnapshot, telemetrySnapshot: QuotaSnapshot)
 }
 
+private enum DashboardProviderDrag {
+    // Encode the source in the drag itself. Native drags have no SwiftUI end
+    // callback, so keeping it in view state leaves canceled drags selected.
+    static let type = UTType(exportedAs: "com.chrisizatt.limitcounter.provider-reorder", conformingTo: .data)
+
+    static func item(for providerID: ProviderID) -> NSItemProvider {
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(forTypeIdentifier: type.identifier, visibility: .ownProcess) { completion in
+            completion(Data(providerID.rawValue.utf8), nil)
+            return nil
+        }
+        return provider
+    }
+}
+
 private struct DashboardCardDropDelegate: DropDelegate {
     let targetProviderID: ProviderID
     let reorderableProviderIDs: Set<ProviderID>
-    @Binding var draggedProviderID: ProviderID?
     let orderStore: ProviderCardOrderStore
-
-    func dropEntered(info: DropInfo) {
-        guard
-            let draggedProviderID,
-            draggedProviderID != targetProviderID,
-            reorderableProviderIDs.contains(draggedProviderID)
-        else {
-            return
-        }
-
-        withAnimation(.easeInOut(duration: 0.18)) {
-            orderStore.move(draggedProviderID, toward: targetProviderID)
-        }
-    }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: .move)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        draggedProviderID = nil
+        guard let provider = info.itemProviders(for: [DashboardProviderDrag.type.identifier]).first else {
+            return false
+        }
+        provider.loadDataRepresentation(forTypeIdentifier: DashboardProviderDrag.type.identifier) { data, _ in
+            guard
+                let data,
+                let rawValue = String(data: data, encoding: .utf8),
+                let sourceID = ProviderID(rawValue: rawValue)
+            else {
+                return
+            }
+            Task { @MainActor in
+                guard sourceID != targetProviderID, reorderableProviderIDs.contains(sourceID) else { return }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    orderStore.move(sourceID, toward: targetProviderID)
+                }
+            }
+        }
         return true
     }
 }
@@ -1752,22 +1787,16 @@ private struct DashboardCardDropDelegate: DropDelegate {
 private struct DashboardReorderModifier: ViewModifier {
     let providerID: ProviderID
     let reorderableProviderIDs: Set<ProviderID>
-    @Binding var draggedProviderID: ProviderID?
     let orderStore: ProviderCardOrderStore
 
     func body(content: Content) -> some View {
         content
-            .opacity(draggedProviderID == providerID ? 0.5 : 1)
-            .onDrag {
-                draggedProviderID = providerID
-                return NSItemProvider(object: providerID.rawValue as NSString)
-            }
+            .onDrag { DashboardProviderDrag.item(for: providerID) }
             .onDrop(
-                of: [UTType.text],
+                of: [DashboardProviderDrag.type],
                 delegate: DashboardCardDropDelegate(
                     targetProviderID: providerID,
                     reorderableProviderIDs: reorderableProviderIDs,
-                    draggedProviderID: $draggedProviderID,
                     orderStore: orderStore
                 )
             )
@@ -1778,14 +1807,12 @@ extension View {
     fileprivate func dashboardReorderable(
         providerID: ProviderID,
         reorderableProviderIDs: Set<ProviderID>,
-        draggedProviderID: Binding<ProviderID?>,
         orderStore: ProviderCardOrderStore
     ) -> some View {
         modifier(
             DashboardReorderModifier(
                 providerID: providerID,
                 reorderableProviderIDs: reorderableProviderIDs,
-                draggedProviderID: draggedProviderID,
                 orderStore: orderStore
             )
         )
@@ -1804,93 +1831,85 @@ private struct OrderedMeter: Identifiable {
     let window: QuotaWindow
 }
 
-private struct MeterDropDelegate: DropDelegate {
-    let targetKey: String
-    let scope: String
-    let reorderableKeys: [String]
-    @Binding var draggedMeterKey: String?
-    @Binding var draggedMeterScope: String?
-    let orderStore: MeterOrderStore
+/// The frames are measured in the same global coordinates as the handle's
+/// gesture. Each compact card keeps its own copy, so identical meter keys in
+/// the provider and period layouts cannot interfere with one another.
+private struct MeterRowFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
 
-    func dropEntered(info: DropInfo) {
-        guard
-            let draggedMeterKey,
-            draggedMeterScope == scope,
-            draggedMeterKey != targetKey,
-            reorderableKeys.contains(draggedMeterKey),
-            reorderableKeys.contains(targetKey)
-        else {
-            return
-        }
-
-        withAnimation(.easeInOut(duration: 0.18)) {
-            orderStore.move(draggedMeterKey, toward: targetKey, scope: scope, natural: reorderableKeys)
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard draggedMeterScope == scope else { return nil }
-        return DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        draggedMeterKey = nil
-        draggedMeterScope = nil
-        return true
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
     }
 }
 
-/// Drag-to-reorder plumbing for compact meter rows. The saved order and
-/// the active drag are scoped so rows cannot move between providers or periods.
-private struct MeterReorderModifier: ViewModifier {
+private struct MeterReorderTargetModifier: ViewModifier {
     let meterKey: String
-    let scope: String
-    let reorderableKeys: [String]
-    @Binding var draggedMeterKey: String?
-    @Binding var draggedMeterScope: String?
-    let orderStore: MeterOrderStore
 
     func body(content: Content) -> some View {
         content
-            .opacity(draggedMeterScope == scope && draggedMeterKey == meterKey ? 0.5 : 1)
-            .onDrag {
-                draggedMeterKey = meterKey
-                draggedMeterScope = scope
-                return NSItemProvider(object: meterKey as NSString)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: MeterRowFramePreferenceKey.self,
+                        value: [meterKey: geometry.frame(in: .global)]
+                    )
+                }
             }
-            .onDrop(
-                of: [UTType.text],
-                delegate: MeterDropDelegate(
-                    targetKey: meterKey,
-                    scope: scope,
-                    reorderableKeys: reorderableKeys,
-                    draggedMeterKey: $draggedMeterKey,
-                    draggedMeterScope: $draggedMeterScope,
-                    orderStore: orderStore
-                )
-            )
     }
 }
 
 extension View {
-    fileprivate func meterReorderable(
-        meterKey: String,
-        scope: String,
-        reorderableKeys: [String],
-        draggedMeterKey: Binding<String?>,
-        draggedMeterScope: Binding<String?>,
-        orderStore: MeterOrderStore
-    ) -> some View {
-        modifier(
-            MeterReorderModifier(
-                meterKey: meterKey,
-                scope: scope,
-                reorderableKeys: reorderableKeys,
-                draggedMeterKey: draggedMeterKey,
-                draggedMeterScope: draggedMeterScope,
-                orderStore: orderStore
+    fileprivate func meterReorderTarget(_ meterKey: String) -> some View {
+        modifier(MeterReorderTargetModifier(meterKey: meterKey))
+    }
+}
+
+/// A gesture on a small handle leaves scrolling and other row hit testing
+/// alone. Gesture state resets on both completion and cancellation, so a drag
+/// cannot leave a meter looking selected when it misses a drop target.
+private struct MeterDragHandle: View {
+    let meterKey: String
+    let scope: String
+    let reorderableKeys: [String]
+    let rowFrames: [String: CGRect]
+    let orderStore: MeterOrderStore
+    let accessibilityName: String
+    @GestureState private var isDragging = false
+
+    var body: some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 8, weight: .semibold))
+            .foregroundStyle(isDragging ? Color.primary : Color.secondary.opacity(0.65))
+            #if os(iOS)
+            .frame(width: 44, height: 44)
+            #else
+            .frame(width: 15, height: 18)
+            #endif
+            .contentShape(Rectangle())
+            .accessibilityLabel("Reorder \(accessibilityName)")
+            .gesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .global)
+                    .updating($isDragging) { _, state, _ in state = true }
+                    .onEnded { value in
+                        guard let targetKey = target(at: value.location), targetKey != meterKey else { return }
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            orderStore.move(meterKey, toward: targetKey, scope: scope, natural: reorderableKeys)
+                        }
+                    }
             )
-        )
+    }
+
+    private func target(at location: CGPoint) -> String? {
+        let candidates = reorderableKeys.compactMap { key -> (String, CGRect)? in
+            guard let frame = rowFrames[key] else { return nil }
+            return (key, frame)
+        }
+        guard let first = candidates.first else { return nil }
+        let bounds = candidates.dropFirst().reduce(first.1) { $0.union($1.1) }
+        guard bounds.insetBy(dx: -16, dy: -16).contains(location) else { return nil }
+        return candidates.min {
+            abs($0.1.midY - location.y) < abs($1.1.midY - location.y)
+        }?.0
     }
 }
 
@@ -1912,22 +1931,22 @@ extension View {
 struct CompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
     let reorderableProviderIDs: Set<ProviderID>
-    @Binding var draggedProviderID: ProviderID?
     let orderStore: ProviderCardOrderStore
     @ObservedObject private var meterOrderStore = MeterOrderStore.shared
-    @State private var draggedMeterKey: String?
-    @State private var draggedMeterScope: String?
+    @State private var meterRowFrames: [String: CGRect] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             ForEach(snapshots) { snapshot in
                 providerBlock(snapshot)
                     .contentShape(Rectangle())
-                    .dashboardReorderable(
-                        providerID: snapshot.providerID,
-                        reorderableProviderIDs: reorderableProviderIDs,
-                        draggedProviderID: $draggedProviderID,
-                        orderStore: orderStore
+                    .onDrop(
+                        of: [DashboardProviderDrag.type],
+                        delegate: DashboardCardDropDelegate(
+                            targetProviderID: snapshot.providerID,
+                            reorderableProviderIDs: reorderableProviderIDs,
+                            orderStore: orderStore
+                        )
                     )
                 if snapshot.id != snapshots.last?.id {
                     Divider().overlay(Color.white.opacity(0.08))
@@ -1937,6 +1956,7 @@ struct CompactDashboardCardView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
+        .onPreferenceChange(MeterRowFramePreferenceKey.self) { meterRowFrames = $0 }
     }
 
     @ViewBuilder
@@ -1974,6 +1994,8 @@ struct CompactDashboardCardView: View {
                 }
             }
             .padding(.bottom, 1)
+            .contentShape(Rectangle())
+            .onDrag { DashboardProviderDrag.item(for: snapshot.providerID) }
 
             if meters.isEmpty {
                 Text("No usage data yet")
@@ -1984,17 +2006,13 @@ struct CompactDashboardCardView: View {
                     compactMeterRow(
                         window: meter.window,
                         accent: accent,
-                        providerID: snapshot.providerID
-                    )
-                    .contentShape(Rectangle())
-                    .meterReorderable(
+                        providerID: snapshot.providerID,
                         meterKey: meter.id,
                         scope: scope,
-                        reorderableKeys: meterKeys,
-                        draggedMeterKey: $draggedMeterKey,
-                        draggedMeterScope: $draggedMeterScope,
-                        orderStore: meterOrderStore
+                        reorderableKeys: meterKeys
                     )
+                    .contentShape(Rectangle())
+                    .meterReorderTarget(meter.id)
                 }
             }
         }
@@ -2004,10 +2022,22 @@ struct CompactDashboardCardView: View {
     private func compactMeterRow(
         window: QuotaWindow,
         accent: Color,
-        providerID: ProviderID
+        providerID: ProviderID,
+        meterKey: String,
+        scope: String,
+        reorderableKeys: [String]
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                MeterDragHandle(
+                    meterKey: meterKey,
+                    scope: scope,
+                    reorderableKeys: reorderableKeys,
+                    rowFrames: meterRowFrames,
+                    orderStore: meterOrderStore,
+                    accessibilityName: window.label
+                )
+
                 Text(window.label)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.primary)
@@ -2068,8 +2098,7 @@ private func compactMeterValueText(for window: QuotaWindow, providerID: Provider
 struct PeriodCompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
     @ObservedObject private var meterOrderStore = MeterOrderStore.shared
-    @State private var draggedMeterKey: String?
-    @State private var draggedMeterScope: String?
+    @State private var meterRowFrames: [String: CGRect] = [:]
 
     private var sections: [QuotaPeriodSection] {
         QuotaPeriodSection.sections(from: snapshots)
@@ -2088,6 +2117,7 @@ struct PeriodCompactDashboardCardView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
+        .onPreferenceChange(MeterRowFramePreferenceKey.self) { meterRowFrames = $0 }
     }
 
     @ViewBuilder
@@ -2128,29 +2158,39 @@ struct PeriodCompactDashboardCardView: View {
             ForEach(rows) { row in
                 if let window = row.window {
                     let meterKey = MeterOrderStore.key(providerID: row.providerID, window: window)
-                    meterRow(row)
+                    meterRow(row, scope: scope, reorderableKeys: meterKeys)
                         .contentShape(Rectangle())
-                        .meterReorderable(
-                            meterKey: meterKey,
-                            scope: scope,
-                            reorderableKeys: meterKeys,
-                            draggedMeterKey: $draggedMeterKey,
-                            draggedMeterScope: $draggedMeterScope,
-                            orderStore: meterOrderStore
-                        )
+                        .meterReorderTarget(meterKey)
                 } else {
-                    meterRow(row)
+                    meterRow(row, scope: scope, reorderableKeys: meterKeys)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func meterRow(_ row: QuotaPeriodRow) -> some View {
+    private func meterRow(_ row: QuotaPeriodRow, scope: String, reorderableKeys: [String]) -> some View {
         let accent = Color(hex: row.providerID.accentColorHex)
 
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
+                if let window = row.window {
+                    MeterDragHandle(
+                        meterKey: MeterOrderStore.key(providerID: row.providerID, window: window),
+                        scope: scope,
+                        reorderableKeys: reorderableKeys,
+                        rowFrames: meterRowFrames,
+                        orderStore: meterOrderStore,
+                        accessibilityName: row.label
+                    )
+                } else {
+                    #if os(iOS)
+                    Color.clear.frame(width: 44, height: 44)
+                    #else
+                    Color.clear.frame(width: 15, height: 18)
+                    #endif
+                }
+
                 ProviderBrandIconView(providerID: row.providerID, size: 13)
                     .frame(width: 16, height: 16)
 

@@ -714,7 +714,9 @@ public struct TransparentWindowConfigurator: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.toolbarStyle = .unifiedCompact
-        window.isMovableByWindowBackground = true
+        // Only the dashboard's dedicated titlebar strip should move this
+        // window. Background dragging also claims drags that start on meters.
+        window.isMovableByWindowBackground = false
 
         if let contentView = window.contentView {
             contentView.wantsLayer = true
