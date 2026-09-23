@@ -6323,7 +6323,15 @@ public struct MetaProviderClient: UserInitiatedProviderClient {
                 webReading = reading
             case .fetch:
                 let liveReading = await WebBillingClient(
-                    baseURL: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!,
+                    // Honour the user's own configured URL like every other
+                    // browser-meter site does. This one went straight at the
+                    // fallback, so a Meta user who had not set an override was
+                    // navigated — carrying their own session cookies — to the
+                    // maintainer's project billing page rather than their own.
+                    baseURL: BrowserSessionRefreshPolicy.validatedURL(
+                        fields[SpendProviderCredentialField.browserSessionURL],
+                        fallback: URL(string: "https://dev.meta.ai/billing/?project_id=1514228250391823&team_id=1760015591684812")!
+                    ),
                     cookieDomains: ["meta.ai", "meta.com"]
                 ).fetch(
                     cookieHeader: webCookie,
