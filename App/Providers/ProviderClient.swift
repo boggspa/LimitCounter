@@ -6250,23 +6250,24 @@ private enum DevinLocalStateReader {
                 print("[DevinLocalStateReader] Successfully loaded \(states.count) account(s) from user-provided path")
                 return states
             }
-            print("[DevinLocalStateReader] Failed to load from user-provided path, will try auto-discovery")
+            print("[DevinLocalStateReader] Failed to load from user-provided path")
         }
 
-        // Fall back to auto-discovery (won't work in sandboxed apps, but useful for non-sandboxed builds)
-        for url in possibleStateDatabaseURLs() {
-            print("[DevinLocalStateReader] Checking: \(url.path)")
-            print("[DevinLocalStateReader] Exists: \(FileManager.default.fileExists(atPath: url.path))")
-            print("[DevinLocalStateReader] Readable: \(FileManager.default.isReadableFile(atPath: url.path))")
-
-            let states = try loadAllCachedPlanInfos(from: url)
-            if !states.isEmpty {
-                print("[DevinLocalStateReader] Successfully loaded \(states.count) account(s) from: \(url.path)")
-                return states
-            }
-        }
-
-        print("[DevinLocalStateReader] Could not find or read state.vscdb from any location")
+        // There used to be an auto-discovery fallback here that reconstructed
+        // the real home directory by stripping "/Library/Containers/" out of
+        // NSHomeDirectory() and then opened Devin's state.vscdb directly.
+        //
+        // It could never work: the app is sandboxed, so the open failed every
+        // time and the reader fell through to notConfigured anyway. What it did
+        // leave behind was worse than useless — the reconstructed paths and the
+        // "Library/Application Support/Devin/User/globalStorage/state.vscdb"
+        // literals were compiled into the shipped binary, where anyone running
+        // `strings` over it would find an app that says it only reads other
+        // apps' state through a user-granted picker apparently probing for one
+        // unconditionally. Dead code is not free when it contradicts the privacy
+        // promise. Reading Devin's state now requires the bookmark or an
+        // explicit path, both of which the user grants.
+        print("[DevinLocalStateReader] No granted Devin state database; not configured")
         throw ProviderFetchError.notConfigured
     }
 
@@ -6283,20 +6284,6 @@ private enum DevinLocalStateReader {
             return false
         }
         return isDirectory.boolValue
-    }
-
-    private static func possibleStateDatabaseURLs() -> [URL] {
-        // In sandboxed apps, these paths won't work - user must provide file via picker
-        // But we keep this for non-sandboxed builds or if the user has granted permanent access
-        var paths: [URL] = []
-
-        // Primary location (real user home, not container)
-        // Note: In sandboxed apps, homeDirectoryForCurrentUser returns the container path
-        let realHome = URL(fileURLWithPath: NSHomeDirectory().replacingOccurrences(of: "/Library/Containers/", with: "").components(separatedBy: "/").dropLast(3).joined(separator: "/"))
-        paths.append(realHome.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb"))
-        paths.append(realHome.appendingPathComponent("Library/Application Support/Devin/User/globalStorage/state.vscdb.backup"))
-
-        return paths
     }
 
     private static func loadAllCachedPlanInfos(from url: URL) throws -> [DevinStateSnapshot] {
