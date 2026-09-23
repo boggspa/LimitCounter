@@ -274,7 +274,25 @@ public struct AntigravityProviderClient: UserInitiatedProviderClient {
     private static let clientID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
     // Installed-app OAuth secrets are public client identifiers, not user credentials.
     private static let clientSecret = "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"
-    private static let userAgent = "antigravity/cli/1.1.9 (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)"
+    /// The CLI's own user agent, which names the architecture.
+    ///
+    /// This is a universal binary, so the process runs whichever slice the OS
+    /// picked and the agent has to describe that slice rather than assert
+    /// `arm64`. Hardcoding it made every Intel Mac lie to Google's endpoint —
+    /// harmless while the app was arm64-only in practice, and a real
+    /// misidentification the moment an Intel build ships. A compile-time branch
+    /// is the correct source of truth here: each slice reports its own
+    /// architecture, which is exactly what the running process is.
+    private static let userAgent: String = {
+        #if arch(arm64)
+        let arch = "arm64"
+        #elseif arch(x86_64)
+        let arch = "x86_64"
+        #else
+        let arch = "unknown"
+        #endif
+        return "antigravity/cli/1.1.9 (aidev_client; os_type=darwin; arch=\(arch); auth_method=consumer)"
+    }()
     private static let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
     private static let loadCodeAssistURL = URL(
         string: "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
