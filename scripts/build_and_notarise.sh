@@ -48,7 +48,10 @@ xcodebuild -exportArchive \
 
 echo "Zipping..."
 NOTARY_ZIP="$PWD/$NOTARY_DIR/LimitCounter.zip"
-ditto -c -k --keepParent "$NOTARY_DIR/export/Limit Counter.app" "$NOTARY_ZIP"
+# Strip resource forks, extended attributes and ACLs so the submitted archive has
+# the same shape as the one published to users: no AppleDouble entries inside the
+# signed bundle. See finish_notarization.sh for why those break a plain `unzip`.
+ditto -c -k --keepParent --norsrc --noextattr --noacl "$NOTARY_DIR/export/Limit Counter.app" "$NOTARY_ZIP"
 echo "$NOTARY_ZIP" > build/.current-notary-zip
 
 echo "Running finish_notarization.sh..."
