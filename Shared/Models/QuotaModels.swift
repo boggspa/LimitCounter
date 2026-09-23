@@ -861,7 +861,19 @@ public extension QuotaWindow {
     /// another, which is the same triple `QuotaResetDetector.WindowKey` keys its
     /// ledger on; the provider goes in front so two providers' identically
     /// named meters stay distinct when they share a list.
-    func stableIdentity(for providerID: ProviderID) -> String {
+    ///
+    /// This assumes one meter per provider per triple, which is the same
+    /// assumption `WindowKey` has always made. A provider that emitted two
+    /// windows identical in all three would collapse to one identity here, in
+    /// the reset ledger, and in `ForEach` — none of the shipping providers does,
+    /// and the two Claude weekly windows differ by unit.
+    ///
+    /// `nonisolated` because the app target builds with
+    /// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` while the callers — the
+    /// meter-order store's `key(providerID:window:)`, the widget target and the
+    /// standalone test harnesses — are not main-actor isolated. It only reads
+    /// `let` fields, so there is nothing to isolate.
+    nonisolated func stableIdentity(for providerID: ProviderID) -> String {
         [
             providerID.rawValue,
             label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
