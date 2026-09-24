@@ -78,21 +78,25 @@ struct ModelUsageInsightData {
     let sources: [ModelUsageInsightSource]
     let entries: [ModelUsageInsightEntry]
 
-    init(archive: ModelUsageArchive, snapshots: [QuotaSnapshot]) {
+    /// `since` keeps only records that end after it, for views that show one recent
+    /// window; every source is still listed with its full coverage.
+    init(archive: ModelUsageArchive, snapshots: [QuotaSnapshot], since: Date? = nil) {
         var sources: [ModelUsageInsightSource] = []
         var entries: [ModelUsageInsightEntry] = []
-        let ledgerSources = Set(archive.buckets.map(\.source))
+        let bySource = Dictionary(grouping: archive.buckets, by: \.source)
+        let ledgerSources = Set(bySource.keys)
+        let isRecent = { (end: Date) in since.map { end > $0 } ?? true }
         for name in archive.sources {
             let provider = ModelUsageSourceIdentity.host(name)
             let coverage = archive.coverage.first { $0.source == name }
-            let rows = archive.buckets.filter { $0.source == name }
+            let rows = bySource[name] ?? []
             let problems = coverage.map { $0.unreadableFiles + $0.malformedLines } ?? 0
             sources.append(.init(id: name, provider: provider, title: ModelUsageSourceIdentity.title(name),
                 detail: ModelUsageSourceIdentity.detail(name, files: coverage?.files ?? 0),
                 first: coverage?.firstEvent ?? rows.map(\.start).min(), last: coverage?.lastEvent ?? rows.map(\.start).max(),
                 scanned: coverage?.scannedAt, local: true,
                 issue: problems > 0 ? "\(coverage?.unreadableFiles ?? 0) files deferred; \(coverage?.malformedLines ?? 0) malformed lines skipped" : nil))
-            entries += rows.map { row in
+            entries += rows.filter { isRecent($0.start.addingTimeInterval(Double($0.seconds))) }.map { row in
                 .init(id: row.id, source: name, provider: provider, model: row.model, start: row.start,
                     end: row.start.addingTimeInterval(Double(row.seconds)), tokens: row.tokens, requests: Double(row.requests),
                     estimatedUSD: row.pricedRequests > 0 ? row.estimatedUSD : nil, pricedTokens: row.pricedTokens,
@@ -102,7 +106,7 @@ struct ModelUsageInsightData {
         }
         var seen = Set<String>()
         for snapshot in snapshots {
-            for bucket in snapshot.analyticsBuckets where bucket.hasUsage {
+            for bucket in snapshot.analyticsBuckets where bucket.hasUsage && isRecent(bucket.endDate) {
                 if bucket.source != .officialAPI {
                     if ledgerSources.contains("codex"), snapshot.providerID == .openai || snapshot.providerID == .codexTelemetry { continue }
                     if ledgerSources.contains("claude"), snapshot.providerID == .claude { continue }
@@ -137,7 +141,7 @@ struct ModelUsageInsightData {
         for snapshot in snapshots where snapshot.analyticsBuckets.isEmpty && !covered.contains(snapshot.providerID) {
             var hours: [String: (start: Date, model: String, tokens: Double, messages: Double)] = [:]
             for event in UsageEventDeduplicator.flatten([snapshot]) where seenEvents.insert(event.id).inserted {
-                guard let tokens = event.tokens, tokens.isFinite, tokens > 0 else { continue }
+                guard let tokens = event.tokens, tokens.isFinite, tokens > 0, isRecent(event.timestamp.addingTimeInterval(3600)) else { continue }
                 let start = Date(timeIntervalSince1970: floor(event.timestamp.timeIntervalSince1970 / 3600) * 3600)
                 let model = event.model.map { String($0.prefix(256)) } ?? "Unknown model"
                 let key = "\(start.timeIntervalSince1970)|\(model)"
@@ -172,12 +176,15 @@ struct ModelUsageInsightData {
     }
 
     func selected(source: String, model: String = "", window: ModelUsageWindow, now: Date) -> [ModelUsageInsightEntry] {
-        let cutoff = now.addingTimeInterval(-window.seconds)
-        return entries.filter { row in
-            (source.isEmpty || row.source == source) && (model.isEmpty || row.model == model)
-                && row.start <= now && row.end > cutoff
-                && (row.precise || row.end.timeIntervalSince(row.start) <= window.seconds)
+        entries.filter { row in
+            (source.isEmpty || row.source == source) && (model.isEmpty || row.model == model) && Self.contains(row, window: window, now: now)
         }
+    }
+
+    /// A precise record overlapping the window, or a coarse bucket that fits inside it.
+    static func contains(_ row: ModelUsageInsightEntry, window: ModelUsageWindow, now: Date) -> Bool {
+        row.start <= now && row.end > now.addingTimeInterval(-window.seconds)
+            && (row.precise || row.end.timeIntervalSince(row.start) <= window.seconds)
     }
 
     /// The sources with the most tokens in the window, ledgers first on a tie, so a
@@ -196,6 +203,34 @@ struct ModelUsageInsightData {
             ModelUsageRollup(source: $0.source, model: $0.model, start: $0.start,
                 seconds: max(1, Int($0.end.timeIntervalSince($0.start))), tokens: $0.tokens, requests: Int($0.requests), runs: Int($0.runs))
         }
+    }
+}
+
+/// TaskWraith's provider accents, mirrored from AGBench `src/renderer/src/styles/theme.css`
+/// (2026-09-24): brand hues held at one equal-contrast luminance, with TaskWraith's
+/// overrides where brands collide. Model usage wears these instead of a generic accent;
+/// runs that span providers wear TaskWraith's ensemble hue.
+enum TaskWraithProviderPalette {
+    private static let hex: [String: String] = [
+        "gemini": "#346EEC", "codex": "#705AFF", "claude": "#B16105", "kimi": "#0073E6", "grok": "#757575",
+        "cursor": "#8C7508", "ollama": "#976C52", "antigravity": "#308713", "pi": "#68768C", "muse": "#1671EA",
+        "devin": "#4878AE", "ensemble": "#986781", "alibaba": "#8C52EF", "deep-reinforce": "#BE5809",
+        "ibm": "#3079BC", "liquid": "#D72D82", "meta": "#1671EA", "cohere": "#5E7C6F", "essential": "#8462CA",
+        "nvidia": "#538200", "openbmb": "#E22B17", "poolside": "#0C8194", "deepseek": "#4E6AEE", "zai": "#177DAA",
+        "minimax": "#C044A4", "mistral": "#D44404", "xiaomi": "#008844", "cerebras": "#BB584A", "groq": "#088482",
+        "openrouter": "#E02948", "thinkingmachines": "#C24E68", "tencent": "#4E73CA", "inception": "#7C5BE9",
+        "nexagi": "#747A42", "sakana": "#EA0C2D", "stealth": "#9E6C00", "unbiased": "#B85A35", "typesafe": "#C700E4"
+    ]
+    /// TaskWraith's own aliases, plus Limit Counter provider ids it spells differently.
+    private static let aliases: [String: String] = [
+        "qwen": "alibaba", "google": "antigravity", "openai": "codex", "ornith": "deep-reinforce", "mimo": "xiaomi",
+        "codexTelemetry": "codex", "openaiAPI": "codex", "chatgpt": "codex", "taskwraith": "ensemble"
+    ]
+
+    /// Hex for a provider id or routed vendor, or nil when TaskWraith has no accent for it.
+    static func hex(for identity: String) -> String? {
+        let key = identity.lowercased()
+        return hex[aliases[identity] ?? aliases[key] ?? key]
     }
 }
 

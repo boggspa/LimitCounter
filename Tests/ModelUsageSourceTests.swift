@@ -554,6 +554,11 @@ struct ModelUsageSourceTests {
         expect(runTotals.runs == 2 && ModelUsageFormat.requests(runTotals.requests, runs: runTotals.runs) == "2 runs"
                && ModelUsageFormat.requests(5, runs: 2) == "5 calls & runs" && ModelUsageFormat.requests(5, runs: 0) == "5 calls",
                "Whole runs are never labelled as calls")
+        expect(TaskWraithProviderPalette.hex(for: "openai") == "#705AFF" && TaskWraithProviderPalette.hex(for: "codexTelemetry") == "#705AFF"
+               && TaskWraithProviderPalette.hex(for: "Claude") == "#B16105" && TaskWraithProviderPalette.hex(for: "qwen") == "#8C52EF",
+               "Provider ids and routed vendors take TaskWraith's accents, aliases included")
+        expect(TaskWraithProviderPalette.hex(for: "taskwraith") == "#986781" && TaskWraithProviderPalette.hex(for: "heatmap") == nil,
+               "Runs spanning providers wear the ensemble hue; unknown identities get no borrowed accent")
         let unnamed = QuotaSnapshot(providerID: .antigravity, displayName: "Antigravity", events: [UsageEvent(timestamp: hour, tokens: 5000, model: "gemini-api:x")])
         let unpriced = ModelUsageInsightTotals(ModelUsageInsightData(archive: .empty, snapshots: [unnamed]).selected(source: "antigravity:events", window: .day, now: now))
         expect(unpriced.tokens.unsplit == 5000 && unpriced.estimateBounds == nil, "An unknown model stays unpriced rather than borrowing a rate")
