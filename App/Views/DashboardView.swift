@@ -200,6 +200,7 @@ struct DashboardView: View {
         GeometryReader { proxy in
             if proxy.size.width >= 720 && proxy.size.height >= 500 {
                 desktopDashboardShell
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                     .overlay(alignment: .top) {
                         HStack(spacing: 0) {
                             Color.clear.frame(width: 110, height: 24)
@@ -244,7 +245,7 @@ struct DashboardView: View {
 
     #if os(macOS)
     private var desktopDashboardShell: some View {
-        HStack(spacing: 0) {
+        HStack(alignment: .top, spacing: 0) {
             dashboardSidebar
                 .frame(width: 252)
 
@@ -254,6 +255,7 @@ struct DashboardView: View {
                 .blendMode(.screen)
 
             dashboardWorkspace
+                .frame(maxHeight: .infinity, alignment: .top)
         }
     }
 
@@ -286,24 +288,26 @@ struct DashboardView: View {
 
             sidebarSectionTitle("Providers")
 
-            VStack(spacing: 5) {
-                ForEach(ProviderID.userFacingCases) { providerID in
-                    if let route = routeForProvider(providerID) {
-                        NavigationLink(value: route) {
+            ScrollView {
+                VStack(spacing: 5) {
+                    ForEach(ProviderID.userFacingCases) { providerID in
+                        if let route = routeForProvider(providerID) {
+                            NavigationLink(value: route) {
+                                ProviderSidebarRow(
+                                    providerID: providerID,
+                                    snapshot: snapshotFor(providerID),
+                                    isVisible: visibilityStore.isVisible(providerID)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        } else {
                             ProviderSidebarRow(
                                 providerID: providerID,
                                 snapshot: snapshotFor(providerID),
                                 isVisible: visibilityStore.isVisible(providerID)
                             )
+                            .opacity(0.72)
                         }
-                        .buttonStyle(.plain)
-                    } else {
-                        ProviderSidebarRow(
-                            providerID: providerID,
-                            snapshot: snapshotFor(providerID),
-                            isVisible: visibilityStore.isVisible(providerID)
-                        )
-                        .opacity(0.72)
                     }
                 }
             }
