@@ -39,19 +39,37 @@ public struct LLMActivityHeatmapView: View {
             guard let host = providerMap[event.id] else { return false }
             return hosts.contains(host)
         }
+        // Ledger rows are five-minute buckets per model, tens of thousands a month, and this
+        // runs on every dashboard redraw. Cells need only tokens per host and routed vendor,
+        // so rows merge per 15-minute slot: every zone offset and 2-hour row boundary falls
+        // on one, so no row changes cell.
+        var merged: [String: (host: ProviderID, start: Date, model: String, tokens: Double)] = [:]
         for row in rollups {
             guard let host = ModelUsageSourceIdentity.replacedSnapshotHost(row.source) else { continue }
-            let event = UsageEvent(timestamp: row.start, tokens: row.tokens.total, model: row.model, type: .bucket)
-            providerMap[event.id] = host
+            let slot = floor(row.start.timeIntervalSince1970 / 900) * 900
+            let key = "\(host.rawValue)|\(ModelUsageDisplayIdentity.provider(model: row.model, source: host.rawValue))|\(slot)"
+            var value = merged[key] ?? (host, Date(timeIntervalSince1970: slot), row.model, 0)
+            value.tokens += row.tokens.total
+            merged[key] = value
+        }
+        for value in merged.values {
+            let event = UsageEvent(timestamp: value.start, tokens: value.tokens, model: value.model, type: .bucket)
+            providerMap[event.id] = value.host
             events.append(event)
         }
         self.allEvents = events
         self.eventToProvider = providerMap
 
-        // 3. Pre-bucket the events by local day + 2-hour row.
+        // 3. Pre-bucket the events by local day + 2-hour row, resolving each 15-minute
+        // slot's calendar position once.
         let calendar = Calendar.current
+        var keys: [Int: HeatmapBucketKey] = [:]
         self.bucketMap = Dictionary(grouping: events) { event in
-            Self.bucketKey(for: event.timestamp, calendar: calendar)
+            let slot = Int(floor(event.timestamp.timeIntervalSince1970 / 900))
+            if let key = keys[slot] { return key }
+            let key = Self.bucketKey(for: event.timestamp, calendar: calendar)
+            keys[slot] = key
+            return key
         }
     }
 
