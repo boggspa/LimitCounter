@@ -136,6 +136,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				"LLMUsageCounter.iOS-Info.plist",
+				"LLMUsageCounter.macOS-Info.plist",
 			);
 			target = A42BC5372F9140180096DECB /* LLMUsageCounter */;
 		};
@@ -708,6 +709,7 @@
 				"GENERATE_INFOPLIST_FILE[sdk=iphonesimulator*]" = NO;
 				"INFOPLIST_FILE[sdk=iphoneos*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
 				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
+				"INFOPLIST_FILE[sdk=macosx*]" = "LLMUsageCounter/LLMUsageCounter.macOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
 				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -760,6 +762,7 @@
 				"GENERATE_INFOPLIST_FILE[sdk=iphonesimulator*]" = NO;
 				"INFOPLIST_FILE[sdk=iphoneos*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
 				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "LLMUsageCounter/LLMUsageCounter.iOS-Info.plist";
+				"INFOPLIST_FILE[sdk=macosx*]" = "LLMUsageCounter/LLMUsageCounter.macOS-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Limit Counter";
 				INFOPLIST_KEY_CFBundleName = "Limit Counter";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
