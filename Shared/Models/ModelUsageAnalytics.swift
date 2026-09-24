@@ -42,12 +42,15 @@ nonisolated extension ModelTokenCounts: Codable {
 }
 
 nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable {
-    case codex, claude, taskwraith
+    case codex, claude, taskwraith, grok, gemini, kimi
     var title: String {
         switch self {
         case .codex: return "Codex"
         case .claude: return "Claude Code"
         case .taskwraith: return "TaskWraith"
+        case .grok: return "Grok CLI"
+        case .gemini: return "Gemini CLI"
+        case .kimi: return "Kimi CLI"
         }
     }
 }

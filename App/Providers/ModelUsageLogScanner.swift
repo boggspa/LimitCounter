@@ -82,6 +82,9 @@ actor ModelUsageLogScanner {
         switch source {
         case .codex, .claude: return try ModelUsageLogParser.read(url: url, source: source, fileID: fileID, emit: emit)
         case .taskwraith: return try TaskWraithUsageParser.read(url: url, fileID: fileID, emit: emit)
+        case .grok: return try GrokUsageParser.read(url: url, fileID: fileID, emit: emit)
+        case .gemini: return try GeminiChatParser.read(url: url, fileID: fileID, emit: emit)
+        case .kimi: return try KimiWireParser.read(url: url, fileID: fileID, emit: emit)
         }
     }
 
@@ -108,6 +111,23 @@ actor ModelUsageLogScanner {
             let names = TaskWraithUsageParser.files
             if isFile { return names.contains(root.lastPathComponent) ? [entry(root)].compactMap { $0 } : [] }
             return names.compactMap { entry(root.appendingPathComponent($0)) }
+        case .grok:
+            // Provider setup may have granted `~/.grok`, its `bin`/`downloads`, or the binary.
+            var folder = isFile ? root.deletingLastPathComponent() : root
+            if ["bin", "downloads"].contains(folder.lastPathComponent) { folder.deleteLastPathComponent() }
+            folders = [folder.appendingPathComponent("sessions")]
+            accepts = { $0.lastPathComponent == "usage.json" }
+        case .gemini:
+            // Chats sit in `tmp/<project>/chats/`, subagent chats one folder deeper.
+            folders = [(isFile ? root.deletingLastPathComponent() : root).appendingPathComponent("tmp")]
+            accepts = { ["json", "jsonl"].contains($0.pathExtension) && $0.deletingLastPathComponent().pathComponents.suffix(2).contains("chats") }
+        case .kimi:
+            // The Kimi grant may be the config folder, its `credentials`, or `kimi-code.json`.
+            var folder = root
+            if isFile { folder = folder.deletingLastPathComponent() }
+            if folder.lastPathComponent == "credentials" { folder.deleteLastPathComponent() }
+            folders = [folder.appendingPathComponent("sessions")]
+            accepts = { $0.lastPathComponent == "wire.jsonl" }
         }
         var files: [(URL, Date, Int)] = []
         var unreadable = 0
@@ -157,6 +177,12 @@ nonisolated enum ModelUsageLogParser {
         }
     }
 
+    /// Reads one chunk inside its own pool: a long synchronous scan never drains the
+    /// caller's pool, so autoreleased chunks would otherwise hold whole files resident.
+    static func nextChunk(_ handle: FileHandle) throws -> Data? {
+        try autoreleasepool { try handle.read(upToCount: 512 * 1024) }
+    }
+
     /// Streams JSON Lines objects; blank lines are skipped and anything else that is
     /// not an object is counted as malformed without stopping the file.
     static func readLines(url: URL, _ handleObject: ([String: Any]) throws -> Void) throws -> Int {
@@ -170,7 +196,7 @@ nonisolated enum ModelUsageLogParser {
                 try handleObject(json)
             }
         }
-        while let chunk = try handle.read(upToCount: 512 * 1024), !chunk.isEmpty {
+        while let chunk = try nextChunk(handle), !chunk.isEmpty {
             try Task.checkCancellation()
             buffer.append(chunk)
             var start = buffer.startIndex

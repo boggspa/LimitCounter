@@ -350,6 +350,9 @@ final class AppStateStore: ObservableObject {
         case .codex: return .codexTelemetry
         case .claude: return .claude
         case .taskwraith: return nil
+        case .grok: return .grok
+        case .gemini: return .gemini
+        case .kimi: return .kimi
         }
     }
 
@@ -393,7 +396,7 @@ final class AppStateStore: ObservableObject {
                 }
             }
             guard !roots.isEmpty else {
-                modelUsageStatus = "Connect local Codex, Claude or TaskWraith folders in provider setup to index model usage."
+                modelUsageStatus = "Connect Codex, Claude, TaskWraith, Grok, Gemini or Kimi folders in provider setup to index model usage."
                 return
             }
             do {

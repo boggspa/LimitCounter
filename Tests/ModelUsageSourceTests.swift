@@ -20,6 +20,7 @@ struct ModelUsageSourceTests {
         try await unchangedRefreshSkipsRollups()
         try streamingArrays()
         try await taskWraithImport()
+        try await nativeCLILogs()
         print("Model usage sources: \(checks) checks passed")
     }
 
@@ -67,6 +68,19 @@ struct ModelUsageSourceTests {
         seen = []
         let truncated = try JSONArrayObjectStream.read(url: arrayURL, key: nil) { seen.append(($0["a"] as? Int) ?? -1) }
         expect(seen == [1] && truncated == 1, "A truncated checkpoint keeps complete records and counts the rest")
+
+        // An attachment larger than the element cap, with escapes at the elision point
+        // and across chunk boundaries, still yields the message's usage fields.
+        let attachment = String(repeating: "z", count: JSONArrayObjectStream.maximumStringBytes - 1) + #"\"\\"#
+            + String(repeating: "w", count: JSONArrayObjectStream.maximumElementBytes + 1_000_000) + #"\"}]"#
+        let heavy = #"{"messages":[{"a":7,"content":"\#(attachment)","tokens":{"input":5},"note":"kept"},{"a":8,"short":"\#(long.prefix(1000))"}]}"#
+        try heavy.write(to: documentURL, atomically: true, encoding: .utf8)
+        var elements: [[String: Any]] = []
+        let heavyMalformed = try JSONArrayObjectStream.read(url: documentURL, key: "messages") { elements.append($0) }
+        expect(heavyMalformed == 0 && elements.map { ($0["a"] as? Int) ?? -1 } == [7, 8], "An element over the cap because of one string still decodes")
+        expect(elements.first?["content"] as? String == "" && elements.first?["note"] as? String == "kept"
+               && (elements.first?["tokens"] as? [String: Any])?["input"] as? Int == 5, "Only the oversized string is emptied")
+        expect((elements.last?["short"] as? String)?.count == 1000, "Strings under the limit are kept whole")
     }
 
     static func taskWraithRecord(_ id: String, provider: String = "grok", model: String = "grok-4.6", input: Double = 100,
@@ -131,6 +145,108 @@ struct ModelUsageSourceTests {
         expect(ModelUsageTotals(fileOnly.buckets).runs == 2, "A grant on usage.json alone reads just that file")
         let json = String(decoding: try JSONEncoder().encode(archive), as: UTF8.self)
         expect(!json.contains("never read") && !json.contains("run-r1"), "Prompts, responses and run ids never leave the record")
+    }
+
+    static func write(_ object: Any, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+    }
+
+    static func nativeCLILogs() async throws {
+        let times = ModelUsageTimestamps()
+        // Grok: input includes cached reads and cache creation; one row per model per turn.
+        let turn: [String: Any] = ["turnNumber": 3, "endedAt": "2026-09-23T13:00:13.969886+00:00", "inputTokens": 1000,
+            "modelUsage": ["grok-4.6-build": ["inputTokens": 600, "cachedReadTokens": 500, "cacheCreationTokens": 40,
+                                              "outputTokens": 30, "reasoningTokens": 10, "totalTokens": 630, "modelCalls": 2],
+                           "grok-4.7-build": ["inputTokens": 400, "cachedReadTokens": 0, "outputTokens": 20, "totalTokens": 420, "modelCalls": 1]]]
+        let grok = GrokUsageParser.calls(from: turn, fileID: "session", times: times)
+        expect(grok.count == 2 && grok[0].model == "grok-4.6-build", "Each model in a turn is its own record")
+        expect(grok[0].tokens == ModelTokenCounts(input: 60, cacheRead: 500, cacheWrite: 40, output: 30, reasoning: 10), "Grok cache fields are carved out of input")
+        expect(grok[0].calls == 2 && grok[1].calls == 1, "Grok's model call counts are kept")
+        close(grok[0].timestamp.timeIntervalSince1970, 1_790_168_413.969, "Microsecond timestamps parse")
+        expect(grok[0].id != grok[1].id && grok[0].id == GrokUsageParser.calls(from: turn, fileID: "session", times: times)[0].id, "Grok identity is stable per turn and model")
+        let bare: [String: Any] = ["turnNumber": 4, "endedAt": "2026-09-23T13:05:00+00:00", "inputTokens": 50, "outputTokens": 5, "totalTokens": 55]
+        let unattributed = GrokUsageParser.calls(from: bare, fileID: "session", times: times)
+        expect(unattributed.count == 1 && unattributed[0].model == "Unknown model" && unattributed[0].calls == 0, "A turn without model usage stays unattributed")
+
+        // Gemini: cached is part of input; tool prompts bill as input and thoughts as output.
+        let message: [String: Any] = ["id": "g1", "timestamp": "2026-05-01T10:00:00.000Z", "type": "gemini", "model": "gemini-3-flash-preview",
+            "tokens": ["input": 1000, "output": 50, "cached": 800, "thoughts": 20, "tool": 5, "total": 1075]]
+        let gemini = GeminiChatParser.call(from: message, fileID: "chat", times: times)!
+        expect(gemini.tokens == ModelTokenCounts(input: 205, cacheRead: 800, output: 70, reasoning: 20), "Gemini reconciles to its reported total")
+        expect(gemini.tokens.total == 1075 && gemini.calls == 1, "Nothing is left unsplit when the total reconciles")
+
+        // Kimi: one StatusUpdate per step; no model is recorded, so none is assumed.
+        let status: [String: Any] = ["timestamp": 1_780_000_000.5, "message": ["type": "StatusUpdate", "payload": [
+            "message_id": "k1", "context_tokens": 1100, "token_usage": ["input_other": 100, "input_cache_read": 900, "input_cache_creation": 100, "output": 40]]]]
+        let kimi = KimiWireParser.call(from: status, fileID: "wire", line: 7)!
+        expect(kimi.tokens == ModelTokenCounts(input: 100, cacheRead: 900, cacheWrite: 100, output: 40) && kimi.model == "Unknown model", "Kimi steps keep their split and no guessed model")
+        expect(ModelRateCatalog.resolve(source: kimi.source, model: kimi.model) == nil, "An unnamed Kimi model stays unpriced")
+        expect(KimiWireParser.call(from: ["timestamp": 1, "message": ["type": "TurnBegin", "payload": [:]]], fileID: "wire", line: 1) == nil, "Only StatusUpdate rows are usage")
+        // Kimi Code: one usage.record per request, naming its route alias.
+        let record: [String: Any] = ["type": "usage.record", "agentId": "main", "model": "kimi-code/k3", "usageScope": "turn", "time": 1_789_183_678_370,
+            "usage": ["inputOther": 4645, "output": 499, "inputCacheRead": 18944, "inputCacheCreation": 0]]
+        let kimiCode = KimiWireParser.call(from: record, fileID: "wire", line: 9)!
+        expect(kimiCode.tokens == ModelTokenCounts(input: 4645, cacheRead: 18944, output: 499) && kimiCode.model == "kimi-code/k3", "Kimi Code records keep their split and model")
+        close(kimiCode.timestamp.timeIntervalSince1970, 1_789_183_678.37, "Kimi Code times are milliseconds")
+        expect(ModelRateCatalog.resolve(source: "kimi", model: "kimi-code/k3")?.model == "kimi-k3"
+               && ModelRateCatalog.resolve(source: "kimi", model: "kimi-code/kimi-for-coding")?.model == "kimi-k2.8-preview"
+               && ModelRateCatalog.resolve(source: "kimi", model: "kimi-code/k4") == nil, "Kimi Code aliases price explicitly and nothing else")
+        expect(KimiWireParser.call(from: record, fileID: "wire", line: 9)?.id == kimiCode.id && KimiWireParser.call(from: record, fileID: "wire", line: 10)?.id != kimiCode.id,
+               "A Kimi Code record's identity is its file and line")
+        var cumulative = record; cumulative["usageScope"] = "session"
+        expect(KimiWireParser.call(from: cumulative, fileID: "wire", line: 11) == nil, "Unknown usage scopes are never summed")
+
+        // Grants: each shape provider setup stores resolves to the right log folder.
+        let home = try temporaryDirectory("native-logs")
+        defer { try? FileManager.default.removeItem(at: home) }
+        try write(["sessionId": "s", "turns": [turn]], to: home.appendingPathComponent(".grok/sessions/p/s/usage.json"))
+        try write(["x": 1], to: home.appendingPathComponent(".grok/sessions/p/s/other.json"))
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".grok/bin"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent(".grok/bin/grok"))
+        try write(["sessionId": "c", "messages": [message, message]], to: home.appendingPathComponent(".gemini/tmp/project/chats/session-1.json"))
+        var subagent = message; subagent["id"] = "g2"
+        try write(["kind": "subagent", "messages": [subagent]], to: home.appendingPathComponent(".gemini/tmp/project/chats/0b1c/agent.json"))
+        let jsonl = [["sessionId": "c", "kind": "main"], message, ["$set": ["summary": "x"]]].map {
+            String(decoding: try! JSONSerialization.data(withJSONObject: $0), as: UTF8.self)
+        }.joined(separator: "\n")
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".gemini/tmp/project2/chats"), withIntermediateDirectories: true)
+        try jsonl.write(to: home.appendingPathComponent(".gemini/tmp/project2/chats/session-2.jsonl"), atomically: true, encoding: .utf8)
+        try write(["not": "a chat"], to: home.appendingPathComponent(".gemini/tmp/project/logs.json"))
+        let wire = String(decoding: try JSONSerialization.data(withJSONObject: status), as: UTF8.self)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".kimi/sessions/h/u"), withIntermediateDirectories: true)
+        try "{\"type\":\"metadata\",\"protocol_version\":1}\n\(wire)\n".write(to: home.appendingPathComponent(".kimi/sessions/h/u/wire.jsonl"), atomically: true, encoding: .utf8)
+        try write(["access_token": "never read"], to: home.appendingPathComponent(".kimi/credentials/kimi-code.json"))
+        let recordLine = String(decoding: try JSONSerialization.data(withJSONObject: record), as: UTF8.self)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".kimi-code/sessions/wd_x/session_1/agents/main"), withIntermediateDirectories: true)
+        try "{\"type\":\"metadata\",\"protocol_version\":\"1.5\"}\n\(recordLine)\n\(recordLine)\n".write(
+            to: home.appendingPathComponent(".kimi-code/sessions/wd_x/session_1/agents/main/wire.jsonl"), atomically: true, encoding: .utf8)
+
+        var failed = 0
+        for grant in [".grok", ".grok/bin", ".grok/bin/grok"] {
+            let files = ModelUsageLogScanner.logFiles(for: .grok, root: home.appendingPathComponent(grant), failed: &failed)
+            expect(files.map { $0.0.lastPathComponent } == ["usage.json"], "Grok grant \(grant) finds session usage only")
+        }
+        expect(ModelUsageLogScanner.logFiles(for: .gemini, root: home.appendingPathComponent(".gemini"), failed: &failed).count == 3, "Gemini reads chats and subagent chats only, in both formats")
+        for grant in [".kimi", ".kimi/credentials", ".kimi/credentials/kimi-code.json", ".kimi-code"] {
+            let files = ModelUsageLogScanner.logFiles(for: .kimi, root: home.appendingPathComponent(grant), failed: &failed)
+            expect(files.map { $0.0.lastPathComponent } == ["wire.jsonl"], "Kimi grant \(grant) finds wire logs")
+        }
+        let now = date("2026-09-24T12:00:00Z")
+        let scanner = ModelUsageLogScanner(directory: home.appendingPathComponent("ledger"))
+        let archive = try await scanner.scan(roots: [.grok: home.appendingPathComponent(".grok/bin"), .gemini: home.appendingPathComponent(".gemini"),
+                                                     .kimi: home.appendingPathComponent(".kimi/credentials/kimi-code.json")], now: now)
+        func requests(_ source: String) -> Int { ModelUsageTotals(archive.buckets.filter { $0.source == source }).requests }
+        expect(requests("grok") == 3, "Grok model calls weigh its requests")
+        expect(requests("gemini") == 2, "A Gemini message repeated within and across chat files counts once")
+        expect(requests("kimi") == 1 && failed == 0, "Kimi steps are indexed")
+        let kimiCodeArchive = try await ModelUsageLogScanner(directory: home.appendingPathComponent("ledger-kimi-code"))
+            .scan(roots: [.kimi: home.appendingPathComponent(".kimi-code")], now: now)
+        let kimiCodeRows = kimiCodeArchive.buckets.filter { $0.source == "kimi" }
+        expect(ModelUsageTotals(kimiCodeRows).requests == 2 && kimiCodeRows.allSatisfy { $0.pricedRequests == $0.requests },
+               "Each Kimi Code request line counts and prices through its alias")
+        let grokRows = archive.buckets.filter { $0.source == "grok" }
+        expect(grokRows.allSatisfy { $0.pricedRequests > 0 }, "Grok Build ids price through their explicit aliases")
     }
 
     static func claudeLine(_ stamp: String, request: String) -> String {

@@ -2,9 +2,12 @@ import Foundation
 
 /// Streams the object elements of one JSON array without holding the document:
 /// the top-level array when `key` is nil, otherwise the array stored under `key` in
-/// the top-level object. Checkpoints and chat documents can exceed 100 MB.
+/// the top-level object. Checkpoints and chat documents can exceed 100 MB, and one
+/// chat message can embed a 20 MB attachment, so a string longer than
+/// `maximumStringBytes` reaches the decoder empty; usage fields are never that long.
 nonisolated enum JSONArrayObjectStream {
     static let maximumElementBytes = 16 * 1024 * 1024
+    static let maximumStringBytes = 64 * 1024
 
     /// Returns the number of elements that could not be decoded or were too large.
     static func read(url: URL, key: String?, _ handleObject: ([String: Any]) throws -> Void) throws -> Int {
@@ -14,12 +17,13 @@ nonisolated enum JSONArrayObjectStream {
         var depth = 0, inString = false, escaped = false
         var elementDepth: Int?          // depth inside the target array
         var element = Data(), capturing = false, oversized = false, malformed = 0
+        var stringStart = 0, eliding = false   // content offset of the element's open string
         var keyBytes: [UInt8] = [], collectingKey = false, lastString: [UInt8]?, pendingKey: [UInt8]?
-        while let chunk = try handle.read(upToCount: 512 * 1024), !chunk.isEmpty {
+        while let chunk = try ModelUsageLogParser.nextChunk(handle), !chunk.isEmpty {
             try Task.checkCancellation()
             try chunk.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
                 guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                var runStart = capturing ? 0 : -1
+                var runStart = capturing && !eliding ? 0 : -1
                 for index in 0..<bytes.count {
                     let byte = bytes[index]
                     if inString {
@@ -28,14 +32,21 @@ nonisolated enum JSONArrayObjectStream {
                         else if byte == 0x22 {
                             inString = false
                             if collectingKey { lastString = keyBytes; collectingKey = false }
+                            if eliding { eliding = false; runStart = index }
                             continue
                         }
                         if collectingKey { keyBytes.append(byte) }
+                        if capturing, !eliding, !oversized, element.count + index - runStart - stringStart > maximumStringBytes {
+                            element.append(base + runStart, count: index - runStart)
+                            element.count = stringStart
+                            eliding = true; runStart = -1
+                        }
                         continue
                     }
                     switch byte {
                     case 0x22:
                         inString = true
+                        if capturing { stringStart = element.count + index - runStart + 1 }
                         if !capturing, depth == 1, wanted != nil { collectingKey = true; keyBytes.removeAll(keepingCapacity: true) }
                     case 0x3A where depth == 1 && !capturing:
                         pendingKey = lastString
@@ -72,6 +83,118 @@ nonisolated enum JSONArrayObjectStream {
             }
         }
         return malformed + (capturing ? 1 : 0)
+    }
+}
+
+/// Internet timestamps with or without fractional seconds (any precision).
+nonisolated struct ModelUsageTimestamps {
+    private let fractional: ISO8601DateFormatter = {
+        let value = ISO8601DateFormatter(); value.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return value
+    }()
+    private let plain = ISO8601DateFormatter()
+
+    func date(_ value: Any?) -> Date? {
+        guard let text = value as? String else { return nil }
+        return fractional.date(from: text) ?? plain.date(from: text)
+    }
+}
+
+/// Grok Build CLI `sessions/<project>/<session>/usage.json`: one record per model per
+/// turn with its API call count. Input includes cached reads and cache creation.
+nonisolated enum GrokUsageParser {
+    static func read(url: URL, fileID: String, emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        let times = ModelUsageTimestamps()
+        return try JSONArrayObjectStream.read(url: url, key: "turns") { turn in
+            for call in calls(from: turn, fileID: fileID, times: times) { try emit(call) }
+        }
+    }
+
+    static func calls(from turn: [String: Any], fileID: String, times: ModelUsageTimestamps) -> [ModelUsageCall] {
+        guard let ended = times.date(turn["endedAt"]) else { return [] }
+        let turnNumber = (turn["turnNumber"] as? NSNumber)?.intValue ?? Int(ended.timeIntervalSince1970)
+        let perModel = (turn["modelUsage"] as? [String: Any])?.compactMapValues { $0 as? [String: Any] } ?? [:]
+        let usages = perModel.isEmpty ? [(TaskWraithUsageParser.text(turn["primaryModelId"]) ?? "Unknown model", turn)] : perModel.map { ($0.key, $0.value) }
+        return usages.sorted { $0.0 < $1.0 }.compactMap { model, usage in
+            let number = { TaskWraithUsageParser.number(usage[$0]) ?? 0 }
+            let input = number("inputTokens"), output = number("outputTokens")
+            let cacheRead = min(input, number("cachedReadTokens")), cacheWrite = min(input - cacheRead, number("cacheCreationTokens"))
+            let tokens = ModelTokenCounts(input: input - cacheRead - cacheWrite, cacheRead: cacheRead, cacheWrite: cacheWrite,
+                output: output, reasoning: min(output, number("reasoningTokens")),
+                unsplit: max(0, number("totalTokens") - input - output))
+            guard tokens.total > 0 else { return nil }
+            return ModelUsageCall(id: ModelUsageLogParser.hash("grok|\(fileID)|\(turnNumber)|\(model)"), source: LocalModelUsageSource.grok.rawValue,
+                timestamp: ended, model: String(model.prefix(256)), tokens: tokens, calls: Int(number("modelCalls")))
+        }
+    }
+}
+
+/// Gemini CLI chats under `tmp/<project>/chats/`: whole JSON documents or JSON Lines.
+/// Each model message is one API response. `input` includes `cached`; `tool` prompt
+/// tokens bill as input and `thoughts` as output, so the reported total reconciles.
+nonisolated enum GeminiChatParser {
+    static func read(url: URL, fileID: String, emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        let times = ModelUsageTimestamps()
+        let consume: ([String: Any]) throws -> Void = { message in
+            if let call = call(from: message, fileID: fileID, times: times) { try emit(call) }
+        }
+        return url.pathExtension == "jsonl"
+            ? try ModelUsageLogParser.readLines(url: url, consume)
+            : try JSONArrayObjectStream.read(url: url, key: "messages", consume)
+    }
+
+    static func call(from message: [String: Any], fileID: String, times: ModelUsageTimestamps) -> ModelUsageCall? {
+        guard let usage = message["tokens"] as? [String: Any], let timestamp = times.date(message["timestamp"]) else { return nil }
+        let number = { TaskWraithUsageParser.number(usage[$0]) ?? 0 }
+        let prompt = number("input"), cached = min(prompt, number("cached")), thoughts = number("thoughts")
+        var tokens = ModelTokenCounts(input: prompt - cached + number("tool"), cacheRead: cached,
+            output: number("output") + thoughts, reasoning: thoughts)
+        tokens.unsplit = max(0, number("total") - tokens.total)
+        guard tokens.total > 0 else { return nil }
+        let identity = TaskWraithUsageParser.text(message["id"]) ?? "\(fileID)|\(timestamp.timeIntervalSince1970)"
+        return ModelUsageCall(id: ModelUsageLogParser.hash("gemini|\(identity)"), source: LocalModelUsageSource.gemini.rawValue,
+            timestamp: timestamp, model: String((TaskWraithUsageParser.text(message["model"]) ?? "Unknown model").prefix(256)), tokens: tokens)
+    }
+}
+
+/// Kimi CLI `sessions/**/wire.jsonl`, one record per API step in either format:
+/// Kimi Code's `usage.record` (millisecond time, model alias such as `kimi-code/k3`)
+/// or the older CLI's `StatusUpdate`, which names no model, so none is assumed.
+/// Kimi Code's migration copied old sessions without their usage, so each folder
+/// holds only its own era.
+nonisolated enum KimiWireParser {
+    static func read(url: URL, fileID: String, emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        var line = 0
+        return try ModelUsageLogParser.readLines(url: url) { row in
+            line += 1
+            if let call = call(from: row, fileID: fileID, line: line) { try emit(call) }
+        }
+    }
+
+    static func call(from row: [String: Any], fileID: String, line: Int) -> ModelUsageCall? {
+        let usage: [String: Any], seconds: Double, model: String, identity: String
+        let keys: (input: String, cacheRead: String, cacheWrite: String)
+        if row["type"] as? String == "usage.record" {
+            // Only per-request "turn" records are known; another scope could be a sum.
+            guard (row["usageScope"] as? String ?? "turn") == "turn", let values = row["usage"] as? [String: Any],
+                  let milliseconds = TaskWraithUsageParser.number(row["time"]), milliseconds > 0 else { return nil }
+            usage = values; seconds = milliseconds / 1000
+            model = String((TaskWraithUsageParser.text(row["model"]) ?? "Unknown model").prefix(256))
+            identity = "\(fileID)|\(line)"
+            keys = ("inputOther", "inputCacheRead", "inputCacheCreation")
+        } else {
+            guard let message = row["message"] as? [String: Any], message["type"] as? String == "StatusUpdate",
+                  let payload = message["payload"] as? [String: Any], let values = payload["token_usage"] as? [String: Any],
+                  let stamp = TaskWraithUsageParser.number(row["timestamp"]), stamp > 0 else { return nil }
+            usage = values; seconds = stamp; model = "Unknown model"
+            identity = TaskWraithUsageParser.text(payload["message_id"]) ?? "\(fileID)|\(line)"
+            keys = ("input_other", "input_cache_read", "input_cache_creation")
+        }
+        let number = { TaskWraithUsageParser.number(usage[$0]) ?? 0 }
+        let tokens = ModelTokenCounts(input: number(keys.input), cacheRead: number(keys.cacheRead),
+            cacheWrite: number(keys.cacheWrite), output: number("output"))
+        guard tokens.total > 0 else { return nil }
+        return ModelUsageCall(id: ModelUsageLogParser.hash("kimi|\(identity)"), source: LocalModelUsageSource.kimi.rawValue,
+            timestamp: Date(timeIntervalSince1970: seconds), model: model, tokens: tokens)
     }
 }
 

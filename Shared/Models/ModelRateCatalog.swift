@@ -109,10 +109,15 @@ nonisolated enum ModelRateCatalog {
         "kimi/k3": ("kimi", "kimi-k3")
     ]
     /// Exact wire ids a provider's own CLI logs. The Grok Build CLI writes `-build`
-    /// ids for the models TaskWraith records, for the same runs, as grok-4.6/4.7.
+    /// ids for the models TaskWraith records, for the same runs, as grok-4.6/4.7;
+    /// Kimi Code logs its route aliases, mapped as TaskWraith's `kimiCostRateModel`.
     private static let nativeAliases: [String: String] = [
         "grok/grok-4.6-build": "grok-4.6",
-        "grok/grok-4.7-build": "grok-4.7"
+        "grok/grok-4.7-build": "grok-4.7",
+        "kimi/kimi-code/kimi-for-coding": "kimi-k2.8-preview",
+        "kimi/kimi-code/kimi-for-coding-highspeed": "kimi-k2.7-code-highspeed",
+        "kimi/kimi-code/k3": "kimi-k3",
+        "kimi/kimi-code/k3-256k": "kimi-k3-256k"
     ]
     private static let routedProviders = [
         "codex": "codex", "openai": "codex", "claude": "claude", "anthropic": "claude",
