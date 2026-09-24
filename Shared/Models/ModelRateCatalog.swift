@@ -43,20 +43,49 @@ nonisolated struct ModelRate: Identifiable, Decodable {
 nonisolated enum ModelRateCatalog {
     static let version = "2026-09-02"
     static let provenance = "TaskWraith ProviderRateService · 2026-09-02"
+    private static let rateIndices = Dictionary(rates.enumerated().map {
+        ("\($0.element.provider)/\($0.element.model)", $0.offset)
+    }, uniquingKeysWith: { first, _ in first })
+    private static let routeAliases: [String: (String, String)] = [
+        "claude/fable": ("claude", "claude-fable-5-1"),
+        "claude/opus": ("claude", "claude-opus-5-5"),
+        "claude/sonnet": ("claude", "claude-sonnet-5"),
+        "kimi/kimi-for-coding": ("kimi", "kimi-k2.8-preview"),
+        "kimi/kimi-for-coding-highspeed": ("kimi", "kimi-k2.7-code-highspeed"),
+        "kimi/k3": ("kimi", "kimi-k3")
+    ]
+    private static let routedProviders = [
+        "codex": "codex", "openai": "codex", "claude": "claude", "anthropic": "claude",
+        "grok": "grok", "xai": "grok", "cursor": "cursor", "gemini": "gemini",
+        "google": "gemini", "kimi": "kimi", "moonshot": "kimi", "mistral": "mistral",
+        "muse": "muse", "meta": "muse", "antigravity": "antigravity", "ollama": "ollama"
+    ]
 
     static func resolve(source: String, model: String) -> ModelRate? {
         let name = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = source == "openaiAPI" || source == "openai" ? "codex" : source
-        if let exact = rates.first(where: { $0.provider == provider && $0.model == name }) { return exact }
-        // Only recognized routing prefixes are stripped. No fuzzy family match or positional fallback.
-        let prefixes = ["codex/": "codex", "openai/": "codex", "claude/": "claude", "anthropic/": "claude"]
-        for (prefix, routedProvider) in prefixes where name.hasPrefix(prefix) {
-            let routedName = String(name.dropFirst(prefix.count))
-            return rates.first { $0.provider == routedProvider && $0.model == routedName }
+        if let exact = exactRate(provider: provider, model: name) { return exact }
+
+        // TaskWraith also catalogs some routed providers under Pi using the full
+        // namespace. Match those exact rows before interpreting the route itself.
+        if let routed = exactRate(provider: "pi", model: name) { return routed }
+        if let alias = routeAliases[name] { return exactRate(provider: alias.0, model: alias.1) }
+
+        // Only explicit Provider Hub namespaces may redirect pricing away from
+        // the host app. An unfamiliar route remains unpriced.
+        if let slash = name.firstIndex(of: "/"),
+           let routedProvider = routedProviders[String(name[..<slash])] {
+            let routedModel = String(name[name.index(after: slash)...])
+            return exactRate(provider: routedProvider, model: routedModel)
         }
+        return nil
+    }
+
+    private static func exactRate(provider: String, model: String) -> ModelRate? {
+        if let index = rateIndices["\(provider)/\(model)"] { return rates[index] }
         // Vendor date suffixes preserve a concrete model identity.
-        if name.count > 9, name.suffix(9).first == "-", name.suffix(8).allSatisfy(\.isNumber) {
-            return rates.first { $0.provider == provider && $0.model == String(name.dropLast(9)) }
+        if model.count > 9, model.suffix(9).first == "-", model.suffix(8).allSatisfy(\.isNumber) {
+            if let index = rateIndices["\(provider)/\(model.dropLast(9))"] { return rates[index] }
         }
         return nil
     }
