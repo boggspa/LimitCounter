@@ -301,19 +301,52 @@ private func testLegacyHistoryIsCleanedOnReadAndWrite() throws {
 private func testPreviousParserCacheIsInvalidated() throws {
     let root = try makeTempRoot("old-parser-cache")
     defer { try? FileManager.default.removeItem(at: root) }
-    let file = root.appendingPathComponent("rollout.jsonl")
-    let modifiedAt = Date()
-    let stalePayload = Data("old diagnostic activity".utf8)
-    let entry = try JSONSerialization.data(withJSONObject: [
-        "p": "codexTelemetry", "f": file.path,
-        "m": modifiedAt.timeIntervalSince1970, "s": 100,
-        "d": stalePayload.base64EncodedString()
-    ])
-    let contents = "{\"version\":1}\n" + String(decoding: entry, as: UTF8.self) + "\n"
-    try contents.write(to: root.appendingPathComponent("cache.jsonl"), atomically: true, encoding: .utf8)
-    let cache = TelemetryParseCache(filename: "cache.jsonl", directory: root)
-    try expect(cache.payload(provider: "codexTelemetry", path: file.path, modifiedAt: modifiedAt, size: 100) == nil,
-               "unchanged session files are reparsed instead of serving old diagnostic records")
+
+    let turnAt = Date().addingTimeInterval(-60 * 60)
+    try writeSession(
+        in: root,
+        named: "rollout-cached.jsonl",
+        lines: [tokenCountLine(at: turnAt, cumulative: 100, lastTurn: 100)],
+        on: turnAt
+    )
+    // Found the way the client finds it, so the cache key's path matches
+    // (the enumerator resolves the temporary directory's /var symlink).
+    let enumerator = FileManager.default.enumerator(
+        at: root.appendingPathComponent("sessions"),
+        includingPropertiesForKeys: nil
+    )
+    let file = try (enumerator?.allObjects as? [URL])?
+        .first { $0.lastPathComponent == "rollout-cached.jsonl" }
+        ?? { throw TestError.failure("session fixture missing") }()
+    let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+    let modifiedAt = try (attributes[.modificationDate] as? Date)
+        ?? { throw TestError.failure("no modification date") }()
+    let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+
+    // Records a parser produced for this exact file, in the whole-file layout.
+    let staleRecords = """
+    [{"t":\(turnAt.timeIntervalSinceReferenceDate),"e":"token_count","k":999999,"p":false,"r":false,"o":false,"a":false,"n":1}]
+    """
+    func writeCache(version: Int) throws {
+        let entry = try JSONSerialization.data(withJSONObject: [
+            "p": "codexTelemetry", "f": file.path,
+            "m": modifiedAt.timeIntervalSince1970, "s": size,
+            "d": Data(staleRecords.utf8).base64EncodedString()
+        ])
+        let contents = "{\"version\":\(version)}\n" + String(decoding: entry, as: UTF8.self) + "\n"
+        try contents.write(to: root.appendingPathComponent("parse-cache.jsonl"), atomically: true, encoding: .utf8)
+    }
+
+    // Control: the current version's entry is served, so the file matches it.
+    try writeCache(version: 2)
+    try expectEqual(try snapshotTokens(root: root), 999_999, "a current cache entry is served for an unchanged file")
+
+    try writeCache(version: 1)
+    try expectEqual(
+        try snapshotTokens(root: root),
+        100,
+        "unchanged session files are reparsed instead of serving an old parser's records"
+    )
 }
 
 // MARK: - Runner

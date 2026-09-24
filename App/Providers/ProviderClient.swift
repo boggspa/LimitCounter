@@ -23,6 +23,21 @@ enum AGBenchUsageReader {
     private static let usageFileRelativePath = "usage.json"
     private static let maximumUsageFileBytes = 32 * 1_024 * 1_024
 
+    /// A `usage.json` record with a provider and a timestamp; records without
+    /// either are never events for any provider.
+    private struct Row {
+        let provider: String
+        let timestamp: Date
+        let totalTokens: Double?
+        let model: String?
+    }
+
+    /// The last parsed version of `usage.json`. TaskWraith rewrites the file
+    /// only when a run finishes, yet Claude, Codex and Kimi each re-parsed
+    /// all of it on every refresh.
+    private static let parsedRowsLock = NSLock()
+    private static var parsedRows: (path: String, modifiedAt: Date, size: Int, rows: [Row])?
+
     /// Returns recent `UsageEvent`s drawn from `usage.json` for the
     /// given provider key. Provider keys match TaskWraith's internal naming
     /// (`"kimi"`, `"gemini"`, `"codex"`, `"claude"`), not our
@@ -43,46 +58,46 @@ enum AGBenchUsageReader {
             return []
         }
 
-        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+        guard let values = try? fileURL.resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+              ),
               values.isRegularFile == true,
               let fileSize = values.fileSize,
               fileSize >= 0,
-              fileSize <= maximumUsageFileBytes,
-              let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+              fileSize <= maximumUsageFileBytes else {
             print("[AGBenchReader] Read failed for \(fileURL.path) (sandbox / permissions?)")
             return []
         }
 
-        guard let records = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+        let rows: [Row]
+        switch parsedRows(of: fileURL, modifiedAt: values.contentModificationDate, size: fileSize) {
+        case .unreadable:
+            print("[AGBenchReader] Read failed for \(fileURL.path) (sandbox / permissions?)")
+            return []
+        case .unexpectedShape:
             print("[AGBenchReader] usage.json had unexpected shape (not a top-level array)")
             return []
+        case .rows(let parsed):
+            rows = parsed
         }
 
         let horizon = now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
         let normalizedKey = providerKey.lowercased()
         var events: [UsageEvent] = []
-        events.reserveCapacity(records.count)
+        events.reserveCapacity(rows.count)
 
-        for record in records {
-            guard let recordProvider = (record["provider"] as? String)?.lowercased(),
-                  recordProvider == normalizedKey else { continue }
-
-            // Timestamps are Unix epoch milliseconds.
-            guard let timestampMs = numericValue(record["timestamp"]) else { continue }
-            let timestamp = Date(timeIntervalSince1970: timestampMs / 1000)
-            guard timestamp >= horizon else { continue }
-
-            let totalTokens = numericValue(record["totalTokens"]) ?? 0
+        for row in rows where row.provider == normalizedKey && row.timestamp >= horizon {
+            let totalTokens = row.totalTokens ?? 0
             // Some records carry tokens == 0 (e.g. a run that failed
             // before producing output); we still emit the event with
             // tokens=nil so it shows up on the heatmap as an activity
             // marker without inflating token totals.
             let tokens: Double? = totalTokens > 0 ? totalTokens : nil
-            let model = (record["model"] as? String) ?? providerKey
+            let model = row.model ?? providerKey
 
             events.append(
                 UsageEvent(
-                    timestamp: timestamp,
+                    timestamp: row.timestamp,
                     tokens: tokens,
                     model: model,
                     type: .message
@@ -92,6 +107,50 @@ enum AGBenchUsageReader {
 
         print("[AGBenchReader] Loaded \(events.count) events for provider '\(providerKey)' from \(fileURL.lastPathComponent)")
         return events
+    }
+
+    private enum ParsedRows {
+        case unreadable
+        case unexpectedShape
+        case rows([Row])
+    }
+
+    /// The file's rows, parsed only when it has changed since the last call.
+    private static func parsedRows(of fileURL: URL, modifiedAt: Date?, size: Int) -> ParsedRows {
+        parsedRowsLock.lock()
+        let memo = parsedRows
+        parsedRowsLock.unlock()
+        if let memo, let modifiedAt,
+           memo.path == fileURL.path, memo.modifiedAt == modifiedAt, memo.size == size {
+            return .rows(memo.rows)
+        }
+
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else { return .unreadable }
+        guard let records = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return .unexpectedShape
+        }
+        var rows: [Row] = []
+        rows.reserveCapacity(records.count)
+        for record in records {
+            guard let provider = (record["provider"] as? String)?.lowercased(),
+                  // Timestamps are Unix epoch milliseconds.
+                  let timestampMs = numericValue(record["timestamp"]) else { continue }
+            rows.append(
+                Row(
+                    provider: provider,
+                    timestamp: Date(timeIntervalSince1970: timestampMs / 1000),
+                    totalTokens: numericValue(record["totalTokens"]),
+                    model: record["model"] as? String
+                )
+            )
+        }
+
+        if let modifiedAt {
+            parsedRowsLock.lock()
+            parsedRows = (fileURL.path, modifiedAt, size, rows)
+            parsedRowsLock.unlock()
+        }
+        return .rows(rows)
     }
 
     /// Resolves the user-bookmarked root URL into the actual
@@ -4793,7 +4852,7 @@ private actor KimiOAuthRefreshCoordinator {
 /// `UsageEvent` per assistant turn so the activity heatmap can render Kimi
 /// activity alongside the API-fetched quota meters. Best-effort: returns []
 /// when the sandbox denies access to the transcripts root.
-private enum KimiLocalTranscriptReader {
+enum KimiLocalTranscriptReader {
     /// Heatmap window — only files modified within this lookback are scanned.
     private static let lookback: TimeInterval = 30 * 24 * 60 * 60
     /// Cap to keep parse time bounded on heavy users.
@@ -4805,11 +4864,24 @@ private enum KimiLocalTranscriptReader {
     /// (b) gives us a stable cross-fetch content fingerprint via the
     /// bucket's wall-clock start time. Same shape Claude uses.
     private static let bucketHours = 2
+    private static let parseCacheProvider = "kimiWire"
+
+    /// One `StatusUpdate`: when the turn completed and the tokens it reported
+    /// (nil when it reported none).
+    private struct Turn: Codable {
+        let timestamp: TimeInterval
+        let tokens: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case timestamp = "t"
+            case tokens = "k"
+        }
+    }
 
     /// Returns recent `UsageEvent`s found under `kimiRootURL/sessions/**/wire.jsonl`,
     /// aggregated into 2-hour heatmap buckets for visual consistency with Claude.
     /// Caller is responsible for any security-scoped access bracketing.
-    static func loadEvents(kimiRootURL: URL) -> [UsageEvent] {
+    static func loadEvents(kimiRootURL: URL, parseCache: TelemetryParseCache = .shared) -> [UsageEvent] {
         let sessionsRoot = kimiRootURL.lastPathComponent == "sessions"
             ? kimiRootURL
             : kimiRootURL.appendingPathComponent("sessions")
@@ -4821,24 +4893,25 @@ private enum KimiLocalTranscriptReader {
         }
 
         let cutoff = Date().addingTimeInterval(-lookback)
+        let resourceKeys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
         guard let enumerator = fileManager.enumerator(
             at: sessionsRoot,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            includingPropertiesForKeys: Array(resourceKeys),
             options: [.skipsHiddenFiles]
         ) else {
             print("[KimiProvider] Local scan: enumeration failed for \(sessionsRoot.path) (sandbox/permission?)")
             return []
         }
 
-        var wireFiles: [(URL, Date)] = []
+        var wireFiles: [(url: URL, modified: Date, size: Int)] = []
         for case let url as URL in enumerator where url.lastPathComponent == "wire.jsonl" {
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+            guard let values = try? url.resourceValues(forKeys: resourceKeys),
                   values.isRegularFile == true else { continue }
             let mtime = values.contentModificationDate ?? .distantPast
             guard mtime >= cutoff else { continue }
-            wireFiles.append((url, mtime))
+            wireFiles.append((url, mtime, values.fileSize ?? 0))
         }
-        wireFiles.sort { $0.1 > $1.1 }
+        wireFiles.sort { $0.modified > $1.modified }
         let scanList = wireFiles.prefix(maxFiles)
 
         if wireFiles.isEmpty {
@@ -4846,16 +4919,39 @@ private enum KimiLocalTranscriptReader {
             return []
         }
 
-        var perTurnEvents: [UsageEvent] = []
-        for (url, _) in scanList {
-            perTurnEvents.append(contentsOf: parseWireJSONL(at: url))
+        // Only the session being written to changes between refreshes; the
+        // rest are served from the cache instead of being re-read whole.
+        parseCache.prune(provider: parseCacheProvider, keepingNewest: maxFiles * 3)
+        defer { parseCache.persist() }
+
+        var turns: [Turn] = []
+        for file in scanList {
+            if let cached = parseCache.value(
+                [Turn].self,
+                provider: parseCacheProvider,
+                path: file.url.path,
+                modifiedAt: file.modified,
+                size: file.size
+            ) {
+                turns.append(contentsOf: cached)
+                continue
+            }
+            guard let parsed = parseWireJSONL(at: file.url) else { continue }
+            parseCache.store(
+                parsed,
+                provider: parseCacheProvider,
+                path: file.url.path,
+                modifiedAt: file.modified,
+                size: file.size
+            )
+            turns.append(contentsOf: parsed)
         }
 
-        let bucketed = bucketEvents(perTurnEvents)
+        let bucketed = bucketEvents(turns)
 
         if let oldest = bucketed.map(\.timestamp).min(),
            let newest = bucketed.map(\.timestamp).max() {
-            print("[KimiProvider] Local scan: \(scanList.count) file(s), \(perTurnEvents.count) turns -> \(bucketed.count) heatmap buckets (oldest=\(oldest) newest=\(newest))")
+            print("[KimiProvider] Local scan: \(scanList.count) file(s), \(turns.count) turns -> \(bucketed.count) heatmap buckets (oldest=\(oldest) newest=\(newest))")
         } else {
             print("[KimiProvider] Local scan: \(scanList.count) file(s) scanned but produced 0 heatmap buckets (no parseable StatusUpdate lines)")
         }
@@ -4863,19 +4959,19 @@ private enum KimiLocalTranscriptReader {
         return bucketed
     }
 
-    /// Collapses per-turn `.message` events into 2-hour `.bucket` events
+    /// Collapses per-turn records into 2-hour `.bucket` events
     /// keyed by local-time bucket start. Sums token counts within each
     /// bucket. Mirrors `ClaudeHeatmapEventBucketer`. The model field
     /// stays "Kimi" so `guessProviderFromModel` resolves correctly when
     /// the heatmap renders.
-    private static func bucketEvents(_ events: [UsageEvent]) -> [UsageEvent] {
-        guard !events.isEmpty else { return [] }
+    private static func bucketEvents(_ turns: [Turn]) -> [UsageEvent] {
+        guard !turns.isEmpty else { return [] }
         let calendar = Calendar.current
         var totals: [Date: Double] = [:]
 
-        for event in events {
-            let bucketStart = bucketStart(for: event.timestamp, calendar: calendar)
-            totals[bucketStart, default: 0] += event.tokens ?? 0
+        for turn in turns {
+            let bucketStart = bucketStart(for: Date(timeIntervalSince1970: turn.timestamp), calendar: calendar)
+            totals[bucketStart, default: 0] += turn.tokens ?? 0
         }
 
         return totals
@@ -4909,24 +5005,21 @@ private enum KimiLocalTranscriptReader {
             ?? dayStart.addingTimeInterval(Double(bucketIndex * bucketHours * 3600))
     }
 
-    /// Parses one `wire.jsonl` file. Emits a single `UsageEvent` per
+    /// Parses one `wire.jsonl` file. Emits a single turn per
     /// `StatusUpdate` line — that's the message Kimi CLI writes once per
     /// completed turn, and it contains the authoritative token counts.
-    private static func parseWireJSONL(at url: URL) -> [UsageEvent] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
+    /// Nil when the file cannot be read, which is retried next scan.
+    private static func parseWireJSONL(at url: URL) -> [Turn]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        // A file that is not UTF-8 throughout has always yielded nothing.
+        guard String(data: data, encoding: .utf8) != nil else { return [] }
 
-        var events: [UsageEvent] = []
-        events.reserveCapacity(64)
+        var turns: [Turn] = []
+        turns.reserveCapacity(64)
 
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            if events.count >= maxEventsPerFile { break }
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty,
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
-                continue
-            }
+        for rawLine in lines(in: data) {
+            if turns.count >= maxEventsPerFile { break }
+            guard let json = jsonObject(inLine: rawLine) else { continue }
 
             guard let tsValue = json["timestamp"],
                   let timestampSec = numericValue(tsValue) else { continue }
@@ -4945,14 +5038,42 @@ private enum KimiLocalTranscriptReader {
             let cacheCreation  = numericValue(tokenUsage?["input_cache_creation"]) ?? 0
             let totalTokens    = inputOther + output + cacheRead + cacheCreation
 
-            events.append(UsageEvent(
-                timestamp: Date(timeIntervalSince1970: timestampSec),
-                tokens: totalTokens > 0 ? totalTokens : nil,
-                model: "Kimi",
-                type: .message
-            ))
+            turns.append(Turn(timestamp: timestampSec, tokens: totalTokens > 0 ? totalTokens : nil))
         }
-        return events
+        return turns
+    }
+
+    /// The file's non-empty lines, split where `String.split(separator: "\n")`
+    /// splits its text: at each LF, except one that ends a CR LF pair, which
+    /// is a single Character. Scanning bytes avoids walking the file
+    /// Character by Character.
+    static func lines(in data: Data) -> [Data] {
+        var lines: [Data] = []
+        data.withUnsafeBytes { bytes in
+            var lineStart = 0
+            for index in 0..<bytes.count where bytes[index] == 0x0A {
+                guard index == 0 || bytes[index - 1] != 0x0D else { continue }
+                if index > lineStart {
+                    lines.append(data[(data.startIndex + lineStart)..<(data.startIndex + index)])
+                }
+                lineStart = index + 1
+            }
+            if bytes.count > lineStart {
+                lines.append(data[(data.startIndex + lineStart)..<data.endIndex])
+            }
+        }
+        return lines
+    }
+
+    /// Parses a line's raw bytes; a line the parser rejects as it stands takes
+    /// the trimmed-String path, which decides exactly as it always has.
+    private static func jsonObject(inLine line: Data) -> [String: Any]? {
+        if let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
+            return json
+        }
+        let trimmed = String(decoding: line, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let lineData = trimmed.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
     }
 
     private static func numericValue(_ value: Any?) -> Double? {
@@ -10809,12 +10930,13 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
         let modifiedAt = (attributes?[.modificationDate] as? Date) ?? .distantPast
         let size = (attributes?[.size] as? Int) ?? 0
 
-        if let payload = TelemetryParseCache.shared.payload(
+        if let cached = TelemetryParseCache.shared.value(
+            [ClaudeUsageRecord].self,
             provider: Self.parseCacheProvider,
             path: url.path,
             modifiedAt: modifiedAt,
             size: size
-        ), let cached = try? JSONDecoder().decode([ClaudeUsageRecord].self, from: payload) {
+        ) {
             return cached
         }
 
@@ -10823,15 +10945,13 @@ private struct ClaudeCodeLocalStateReader: @unchecked Sendable {
             maxBytes: Self.maxTranscriptBytesPerFile,
             parseTimestamp: parseTimestamp(_:)
         )
-        if let payload = try? JSONEncoder().encode(records) {
-            TelemetryParseCache.shared.store(
-                provider: Self.parseCacheProvider,
-                path: url.path,
-                modifiedAt: modifiedAt,
-                size: size,
-                payload: payload
-            )
-        }
+        TelemetryParseCache.shared.store(
+            records,
+            provider: Self.parseCacheProvider,
+            path: url.path,
+            modifiedAt: modifiedAt,
+            size: size
+        )
         return records
     }
 

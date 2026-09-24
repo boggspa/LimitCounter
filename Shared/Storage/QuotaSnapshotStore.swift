@@ -16,6 +16,23 @@ public final class QuotaSnapshotStore {
     private let decoder = JSONDecoder()
     private let defaultsOverride: UserDefaults?
 
+    /// One snapshot as last written: its JSON, and the snapshot that JSON
+    /// decodes back to (dates lose their fractional seconds on the way).
+    private struct EncodedSnapshot {
+        let json: Data
+        let stored: QuotaSnapshot
+    }
+
+    /// A sync upserts each provider in turn, and every upsert used to decode
+    /// and re-encode every provider's snapshot. The stored bytes and what
+    /// they decode to are remembered, so a load decodes nothing while those
+    /// bytes are unchanged, and a save encodes only the snapshots that differ
+    /// from their last-written JSON. Both are checked against the stored
+    /// bytes, so a write by the widget or another store is always picked up.
+    private let memoLock = NSLock()
+    private var loaded: (data: Data, snapshots: [QuotaSnapshot])?
+    private var encodedByAccount: [ProviderAccountKey: EncodedSnapshot] = [:]
+
     private var defaults: UserDefaults {
         if let defaultsOverride { return defaultsOverride }
         return UserDefaults(suiteName: appGroupID) ?? .standard
@@ -30,15 +47,26 @@ public final class QuotaSnapshotStore {
     // MARK: - Read
 
     public func loadSnapshots() -> [QuotaSnapshot] {
-        guard
-            let data = defaults.data(forKey: snapshotsKey),
-            let snapshots = try? decoder.decode([QuotaSnapshot].self, from: data)
-        else {
+        guard let data = defaults.data(forKey: snapshotsKey) else {
+            return []
+        }
+        memoLock.lock()
+        let remembered = loaded
+        memoLock.unlock()
+        if let remembered, remembered.data == data {
+            return remembered.snapshots
+        }
+
+        guard let snapshots = try? decoder.decode([QuotaSnapshot].self, from: data) else {
             return []
         }
         let cleaned = snapshots.map { CodexActivityHistory.cleaned($0) }
         if cleaned != snapshots {
             save(cleaned)
+        } else {
+            memoLock.lock()
+            loaded = (data, cleaned)
+            memoLock.unlock()
         }
         return cleaned
     }
@@ -97,6 +125,10 @@ public final class QuotaSnapshotStore {
 
     public func clearAll() {
         defaults.removeObject(forKey: snapshotsKey)
+        memoLock.lock()
+        loaded = nil
+        encodedByAccount = [:]
+        memoLock.unlock()
     }
 
     // MARK: - Staleness
@@ -113,9 +145,41 @@ public final class QuotaSnapshotStore {
         // Apply this on writes too, so an older synced snapshot cannot restore
         // diagnostic markers that were already removed from local history.
         let cleaned = snapshots.map { CodexActivityHistory.cleaned($0) }
-        if let data = try? encoder.encode(cleaned) {
-            defaults.set(data, forKey: snapshotsKey)
+        memoLock.lock()
+        let previous = encodedByAccount
+        memoLock.unlock()
+
+        // The array's JSON is its elements' JSON joined, so an unchanged
+        // snapshot's last-written JSON is reused as it stands.
+        var written: [ProviderAccountKey: EncodedSnapshot] = [:]
+        var stored: [QuotaSnapshot] = []
+        stored.reserveCapacity(cleaned.count)
+        var data = Data("[".utf8)
+        for snapshot in cleaned {
+            let encoded: EncodedSnapshot
+            if let last = previous[snapshot.accountKey], last.stored == snapshot {
+                encoded = last
+            } else {
+                guard let json = try? encoder.encode(snapshot),
+                      let roundTripped = try? decoder.decode(QuotaSnapshot.self, from: json) else {
+                    return
+                }
+                encoded = EncodedSnapshot(json: json, stored: roundTripped)
+            }
+            if !stored.isEmpty {
+                data.append(UInt8(ascii: ","))
+            }
+            data.append(encoded.json)
+            stored.append(encoded.stored)
+            written[snapshot.accountKey] = encoded
         }
+        data.append(UInt8(ascii: "]"))
+
+        defaults.set(data, forKey: snapshotsKey)
+        memoLock.lock()
+        loaded = (data, stored)
+        encodedByAccount = written
+        memoLock.unlock()
     }
 }
 

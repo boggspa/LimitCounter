@@ -3185,6 +3185,285 @@ private func testMuseCliRefreshCacheKeepsLastReadingAcrossRestart() async throws
     try expectEqual(persisted, reading, "persisted CLI reading survives restart")
 }
 
+// MARK: - Per-file parse caches
+
+private func makeParseCacheRoot(_ name: String) throws -> URL {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-\(name)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    return root
+}
+
+/// Rewrites a file's bytes but gives it back the identity it had, so only a
+/// cache that skips unchanged files still reports the old contents.
+private func replaceKeepingIdentity(_ url: URL, with text: String, modifiedAt: Date) throws {
+    let original = try Data(contentsOf: url)
+    let replacement = Data(text.utf8)
+    guard replacement.count == original.count else {
+        throw AdditionalProviderTestError.failure("fixture edit must keep \(url.lastPathComponent)'s size")
+    }
+    try replacement.write(to: url)
+    try FileManager.default.setAttributes([.modificationDate: modifiedAt], ofItemAtPath: url.path)
+}
+
+private func touch(_ url: URL, at modifiedAt: Date) throws {
+    try FileManager.default.setAttributes([.modificationDate: modifiedAt], ofItemAtPath: url.path)
+}
+
+/// A small deterministic generator, so the splitter property tests are
+/// reproducible.
+private struct SplitFixtureGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next(below bound: Int) -> Int {
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Int((state >> 33) % UInt64(bound))
+    }
+
+    mutating func data(from fragments: [[UInt8]], maxFragments: Int) -> Data {
+        var bytes: [UInt8] = []
+        for _ in 0..<next(below: maxFragments) {
+            bytes += fragments[next(below: fragments.count)]
+        }
+        return Data(bytes)
+    }
+}
+
+private let validSplitFragments: [[UInt8]] = [
+    "a", "{\"k\":1}", " ", "\t", "é", "€", "😀", "e\u{0301}", "\n", "\r", "\r\n", "\u{0B}", "\u{0C}",
+    "\u{85}", "\u{2028}", "\u{2029}", "\n\u{0301}", "\u{A0}"
+].map { Array($0.utf8) }
+
+private func testMuseLineScanSplitsLikeCharacterNewlines() throws {
+    let fragments = validSplitFragments + [[0xC2], [0xE2, 0x80], [0xFF], [0x80], [0xE2], [0xF0, 0x9F]]
+    var generator = SplitFixtureGenerator(seed: 0x4D75_7365)
+    for _ in 0..<3_000 {
+        let data = generator.data(from: fragments, maxFragments: 24)
+        var scanned: [String] = []
+        MuseLocalUsageReader.forEachLine(in: data) { scanned.append(String(decoding: $0, as: UTF8.self)) }
+        let expected = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        guard scanned == expected else {
+            throw AdditionalProviderTestError.failure(
+                "Muse byte scan split \(Array(data)) into \(scanned), Character split gives \(expected)"
+            )
+        }
+    }
+}
+
+private func testMuseByteIngestionMatchesStringIngestion() throws {
+    let recordedAt = 1_790_000_000_000_000
+    let lines = [
+        #"{"id":"a1","recorded_at":\#(recordedAt),"stream":{"id":"s"},"sequence":1,"payload_type":"runtime.session","payload":{"run_id":"r1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"u1","usage_family":"provider","quantity":{"reported":true,"input_tokens":1000,"output_tokens":100,"cached_tokens":600}}}}}"#,
+        "  \t" + #"{"id":"a2","stream":{"id":"s"},"sequence":2,"payload_type":"runtime.session","payload":{"run_id":"r1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"u2","usage_family":"provider","quantity":{"reported":true,"input_tokens":7,"output_tokens":3}}}}}"# + " ",
+        "\u{A0}" + #"{"id":"a3","stream":{"id":"s"},"sequence":3,"payload_type":"runtime.session","payload":{"run_id":"r2","event":{"kind":"goal_usage_attribution","record":{"usage_id":"u3","usage_family":"provider","quantity":{"reported":true,"input_tokens":50,"output_tokens":5}}}}}"# + "\u{3000}",
+        #"{"id":"c1","stream":{"id":"s"},"sequence":4,"payload_type":"runtime.session","payload":{"run_id":"r1","event":{"kind":"model_completed","usage":{"cache_read_tokens":500},"duration_ms":10,"model":"muse-spark-1.2"}}}"#,
+        #"{"id":"a1","stream":{"id":"s"},"sequence":1}"#,
+        "not json",
+        "[1,2]"
+    ]
+    var fromStrings = MuseSessionUsageReducer(museSessionId: "s", logPath: "/tmp/s.jsonl")
+    var fromBytes = MuseSessionUsageReducer(museSessionId: "s", logPath: "/tmp/s.jsonl")
+    for line in lines {
+        fromStrings.ingestLine(line)
+        fromBytes.ingestLine(utf8: Data(line.utf8))
+    }
+    var invalid = Data(lines[1].utf8)
+    invalid.append(0xFF)
+    fromStrings.ingestLine(String(decoding: invalid, as: UTF8.self))
+    fromBytes.ingestLine(utf8: invalid)
+
+    let rate = MuseModelRate.sparkDefault
+    let expected = fromStrings.snapshot(rate: rate)
+    let actual = fromBytes.snapshot(rate: rate)
+    try expectEqual(actual.inputTokens, expected.inputTokens, "byte ingestion input tokens")
+    try expectEqual(actual.outputTokens, expected.outputTokens, "byte ingestion output tokens")
+    try expectEqual(actual.cacheReadInputTokens, expected.cacheReadInputTokens, "byte ingestion cache reads")
+    try expectEqual(Set(actual.usageIds), Set(expected.usageIds), "byte ingestion accepts the same attributions")
+    try expectEqual(actual.latestRecordedAt, expected.latestRecordedAt, "byte ingestion recorded-at")
+    try expectEqual(actual.estimatedCostUSD, expected.estimatedCostUSD, "byte ingestion cost")
+    try expectEqual(expected.usageIds.count, 3, "padded lines are still ingested")
+}
+
+private func testMuseSessionCacheReparsesOnlyChangedSessions() throws {
+    let now = Date()
+    let base = try makeParseCacheRoot("muse-cache")
+    defer { try? FileManager.default.removeItem(at: base) }
+    let root = base.appendingPathComponent("muse", isDirectory: true)
+    let session = root.appendingPathComponent("sessions/one/session.jsonl")
+    try FileManager.default.createDirectory(at: session.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let recordedAt = Int(now.timeIntervalSince1970 * 1_000_000)
+    func attribution(_ id: String, input: Int) -> String {
+        #"{"id":"\#(id)","recorded_at":\#(recordedAt),"stream":{"id":"one"},"sequence":1,"payload_type":"runtime.session","payload":{"run_id":"run","event":{"kind":"goal_usage_attribution","record":{"usage_id":"\#(id)","usage_family":"provider","quantity":{"reported":true,"input_tokens":\#(input),"output_tokens":100}}}}}"#
+    }
+    let fixedDate = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970) - 60)
+    try (attribution("u1", input: 1000) + "\n").write(to: session, atomically: true, encoding: .utf8)
+    try touch(session, at: fixedDate)
+
+    let cacheDirectory = base.appendingPathComponent("cache", isDirectory: true)
+    let cache = TelemetryParseCache(filename: "cache.jsonl", directory: cacheDirectory)
+    let first = try MuseLocalUsageReader.read(rootURL: root, now: now, parseCache: cache)
+        ?? { throw AdditionalProviderTestError.failure("Muse fixture was not read") }()
+    try expectClose(first.inputTokens, 1_000, "Muse first read parses the session")
+
+    try replaceKeepingIdentity(session, with: attribution("u1", input: 2000) + "\n", modifiedAt: fixedDate)
+    let cached = try MuseLocalUsageReader.read(rootURL: root, now: now, parseCache: cache)
+        ?? { throw AdditionalProviderTestError.failure("Muse cached read failed") }()
+    try expectClose(cached.inputTokens, 1_000, "an unchanged Muse session is served from the cache")
+    try expectClose(cached.currentMonthCostUSD, first.currentMonthCostUSD, "cached sessions are priced the same")
+
+    try (attribution("u1", input: 2000) + "\n" + attribution("u2", input: 500) + "\n")
+        .write(to: session, atomically: true, encoding: .utf8)
+    let updated = try MuseLocalUsageReader.read(rootURL: root, now: now, parseCache: cache)
+        ?? { throw AdditionalProviderTestError.failure("Muse updated read failed") }()
+    try expectClose(updated.inputTokens, 2_500, "a Muse session that changed is re-parsed")
+
+    let reloaded = try MuseLocalUsageReader.read(
+        rootURL: root,
+        now: now,
+        parseCache: TelemetryParseCache(filename: "cache.jsonl", directory: cacheDirectory)
+    ) ?? { throw AdditionalProviderTestError.failure("Muse reload failed") }()
+    try expectClose(reloaded.inputTokens, 2_500, "the Muse cache persists across launches")
+}
+
+private func testMistralSessionCacheReparsesOnlyChangedFiles() throws {
+    let root = try makeParseCacheRoot("mistral-cache")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let session = root.appendingPathComponent("logs/session/example", isDirectory: true)
+    try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+    let metaURL = session.appendingPathComponent("meta.json")
+    let messagesURL = session.appendingPathComponent("messages.jsonl")
+    func meta(model: String) -> String {
+        #"{"end_time":"2026-08-01T02:15:18+00:00","config":{"active_model":"\#(model)"},"stats":{"session_prompt_tokens":10,"session_completion_tokens":10}}"#
+    }
+    // 4 input chars and 8 output chars: 1 and 2 tokens.
+    try meta(model: "mistral-medium-3.5").write(to: metaURL, atomically: true, encoding: .utf8)
+    try "{\"role\":\"user\",\"content\":\"USER\"}\n{\"role\":\"assistant\",\"content\":\"ASSISTOK\"}\n"
+        .write(to: messagesURL, atomically: true, encoding: .utf8)
+    let fixedDate = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 60)
+    try touch(metaURL, at: fixedDate)
+    try touch(messagesURL, at: fixedDate)
+
+    let now = date("2026-08-01T12:00:00Z")
+    let cache = TelemetryParseCache(filename: "cache.jsonl", directory: root.appendingPathComponent("cache"))
+    func read() throws -> MistralLocalUsageSummary {
+        try MistralVibeUsageReader.read(rootURL: root, now: now, parseCache: cache)
+            ?? { throw AdditionalProviderTestError.failure("Mistral fixture was not read") }()
+    }
+    let first = try read()
+    try expectClose(first.inputTokens, 1, "Mistral first read counts input chars")
+    try expectClose(first.outputTokens, 2, "Mistral first read counts output chars")
+
+    // Same sizes and dates, different contents: both files are served cached.
+    try replaceKeepingIdentity(
+        messagesURL,
+        with: "{\"role\":\"user\",\"content\":\"USERUSER\"}\n{\"role\":\"assistant\",\"content\":\"ASSI\"}\n",
+        modifiedAt: fixedDate
+    )
+    try replaceKeepingIdentity(metaURL, with: meta(model: "devstral-small    "), modifiedAt: fixedDate)
+    let cached = try read()
+    try expectClose(cached.inputTokens, 1, "unchanged messages are not re-counted")
+    try expectClose(cached.currentMonthCostUSD, first.currentMonthCostUSD, "unchanged metadata is not re-read")
+    try expectEqual(cached.analyticsBuckets.first?.model, "mistral-medium-3.5", "the cached model is kept")
+
+    try touch(messagesURL, at: fixedDate.addingTimeInterval(1))
+    let recounted = try read()
+    try expectClose(recounted.inputTokens, 2, "changed messages are re-counted")
+    try expectClose(recounted.outputTokens, 1, "changed messages are re-counted")
+    try expectEqual(recounted.analyticsBuckets.first?.model, "mistral-medium-3.5", "metadata stays cached on its own")
+
+    try touch(metaURL, at: fixedDate.addingTimeInterval(1))
+    let reread = try read()
+    try expectEqual(reread.analyticsBuckets.first?.model, "devstral-small", "changed metadata is re-read")
+    try expectClose(
+        reread.currentMonthCostUSD,
+        MistralModelRate.devstralSmall.estimateUSD(inputTokens: 2, outputTokens: 1),
+        "the re-read model reprices the session"
+    )
+}
+
+private func testKimiLineScanSplitsLikeStringSplit() throws {
+    var generator = SplitFixtureGenerator(seed: 0x4B69_6D69)
+    for _ in 0..<3_000 {
+        let data = generator.data(from: validSplitFragments, maxFragments: 24)
+        let scanned = KimiLocalTranscriptReader.lines(in: data).map { String(decoding: $0, as: UTF8.self) }
+        let expected = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard scanned == expected else {
+            throw AdditionalProviderTestError.failure(
+                "Kimi byte scan split \(Array(data)) into \(scanned), String split gives \(expected)"
+            )
+        }
+    }
+}
+
+private func testKimiWireCacheReparsesOnlyChangedFiles() throws {
+    let root = try makeParseCacheRoot("kimi-cache")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let wire = root.appendingPathComponent("sessions/abc/wire.jsonl")
+    try FileManager.default.createDirectory(at: wire.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let turnAt = floor(Date().timeIntervalSince1970) - 3_600
+    func statusUpdate(output: Int, at offset: Double = 0) -> String {
+        #"{"timestamp":\#(turnAt + offset),"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":100,"output":\#(output),"input_cache_read":0,"input_cache_creation":0}}}}"#
+    }
+    let fixedDate = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 60)
+    try (statusUpdate(output: 200) + "\n").write(to: wire, atomically: true, encoding: .utf8)
+    try touch(wire, at: fixedDate)
+
+    let cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
+    let cache = TelemetryParseCache(filename: "cache.jsonl", directory: cacheDirectory)
+    func totalTokens(_ cache: TelemetryParseCache) -> Double {
+        KimiLocalTranscriptReader.loadEvents(kimiRootURL: root, parseCache: cache)
+            .reduce(0) { $0 + ($1.tokens ?? 0) }
+    }
+    try expectClose(totalTokens(cache), 300, "Kimi first read parses the transcript")
+
+    try replaceKeepingIdentity(wire, with: statusUpdate(output: 900) + "\n", modifiedAt: fixedDate)
+    try expectClose(totalTokens(cache), 300, "an unchanged Kimi transcript is served from the cache")
+
+    try (statusUpdate(output: 900) + "\n" + statusUpdate(output: 1, at: 1) + "\n")
+        .write(to: wire, atomically: true, encoding: .utf8)
+    try expectClose(totalTokens(cache), 1_101, "a Kimi transcript that changed is re-parsed")
+    try expectClose(
+        totalTokens(TelemetryParseCache(filename: "cache.jsonl", directory: cacheDirectory)),
+        1_101,
+        "the Kimi cache persists across launches"
+    )
+}
+
+private func testAGBenchUsageRowsAreReparsedOnlyWhenTheFileChanges() throws {
+    let root = try makeParseCacheRoot("agbench-usage")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let usage = root.appendingPathComponent("usage.json")
+    let now = Date()
+    let timestampMs = Int((now.timeIntervalSince1970 - 3_600) * 1_000)
+    func rows(tokens: Int) -> String {
+        #"[{"provider":"Kimi","timestamp":\#(timestampMs),"totalTokens":\#(tokens),"model":"k2"},{"provider":"codex","timestamp":\#(timestampMs),"totalTokens":5},{"timestamp":\#(timestampMs),"totalTokens":9}]"#
+    }
+    let fixedDate = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970) - 60)
+    try rows(tokens: 100).write(to: usage, atomically: true, encoding: .utf8)
+    try touch(usage, at: fixedDate)
+
+    func kimiTokens() -> [Double?] {
+        AGBenchUsageReader.events(forProviderKey: "kimi", rootURL: root, now: now).map(\.tokens)
+    }
+    try expectEqual(kimiTokens(), [100], "usage.json rows are filtered by provider")
+    let codex = AGBenchUsageReader.events(forProviderKey: "codex", rootURL: root, now: now)
+    try expectEqual(codex.map(\.model), ["codex"], "a row without a model falls back to the provider key")
+
+    try replaceKeepingIdentity(usage, with: rows(tokens: 900), modifiedAt: fixedDate)
+    try expectEqual(kimiTokens(), [100], "an unchanged usage.json is not re-parsed")
+
+    try rows(tokens: 12345).write(to: usage, atomically: true, encoding: .utf8)
+    try expectEqual(kimiTokens(), [12_345], "a rewritten usage.json is re-parsed")
+}
+
 @main
 private enum AdditionalProviderUsageTestRunner {
     static func main() async throws {
@@ -3286,6 +3565,13 @@ private enum AdditionalProviderUsageTestRunner {
         try await testMuseCliRefreshCacheKeepsLastReadingAcrossRestart()
         try await testMuseSubscriptionRefreshCacheServesHourlyAndSurvivesRestart()
         try await testMetaSnapshotLeadsWithCachedSubscriptionMeters()
+        try testMuseLineScanSplitsLikeCharacterNewlines()
+        try testMuseByteIngestionMatchesStringIngestion()
+        try testMuseSessionCacheReparsesOnlyChangedSessions()
+        try testMistralSessionCacheReparsesOnlyChangedFiles()
+        try testKimiLineScanSplitsLikeStringSplit()
+        try testKimiWireCacheReparsesOnlyChangedFiles()
+        try testAGBenchUsageRowsAreReparsedOnlyWhenTheFileChanges()
         print("Additional provider usage tests passed")
     }
 }

@@ -140,13 +140,13 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         )
 
         for telemetryInfo in scanFiles {
-            let records = cachedTelemetryRecords(for: telemetryInfo)
-            guard !records.isEmpty else { continue }
+            let parsed = cachedTelemetryRecords(for: telemetryInfo)
+            guard !parsed.records.isEmpty else { continue }
 
-            for record in records {
+            for (record, eventID) in zip(parsed.records, parsed.eventIDs) {
                 guard record.timestamp <= now else { continue }
                 events.append(UsageEvent(
-                    id: stableEventID(for: record),
+                    id: eventID,
                     timestamp: record.timestamp,
                     tokens: record.tokenCount,
                     model: "Codex",
@@ -432,31 +432,30 @@ public struct CodexTelemetryProviderClient: ProviderClient {
     /// Cache-aware wrapper around `readTelemetryRecords`. Only session JSONL is
     /// cached: `logs_2.sqlite` and the rolling text logs change on virtually
     /// every refresh, so caching those would only churn the store.
-    private func cachedTelemetryRecords(for info: CodexTelemetryFileInfo) -> [CodexTelemetryRecord] {
+    private func cachedTelemetryRecords(for info: CodexTelemetryFileInfo) -> CodexParsedTelemetryFile {
         guard isSessionTelemetryURL(info.url) else {
-            return (try? readTelemetryRecords(from: info.url)) ?? []
+            return CodexParsedTelemetryFile(records: (try? readTelemetryRecords(from: info.url)) ?? [])
         }
 
-        if let payload = parseCache.payload(
+        if let cached = parseCache.value(
+            CodexParsedTelemetryFile.self,
             provider: Self.parseCacheProvider,
             path: info.url.path,
             modifiedAt: info.modificationDate,
             size: info.fileSize
-        ), let cached = try? JSONDecoder().decode([CodexTelemetryRecord].self, from: payload) {
+        ) {
             return cached
         }
 
-        let records = (try? readTelemetryRecords(from: info.url)) ?? []
-        if let payload = try? JSONEncoder().encode(records) {
-            parseCache.store(
-                provider: Self.parseCacheProvider,
-                path: info.url.path,
-                modifiedAt: info.modificationDate,
-                size: info.fileSize,
-                payload: payload
-            )
-        }
-        return records
+        let parsed = CodexParsedTelemetryFile(records: (try? readTelemetryRecords(from: info.url)) ?? [])
+        parseCache.store(
+            parsed,
+            provider: Self.parseCacheProvider,
+            path: info.url.path,
+            modifiedAt: info.modificationDate,
+            size: info.fileSize
+        )
+        return parsed
     }
 
     private func readTelemetryRecords(from url: URL) throws -> [CodexTelemetryRecord] {
@@ -685,9 +684,19 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         var indexOfLastRetained: [CodexTelemetryBucketKey: Int] = [:]
         var bucketCounts: [CodexTelemetryBucketKey: Int] = [:]
         let calendar = Calendar.current
+        // Newest first, so nearly every event shares the previous one's day:
+        // its bounds are computed once per day rather than once per event.
+        var day: DateInterval?
 
         for event in events.sorted(by: { $0.timestamp > $1.timestamp }) where event.timestamp >= cutoff && event.timestamp <= now {
-            let key = CodexTelemetryBucketKey(timestamp: event.timestamp, calendar: calendar)
+            let isSameDay = day.map { $0.start <= event.timestamp && event.timestamp < $0.end } ?? false
+            if !isSameDay {
+                day = calendar.dateInterval(of: .day, for: event.timestamp)
+            }
+            let key = CodexTelemetryBucketKey(
+                dayStart: day?.start ?? calendar.startOfDay(for: event.timestamp),
+                row: calendar.component(.hour, from: event.timestamp) / 2
+            )
             guard bucketCounts[key, default: 0] < maxEventsPerHeatmapBucket else {
                 // Bucket is full: carry the tokens over rather than dropping them.
                 if let tokens = event.tokens, tokens > 0, let index = indexOfLastRetained[key] {
@@ -1052,7 +1061,7 @@ public struct CodexTelemetryProviderClient: ProviderClient {
         return Data(base64Encoded: encoded)
     }
 
-    private func stableEventID(for record: CodexTelemetryRecord) -> UUID {
+    fileprivate nonisolated static func stableEventID(for record: CodexTelemetryRecord) -> UUID {
         let timestamp = String(format: "%.9f", record.timestamp.timeIntervalSince1970)
         let key = [
             timestamp,
@@ -1131,12 +1140,29 @@ private struct CodexTelemetryRecord: Codable {
     }
 }
 
+/// One file's records with their heatmap event IDs. An ID hashes a formatted
+/// key, so deriving them once per parsed file rather than per record on every
+/// refresh is what lets an unchanged session cost nothing. Encoded as the bare
+/// record array, the parse cache's existing format.
+private struct CodexParsedTelemetryFile: Codable {
+    let records: [CodexTelemetryRecord]
+    let eventIDs: [UUID]
+
+    init(records: [CodexTelemetryRecord]) {
+        self.records = records
+        eventIDs = records.map(CodexTelemetryProviderClient.stableEventID(for:))
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init(records: try [CodexTelemetryRecord](from: decoder))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try records.encode(to: encoder)
+    }
+}
+
 private struct CodexTelemetryBucketKey: Hashable {
     let dayStart: Date
     let row: Int
-
-    init(timestamp: Date, calendar: Calendar) {
-        dayStart = calendar.startOfDay(for: timestamp)
-        row = calendar.component(.hour, from: timestamp) / 2
-    }
 }

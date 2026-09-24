@@ -211,16 +211,33 @@ enum MistralSessionCostEstimator {
     }
 
     private static let jsonlMaximumBytes = 2 * 1_048_576
+    static let messagesParseCacheProvider = "mistralVibeMessages"
+
+    /// A `messages.jsonl`'s counts, a pure function of its bytes. `counted`
+    /// is false when no line parsed, which sends the estimate to its
+    /// fallback just as an unreadable file does.
+    private struct CachedCharCounts: Codable {
+        let counted: Bool
+        let input: Int
+        let output: Int
+
+        enum CodingKeys: String, CodingKey {
+            case counted = "c"
+            case input = "i"
+            case output = "o"
+        }
+    }
 
     static func estimate(
         activeModel: String?,
         sessionPromptTokens: Double?,
         sessionCompletionTokens: Double?,
-        sessionDirectory: URL
+        sessionDirectory: URL,
+        parseCache: TelemetryParseCache? = nil
     ) -> Estimate {
         let rate = MistralModelRate.lookup(activeModel)
         let jsonlURL = sessionDirectory.appendingPathComponent("messages.jsonl", isDirectory: false)
-        if let chars = uniqueMessageCharCounts(jsonlURL: jsonlURL) {
+        if let chars = messageCharCounts(jsonlURL: jsonlURL, parseCache: parseCache) {
             let inputTokens = MistralTokenEstimate.estimateTokensFromChars(chars.input)
             let outputTokens = MistralTokenEstimate.estimateTokensFromChars(chars.output)
             return Estimate(
@@ -245,49 +262,75 @@ enum MistralSessionCostEstimator {
         )
     }
 
-    /// UTF-16 code unit counts (JS `.length` / TaskWraith doctrine). Content is never retained.
-    /// System prompt / tools_available are excluded — live TW meters host prompt + stream only.
-    private static func uniqueMessageCharCounts(
-        jsonlURL: URL
+    /// `uniqueMessageCharCounts`, parsed only when the file has changed since
+    /// the last scan. A session's messages stop changing once it ends, and
+    /// re-counting a thousand of them was most of a Mistral refresh.
+    private static func messageCharCounts(
+        jsonlURL: URL,
+        parseCache: TelemetryParseCache?
     ) -> (input: Int, output: Int)? {
-        let values = try? jsonlURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        let values = try? jsonlURL.resourceValues(
+            forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+        )
         guard values?.isRegularFile == true,
               let fileSize = values?.fileSize,
               fileSize >= 0,
               fileSize <= jsonlMaximumBytes else { return nil }
+        guard let parseCache, let modifiedAt = values?.contentModificationDate else {
+            return uniqueMessageCharCounts(jsonlURL: jsonlURL) ?? nil
+        }
+
+        if let cached = parseCache.value(
+            CachedCharCounts.self,
+            provider: messagesParseCacheProvider,
+            path: jsonlURL.path,
+            modifiedAt: modifiedAt,
+            size: fileSize
+        ) {
+            return cached.counted ? (cached.input, cached.output) : nil
+        }
+        // An unreadable file is retried next scan rather than cached.
+        guard let counts = uniqueMessageCharCounts(jsonlURL: jsonlURL) else { return nil }
+        parseCache.store(
+            CachedCharCounts(
+                counted: counts != nil,
+                input: counts?.input ?? 0,
+                output: counts?.output ?? 0
+            ),
+            provider: messagesParseCacheProvider,
+            path: jsonlURL.path,
+            modifiedAt: modifiedAt,
+            size: fileSize
+        )
+        return counts
+    }
+
+    /// UTF-16 code unit counts (JS `.length` / TaskWraith doctrine). Content is never retained.
+    /// System prompt / tools_available are excluded — live TW meters host prompt + stream only.
+    ///
+    /// Nil when the file cannot be read; `.some(nil)` when no line held a
+    /// message. The caller has already bounded the file to `jsonlMaximumBytes`.
+    private static func uniqueMessageCharCounts(
+        jsonlURL: URL
+    ) -> (input: Int, output: Int)?? {
+        guard let data = try? Data(contentsOf: jsonlURL) else { return nil }
 
         var inputChars = 0
         var outputChars = 0
-
-        guard let handle = try? FileHandle(forReadingFrom: jsonlURL) else { return nil }
-        defer { try? handle.close() }
-
-        var buffer = Data()
-        let chunkSize = 256 * 1_024
         var parsedAnyLine = false
-        while true {
-            let chunk = handle.readData(ofLength: chunkSize)
-            if chunk.isEmpty { break }
-            buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let lineData = buffer.subdata(in: buffer.startIndex..<newline)
-                buffer.removeSubrange(buffer.startIndex...newline)
-                guard !lineData.isEmpty,
-                      let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                      let role = (object["role"] as? String)?.lowercased() else { continue }
-                parsedAnyLine = true
-                accumulate(role: role, object: object, inputChars: &inputChars, outputChars: &outputChars)
-            }
-            if buffer.count > jsonlMaximumBytes { return nil }
-        }
-        if !buffer.isEmpty,
-           let object = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any],
-           let role = (object["role"] as? String)?.lowercased() {
+        var lineStart = data.startIndex
+        while lineStart < data.endIndex {
+            let lineEnd = data[lineStart...].firstIndex(of: 0x0A) ?? data.endIndex
+            let line = data[lineStart..<lineEnd]
+            lineStart = lineEnd < data.endIndex ? data.index(after: lineEnd) : data.endIndex
+            guard !line.isEmpty,
+                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let role = (object["role"] as? String)?.lowercased() else { continue }
             parsedAnyLine = true
             accumulate(role: role, object: object, inputChars: &inputChars, outputChars: &outputChars)
         }
 
-        guard parsedAnyLine || inputChars > 0 || outputChars > 0 else { return nil }
+        guard parsedAnyLine || inputChars > 0 || outputChars > 0 else { return .some(nil) }
         return (inputChars, outputChars)
     }
 
@@ -396,20 +439,82 @@ enum MistralVibeUsageReader {
         var note = "TaskWraith-style chars÷4 × catalogue"
     }
 
+    /// What a scan uses from one `meta.json`. The files run to a few hundred
+    /// KB each, so decoding a thousand of them on every refresh cost more
+    /// than the rest of the scan; this is cached until the file changes.
+    private struct CachedSessionMeta: Codable {
+        /// False when the file did not decode or carried no stats, which
+        /// skips the session.
+        let usable: Bool
+        let timestamp: Date?
+        let activeModel: String?
+        let sessionPromptTokens: Double?
+        let sessionCompletionTokens: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case usable = "u"
+            case timestamp = "t"
+            case activeModel = "m"
+            case sessionPromptTokens = "p"
+            case sessionCompletionTokens = "c"
+        }
+
+        init(data: Data) {
+            guard let meta = try? JSONDecoder().decode(SessionMeta.self, from: data),
+                  let stats = meta.stats else {
+                self.init(
+                    usable: false,
+                    timestamp: nil,
+                    activeModel: nil,
+                    sessionPromptTokens: nil,
+                    sessionCompletionTokens: nil
+                )
+                return
+            }
+            self.init(
+                usable: true,
+                timestamp: ProviderDateParser.parse(meta.endTime) ?? ProviderDateParser.parse(meta.startTime),
+                activeModel: meta.config?.activeModel?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                sessionPromptTokens: stats.sessionPromptTokens,
+                sessionCompletionTokens: stats.sessionCompletionTokens
+            )
+        }
+
+        init(
+            usable: Bool,
+            timestamp: Date?,
+            activeModel: String?,
+            sessionPromptTokens: Double?,
+            sessionCompletionTokens: Double?
+        ) {
+            self.usable = usable
+            self.timestamp = timestamp
+            self.activeModel = activeModel
+            self.sessionPromptTokens = sessionPromptTokens
+            self.sessionCompletionTokens = sessionCompletionTokens
+        }
+    }
+
+    private static let parseCacheProvider = "mistralVibeMeta"
+
     /// Bump when local cost doctrine changes so watermarked manual anchors rebase.
     static let estimateDoctrineVersion = "tw-est-v1"
 
-    static func read(rootURL: URL, now: Date = Date()) -> MistralLocalUsageSummary? {
+    static func read(
+        rootURL: URL,
+        now: Date = Date(),
+        parseCache: TelemetryParseCache = .shared
+    ) -> MistralLocalUsageSummary? {
         let sessionsURL = normalizedSessionsURL(rootURL)
         guard FileManager.default.fileExists(atPath: sessionsURL.path) else { return nil }
 
         let cutoff = now.addingTimeInterval(-40 * 86_400)
-        let decoder = JSONDecoder()
+        let utcCalendar = Self.utcCalendar
         var daily: [DailyKey: DailyValue] = [:]
         var events: [UsageEvent] = []
         var costObservations: [MistralLocalUsageSummary.CostObservation] = []
         var scannedMetaFiles = 0
-        var candidates: [(url: URL, modified: Date?)] = []
+        var candidates: [(url: URL, modified: Date?, size: Int)] = []
 
         guard let enumerator = FileManager.default.enumerator(
             at: sessionsURL,
@@ -428,31 +533,38 @@ enum MistralVibeUsageReader {
             guard values?.isRegularFile == true else { continue }
             if let modified = values?.contentModificationDate, modified < cutoff { continue }
             guard (values?.fileSize ?? Int.max) <= 1_048_576 else { continue }
-            candidates.append((fileURL, values?.contentModificationDate))
+            candidates.append((fileURL, values?.contentModificationDate, values?.fileSize ?? 0))
         }
 
         candidates.sort { lhs, rhs in
             (lhs.modified ?? .distantPast) > (rhs.modified ?? .distantPast)
         }
 
-        for candidate in candidates.prefix(2_000) {
-            guard let data = boundedFileData(at: candidate.url, maximumBytes: 1_048_576),
-                  let meta = try? decoder.decode(SessionMeta.self, from: data),
-                  let stats = meta.stats else { continue }
+        // Both files of a finished session stop changing, so a steady-state
+        // refresh reads neither; only the session being written is parsed.
+        parseCache.prune(provider: parseCacheProvider, keepingNewest: max(candidates.count * 2, 512))
+        parseCache.prune(
+            provider: MistralSessionCostEstimator.messagesParseCacheProvider,
+            keepingNewest: max(candidates.count * 2, 512)
+        )
+        defer { parseCache.persist() }
 
-            let timestamp = ProviderDateParser.parse(meta.endTime)
-                ?? ProviderDateParser.parse(meta.startTime)
+        for candidate in candidates.prefix(2_000) {
+            guard let meta = sessionMeta(for: candidate, parseCache: parseCache),
+                  meta.usable else { continue }
+
+            let timestamp = meta.timestamp
                 ?? candidate.modified
                 ?? now
             guard timestamp >= cutoff else { continue }
 
-            let activeModel = meta.config?.activeModel?.trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty
+            let activeModel = meta.activeModel
             let estimate = MistralSessionCostEstimator.estimate(
                 activeModel: activeModel,
-                sessionPromptTokens: stats.sessionPromptTokens,
-                sessionCompletionTokens: stats.sessionCompletionTokens,
-                sessionDirectory: candidate.url.deletingLastPathComponent()
+                sessionPromptTokens: meta.sessionPromptTokens,
+                sessionCompletionTokens: meta.sessionCompletionTokens,
+                sessionDirectory: candidate.url.deletingLastPathComponent(),
+                parseCache: parseCache
             )
             let input = estimate.inputTokens
             let output = estimate.outputTokens
@@ -507,6 +619,36 @@ enum MistralVibeUsageReader {
             analyticsBuckets: analytics,
             costObservations: costObservations
         )
+    }
+
+    /// Nil when the file cannot be read, which is retried next scan rather
+    /// than cached.
+    private static func sessionMeta(
+        for candidate: (url: URL, modified: Date?, size: Int),
+        parseCache: TelemetryParseCache
+    ) -> CachedSessionMeta? {
+        if let modified = candidate.modified,
+           let cached = parseCache.value(
+            CachedSessionMeta.self,
+            provider: parseCacheProvider,
+            path: candidate.url.path,
+            modifiedAt: modified,
+            size: candidate.size
+           ) {
+            return cached
+        }
+        guard let data = boundedFileData(at: candidate.url, maximumBytes: 1_048_576) else { return nil }
+        let meta = CachedSessionMeta(data: data)
+        if let modified = candidate.modified {
+            parseCache.store(
+                meta,
+                provider: parseCacheProvider,
+                path: candidate.url.path,
+                modifiedAt: modified,
+                size: candidate.size
+            )
+        }
+        return meta
     }
 
     private static func normalizedSessionsURL(_ selectedURL: URL) -> URL {
@@ -3328,6 +3470,17 @@ struct MuseSessionUsageReducer {
         ingestEnvelope(object)
     }
 
+    /// `ingestLine` for a line's raw UTF-8, without building a String first.
+    /// A line the parser rejects as it stands takes the String path, whose
+    /// trimming and lossy decoding decide exactly as they always have.
+    mutating func ingestLine(utf8 line: Data) {
+        if let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
+            ingestEnvelope(object)
+        } else {
+            ingestLine(String(decoding: line, as: UTF8.self))
+        }
+    }
+
     mutating func ingestEnvelope(_ envelope: [String: Any]) {
         let stream = envelope["stream"] as? [String: Any]
         let streamId = stringValue(stream?["id"]) ?? ""
@@ -3528,6 +3681,29 @@ enum MuseLocalUsageReader {
     private static let maxPrefixBytes = 8 * 1_024 * 1_024
     /// Skip session files larger than this entirely.
     private static let maxHardSkipBytes = 32 * 1_024 * 1_024
+    private static let parseCacheProvider = "museSession"
+
+    /// What one session file reports, before pricing. Rates are applied on
+    /// every read, so a catalog change reprices sessions without re-parsing
+    /// them; the file itself is parsed only when it changes.
+    struct SessionUsage: Codable, Equatable {
+        let model: String?
+        let inputTokens: Double
+        let outputTokens: Double
+        let cacheReadInputTokens: Double
+        /// Provider-reported attributions; zero means the session is skipped.
+        let reportedUsageCount: Int
+        let latestRecordedAt: Date?
+
+        enum CodingKeys: String, CodingKey {
+            case model = "m"
+            case inputTokens = "i"
+            case outputTokens = "o"
+            case cacheReadInputTokens = "c"
+            case reportedUsageCount = "u"
+            case latestRecordedAt = "r"
+        }
+    }
 
     private struct DailyKey: Hashable {
         let date: Date
@@ -3542,31 +3718,84 @@ enum MuseLocalUsageReader {
         var cost = 0.0
     }
 
-    /// UTF-8 session.jsonl text, fully for files ≤ `maximumBytes`, otherwise the leading
-    /// `maximumBytes` with any incomplete trailing line dropped.
-    static func sessionJSONLText(at url: URL, maximumBytes: Int) -> String? {
-        if let data = boundedFileData(at: url, maximumBytes: maximumBytes),
-           let text = String(data: data, encoding: .utf8) {
-            return text
+    /// session.jsonl bytes: the whole file up to `maximumBytes`, otherwise the
+    /// leading `maximumBytes` cut back to its last newline. Empty when no
+    /// complete line remains; nil only when the file cannot be read, which is
+    /// worth retrying rather than caching.
+    static func sessionJSONLData(at url: URL, maximumBytes: Int) -> Data? {
+        if let data = boundedFileData(at: url, maximumBytes: maximumBytes) {
+            return data
         }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         let data = handle.readData(ofLength: maximumBytes)
-        guard !data.isEmpty else { return nil }
-        var text = String(decoding: data, as: UTF8.self)
-        // Only drop a trailing incomplete line when this is a truncated prefix read.
-        if data.count >= maximumBytes {
-            if let lastNewline = text.lastIndex(of: "\n") {
-                text = String(text[..<lastNewline])
-            } else {
-                // Prefix ended mid-line with no complete JSONL record.
-                return nil
-            }
-        }
-        return text.isEmpty ? nil : text
+        guard data.count >= maximumBytes else { return data }
+        // Only a truncated prefix read drops its trailing incomplete line.
+        guard let lastNewline = data.lastIndex(of: 0x0A) else { return Data() }
+        return data[data.startIndex..<lastNewline]
     }
 
-    static func read(rootURL: URL, now: Date = Date()) -> MuseLocalUsageSummary? {
+    /// Calls `body` with each line of `data`, split exactly where
+    /// `split(whereSeparator: \.isNewline)` splits its decoded text: at LF,
+    /// VT, FF, CR, NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR, skipping
+    /// empty lines. Each of those always forms its own grapheme (CR LF
+    /// aside, which yields an empty line here), and UTF-8 never hides one
+    /// inside another sequence, so scanning bytes finds the same breaks
+    /// without walking a multi-megabyte file Character by Character.
+    static func forEachLine(in data: Data, _ body: (Data) -> Void) {
+        var lines: [Range<Int>] = []
+        data.withUnsafeBytes { bytes in
+            var lineStart = 0
+            var index = 0
+            while index < bytes.count {
+                let byte = bytes[index]
+                let separatorLength: Int
+                if byte >= 0x0A, byte <= 0x0D {
+                    separatorLength = 1
+                } else if byte == 0xC2, index + 1 < bytes.count, bytes[index + 1] == 0x85 {
+                    separatorLength = 2
+                } else if byte == 0xE2, index + 2 < bytes.count, bytes[index + 1] == 0x80,
+                          bytes[index + 2] == 0xA8 || bytes[index + 2] == 0xA9 {
+                    separatorLength = 3
+                } else {
+                    index += 1
+                    continue
+                }
+                if index > lineStart { lines.append(lineStart..<index) }
+                index += separatorLength
+                lineStart = index
+            }
+            if bytes.count > lineStart { lines.append(lineStart..<bytes.count) }
+        }
+        for line in lines {
+            body(data[(data.startIndex + line.lowerBound)..<(data.startIndex + line.upperBound)])
+        }
+    }
+
+    /// Reduces one session file. Nil when it cannot be read.
+    static func sessionUsage(at url: URL) -> SessionUsage? {
+        guard let data = sessionJSONLData(at: url, maximumBytes: maxPrefixBytes) else { return nil }
+        var reducer = MuseSessionUsageReducer(
+            museSessionId: url.deletingLastPathComponent().lastPathComponent,
+            logPath: url.path
+        )
+        forEachLine(in: data) { reducer.ingestLine(utf8: $0) }
+        let snapshot = reducer.snapshot(rate: nil)
+        return SessionUsage(
+            model: snapshot.model,
+            inputTokens: snapshot.inputTokens,
+            outputTokens: snapshot.outputTokens,
+            cacheReadInputTokens: snapshot.cacheReadInputTokens,
+            reportedUsageCount: snapshot.usageIds.count,
+            latestRecordedAt: snapshot.latestRecordedAt
+        )
+    }
+
+    static func read(
+        rootURL: URL,
+        now: Date = Date(),
+        parseCache: TelemetryParseCache = .shared
+    ) -> MuseLocalUsageSummary? {
         let dataHome = normalizedMuseDataHomeURL(rootURL)
         let sessionsRoot = dataHome.appendingPathComponent("sessions", isDirectory: true)
         let dataHomeConfigured = FileManager.default.fileExists(atPath: dataHome.path)
@@ -3579,7 +3808,7 @@ enum MuseLocalUsageReader {
         let thirtyDayCutoff = now.addingTimeInterval(-30 * 86_400)
         let scanCutoff = now.addingTimeInterval(-40 * 86_400)
 
-        var candidates: [(url: URL, modified: Date)] = []
+        var candidates: [(url: URL, modified: Date, size: Int)] = []
         if FileManager.default.fileExists(atPath: sessionsRoot.path),
            let enumerator = FileManager.default.enumerator(
             at: sessionsRoot,
@@ -3595,7 +3824,7 @@ enum MuseLocalUsageReader {
                 if let size = values?.fileSize, size > maxHardSkipBytes { continue }
                 let modified = values?.contentModificationDate ?? .distantPast
                 if modified < scanCutoff { continue }
-                candidates.append((fileURL, modified))
+                candidates.append((fileURL, modified, values?.fileSize ?? 0))
             }
         }
 
@@ -3603,42 +3832,68 @@ enum MuseLocalUsageReader {
         var daily: [DailyKey: DailyValue] = [:]
         var events: [UsageEvent] = []
         var costObservations: [MuseLocalUsageSummary.CostObservation] = []
+        // One catalog read per model per scan rather than one per session.
+        var ratesByModel: [String: MuseModelRate] = [:]
+
+        // Sessions are append-only, so only the one being written to changes
+        // between refreshes; every other file is served from the cache.
+        parseCache.prune(provider: parseCacheProvider, keepingNewest: max(candidates.count * 2, 512))
+        defer { parseCache.persist() }
 
         for candidate in candidates.prefix(maxSessionFiles) {
-            guard let text = sessionJSONLText(at: candidate.url, maximumBytes: maxPrefixBytes) else {
-                continue
+            let usage: SessionUsage
+            if let cached = parseCache.value(
+                SessionUsage.self,
+                provider: parseCacheProvider,
+                path: candidate.url.path,
+                modifiedAt: candidate.modified,
+                size: candidate.size
+            ) {
+                usage = cached
+            } else {
+                guard let parsed = sessionUsage(at: candidate.url) else { continue }
+                parseCache.store(
+                    parsed,
+                    provider: parseCacheProvider,
+                    path: candidate.url.path,
+                    modifiedAt: candidate.modified,
+                    size: candidate.size
+                )
+                usage = parsed
             }
 
-            let sessionId = candidate.url.deletingLastPathComponent().lastPathComponent
-            var reducer = MuseSessionUsageReducer(
-                museSessionId: sessionId,
-                logPath: candidate.url.path
-            )
-            for line in text.split(whereSeparator: \.isNewline) {
-                reducer.ingestLine(String(line))
+            guard usage.reportedUsageCount > 0 else { continue }
+            let model = usage.model ?? "muse-spark-1.2"
+            let rate: MuseModelRate
+            if let known = ratesByModel[model] {
+                rate = known
+            } else {
+                rate = MuseModelCatalogRateLoader.load(from: dataHome, modelId: model)
+                    ?? MuseModelRate.defaultRate(for: model)
+                ratesByModel[model] = rate
             }
-
-            let provisional = reducer.snapshot(rate: nil)
-            guard !provisional.usageIds.isEmpty else { continue }
-            let model = provisional.model ?? "muse-spark-1.2"
-            let rate = MuseModelCatalogRateLoader.load(from: dataHome, modelId: model)
-                ?? MuseModelRate.defaultRate(for: model)
-            let snap = reducer.snapshot(rate: rate)
-            let timestamp = snap.latestRecordedAt ?? candidate.modified
+            let timestamp = usage.latestRecordedAt ?? candidate.modified
             guard timestamp >= scanCutoff else { continue }
 
-            let cost = snap.estimatedCostUSD ?? 0
+            // Live Muse session metering: cacheCreation stays 0 (MuseUsage.ts).
+            let cost = MuseCostEstimator.estimateUSD(
+                input: usage.inputTokens,
+                output: usage.outputTokens,
+                cacheRead: usage.cacheReadInputTokens,
+                cacheCreation: 0,
+                rate: rate
+            )
             let day = calendar.startOfDay(for: timestamp)
             let key = DailyKey(date: day, model: model)
             var value = daily[key] ?? DailyValue()
-            value.input += snap.inputTokens
-            value.output += snap.outputTokens
-            value.cached += snap.cacheReadInputTokens
+            value.input += usage.inputTokens
+            value.output += usage.outputTokens
+            value.cached += usage.cacheReadInputTokens
             value.requests += 1
             value.cost += cost
             daily[key] = value
             costObservations.append(.init(timestamp: timestamp, costUSD: cost))
-            let tokens = snap.totalTokens
+            let tokens = usage.inputTokens + usage.outputTokens
             events.append(
                 UsageEvent(
                     timestamp: timestamp,
