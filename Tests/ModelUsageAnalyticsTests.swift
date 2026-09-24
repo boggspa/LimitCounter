@@ -139,13 +139,18 @@ struct ModelUsageAnalyticsTests {
         let mistral = UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now,
             model: "mistral-medium-3.5", inputTokens: 10000, outputTokens: 1000, requests: 5,
             costUSD: 0.50, source: .localEstimate)
+        let muse = UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now,
+            model: "muse-spark-1.2", inputTokens: 300, outputTokens: 100,
+            cachedInputTokens: 700, requests: 1, costUSD: 0.000905,
+            source: .localEstimate, note: "Muse session tokens (cache separated) × catalog rates")
         let snapshots = [
             QuotaSnapshot(providerID: .openaiAPI, displayName: "API", windows: [], analyticsBuckets: [official, cost]),
             QuotaSnapshot(providerID: .mistral, displayName: "Mistral", windows: [], analyticsBuckets: [mistral]),
+            QuotaSnapshot(providerID: .meta, displayName: "Muse", windows: [], analyticsBuckets: [muse]),
             QuotaSnapshot(providerID: .claude, displayName: "Claude", windows: [], analyticsBuckets: [.init(startDate: now.addingTimeInterval(-60), endDate: now, model: "claude-opus-5-5", inputTokens: 999999, source: .localTelemetry)])
         ]
         let insights = ModelUsageInsightData(archive: archive, snapshots: snapshots)
-        expect(insights.sources.count == 3, "Provider analytics coexist with local history")
+        expect(insights.sources.count == 4, "Provider analytics coexist with local history")
         expect(insights.entries.filter { $0.source == "claude" }.count == 1, "Local host bucket copy is not added to request ledger")
         let apiRows = insights.selected(source: "openaiAPI:officialAPI", window: .day, now: now)
         let apiTotals = ModelUsageInsightTotals(apiRows)
@@ -155,6 +160,9 @@ struct ModelUsageAnalyticsTests {
         let mistralTotals = ModelUsageInsightTotals(insights.selected(source: "mistral:localEstimate", window: .day, now: now))
         expect(mistralTotals.actualUSD == nil && mistralTotals.reportedEstimateUSD == 0.5, "Local estimates are not billed spend")
         close(mistralTotals.estimatedUSD!, 0.0225, "Provider model rates apply when per-call tier is unnecessary")
+        let museTotals = ModelUsageInsightTotals(insights.selected(source: "meta:localEstimate", window: .day, now: now))
+        close(museTotals.tokens.total, 1_100, "Muse cache reads are included once in analytics")
+        close(museTotals.estimatedUSD!, 0.000905, "Muse API equivalent prices disjoint cache reads")
         let scanRoot = temporary.appendingPathComponent("connected")
         try FileManager.default.createDirectory(at: scanRoot.appendingPathComponent("projects"), withIntermediateDirectories: true)
         try fixture.write(to: scanRoot.appendingPathComponent("projects/session.jsonl"))

@@ -3655,13 +3655,15 @@ enum MuseLocalUsageReader {
                 endDate: calendar.date(byAdding: .day, value: 1, to: key.date)
                     ?? key.date.addingTimeInterval(86_400),
                 model: key.model,
-                inputTokens: value.input,
+                // Muse reports cache reads inside input. Analytics buckets use
+                // disjoint categories so cached tokens are counted only once.
+                inputTokens: max(0, value.input - value.cached),
                 outputTokens: value.output,
                 cachedInputTokens: value.cached,
                 requests: value.requests,
                 costUSD: value.cost,
                 source: .localEstimate,
-                note: "Muse session tokens × catalog rates"
+                note: "Muse session tokens (cache separated) × catalog rates"
             )
         }.sorted { $0.startDate > $1.startDate }
 
@@ -3674,7 +3676,8 @@ enum MuseLocalUsageReader {
                 .filter { $0.endDate >= thirtyDayCutoff }
                 .compactMap(\.costUSD)
                 .reduce(0, +),
-            inputTokens: buckets.reduce(0) { $0 + $1.inputTokens },
+            // Keep this legacy summary's input total cache-inclusive.
+            inputTokens: buckets.reduce(0) { $0 + $1.inputTokens + $1.cachedInputTokens },
             outputTokens: buckets.reduce(0) { $0 + $1.outputTokens },
             cachedTokens: buckets.reduce(0) { $0 + $1.cachedInputTokens },
             events: events.sorted { $0.timestamp > $1.timestamp },

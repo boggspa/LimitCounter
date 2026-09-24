@@ -1199,6 +1199,33 @@ private func testMuseSessionUsageReducerCountsProviderAttributionOnce() throws {
     try expectClose(afterNoise.estimatedCostUSD ?? -1, 0.02056375, "Cost stays single-counted")
 }
 
+private func testMuseAnalyticsSeparatesCachedInput() throws {
+    let now = Date()
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-muse-analytics-\(UUID().uuidString)")
+        .appendingPathComponent("muse")
+    let session = root.appendingPathComponent("sessions/test/session.jsonl")
+    defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+    try FileManager.default.createDirectory(at: session.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let recordedAt = Int(now.timeIntervalSince1970 * 1_000_000)
+    let attribution = """
+    {"schema_version":1,"id":"attr-1","recorded_at":\(recordedAt),"stream":{"kind":"session","id":"test"},"sequence":1,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"goal_usage_attribution","record":{"usage_id":"usage-1","usage_family":"provider","quantity":{"unit":"tokens","reported":true,"input_tokens":1000,"output_tokens":100,"cached_tokens":700}}}}}
+    """
+    let completed = """
+    {"schema_version":1,"id":"done-1","recorded_at":\(recordedAt),"stream":{"kind":"session","id":"test"},"sequence":2,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_completed","usage":{"cache_read_tokens":700},"model":"muse-spark-1.2"}}}
+    """
+    try (attribution + "\n" + completed + "\n").write(to: session, atomically: true, encoding: .utf8)
+
+    let summary = try MuseLocalUsageReader.read(rootURL: root, now: now)
+        ?? { throw AdditionalProviderTestError.failure("Muse session fixture was not read") }()
+    let bucket = try summary.analyticsBuckets.first
+        ?? { throw AdditionalProviderTestError.failure("Muse analytics bucket was not emitted") }()
+    try expectClose(bucket.inputTokens, 300, "Muse analytics keeps only fresh input")
+    try expectClose(bucket.cachedInputTokens, 700, "Muse cache read is separate")
+    try expectClose(bucket.totalTokens, 1_100, "Muse analytics counts each token once")
+    try expectClose(summary.inputTokens, 1_000, "Legacy Muse summary keeps cache-inclusive input")
+}
+
 private func testMetaCreditUsedAndDefaultMonthlyReset() throws {
     let creditUsed = try DeepSeekTopUpMeter.creditUsed(totalTopUp: 15, currentBalance: 14.95)
         ?? { throw AdditionalProviderTestError.failure("Meta preload credit used was not derived") }()
@@ -3196,6 +3223,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testTaskWraithPricingIsProviderScopedAndEstimated()
         try testMuseCostEstimatorMatchesSparkSessionTotals()
         try testMuseSessionUsageReducerCountsProviderAttributionOnce()
+        try testMuseAnalyticsSeparatesCachedInput()
         try testMetaCreditUsedAndDefaultMonthlyReset()
         try testMetaWebBillingRefreshCadenceProtectsBrowserSession()
         try testMetaRemainingWatermarkAdvancesAndResetsOnMonth()
