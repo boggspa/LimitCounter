@@ -458,5 +458,38 @@ struct ModelUsageSourceTests {
         expect(mistral.inferredTokens == 11_000 && mistral.measuredTokens == 0, "Character-length counts are marked inferred")
         expect(mistral.reportedEstimateUSD == 0.5 && mistral.actualUSD == nil, "A card's own estimate is never billed spend")
         expect(ModelUsageTokenBasis.isInferred(note: "Catalogue × Vibe session tokens") == false, "Vendor-reported session tokens stay measured")
+
+        // Card events carry totals only: unsplit tokens, priced as a range, unless a ledger covers the provider.
+        let hour = date("2026-09-24T11:00:00Z")
+        let events = [UsageEvent(timestamp: hour.addingTimeInterval(60), tokens: 600_000, model: "gemini-3.1-pro-preview"),
+                      UsageEvent(timestamp: hour.addingTimeInterval(60), tokens: 600_000, model: "gemini-3.1-pro-preview"),
+                      UsageEvent(timestamp: hour.addingTimeInterval(120), tokens: 400_000, model: "gemini-3.1-pro-preview"),
+                      UsageEvent(timestamp: hour.addingTimeInterval(180), tokens: nil, model: "gemini-3.1-pro-preview", type: .activity)]
+        let card = QuotaSnapshot(providerID: .gemini, displayName: "Gemini", events: events)
+        let cardData = ModelUsageInsightData(archive: .empty, snapshots: [card, card])
+        let activity = ModelUsageInsightTotals(cardData.selected(source: "gemini:events", window: .hour, now: now))
+        expect(activity.tokens.unsplit == 1_000_000 && activity.tokens.prompt == 0 && activity.requests == 2,
+               "A re-appended or repeated card event counts once, as unsplit tokens")
+        expect(activity.estimatedUSD == nil && activity.rangedTokens == 1_000_000, "Card totals are priced only as a range")
+        close(activity.estimateBounds?.lowerBound, 0.2, "The range starts at the cheapest token rate")
+        close(activity.estimateBounds?.upperBound, 12, "The range ends at the dearest token rate")
+        expect(cardData.sources.first { $0.id == "gemini:events" }?.title.hasSuffix("card activity") == true, "The source names where its totals came from")
+        let ledger = ModelUsageArchive(generatedAt: now, buckets: [ModelUsageRollup(source: "gemini", model: "gemini-3.1-pro-preview",
+            start: hour, seconds: 300, tokens: .init(input: 10), requests: 1)])
+        expect(!ModelUsageInsightData(archive: ledger, snapshots: [card]).sources.contains { $0.id == "gemini:events" },
+               "A native ledger supersedes the card's totals")
+        let ranked = ModelUsageInsightData(archive: ledger, snapshots: [QuotaSnapshot(providerID: .mistral, displayName: "Mistral", windows: [],
+            analyticsBuckets: [estimated])]).busiest(3, window: .day, now: now)
+        expect(ranked.map(\.source.id) == ["mistral:localEstimate", "gemini"] && ranked.first?.totals.tokens.total == 11_000,
+               "The summary lists the busiest sources first, not the first by name")
+        let quiet = ModelUsageInsightData(archive: ModelUsageArchive(generatedAt: now, buckets: [ModelUsageRollup(source: "taskwraith", model: "grok/grok-4.6",
+            start: hour, seconds: 300, tokens: .init(input: 10), requests: 2, runs: 2)]), snapshots: [])
+        let runTotals = ModelUsageInsightTotals(quiet.selected(source: "taskwraith", window: .day, now: now))
+        expect(runTotals.runs == 2 && ModelUsageFormat.requests(runTotals.requests, runs: runTotals.runs) == "2 runs"
+               && ModelUsageFormat.requests(5, runs: 2) == "5 calls & runs" && ModelUsageFormat.requests(5, runs: 0) == "5 calls",
+               "Whole runs are never labelled as calls")
+        let unnamed = QuotaSnapshot(providerID: .antigravity, displayName: "Antigravity", events: [UsageEvent(timestamp: hour, tokens: 5000, model: "gemini-api:x")])
+        let unpriced = ModelUsageInsightTotals(ModelUsageInsightData(archive: .empty, snapshots: [unnamed]).selected(source: "antigravity:events", window: .day, now: now))
+        expect(unpriced.tokens.unsplit == 5000 && unpriced.estimateBounds == nil, "An unknown model stays unpriced rather than borrowing a rate")
     }
 }

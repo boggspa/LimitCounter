@@ -351,6 +351,7 @@ nonisolated struct ModelUsageDay: Identifiable {
     var date: Date
     var tokens: Double = 0
     var requests: Int = 0
+    var runs: Int = 0
     var id: Date { date }
 }
 
@@ -361,7 +362,7 @@ nonisolated enum ModelUsageCalendar {
         for row in rows where row.start <= now {
             let day = calendar.startOfDay(for: row.start)
             var value = totals[day] ?? ModelUsageDay(date: day)
-            value.tokens += row.tokens.total; value.requests += row.requests
+            value.tokens += row.tokens.total; value.requests += row.requests; value.runs += row.runs
             totals[day] = value
         }
         return (0..<count).reversed().compactMap { offset in

@@ -23,6 +23,8 @@ struct ModelUsageInsightEntry: Identifiable {
     var rangedTokens: Double = 0
     /// Token counts are a local estimate rather than provider-reported.
     var inferred = false
+    /// Requests that are whole runs of unknown call count, such as TaskWraith runs.
+    var runs: Double = 0
 }
 
 struct ModelUsageInsightSource: Identifiable {
@@ -41,6 +43,7 @@ struct ModelUsageInsightTotals {
     var tokens = ModelTokenCounts()
     var inferredTokens: Double = 0
     var requests: Double = 0
+    var runs: Double = 0
     var estimatedUSD: Double?
     var actualUSD: Double?
     var reportedEstimateUSD: Double?
@@ -61,7 +64,7 @@ struct ModelUsageInsightTotals {
 
     init(_ entries: [ModelUsageInsightEntry]) {
         for entry in entries {
-            tokens.add(entry.tokens); requests += entry.requests; pricedTokens += entry.pricedTokens
+            tokens.add(entry.tokens); requests += entry.requests; runs += entry.runs; pricedTokens += entry.pricedTokens
             if entry.inferred { inferredTokens += entry.tokens.total }
             if let cost = entry.estimatedUSD { estimatedUSD = (estimatedUSD ?? 0) + cost }
             if let cost = entry.actualUSD { actualUSD = (actualUSD ?? 0) + cost }
@@ -94,7 +97,7 @@ struct ModelUsageInsightData {
                     end: row.start.addingTimeInterval(Double(row.seconds)), tokens: row.tokens, requests: Double(row.requests),
                     estimatedUSD: row.pricedRequests > 0 ? row.estimatedUSD : nil, pricedTokens: row.pricedTokens,
                     actualUSD: nil, reportedEstimateUSD: nil, precise: true, rangeLowUSD: row.rangeLowUSD,
-                    rangeHighUSD: row.rangeHighUSD, rangedTokens: row.rangedTokens, inferred: row.inferred)
+                    rangeHighUSD: row.rangeHighUSD, rangedTokens: row.rangedTokens, inferred: row.inferred, runs: Double(row.runs))
             }
         }
         var seen = Set<String>()
@@ -126,12 +129,41 @@ struct ModelUsageInsightData {
                     inferred: ModelUsageTokenBasis.isInferred(note: bucket.note)))
             }
         }
+        // Cards that keep only per-event totals, for providers no ledger or bucket history
+        // covers: the split is unknown, so tokens stay unsplit and any estimate a range.
+        var covered = Set(ledgerSources.compactMap(ModelUsageSourceIdentity.host))
+        if ledgerSources.contains("codex") { covered.insert(.codexTelemetry) }
+        var seenEvents = Set<UUID>()
+        for snapshot in snapshots where snapshot.analyticsBuckets.isEmpty && !covered.contains(snapshot.providerID) {
+            var hours: [String: (start: Date, model: String, tokens: Double, messages: Double)] = [:]
+            for event in UsageEventDeduplicator.flatten([snapshot]) where seenEvents.insert(event.id).inserted {
+                guard let tokens = event.tokens, tokens.isFinite, tokens > 0 else { continue }
+                let start = Date(timeIntervalSince1970: floor(event.timestamp.timeIntervalSince1970 / 3600) * 3600)
+                let model = event.model.map { String($0.prefix(256)) } ?? "Unknown model"
+                let key = "\(start.timeIntervalSince1970)|\(model)"
+                var hour = hours[key] ?? (start, model, 0, 0)
+                hour.tokens += tokens
+                if event.type == .message { hour.messages += 1 }
+                hours[key] = hour
+            }
+            let provider = snapshot.providerID
+            let source = "\(provider.rawValue):events"
+            for (key, hour) in hours {
+                let counts = ModelTokenCounts(unsplit: hour.tokens)
+                let cost = ModelRateCatalog.costRange(source: provider == .meta ? "muse" : provider.rawValue, model: hour.model, tokens: counts, calls: 0)
+                entries.append(.init(id: "\(source):\(key)", source: source, provider: provider, model: hour.model,
+                    start: hour.start, end: hour.start.addingTimeInterval(3600), tokens: counts, requests: hour.messages,
+                    estimatedUSD: nil, pricedTokens: 0, actualUSD: nil, reportedEstimateUSD: nil, precise: false,
+                    rangeLowUSD: cost?.low ?? 0, rangeHighUSD: cost?.high ?? 0, rangedTokens: cost == nil ? 0 : hour.tokens, inferred: false))
+            }
+        }
         for (id, rows) in Dictionary(grouping: entries.filter { !$0.precise }, by: \.source) {
             guard let row = rows.first else { continue }
-            let official = id.hasSuffix(UsageAnalyticsSource.officialAPI.rawValue)
-            let label = official ? "API report" : "provider history"
+            let official = id.hasSuffix(UsageAnalyticsSource.officialAPI.rawValue), events = id.hasSuffix(":events")
+            let label = official ? "API report" : events ? "card activity" : "provider history"
             sources.append(.init(id: id, provider: row.provider, title: "\(row.provider?.displayName ?? id) · \(label)",
-                detail: "Available provider buckets; retention and resolution vary",
+                detail: events ? "Token totals per event from the quota card; no input/output split"
+                    : "Available provider buckets; retention and resolution vary",
                 first: rows.map(\.start).min(), last: rows.map(\.end).max(),
                 scanned: snapshots.first { $0.providerID == row.provider }?.fetchedAt, local: false, issue: nil))
         }
@@ -148,10 +180,21 @@ struct ModelUsageInsightData {
         }
     }
 
+    /// The sources with the most tokens in the window, ledgers first on a tie, so a
+    /// busy source is never hidden behind quieter ones that sort earlier by name.
+    func busiest(_ limit: Int, window: ModelUsageWindow, now: Date) -> [(source: ModelUsageInsightSource, totals: ModelUsageInsightTotals)] {
+        let ranked = sources.map { (source: $0, totals: ModelUsageInsightTotals(selected(source: $0.id, window: window, now: now))) }
+        return Array(ranked.sorted {
+            if $0.totals.tokens.total != $1.totals.tokens.total { return $0.totals.tokens.total > $1.totals.tokens.total }
+            if $0.source.local != $1.source.local { return $0.source.local }
+            return $0.source.id < $1.source.id
+        }.prefix(limit))
+    }
+
     func chartRows(source: String, model: String = "") -> [ModelUsageRollup] {
         entries.filter { $0.source == source && (model.isEmpty || $0.model == model) && $0.tokens.total > 0 }.map {
             ModelUsageRollup(source: $0.source, model: $0.model, start: $0.start,
-                seconds: max(1, Int($0.end.timeIntervalSince($0.start))), tokens: $0.tokens, requests: Int($0.requests))
+                seconds: max(1, Int($0.end.timeIntervalSince($0.start))), tokens: $0.tokens, requests: Int($0.requests), runs: Int($0.runs))
         }
     }
 }
@@ -171,6 +214,13 @@ enum ModelUsageFormat {
         guard let bounds = totals.estimateBounds else { return "—" }
         guard bounds.lowerBound != bounds.upperBound else { return money(bounds.lowerBound) }
         return "\(money(bounds.lowerBound))–\(money(bounds.upperBound))"
+    }
+
+    /// Whole runs are never called calls: their API call counts were not recorded.
+    static func requests(_ requests: Double, runs: Double) -> String {
+        let count = tokens(requests)
+        if runs <= 0 { return "\(count) calls" }
+        return runs >= requests ? "\(count) runs" : "\(count) calls & runs"
     }
 
     static func tokens(_ value: Double) -> String {

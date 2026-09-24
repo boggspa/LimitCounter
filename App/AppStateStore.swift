@@ -396,7 +396,7 @@ final class AppStateStore: ObservableObject {
                 }
             }
             guard !roots.isEmpty else {
-                modelUsageStatus = "Connect Codex, Claude, TaskWraith, Grok, Gemini or Kimi folders in provider setup to index model usage."
+                modelUsageStatus = "Connect Codex, Claude, Grok, Gemini or Kimi folders in provider setup, or TaskWraith's data folder in Settings, to index model usage."
                 return
             }
             do {

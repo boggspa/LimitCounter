@@ -89,7 +89,7 @@ struct ModelUsageDashboardView: View {
 
     private var emptyState: some View {
         AnalyticsPanel(title: "Your history starts here", subtitle: "Local collection on Mac · private iCloud sync to iPhone") {
-            Text("Connect Codex or Claude log folders in Providers to backfill available history. Providers that already report model usage also appear here. Your quota dashboard continues updating while history is indexed.")
+            Text("Connect Codex, Claude, Grok, Gemini or Kimi folders in Providers, or TaskWraith's data folder in Settings, to backfill available history. Providers that already report model usage also appear here. Your quota dashboard continues updating while history is indexed.")
                 .font(.subheadline).foregroundStyle(.secondary)
             Button("Refresh model history") { appState.refreshModelUsage() }
                 .buttonStyle(.bordered).disabled(appState.isIndexingModelUsage)
@@ -157,7 +157,8 @@ struct ModelUsageDashboardView: View {
             } else {
                 AnalyticsMetric(title: "Tracked tokens", value: ModelUsageFormat.tokens(totals.tokens.total), footnote: "\(window.rawValue) · \(models) models", color: .cyan)
             }
-            AnalyticsMetric(title: "Requests", value: ModelUsageFormat.tokens(totals.requests), footnote: "Recorded calls", color: .mint)
+            AnalyticsMetric(title: "Requests", value: ModelUsageFormat.tokens(totals.requests), footnote: totals.runs <= 0 ? "Recorded calls"
+                : totals.runs >= totals.requests ? "Whole runs; call counts not recorded" : "Includes \(ModelUsageFormat.tokens(totals.runs)) runs of unknown call count", color: .mint)
             AnalyticsMetric(title: "Cache hit share", value: totals.cacheShare.formatted(.percent.precision(.fractionLength(1))), footnote: "Of prompt tokens", color: .purple)
             AnalyticsMetric(title: "API equivalent", value: ModelUsageFormat.estimate(totals), footnote: estimateFootnote(totals), color: .orange)
             if let cost = totals.actualUSD {
@@ -297,7 +298,7 @@ struct ModelUsageDashboardView: View {
                             .font(.caption.monospacedDigit()).foregroundStyle(.cyan)
                     }
                     ProgressView(value: item.total.tokens.total / max(1, total)).tint(.cyan)
-                    Text("\(ModelUsageFormat.tokens(item.total.tokens.prompt)) input incl. cache  ·  \(ModelUsageFormat.tokens(item.total.tokens.output)) output  ·  \(ModelUsageFormat.tokens(item.total.requests)) calls")
+                    Text("\(ModelUsageFormat.tokens(item.total.tokens.prompt)) input incl. cache  ·  \(ModelUsageFormat.tokens(item.total.tokens.output)) output  ·  \(ModelUsageFormat.requests(item.total.requests, runs: item.total.runs))")
                         .font(.caption2).foregroundStyle(.secondary)
                 }.padding(.vertical, 4)
             }
@@ -405,7 +406,7 @@ private struct ModelUsageTokenChart: View {
             for row in rows where row.seconds <= Int(interval) && row.start <= now {
                 let key = floor(row.start.timeIntervalSince1970 / interval) * interval
                 var point = grouped[key] ?? ModelUsageDay(date: Date(timeIntervalSince1970: key))
-                point.tokens += row.tokens.total; point.requests += row.requests; grouped[key] = point
+                point.tokens += row.tokens.total; point.requests += row.requests; point.runs += row.runs; grouped[key] = point
             }
             return (0..<count).reversed().map { offset in
                 let key = last - Double(offset) * interval
@@ -441,7 +442,7 @@ private struct ModelUsageTokenChart: View {
                 if let selected {
                     Text(selected.date.formatted(date: .abbreviated, time: window == .hour || window == .day ? .shortened : .omitted))
                     Spacer()
-                    Text("\(ModelUsageFormat.tokens(selected.tokens)) tokens · \(selected.requests) calls").monospacedDigit()
+                    Text("\(ModelUsageFormat.tokens(selected.tokens)) tokens · \(ModelUsageFormat.requests(Double(selected.requests), runs: Double(selected.runs)))").monospacedDigit()
                 } else {
                     Text("Peak \(ModelUsageFormat.tokens(points.map(\.tokens).max() ?? 0))")
                     Spacer()
@@ -537,7 +538,7 @@ private struct ModelUsageYearGrid: View {
                                                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(selected?.date == value.date ? .white : .clear, lineWidth: 2))
                                                 .frame(width: 28, height: 28)
                                         }.buttonStyle(.plain)
-                                        .accessibilityLabel("\(value.date.formatted(date: .complete, time: .omitted)), \(ModelUsageFormat.tokens(value.tokens)) tokens, \(value.requests) calls")
+                                        .accessibilityLabel("\(value.date.formatted(date: .complete, time: .omitted)), \(ModelUsageFormat.tokens(value.tokens)) tokens, \(ModelUsageFormat.requests(Double(value.requests), runs: Double(value.runs))))")
                                         .help("\(value.date.formatted(date: .abbreviated, time: .omitted)): \(ModelUsageFormat.tokens(value.tokens)) tokens")
                                     } else { Color.clear.frame(width: 28, height: 28) }
                                 }
@@ -547,7 +548,7 @@ private struct ModelUsageYearGrid: View {
                 }.padding(.vertical, 4)
             }.defaultScrollAnchor(.trailing)
             if let selected {
-                Text("\(selected.date.formatted(date: .complete, time: .omitted)) · \(ModelUsageFormat.tokens(selected.tokens)) tokens · \(selected.requests) calls")
+                Text("\(selected.date.formatted(date: .complete, time: .omitted)) · \(ModelUsageFormat.tokens(selected.tokens)) tokens · \(ModelUsageFormat.requests(Double(selected.requests), runs: Double(selected.runs)))")
                     .font(.caption).foregroundStyle(.cyan)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 125), alignment: .leading)], alignment: .leading, spacing: 12) {
@@ -628,8 +629,7 @@ struct ModelUsageSummaryCard: View {
                     Text(appState.isIndexingModelUsage ? "Indexing your model history…" : "Explore token history, models and API-equivalent estimates.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    ForEach(data.sources.prefix(3)) { source in
-                        let totals = ModelUsageInsightTotals(data.selected(source: source.id, window: .day, now: Date()))
+                    ForEach(data.busiest(3, window: .day, now: Date()), id: \.source.id) { source, totals in
                         HStack(alignment: .firstTextBaseline) {
                             Text(source.title).font(.caption).lineLimit(1)
                             Spacer()
