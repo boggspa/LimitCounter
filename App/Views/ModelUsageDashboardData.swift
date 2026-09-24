@@ -110,6 +110,8 @@ struct ModelUsageInsightData {
                 if bucket.source != .officialAPI {
                     if ledgerSources.contains("codex"), snapshot.providerID == .openai || snapshot.providerID == .codexTelemetry { continue }
                     if ledgerSources.contains("claude"), snapshot.providerID == .claude { continue }
+                    // The Vibe card's chars ÷ 4 estimates describe the sessions the ledger measured.
+                    if ledgerSources.contains("mistral"), snapshot.providerID == .mistral { continue }
                 }
                 let source = "\(snapshot.providerID.rawValue):\(bucket.source.rawValue)"
                 guard seen.insert("\(source):\(bucket.id)").inserted else { continue }

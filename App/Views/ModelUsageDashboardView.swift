@@ -109,7 +109,7 @@ struct ModelUsageDashboardView: View {
     private var emptyState: some View {
         StackCard(accent: .white) {
             StackSection(title: "No history yet", caption: "Collected on Mac · iCloud to iPhone") {
-                Text("Connect Codex, Claude, Grok, Gemini or Kimi in Providers, or TaskWraith in Settings.")
+                Text("Connect Codex, Claude, Grok, Gemini, Kimi or Mistral Vibe in Providers, or TaskWraith in Settings.")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 Button("Refresh") { appState.refreshModelUsage() }
                     .controlSize(.small).disabled(appState.isIndexingModelUsage)

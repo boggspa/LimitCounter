@@ -353,6 +353,7 @@ final class AppStateStore: ObservableObject {
         case .grok: return .grok
         case .gemini: return .gemini
         case .kimi: return .kimi
+        case .mistral: return .mistral
         }
     }
 
@@ -396,7 +397,7 @@ final class AppStateStore: ObservableObject {
                 }
             }
             guard !roots.isEmpty else {
-                modelUsageStatus = "Connect Codex, Claude, Grok, Gemini or Kimi folders in provider setup, or TaskWraith's data folder in Settings, to index model usage."
+                modelUsageStatus = "Connect Codex, Claude, Grok, Gemini, Kimi or Mistral Vibe folders in provider setup, or TaskWraith's data folder in Settings, to index model usage."
                 return
             }
             do {

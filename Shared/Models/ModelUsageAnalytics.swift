@@ -42,7 +42,7 @@ nonisolated extension ModelTokenCounts: Codable {
 }
 
 nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable {
-    case codex, claude, taskwraith, grok, gemini, kimi
+    case codex, claude, taskwraith, grok, gemini, kimi, mistral
     var title: String {
         switch self {
         case .codex: return "Codex"
@@ -51,6 +51,7 @@ nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable 
         case .grok: return "Grok CLI"
         case .gemini: return "Gemini CLI"
         case .kimi: return "Kimi CLI"
+        case .mistral: return "Mistral Vibe"
         }
     }
 }
@@ -66,6 +67,7 @@ enum ModelUsageSourceIdentity {
         case "grok": return .grok
         case "gemini": return .gemini
         case "kimi": return .kimi
+        case "mistral": return .mistral
         default: return nil
         }
     }
@@ -77,6 +79,7 @@ enum ModelUsageSourceIdentity {
         case "grok": return "Grok CLI local"
         case "gemini": return "Gemini CLI local"
         case "kimi": return "Kimi CLI local"
+        case "mistral": return "Mistral Vibe local"
         case "taskwraith": return "TaskWraith runs"
         default: return source
         }
@@ -86,6 +89,7 @@ enum ModelUsageSourceIdentity {
         switch source {
         case "codex", "claude": return "\(files) logs · request deduplication · up to 366 days"
         case "taskwraith": return "\(files) files · private Codex and Kimi transcripts · other runs where no provider log reaches"
+        case "mistral": return "\(files) sessions · provider-reported session totals · up to 366 days"
         default: return "\(files) CLI logs · provider-reported tokens · up to 366 days"
         }
     }
@@ -408,10 +412,13 @@ nonisolated enum ModelUsageAggregation {
     /// and Kimi in private homes indexed as its own transcripts. From a key's earliest
     /// transcript call on, run records of that provider are dropped as duplicates; before
     /// it, or with no transcript source connected, they are the only record and are kept.
-    static func coverageKey(ofRunsFrom provider: String) -> String? {
+    /// Mistral Vibe logs whole sessions of its own few models, while TaskWraith also ran
+    /// other Mistral models outside Vibe, so Mistral coverage is per model.
+    static func coverageKey(ofRunsFrom provider: String, model: String) -> String? {
         switch provider {
         case "claude", "gemini", "grok": return provider
         case "codex", "kimi": return "\(LocalModelUsageSource.taskwraith.rawValue):\(provider)"
+        case "mistral": return "mistral:\(model)"
         default: return nil
         }
     }
@@ -420,6 +427,7 @@ nonisolated enum ModelUsageAggregation {
     static func coverageKey(of call: ModelUsageCall) -> String? {
         switch call.source {
         case "claude", "gemini", "grok": return call.source
+        case "mistral": return "mistral:\(call.model)"
         case LocalModelUsageSource.taskwraith.rawValue where call.calls != 0:
             return call.model.split(separator: "/").first.map { "\(call.source):\($0)" }
         default: return nil
@@ -428,9 +436,9 @@ nonisolated enum ModelUsageAggregation {
 
     /// The coverage that would make a TaskWraith run record a duplicate, if any.
     static func coverageKey(ofRun call: ModelUsageCall) -> String? {
-        guard call.source == LocalModelUsageSource.taskwraith.rawValue, call.calls == 0,
-              let provider = call.model.split(separator: "/").first else { return nil }
-        return coverageKey(ofRunsFrom: String(provider))
+        let parts = call.model.split(separator: "/", maxSplits: 1)
+        guard call.source == LocalModelUsageSource.taskwraith.rawValue, call.calls == 0, let provider = parts.first else { return nil }
+        return coverageKey(ofRunsFrom: String(provider), model: parts.count > 1 ? String(parts[1]) : "")
     }
 
     /// Each record is priced on its own before it joins a bucket, so an aggregate can

@@ -156,6 +156,38 @@ nonisolated enum GeminiChatParser {
     }
 }
 
+/// Mistral Vibe `logs/session/<session>/meta.json`: the Mistral API's reported totals for
+/// a whole session, the only granularity Vibe keeps, dated at the session's start.
+/// Prompt tokens include cached reads; sessions from before Vibe reported cached tokens
+/// keep their prompt unsplit. `steps` counts agent steps, not API calls, so each session
+/// is a run with an unreported call count.
+nonisolated enum MistralVibeSessionParser {
+    static func read(url: URL, fileID: String, emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        let data = try Data(contentsOf: url)
+        guard let session = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return 1 }
+        if let call = call(from: session, fileID: fileID, times: ModelUsageTimestamps()) { try emit(call) }
+        return 0
+    }
+
+    static func call(from session: [String: Any], fileID: String, times: ModelUsageTimestamps) -> ModelUsageCall? {
+        guard let stats = session["stats"] as? [String: Any],
+              let started = times.date(session["start_time"]) ?? times.date(session["end_time"]) else { return nil }
+        let prompt = TaskWraithUsageParser.number(stats["session_prompt_tokens"]) ?? 0
+        var tokens = ModelTokenCounts(output: TaskWraithUsageParser.number(stats["session_completion_tokens"]) ?? 0)
+        if let cached = TaskWraithUsageParser.number(stats["session_cached_tokens"]) {
+            tokens.cacheRead = min(prompt, cached)
+            tokens.input = prompt - tokens.cacheRead
+        } else {
+            tokens.unsplit = prompt
+        }
+        guard tokens.total > 0 else { return nil }
+        let model = TaskWraithUsageParser.text((session["config"] as? [String: Any])?["active_model"]) ?? "Unknown model"
+        let identity = TaskWraithUsageParser.text(session["session_id"]) ?? fileID
+        return ModelUsageCall(id: ModelUsageLogParser.hash("mistral|\(identity)"), source: LocalModelUsageSource.mistral.rawValue,
+            timestamp: started, model: String(model.prefix(256)), tokens: tokens, calls: 0)
+    }
+}
+
 /// Kimi CLI `sessions/**/wire.jsonl`, one record per API step in either format:
 /// Kimi Code's `usage.record` (millisecond time, model alias such as `kimi-code/k3`)
 /// or the older CLI's `StatusUpdate`, which names no model, so none is assumed.
@@ -201,7 +233,7 @@ nonisolated enum KimiWireParser {
 /// TaskWraith's usage store: a `usage.json` checkpoint plus JSON Lines journal and
 /// archive artifacts. `id` is TaskWraith's own idempotency key across all three.
 /// Records of runs that a transcript also covers are dropped when rolling up; see
-/// `ModelUsageAggregation.coverageKey(ofRunsFrom:)`.
+/// `ModelUsageAggregation.coverageKey(ofRunsFrom:model:)`.
 nonisolated enum TaskWraithUsageParser {
     static let files = ["usage.json", "usage-journal.jsonl", "usage-archive.jsonl"]
     /// TaskWraith runs Codex and Kimi with private homes inside its data folder. Their

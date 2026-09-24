@@ -127,6 +127,7 @@ actor ModelUsageLogScanner {
         case .grok: return try GrokUsageParser.read(url: url, fileID: fileID, emit: emit)
         case .gemini: return try GeminiChatParser.read(url: url, fileID: fileID, emit: emit)
         case .kimi: return try KimiWireParser.read(url: url, fileID: fileID, emit: emit)
+        case .mistral: return try MistralVibeSessionParser.read(url: url, fileID: fileID, emit: emit)
         }
     }
 
@@ -175,6 +176,13 @@ actor ModelUsageLogScanner {
             if folder.lastPathComponent == "credentials" { folder.deleteLastPathComponent() }
             folders = [folder.appendingPathComponent("sessions")]
             accepts = { $0.lastPathComponent == "wire.jsonl" }
+        case .mistral:
+            // The Vibe grant may be `~/.vibe`, its `logs` or `logs/session`, or one `meta.json`.
+            var folder = isFile ? root.deletingLastPathComponent().deletingLastPathComponent() : root
+            if folder.lastPathComponent == "logs" { folder.appendPathComponent("session") }
+            else if folder.lastPathComponent != "session" { folder.appendPathComponent("logs/session") }
+            folders = [folder]
+            accepts = { $0.lastPathComponent == "meta.json" }
         }
         var unreadable = 0
         defer { failed += unreadable }

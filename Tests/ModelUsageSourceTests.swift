@@ -23,6 +23,7 @@ struct ModelUsageSourceTests {
         try await taskWraithImport()
         try await taskWraithPrivateHomes()
         try await nativeCLILogs()
+        try await mistralVibeSessions()
         print("Model usage sources: \(checks) checks passed")
     }
 
@@ -217,6 +218,76 @@ struct ModelUsageSourceTests {
     static func write(_ object: Any, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: object).write(to: url)
+    }
+
+    /// Mistral Vibe keeps only per-session totals, as the Mistral API reported them;
+    /// TaskWraith's projected Mistral runs give way to them model by model.
+    static func mistralVibeSessions() async throws {
+        let times = ModelUsageTimestamps()
+        func session(_ id: String, start: String, model: String = "mistral-medium-3.5", prompt: Double = 67080,
+                     cached: Double? = 2176, completion: Double = 661) -> [String: Any] {
+            var stats: [String: Any] = ["steps": 2, "session_prompt_tokens": prompt, "session_completion_tokens": completion,
+                                        "session_total_llm_tokens": prompt + completion, "session_cost": 0.1]
+            if let cached { stats["session_cached_tokens"] = cached }
+            return ["session_id": id, "start_time": start, "end_time": start, "stats": stats,
+                    "config": ["active_model": model], "environment": ["working_directory": "/never/read"]]
+        }
+        let measured = MistralVibeSessionParser.call(from: session("v1", start: "2026-09-03T11:58:56.500+00:00"), fileID: "meta", times: times)!
+        expect(measured.tokens == ModelTokenCounts(input: 64904, cacheRead: 2176, output: 661) && measured.calls == 0 && !measured.inferred,
+               "A Vibe session keeps its reported split, as one run with an unreported call count")
+        expect(measured.source == "mistral" && measured.model == "mistral-medium-3.5", "…under Mistral and its active model")
+        close(measured.timestamp.timeIntervalSince1970, 1_788_436_736.5, "…dated at its start")
+        expect(MistralVibeSessionParser.call(from: session("v1", start: "2026-09-03T11:58:56Z"), fileID: "other", times: times)?.id == measured.id,
+               "A session's identity is its id, whichever file holds it")
+        let early = MistralVibeSessionParser.call(from: session("v0", start: "2026-07-26T09:40:07Z", cached: nil), fileID: "meta", times: times)!
+        let range = ModelRateCatalog.costRange(source: early.source, model: early.model, tokens: early.tokens, calls: 0)
+        expect(early.tokens == ModelTokenCounts(output: 661, unsplit: 67080) && range.map { !$0.exact && $0.low < $0.high } == true,
+               "A session from before Vibe reported cache keeps its prompt unsplit and prices as a range")
+        expect(MistralVibeSessionParser.call(from: session("v2", start: "2026-09-03T12:00:00Z", prompt: 0, cached: 0, completion: 0), fileID: "m", times: times) == nil
+               && MistralVibeSessionParser.call(from: ["session_id": "v4", "start_time": "2026-09-03T12:00:00Z"], fileID: "m", times: times) == nil,
+               "Sessions without tokens are not usage")
+
+        let home = try temporaryDirectory("vibe")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sessions = home.appendingPathComponent(".vibe/logs/session")
+        try write(session("v1", start: "2026-09-20T10:00:00Z"), to: sessions.appendingPathComponent("session_a/meta.json"))
+        try write(session("v3", start: "2026-09-21T10:00:00Z", model: "devstral-small", prompt: 1000, cached: 900, completion: 10),
+                  to: sessions.appendingPathComponent("session_b/meta.json"))
+        try "{\"role\":\"user\",\"content\":\"never read\"}\n".write(to: sessions.appendingPathComponent("session_a/messages.jsonl"), atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: sessions.appendingPathComponent("session_c"), withIntermediateDirectories: true)
+        try "{ not json".write(to: sessions.appendingPathComponent("session_c/meta.json"), atomically: true, encoding: .utf8)
+        var failed = 0
+        for grant in [".vibe", ".vibe/logs", ".vibe/logs/session", ".vibe/logs/session/session_a/meta.json"] {
+            let files = ModelUsageLogScanner.logFiles(for: .mistral, root: home.appendingPathComponent(grant), failed: &failed)
+            expect(files.count == 3 && files.allSatisfy { $0.0.lastPathComponent == "meta.json" }, "Vibe grant \(grant) finds session metadata only")
+        }
+
+        let data = home.appendingPathComponent("taskwraith")
+        let runs = [("t1", "mistral-medium-3.5", "2026-09-19T12:00:00Z"), ("t2", "mistral-medium-3.5", "2026-09-20T12:00:00Z"),
+                    ("t3", "devstral-2512", "2026-09-20T12:00:00Z")].map {
+            taskWraithRecord($0.0, provider: "mistral", model: $0.1, extra: ["timestamp": date($0.2).timeIntervalSince1970 * 1000])
+        }
+        try write(runs, to: data.appendingPathComponent("usage.json"))
+        let now = date("2026-09-24T12:00:00Z")
+        let archive = try await ModelUsageLogScanner(directory: home.appendingPathComponent("ledger"))
+            .scan(roots: [.mistral: home.appendingPathComponent(".vibe"), .taskwraith: data], now: now)
+        let vibe = ModelUsageTotals(archive.buckets.filter { $0.source == "mistral" })
+        expect(vibe.runs == 2 && vibe.tokens.total == 67741 + 1010 && vibe.pricedRequests == vibe.requests,
+               "Vibe sessions index as runs and price through Mistral's rows")
+        expect(archive.coverage.first { $0.source == "mistral" }?.malformedLines == 1, "An unreadable session file is counted, not guessed")
+        let taskwraith = archive.buckets.filter { $0.source == "taskwraith" }
+        expect(ModelUsageTotals(taskwraith).runs == 2 && Set(taskwraith.map(\.model)) == ["mistral/mistral-medium-3.5", "mistral/devstral-2512"],
+               "TaskWraith's run before Vibe's first session of its model stays, the later one is dropped, and runs of models Vibe never ran stay")
+        expect(ModelUsageSourceIdentity.title("mistral") == "Mistral Vibe local" && ModelUsageSourceIdentity.host("mistral") == .mistral,
+               "The source is attributed to Mistral")
+
+        let card = QuotaSnapshot(providerID: .mistral, displayName: "Mistral", windows: [], analyticsBuckets: [
+            UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now, model: "mistral-medium-3.5", inputTokens: 10_000,
+                outputTokens: 1000, requests: 5, costUSD: 0.5, source: .localEstimate, note: "TaskWraith-style chars÷4 × catalogue"),
+            UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now, costUSD: 9, source: .officialAPI, note: "Cost")])
+        let sources = Set(ModelUsageInsightData(archive: archive, snapshots: [card]).entries.map(\.source))
+        expect(!sources.contains("mistral:localEstimate") && sources.contains("mistral:officialAPI") && sources.contains("mistral"),
+               "Measured Vibe history replaces the card's estimates, never its API spend")
     }
 
     static func nativeCLILogs() async throws {
