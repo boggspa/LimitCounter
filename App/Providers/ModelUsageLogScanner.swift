@@ -19,6 +19,9 @@ actor ModelUsageLogScanner {
         let ledger = try ModelUsageLedger(url: directory.appendingPathComponent("requests-v1.sqlite"))
         let previousArchive = ModelUsageArchiveStore.load(from: directory)
         var coverage = previousArchive.coverage
+        // Each status change redraws the dashboard, so only files being parsed are reported,
+        // at most every two seconds; an unchanged refresh reports nothing.
+        var reported = Date.distantPast
         for source in LocalModelUsageSource.allCases {
             guard let root = roots[source] else { continue }
             var failed = 0
@@ -26,10 +29,13 @@ actor ModelUsageLogScanner {
             files.sort { $0.1 > $1.1 }
             for (index, file) in files.enumerated() {
                 try Task.checkCancellation()
-                if index % 25 == 0 { await progress("\(source.title) · \(index + 1) of \(files.count) logs") }
                 let key = ModelUsageLogParser.hash(file.0.standardizedFileURL.path)
                 let version = Self.parserVersion(source)
                 if try ledger.isCurrent(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: version) { continue }
+                if Date().timeIntervalSince(reported) >= 2 {
+                    reported = Date()
+                    await progress("\(source.title) · \(index + 1) of \(files.count) logs")
+                }
                 do {
                     try ledger.replaceFile(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: version) { emit in
                         let malformed = try Self.parse(file.0, source: source, fileID: key, emit: emit)
