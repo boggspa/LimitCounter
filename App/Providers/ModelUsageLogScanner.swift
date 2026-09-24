@@ -9,8 +9,10 @@ actor ModelUsageLogScanner {
     /// Bump a source's version when its parser's output changes, so cached files re-parse.
     static func parserVersion(_ source: LocalModelUsageSource) -> Int { source == .taskwraith ? 2 : 1 }
     private let directory: URL
-    /// Full ledger rollups performed; unchanged refreshes must not add to it.
+    /// Ledger rollup passes, whole or from a changed day; unchanged refreshes must not add to it.
     private(set) var rollupPasses = 0
+    /// The UTC day the last pass rebuilt from; nil when it rebuilt everything.
+    private(set) var rebuiltFrom: Date?
 
     init(directory: URL = ModelUsageArchiveStore.directory) { self.directory = directory }
 
@@ -55,30 +57,56 @@ actor ModelUsageLogScanner {
         // Rollups change only with the ledger, a parser, the rate catalog or the
         // aggregation rules, or when the clock reaches the next UTC midnight (resolution
         // and retention step daily) or a future-dated call. Otherwise reuse the saved
-        // buckets; CloudKit publication is retried by the caller either way.
-        let fingerprint = [String(ModelUsageArchive.schemaVersion), String(ModelUsageAggregation.version),
-                           ModelRateCatalog.revision, LocalModelUsageSource.allCases.map { "\($0.rawValue)=\(Self.parserVersion($0))" }.joined(separator: ","),
-                           String(try ledger.generation())]
+        // buckets; CloudKit publication is retried by the caller either way. The saved
+        // state is the rules, ledger generation, valid-until time and archive stamp.
+        let rules = [String(ModelUsageArchive.schemaVersion), String(ModelUsageAggregation.version),
+                     ModelRateCatalog.revision, LocalModelUsageSource.allCases.map { "\($0.rawValue)=\(Self.parserVersion($0))" }.joined(separator: ",")]
             .joined(separator: "|")
-        if let state = try ledger.metaValue(Self.rollupStateKey)?.split(separator: "\n").map(String.init),
-           state.count == 3, state[0] == fingerprint, let validUntil = Double(state[1]),
-           now.timeIntervalSince1970 < validUntil, state[2] == Self.stamp(previousArchive) {
+        let generation = String(try ledger.generation())
+        let saved = try ledger.metaValue(Self.rollupStateKey).flatMap { text -> [String]? in
+            let state = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard state.count == 4, state[0] == rules, let validUntil = Double(state[2]), now.timeIntervalSince1970 < validUntil,
+                  state[3] == Self.stamp(previousArchive) else { return nil }
+            return state
+        }
+        if let saved, saved[1] == generation {
             var archive = previousArchive
             archive.coverage = Self.dated(coverage, buckets: archive.buckets)
             if archive.hasSameContent(as: previousArchive) { return previousArchive }
             archive.generatedAt = now
             try ModelUsageArchiveStore.save(archive, to: directory)
-            try ledger.setMetaValue([fingerprint, state[1], Self.stamp(archive)].joined(separator: "\n"), for: Self.rollupStateKey)
+            try ledger.setMetaValue([rules, generation, saved[2], Self.stamp(archive)].joined(separator: "\n"), for: Self.rollupStateKey)
             return archive
         }
-        rollupPasses += 1
-        try ledger.prune(now: now)
-        var archive = ModelUsageArchive(generatedAt: now, buckets: try ledger.rollups(now: now))
+        // While the saved buckets hold for these rules and this day, a changed ledger is
+        // rebuilt only from the UTC day of its earliest changed call: buckets never cross
+        // midnight, and no earlier call's winner, first time or watermark can have moved.
+        var kept: [ModelUsageRollup] = []
+        var from: Date?
+        var earlier: [String: Date] = [:]
+        if saved != nil, let marks = try ledger.watermarks() {
+            let day = try ledger.changedFrom().map(ModelUsageAggregation.dayStart) ?? .distantFuture
+            if day > ModelUsageAggregation.retentionStart(now) {
+                kept = previousArchive.buckets.filter { $0.start < day }
+                from = day
+                earlier = marks
+            }
+        }
+        var pass = (buckets: [ModelUsageRollup](), watermarks: earlier)
+        // A file can change without any of its calls changing; then nothing is rebuilt.
+        if from != .distantFuture {
+            rollupPasses += 1
+            rebuiltFrom = from
+            if from == nil { try ledger.prune(now: now) }
+            pass = try ledger.rollupPass(now: now, from: from, earlier: earlier)
+        }
+        var archive = ModelUsageArchive(generatedAt: now, buckets: (kept + pass.buckets).sorted { $0.id < $1.id })
         archive.coverage = Self.dated(coverage, buckets: archive.buckets)
         let validUntil = try ledger.nextRollupChange(after: now).timeIntervalSince1970
         if archive.hasSameContent(as: previousArchive) { archive = previousArchive }
         else { try ModelUsageArchiveStore.save(archive, to: directory) }
-        try ledger.setMetaValue([fingerprint, String(validUntil), Self.stamp(archive)].joined(separator: "\n"), for: Self.rollupStateKey)
+        try ledger.commitRollup(state: [rules, generation, String(validUntil), Self.stamp(archive)].joined(separator: "\n"),
+                                for: Self.rollupStateKey, watermarks: pass.watermarks)
         return archive
     }
 

@@ -35,8 +35,15 @@ nonisolated enum ModelUsageArchiveStore {
 nonisolated final class ModelUsageLedger {
     private var database: OpaquePointer?
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-    private let encoder = JSONEncoder()
+    /// Sorted keys make a payload canonical, so a re-read file can tell its unchanged
+    /// calls from changed ones.
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     private let decoder = JSONDecoder()
+    private static let changedKey = "changedFrom", watermarksKey = "rollupWatermarks"
 
     init(url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -57,6 +64,8 @@ nonisolated final class ModelUsageLedger {
             CREATE INDEX IF NOT EXISTS calls_identity ON calls(source,call);
             CREATE INDEX IF NOT EXISTS calls_date ON calls(at);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TEMP TABLE IF NOT EXISTS previous (
+                call TEXT PRIMARY KEY, at REAL NOT NULL, output REAL NOT NULL, total REAL NOT NULL, payload BLOB NOT NULL);
             """)
     }
 
@@ -106,6 +115,12 @@ nonisolated final class ModelUsageLedger {
                      read: (_ emit: (ModelUsageCall) throws -> Void) throws -> Int) throws {
         try execute("BEGIN IMMEDIATE")
         do {
+            // The file's calls as they were, to find the ones this read changes.
+            try execute("DELETE FROM temp.previous")
+            let keep = try prepare("INSERT INTO temp.previous SELECT call,at,output,total,payload FROM calls WHERE source=? AND file=?")
+            bind(source, 1, keep); bind(file, 2, keep)
+            defer { sqlite3_finalize(keep) }
+            try step(keep)
             let delete = try prepare("DELETE FROM calls WHERE source=? AND file=?")
             bind(source, 1, delete); bind(file, 2, delete)
             defer { sqlite3_finalize(delete) }
@@ -134,6 +149,7 @@ nonisolated final class ModelUsageLedger {
             sqlite3_bind_double(metadata, 3, modified.timeIntervalSince1970)
             sqlite3_bind_int64(metadata, 4, Int64(bytes)); sqlite3_bind_int(metadata, 5, Int32(version))
             sqlite3_bind_int(metadata, 6, Int32(malformed)); try step(metadata)
+            try markChanged(source: source, file: file)
             try execute("""
                 INSERT INTO meta VALUES('generation','1')
                 ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)
@@ -145,21 +161,90 @@ nonisolated final class ModelUsageLedger {
         }
     }
 
-    func rollups(now: Date) throws -> [ModelUsageRollup] {
+    /// Notes the earliest instant a replaced file's changed calls reach, counting every copy
+    /// of each changed call in any file, before and after, since those copies decide its
+    /// winner and first time. The mark accumulates until a rollup absorbs it.
+    private func markChanged(source: String, file: String) throws {
+        let statement = try prepare("""
+            WITH changed(call) AS (
+                SELECT call FROM temp.previous p WHERE NOT EXISTS (
+                    SELECT 1 FROM calls c WHERE c.source=?1 AND c.file=?2 AND c.call=p.call
+                        AND c.at=p.at AND c.output=p.output AND c.total=p.total AND c.payload=p.payload)
+                UNION
+                SELECT call FROM calls c WHERE c.source=?1 AND c.file=?2 AND NOT EXISTS (
+                    SELECT 1 FROM temp.previous p WHERE p.call=c.call
+                        AND p.at=c.at AND p.output=c.output AND p.total=c.total AND p.payload=c.payload))
+            SELECT MIN(at) FROM (
+                SELECT at FROM calls WHERE source=?1 AND call IN (SELECT call FROM changed)
+                UNION ALL SELECT at FROM temp.previous WHERE call IN (SELECT call FROM changed))
+            """)
+        defer { sqlite3_finalize(statement) }
+        bind(source, 1, statement); bind(file, 2, statement)
+        guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return }
+        // Whole seconds a second early: the text is exact and never later than the call.
+        let earliest = Int64(floor(sqlite3_column_double(statement, 0))) - 1
+        if let known = try metaValue(Self.changedKey).flatMap(Int64.init), known <= earliest { return }
+        try setMetaValue(String(earliest), for: Self.changedKey)
+    }
+
+    /// The earliest instant any call changed since the last committed rollup, if one did.
+    func changedFrom() throws -> Date? {
+        try metaValue(Self.changedKey).flatMap(Int64.init).map { Date(timeIntervalSince1970: Double($0)) }
+    }
+
+    /// The watermarks the last committed rollup ended with.
+    func watermarks() throws -> [String: Date]? {
+        guard let text = try metaValue(Self.watermarksKey),
+              let values = try? decoder.decode([String: Double].self, from: Data(text.utf8)) else { return nil }
+        return values.mapValues { Date(timeIntervalSince1970: $0) }
+    }
+
+    /// Saves a finished rollup's state and watermarks and clears the changes it absorbed,
+    /// in one transaction, so a later rollup never continues from a mismatched pair.
+    func commitRollup(state: String, for key: String, watermarks: [String: Date]) throws {
+        let marks = String(decoding: try encoder.encode(watermarks.mapValues(\.timeIntervalSince1970)), as: UTF8.self)
+        try execute("BEGIN IMMEDIATE")
+        do {
+            try setMetaValue(state, for: key)
+            try setMetaValue(marks, for: Self.watermarksKey)
+            let clear = try prepare("DELETE FROM meta WHERE key=?")
+            defer { sqlite3_finalize(clear) }
+            bind(Self.changedKey, 1, clear); try step(clear)
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    func rollups(now: Date) throws -> [ModelUsageRollup] { try rollupPass(now: now).buckets }
+
+    /// Buckets of the winning copy of every call first seen from `from` on (every call when
+    /// nil), and the earliest transcript call per coverage key. A pass from a day continues
+    /// an earlier one: `earlier` holds that pass's watermarks, of which those before `from`
+    /// still stand, and only calls with a copy on or after `from` are read.
+    func rollupPass(now: Date, from: Date? = nil, earlier: [String: Date] = [:]) throws
+        -> (buckets: [ModelUsageRollup], watermarks: [String: Date]) {
+        // Every copy of each call seen from `from` on, looked up by identity.
+        let calls = from == nil ? "calls WHERE at >= ?1 AND at <= ?2" : """
+            (SELECT DISTINCT source AS s,call AS k FROM calls WHERE at >= ?3 AND at <= ?2)
+                JOIN calls ON source=s AND call=k WHERE at >= ?1 AND at <= ?2
+            """
         let statement = try prepare("""
             SELECT payload,first_at FROM (
                 SELECT payload,MIN(at) OVER(PARTITION BY source,call) AS first_at,
                        ROW_NUMBER() OVER(PARTITION BY source,call ORDER BY output DESC,total DESC,at DESC,file) AS rank
-                FROM calls WHERE at >= ? AND at <= ?
-            ) WHERE rank=1
+                FROM \(calls)
+            ) WHERE rank=1\(from == nil ? "" : " AND first_at >= ?3")
             """)
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_double(statement, 1, ModelUsageAggregation.retentionStart(now).timeIntervalSince1970)
         sqlite3_bind_double(statement, 2, now.timeIntervalSince1970)
+        if let from { sqlite3_bind_double(statement, 3, from.timeIntervalSince1970) }
         var result: [String: ModelUsageRollup] = [:]
         var rates: [String: ModelRate?] = [:]
         // Run records wait until every transcript call has lowered its coverage watermark.
-        var watermarks: [String: Date] = [:]
+        var watermarks = from.map { from in earlier.filter { $0.value < from } } ?? [:]
         var runs: [(key: String, call: ModelUsageCall)] = []
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
@@ -179,7 +264,7 @@ nonisolated final class ModelUsageLedger {
         for run in runs where watermarks[run.key].map({ run.call.timestamp < $0 }) ?? true {
             ModelUsageAggregation.add(run.call, now: now, into: &result, rates: &rates)
         }
-        return result.values.sorted { $0.id < $1.id }
+        return (result.values.sorted { $0.id < $1.id }, watermarks)
     }
 
     func malformedLines(source: String) throws -> Int {

@@ -18,6 +18,7 @@ struct ModelUsageSourceTests {
         try snapshotInsights()
         sourceAttribution()
         try await unchangedRefreshSkipsRollups()
+        try await changedDayRollups()
         try streamingArrays()
         try await taskWraithImport()
         try await taskWraithPrivateHomes()
@@ -374,6 +375,62 @@ struct ModelUsageSourceTests {
         await expectPasses(7, true, "Waiting for it does not rebuild")
         let arrived = try await scanner.scan(roots: [.claude: root], now: date("2027-06-03T13:00:30Z"))
         await expectPasses(8, ModelUsageTotals(arrived.buckets).requests == 2, "Its arrival rebuilds rollups")
+    }
+
+    /// A changed log rebuilds rollups only from the UTC day its earliest changed call
+    /// reaches; after every change the result must equal a full rollup of the same logs.
+    static func changedDayRollups() async throws {
+        let directory = try temporaryDirectory("changed-day")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let claude = directory.appendingPathComponent("claude"), projects = claude.appendingPathComponent("projects")
+        let taskwraith = directory.appendingPathComponent("taskwraith")
+        for folder in [projects, taskwraith] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        func line(_ stamp: String, _ request: String, output: Int = 40) -> String {
+            #"{"timestamp":"\#(stamp)","requestId":"\#(request)","message":{"id":"m-\#(request)","model":"claude-opus-5-5","usage":{"input_tokens":100,"output_tokens":\#(output)}}}"# + "\n"
+        }
+        var modified = date("2026-06-06T00:00:00Z")
+        func write(_ data: Data, to url: URL) throws {
+            try data.write(to: url)
+            modified = modified.addingTimeInterval(10)   // every rewrite is seen as a change
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+        }
+        func log(_ name: String, _ lines: [String]) throws { try write(Data(lines.joined().utf8), to: projects.appendingPathComponent(name)) }
+        func runs(_ output: Double = 20) throws {
+            let records = [("r1", "2026-06-01T12:00:00Z", 20.0), ("r2", "2026-06-02T12:00:00Z", output), ("r3", "2026-06-03T12:00:00Z", 20)].map {
+                taskWraithRecord($0.0, provider: "claude", model: "claude-opus-5-5", output: $0.2, extra: ["timestamp": date($0.1).timeIntervalSince1970 * 1000])
+            }
+            try write(try JSONSerialization.data(withJSONObject: records), to: taskwraith.appendingPathComponent("usage.json"))
+        }
+        let roots: [LocalModelUsageSource: URL] = [.claude: claude, .taskwraith: taskwraith]
+        let scanner = ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger"))
+        var step = 0.0
+        func matchesFullRollup(passes: Int, from day: String?, runs: Int, _ message: String) async throws {
+            step += 1
+            let now = date("2026-06-06T12:00:00Z").addingTimeInterval(step * 60)
+            let archive = try await scanner.scan(roots: roots, now: now)
+            let full = try await ModelUsageLogScanner(directory: directory.appendingPathComponent("full-\(Int(step))")).scan(roots: roots, now: now)
+            let count = await scanner.rollupPasses, rebuilt = await scanner.rebuiltFrom
+            expect(archive.buckets == full.buckets && count == passes && rebuilt == day.map(date)
+                   && ModelUsageTotals(archive.buckets.filter { $0.source == "taskwraith" }).runs == runs, message)
+        }
+
+        try runs()
+        try log("a.jsonl", [line("2026-06-03T10:00:00Z", "a"), line("2026-06-04T10:00:00Z", "b")])
+        try log("b.jsonl", [line("2026-06-04T09:00:00Z", "b", output: 30)])
+        try await matchesFullRollup(passes: 1, from: nil, runs: 2, "A first scan rolls up everything; runs before the transcripts begin are kept")
+        try log("a.jsonl", [line("2026-06-03T10:00:00Z", "a"), line("2026-06-04T10:00:00Z", "b"), line("2026-06-05T10:00:00Z", "c")])
+        try await matchesFullRollup(passes: 2, from: "2026-06-05T00:00:00Z", runs: 2, "A new call rebuilds from its own day")
+        try log("b.jsonl", [line("2026-06-04T09:00:00Z", "b", output: 50)])
+        try await matchesFullRollup(passes: 3, from: "2026-06-04T00:00:00Z", runs: 2, "A copy that becomes the winner rebuilds from its first copy's day")
+        try log("c.jsonl", [line("2026-06-02T08:00:00Z", "d")])
+        try await matchesFullRollup(passes: 4, from: "2026-06-02T00:00:00Z", runs: 1, "An earlier transcript call lowers the watermark and drops the run it now covers")
+        try log("c.jsonl", [line("2026-06-02T14:00:00Z", "d")])
+        try await matchesFullRollup(passes: 5, from: "2026-06-02T00:00:00Z", runs: 2, "A watermark that rises restores the run")
+        try log("a.jsonl", [line("2026-06-03T10:00:00Z", "a"), line("2026-06-04T10:00:00Z", "b"), line("2026-06-05T10:00:00Z", "c"),
+                            #"{"type":"user","timestamp":"2026-06-06T11:00:00Z"}"# + "\n"])
+        try await matchesFullRollup(passes: 5, from: "2026-06-02T00:00:00Z", runs: 2, "A log that grows without calls reuses every bucket")
+        try runs(25)
+        try await matchesFullRollup(passes: 6, from: "2026-06-02T00:00:00Z", runs: 2, "A changed run record rebuilds from its day")
     }
 
     static func pricingBounds() throws {
