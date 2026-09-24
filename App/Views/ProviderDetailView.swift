@@ -60,7 +60,7 @@ struct ProviderDetailView: View {
                 .padding(10)
             }
         }
-        .navigationTitle(snapshot.displayName)
+        .navigationTitle(snapshot.accountDisplayName)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
@@ -73,7 +73,12 @@ struct ProviderDetailView: View {
             ProviderBrandIconView(providerID: snapshot.providerID, size: 36)
 
             VStack(alignment: .leading, spacing: 2) {
-                ProviderCardTitleText(title: snapshot.displayName, accentColor: accent)
+                HStack(spacing: 6) {
+                    ProviderCardTitleText(title: snapshot.displayName, accentColor: accent)
+                    if let badge = snapshot.accountBadgeText {
+                        AccountLabelChip(text: badge, accent: accent)
+                    }
+                }
                 if let plan = snapshot.displayPlanName {
                     Text(plan)
                         .font(.caption)
@@ -142,7 +147,7 @@ struct ProviderDetailView: View {
             rows.append(ResetHistoryRow(id: "provider|\(event.id)", title: title, detail: nil, date: event.occurredAt, systemImage: image))
         }
 
-        for event in resetLedger.events(for: snapshot.providerID) where event.occurredAt >= cutoff {
+        for event in resetLedger.events(for: snapshot.accountKey) where event.occurredAt >= cutoff {
             guard event.kind != .scheduled else { continue }
             // The provider's own "Reset used" entry already covers a redeemed credit.
             if event.kind == .bankedRedeemed, event.windowLabel == nil, !providerHistory.isEmpty { continue }

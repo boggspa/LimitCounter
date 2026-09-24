@@ -150,6 +150,33 @@ public struct ProviderCardTitleText: View {
     }
 }
 
+/// The account's label beside a provider title: "Work", never an email. Shown
+/// only for accounts the user named, so a single-account card is unchanged.
+public struct AccountLabelChip: View {
+    let text: String
+    let accent: Color
+
+    public init(text: String, accent: Color) {
+        self.text = text
+        self.accent = accent
+    }
+
+    public var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(accent.opacity(0.18), in: Capsule(style: .continuous))
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(accent.opacity(0.35), lineWidth: 0.8)
+            )
+            .foregroundStyle(.white.opacity(0.9))
+            .accessibilityLabel("Account \(text)")
+    }
+}
+
 /// How stale a snapshot's `fetchedAt` is, used to escalate the "Updated …"
 /// line from quiet tertiary text to a prominent amber/red warning. This is
 /// what surfaces an iOS viewer that has fallen hours/days behind the Mac
@@ -305,7 +332,12 @@ public struct QuotaCardView: View {
             ProviderBrandIconView(providerID: snapshot.providerID, size: 24)
 
             VStack(alignment: .leading, spacing: 1) {
-                ProviderCardTitleText(title: snapshot.displayName, accentColor: accentColor)
+                HStack(spacing: 6) {
+                    ProviderCardTitleText(title: snapshot.displayName, accentColor: accentColor)
+                    if let badge = snapshot.accountBadgeText {
+                        AccountLabelChip(text: badge, accent: accentColor)
+                    }
+                }
 
                 headerMetadataLine(plan: snapshot.planName, updatedAt: snapshot.fetchedAt)
 
@@ -1112,7 +1144,7 @@ public struct QuotaCardSmallView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     ProviderBrandIconView(providerID: snapshot.providerID, size: 14)
-                    Text(snapshot.displayName)
+                    Text(snapshot.accountDisplayName)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)

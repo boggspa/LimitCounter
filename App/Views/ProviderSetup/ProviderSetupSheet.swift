@@ -56,11 +56,11 @@ struct ProviderSetupSheet: View {
         HStack(spacing: 8) {
             // Steps advance inside the canvas rather than pushing a stack, so
             // "back" is one level and only exists on the form page.
-            if case .credential(let providerID) = model.page {
+            if case .credential(let account) = model.page {
                 Button {
-                    model.page = .provider(providerID)
+                    model.page = .provider(account.providerID)
                 } label: {
-                    Label(providerID.displayName, systemImage: "chevron.left")
+                    Label(account.providerID.displayName, systemImage: "chevron.left")
                         .font(.system(size: 12, weight: .medium))
                         .labelStyle(.titleAndIcon)
                 }
@@ -85,7 +85,12 @@ struct ProviderSetupSheet: View {
     private var title: String {
         switch model.page {
         case .overview: return "Setup"
-        case .provider(let id), .credential(let id): return id.displayName
+        case .provider(let id): return id.displayName
+        case .credential(let account):
+            if let label = model.accountLabel(for: account) {
+                return "\(account.providerID.displayName) · \(label)"
+            }
+            return account.providerID.displayName
         case .preferences: return "Preferences"
         }
     }

@@ -14,8 +14,15 @@ public final class KeychainService {
 
     // MARK: - Public API
 
+    /// The primary account's credential. Every provider-keyed call is the
+    /// account-keyed one for that provider's primary account, so the keychain
+    /// item name (`kSecAttrAccount`) a pre-account install wrote is unchanged.
     public func credential(for providerID: ProviderID) -> ProviderCredential? {
-        guard let data = read(account: providerID.rawValue) else { return nil }
+        credential(for: .primary(providerID))
+    }
+
+    public func credential(for account: ProviderAccountKey) -> ProviderCredential? {
+        guard let data = read(account: account.rawValue) else { return nil }
         return try? decoder.decode(ProviderCredential.self, from: data)
     }
 
@@ -24,11 +31,16 @@ public final class KeychainService {
     /// treating an in-memory token as durable when the OS rejected it.
     @discardableResult
     public func save(_ credential: ProviderCredential, for providerID: ProviderID) -> Bool {
+        save(credential, for: .primary(providerID))
+    }
+
+    @discardableResult
+    public func save(_ credential: ProviderCredential, for account: ProviderAccountKey) -> Bool {
         do {
             let data = try encoder.encode(credential)
-            return write(data: data, account: providerID.rawValue)
+            return write(data: data, account: account.rawValue)
         } catch {
-            print("[KeychainService] Failed to encode credential for \(providerID.rawValue): \(error.localizedDescription)")
+            print("[KeychainService] Failed to encode credential for \(account.rawValue): \(error.localizedDescription)")
             return false
         }
     }
@@ -41,8 +53,16 @@ public final class KeychainService {
         _ updates: [String: String],
         for providerID: ProviderID
     ) -> Bool {
-        guard let credential = credential(for: providerID) else {
-            print("[KeychainService] Cannot update \(providerID.rawValue): stored credential is unavailable")
+        updateExtraFields(updates, for: .primary(providerID))
+    }
+
+    @discardableResult
+    public func updateExtraFields(
+        _ updates: [String: String],
+        for account: ProviderAccountKey
+    ) -> Bool {
+        guard let credential = credential(for: account) else {
+            print("[KeychainService] Cannot update \(account.rawValue): stored credential is unavailable")
             return false
         }
 
@@ -57,15 +77,23 @@ public final class KeychainService {
             extraFields: extraFields,
             bookmarkData: credential.bookmarkData
         )
-        return save(updated, for: providerID)
+        return save(updated, for: account)
     }
 
     public func delete(for providerID: ProviderID) {
-        delete(account: providerID.rawValue)
+        delete(for: .primary(providerID))
+    }
+
+    public func delete(for account: ProviderAccountKey) {
+        delete(account: account.rawValue)
     }
 
     public func hasCredential(for providerID: ProviderID) -> Bool {
-        credential(for: providerID) != nil
+        hasCredential(for: .primary(providerID))
+    }
+
+    public func hasCredential(for account: ProviderAccountKey) -> Bool {
+        credential(for: account) != nil
     }
 
     // MARK: - Keychain Primitives

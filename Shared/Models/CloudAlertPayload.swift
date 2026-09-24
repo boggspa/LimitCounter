@@ -45,6 +45,10 @@ public struct CloudAlertPayload: Codable, Hashable {
     /// Finer reset classification carried alongside `kind`; nil for alerts
     /// published by builds that predate it.
     public let resetKind: QuotaResetKind?
+    /// Which account of the provider the alert is about. Empty (the primary)
+    /// for alerts published before accounts existed.
+    public let accountSlot: String
+    public let accountLabel: String?
 
     public nonisolated init(
         providerID: ProviderID,
@@ -54,7 +58,9 @@ public struct CloudAlertPayload: Codable, Hashable {
         createdAt: Date,
         windowLabel: String?,
         kind: CloudAlertKind,
-        resetKind: QuotaResetKind? = nil
+        resetKind: QuotaResetKind? = nil,
+        accountSlot: String = ProviderAccountKey.primarySlot,
+        accountLabel: String? = nil
     ) {
         self.providerID = providerID
         self.title = title
@@ -64,6 +70,33 @@ public struct CloudAlertPayload: Codable, Hashable {
         self.windowLabel = windowLabel
         self.kind = kind
         self.resetKind = resetKind
+        self.accountSlot = ProviderAccountKey.normalizedSlot(accountSlot)
+        self.accountLabel = accountLabel
+    }
+
+    public nonisolated var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case providerID, title, body, signature, createdAt, windowLabel, kind, resetKind
+        case accountSlot, accountLabel
+    }
+
+    public nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        providerID = try container.decode(ProviderID.self, forKey: .providerID)
+        title = try container.decode(String.self, forKey: .title)
+        body = try container.decode(String.self, forKey: .body)
+        signature = try container.decode(String.self, forKey: .signature)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        windowLabel = try container.decodeIfPresent(String.self, forKey: .windowLabel)
+        kind = try container.decode(CloudAlertKind.self, forKey: .kind)
+        resetKind = try container.decodeIfPresent(QuotaResetKind.self, forKey: .resetKind)
+        accountSlot = ProviderAccountKey.normalizedSlot(
+            try container.decodeIfPresent(String.self, forKey: .accountSlot) ?? ProviderAccountKey.primarySlot
+        )
+        accountLabel = try container.decodeIfPresent(String.self, forKey: .accountLabel)
     }
 
     /// Whether the alert earns a banner and a notification. A banked reset the
@@ -188,15 +221,18 @@ public enum UsageResetAlertBuilder {
                 : .scheduledReset
             let resetKind = dominantResetKind(of: resetSignals, alertKind: kind)
             let newestSignalDate = resetSignals.map(\.detectedAt).max() ?? noticedAt
-            let title = resetAlertTitle(displayName: snapshot.displayName, resetKind: resetKind)
+            let title = resetAlertTitle(displayName: snapshot.accountDisplayName, resetKind: resetKind)
             let body = resetAlertBody(
                 labels: labels,
                 signals: resetSignals,
                 noticedAt: noticedAt
             )
+            // The account key sits where the provider raw value used to: the
+            // primary account's signatures are unchanged, and a secondary
+            // account's reset can never be deduplicated away as the primary's.
             let signature = [
                 "reset",
-                snapshot.providerID.rawValue,
+                snapshot.accountKey.rawValue,
                 kind.rawValue,
                 String(Int(newestSignalDate.timeIntervalSince1970)),
                 labelSummary,
@@ -211,7 +247,9 @@ public enum UsageResetAlertBuilder {
                 createdAt: noticedAt,
                 windowLabel: labelSummary,
                 kind: kind,
-                resetKind: resetKind
+                resetKind: resetKind,
+                accountSlot: snapshot.accountSlot,
+                accountLabel: snapshot.accountBadgeText
             )
         }
 
@@ -225,7 +263,7 @@ public enum UsageResetAlertBuilder {
         let labelSummary = (label?.isEmpty == false ? label : nil) ?? "Banked reset"
         let signature = [
             "reset",
-            snapshot.providerID.rawValue,
+            snapshot.accountKey.rawValue,
             CloudAlertKind.resetAvailable.rawValue,
             String(Int(available.detectedAt.timeIntervalSince1970)),
             labelSummary,
@@ -234,13 +272,15 @@ public enum UsageResetAlertBuilder {
 
         return CloudAlertPayload(
             providerID: snapshot.providerID,
-            title: "\(snapshot.displayName) reset available",
+            title: "\(snapshot.accountDisplayName) reset available",
             body: "\(available.message) Noticed at \(clockString(for: noticedAt)).",
             signature: signature,
             createdAt: noticedAt,
             windowLabel: labelSummary,
             kind: .resetAvailable,
-            resetKind: .bankedAvailable
+            resetKind: .bankedAvailable,
+            accountSlot: snapshot.accountSlot,
+            accountLabel: snapshot.accountBadgeText
         )
     }
 

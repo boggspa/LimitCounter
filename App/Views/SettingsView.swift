@@ -810,7 +810,21 @@ enum ProviderWebImportKind: String, Hashable {
 }
 
 struct ProviderCredentialView: View {
-    let providerID: ProviderID
+    /// Which account this form edits. The primary account's key is the
+    /// provider itself, which is what every pre-account caller passes.
+    let account: ProviderAccountKey
+    var providerID: ProviderID { account.providerID }
+
+    @ObservedObject private var accountRegistry = ProviderAccountRegistry.shared
+    @State private var accountLabelDraft = ""
+
+    init(providerID: ProviderID) {
+        self.init(account: .primary(providerID))
+    }
+
+    init(account: ProviderAccountKey) {
+        self.account = account
+    }
 
     @State private var accessToken = ""
     @State private var accountIdentifier = ""
@@ -853,7 +867,7 @@ struct ProviderCredentialView: View {
     }
 
     private var importCopy: ProviderSetupPolicy.ImportCopy {
-        ProviderSetupPolicy.importCopy(for: providerID)
+        ProviderSetupPolicy.importCopy(for: providerID, account: account)
     }
 
     private var importSectionTitle: String { importCopy.sectionTitle }
@@ -974,6 +988,19 @@ struct ProviderCredentialView: View {
         // No backdrop of its own: the setup sheet paints the glass, and a
         // second one on top only muddies the first.
         Form {
+            if !account.isPrimary {
+                Section("Account") {
+                    TextField("Label", text: $accountLabelDraft)
+                        .onSubmit(commitAccountLabel)
+                    Text(ProviderSetupPolicy.additionalAccountHint(for: providerID))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .listRowBackground(Color.white.opacity(0.04))
+            }
+
             Section("Connection") {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(providerID.integrationStatus.badgeTitle)
@@ -994,8 +1021,9 @@ struct ProviderCredentialView: View {
                 .listRowBackground(Color.white.opacity(0.04))
             }
 
-            // Show auto-detected credential files
-            if !providerDetectedCredentials.isEmpty {
+            // Show auto-detected credential files. They are the primary
+            // account's: a second account is, by definition, somewhere else.
+            if account.isPrimary, !providerDetectedCredentials.isEmpty {
                 Section("Auto-Detected (\(providerDetectedCredentials.count) files found)") {
                     ForEach(providerDetectedCredentials) { detected in
                         Button(action: { importDetectedCredential(detected) }) {
@@ -1040,13 +1068,13 @@ struct ProviderCredentialView: View {
             .padding(.horizontal, 12)
             .listRowBackground(Color.white.opacity(0.04))
 
-            if providerID == .openai {
+            if providerID == .openai, account.isPrimary {
                 codexTelemetrySection
             }
 
             #if DEBUG
             Section("Debug Info") {
-                Text("Provider: \(providerID.rawValue)")
+                Text("Account: \(account.rawValue)")
                     .font(.caption)
                 Text("Detected files: \(providerDetectedCredentials.count)")
                     .font(.caption)
@@ -1508,7 +1536,10 @@ struct ProviderCredentialView: View {
         // row and overflows instead, which is what pushed this form out past
         // both edges of the sheet.
         .formStyle(.grouped)
-        .navigationTitle(providerID.displayName)
+        .navigationTitle(
+            accountRegistry.label(for: account).map { "\(providerID.displayName) · \($0)" } ?? providerID.displayName
+        )
+        .onDisappear(perform: commitAccountLabel)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
@@ -1707,7 +1738,7 @@ struct ProviderCredentialView: View {
 
     private func importFromFile() {
         #if os(macOS)
-        CredentialImportService.showImportPanel(for: providerID) { result in
+        CredentialImportService.showImportPanel(for: providerID, account: account) { result in
             DispatchQueue.main.async {
                 switch result {
                 case .success(let credential):
@@ -1862,10 +1893,18 @@ struct ProviderCredentialView: View {
     }
 
     private func loadExisting() {
-        let credential = KeychainService.shared.credential(for: providerID)
+        let credential = KeychainService.shared.credential(for: account)
         let draft = ProviderSetupPolicy.draft(from: credential, providerID: providerID)
         apply(draft)
         applySessionFlags(from: draft)
+        accountLabelDraft = accountRegistry.label(for: account) ?? ""
+
+        // A second Claude account exists for its live meters, and those come
+        // from that account's own Claude Code sign-in, so the read starts on.
+        // The primary keeps its explicit opt-in.
+        if !account.isPrimary, providerID == .claude, credential == nil {
+            ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(true, in: &storedExtraFields)
+        }
 
         // Scan for available credential files
         detectedCredentials = CredentialImportService.detectAvailableCredentials()
@@ -1920,7 +1959,7 @@ struct ProviderCredentialView: View {
             return true
         }
 
-        guard KeychainService.shared.save(credential, for: providerID) else {
+        guard KeychainService.shared.save(credential, for: account) else {
             showKeychainSaveFailure(for: providerID)
             return false
         }
@@ -2036,19 +2075,30 @@ struct ProviderCredentialView: View {
     private func applyImportedCredential(
         _ credential: CredentialImportService.ImportedCredential
     ) -> Bool {
-        let merged = providerID == .cursor
+        var merged = providerID == .cursor
             ? ProviderSetupPolicy.mergingCursor(
                 currentDraft,
                 imported: credential,
-                existing: KeychainService.shared.credential(for: .cursor)
+                existing: KeychainService.shared.credential(for: account)
             )
             : ProviderSetupPolicy.merging(
                 currentDraft,
                 imported: credential,
                 providerID: providerID
             )
+        // The folder grant is what makes a second Claude account readable at
+        // all; an import that cleared the opt-in would leave it meterless.
+        if providerID == .claude, !account.isPrimary {
+            ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(true, in: &merged.extraFields)
+        }
         apply(merged)
         return saveCredentialWithExtraFields(merged.extraFields)
+    }
+
+    private func commitAccountLabel() {
+        guard !account.isPrimary else { return }
+        accountRegistry.rename(account, to: accountLabelDraft)
+        accountLabelDraft = accountRegistry.label(for: account) ?? accountLabelDraft
     }
 
     private func showKeychainSaveFailure(for targetProviderID: ProviderID) {
@@ -2065,7 +2115,7 @@ struct ProviderCredentialView: View {
         } else if providerID == .mimo {
             MimoWebSessionImportModel.clearStoredWebsiteData()
         }
-        KeychainService.shared.delete(for: providerID)
+        KeychainService.shared.delete(for: account)
         accessToken = ""
         accountIdentifier = ""
         customEndpoint = ""

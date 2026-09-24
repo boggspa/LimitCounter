@@ -76,12 +76,22 @@ private struct MenuBarPopoverView: View {
             }
     }
 
+    /// One chip per provider, however many accounts it has.
+    private var visibleProviderIDs: [ProviderID] {
+        var seen = Set<ProviderID>()
+        return visibleSnapshots.compactMap { seen.insert($0.providerID).inserted ? $0.providerID : nil }
+    }
+
+    /// Every account of the selected provider, primary first.
+    private var selectedSnapshots: [QuotaSnapshot] {
+        let providerID = selectedProviderID.flatMap { visibleProviderIDs.contains($0) ? $0 : nil }
+            ?? visibleProviderIDs.first
+        guard let providerID else { return [] }
+        return visibleSnapshots.filter { $0.providerID == providerID }
+    }
+
     private var selectedSnapshot: QuotaSnapshot? {
-        if let selectedProviderID,
-           let match = visibleSnapshots.first(where: { $0.providerID == selectedProviderID }) {
-            return match
-        }
-        return visibleSnapshots.first
+        selectedSnapshots.first
     }
 
     var body: some View {
@@ -101,10 +111,12 @@ private struct MenuBarPopoverView: View {
                             NSApplication.shared.activate(ignoringOtherApps: true)
                         }
 
-                        if let selectedSnapshot {
-                            focusedProviderSection(selectedSnapshot)
-                        } else {
+                        if selectedSnapshots.isEmpty {
                             emptyState
+                        } else {
+                            ForEach(selectedSnapshots) { snapshot in
+                                focusedProviderSection(snapshot)
+                            }
                         }
                     }
                     .padding(.horizontal, 12)
@@ -157,14 +169,14 @@ private struct MenuBarPopoverView: View {
     private var providerSwitcher: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
-                ForEach(visibleSnapshots) { snapshot in
-                    let isSelected = selectedSnapshot?.providerID == snapshot.providerID
+                ForEach(visibleProviderIDs, id: \.self) { providerID in
+                    let isSelected = selectedSnapshot?.providerID == providerID
                     Button {
-                        selectedProviderID = snapshot.providerID
+                        selectedProviderID = providerID
                     } label: {
                         HStack(spacing: 5) {
-                            ProviderBrandIconView(providerID: snapshot.providerID, size: 15)
-                            Text(snapshot.providerID.displayName)
+                            ProviderBrandIconView(providerID: providerID, size: 15)
+                            Text(providerID.displayName)
                                 .font(.caption.weight(.semibold))
                                 .lineLimit(1)
                         }
@@ -173,7 +185,7 @@ private struct MenuBarPopoverView: View {
                         .foregroundStyle(isSelected ? .white : .secondary)
                         .background(
                             Capsule(style: .continuous)
-                                .fill((isSelected ? Color(hex: snapshot.providerID.accentColorHex) : Color.white).opacity(isSelected ? 0.22 : 0.055))
+                                .fill((isSelected ? Color(hex: providerID.accentColorHex) : Color.white).opacity(isSelected ? 0.22 : 0.055))
                         )
                         .overlay(
                             Capsule(style: .continuous)
@@ -195,7 +207,7 @@ private struct MenuBarPopoverView: View {
                     Text("Overview")
                         .font(.caption.weight(.bold))
                     Spacer()
-                    Text("\(visibleSnapshots.count) providers")
+                    Text("\(visibleProviderIDs.count) providers")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
@@ -217,23 +229,27 @@ private struct MenuBarPopoverView: View {
                 HStack(spacing: 8) {
                     ProviderBrandIconView(providerID: snapshot.providerID, size: 22)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(snapshot.displayName)
+                        Text(snapshot.accountDisplayName)
                             .font(.caption.weight(.bold))
                         MiniMetadataLine(plan: snapshot.displayPlanName, updatedAt: snapshot.fetchedAt)
                     }
 
                     Spacer()
 
-                    Button {
-                        panelStore.toggle(kind: .provider, providerID: snapshot.providerID)
-                        FloatingPanelManager.shared.reconcile()
-                    } label: {
-                        Image(systemName: panelStore.isVisible(kind: .provider, providerID: snapshot.providerID) ? "pin.fill" : "pin")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 28, height: 28)
+                    // Pinned panels are per provider, so the pin lives on the
+                    // primary account's section.
+                    if snapshot.isPrimaryAccount {
+                        Button {
+                            panelStore.toggle(kind: .provider, providerID: snapshot.providerID)
+                            FloatingPanelManager.shared.reconcile()
+                        } label: {
+                            Image(systemName: panelStore.isVisible(kind: .provider, providerID: snapshot.providerID) ? "pin.fill" : "pin")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 28, height: 28)
+                        }
+                        .glassButtonStyle()
+                        .help("Pin provider panel")
                     }
-                    .glassButtonStyle()
-                    .help("Pin provider panel")
                 }
 
                 if snapshot.fetchState == .error {
@@ -320,7 +336,7 @@ private struct MenuBarOverviewRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
-                    Text(snapshot.displayName)
+                    Text(snapshot.accountDisplayName)
                         .font(.caption.weight(.semibold))
                         .lineLimit(1)
                     Spacer()

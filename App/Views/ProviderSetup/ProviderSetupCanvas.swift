@@ -22,18 +22,18 @@ struct ProviderSetupCanvas: View {
                 ProviderSetupProviderPage(
                     model: model,
                     providerID: providerID,
-                    onConfigure: { model.page = .credential(providerID) }
+                    onConfigure: { model.page = .credential(.primary(providerID)) }
                 )
                 // A stable identity per provider, so switching pages does not
                 // re-run onAppear work against the wrong provider.
                 .id(providerID)
-            case .credential(let providerID):
+            case .credential(let account):
                 // The existing configuration form, hosted as a page. It used to
                 // get an `NSWindow` of its own, one per provider, pinned above
                 // every other app.
-                ProviderCredentialView(providerID: providerID)
-                    .id(providerID)
-                    .onDisappear { model.refreshHealth(for: providerID) }
+                ProviderCredentialView(account: account)
+                    .id(account)
+                    .onDisappear { model.refreshHealth(for: account.providerID) }
             case .preferences:
                 ProviderSetupPreferencesPage(model: model)
             }
@@ -175,41 +175,54 @@ struct ProviderSetupProviderPage: View {
     let providerID: ProviderID
     var onConfigure: () -> Void
 
+    @State private var showAddAccount = false
+    @State private var accountPendingRemoval: ProviderAccountKey?
+
     private var accent: Color { Color(hex: providerID.accentColorHex) }
 
     var body: some View {
         VStack(spacing: 0) {
-            Spacer(minLength: 24)
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 24)
 
-            VStack(spacing: 0) {
-                ProviderBrandIconView(providerID: providerID, size: 52)
-                    .padding(.bottom, 24)
+                    ProviderBrandIconView(providerID: providerID, size: 52)
+                        .padding(.bottom, 24)
 
-                Text(headline)
-                    .font(.title2.weight(.semibold))
-                    .multilineTextAlignment(.center)
-                    .padding(.bottom, 16)
+                    Text(headline)
+                        .font(.title2.weight(.semibold))
+                        .multilineTextAlignment(.center)
+                        .padding(.bottom, 16)
 
-                Text(bodyCopy)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 380)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 24)
+                    Text(bodyCopy)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 24)
 
-                Button(primaryLabel, action: onConfigure)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .tint(accent)
+                    Button(primaryLabel, action: onConfigure)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .tint(accent)
 
-                if let banner = model.banner, bannerBelongsHere(banner) {
-                    bannerView(banner)
-                        .padding(.top, 16)
+                    if let banner = model.banner, bannerBelongsHere(banner) {
+                        bannerView(banner)
+                            .padding(.top, 16)
+                    }
+
+                    if providerID.supportsAdditionalAccounts {
+                        accountsBlock
+                            .padding(.top, 32)
+                    }
+
+                    Spacer(minLength: 24)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 28)
             }
-
-            Spacer(minLength: 24)
+            .scrollContentBackground(.hidden)
 
             Divider().opacity(0.16)
 
@@ -231,6 +244,138 @@ struct ProviderSetupProviderPage: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
         }
+    }
+
+    // MARK: Additional accounts
+
+    /// The provider's other accounts, one row each, and the way to add one.
+    /// Tracking only: nothing here switches which account a CLI uses.
+    private var accountsBlock: some View {
+        let records = model.accounts(for: providerID)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text("ACCOUNTS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+                Text("\(records.count + 1)")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                Button {
+                    showAddAccount = true
+                } label: {
+                    Label("Add account", systemImage: "plus")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .disabled(!model.canAddAccount(for: providerID))
+                .popover(isPresented: $showAddAccount, arrowEdge: .bottom) {
+                    AddAccountPopover(model: model, providerID: providerID, isPresented: $showAddAccount)
+                }
+            }
+
+            Text(ProviderSetupPolicy.additionalAccountHint(for: providerID))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 4) {
+                accountRow(
+                    label: "Primary",
+                    health: model.health(for: providerID),
+                    open: onConfigure,
+                    remove: nil
+                )
+                ForEach(records) { record in
+                    accountRow(
+                        label: record.label,
+                        health: model.accountHealth(for: record.key),
+                        open: { model.page = .credential(record.key) },
+                        remove: { accountPendingRemoval = record.key }
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: 420)
+        .confirmationDialog(
+            "Remove \(pendingRemovalLabel)?",
+            isPresented: Binding(
+                get: { accountPendingRemoval != nil },
+                set: { if !$0 { accountPendingRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove account", role: .destructive) {
+                if let key = accountPendingRemoval {
+                    model.removeAccount(key)
+                }
+                accountPendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { accountPendingRemoval = nil }
+        } message: {
+            Text("Its stored credential and cached readings on this Mac are deleted. The account itself is untouched.")
+        }
+    }
+
+    private var pendingRemovalLabel: String {
+        accountPendingRemoval.flatMap { model.accountLabel(for: $0) } ?? "account"
+    }
+
+    private func accountRow(
+        label: String,
+        health: ProviderSetupHealth,
+        open: @escaping () -> Void,
+        remove: (() -> Void)?
+    ) -> some View {
+        HStack(spacing: 8) {
+            Group {
+                switch health {
+                case .connected, .autoDetected:
+                    Circle().fill(accent).frame(width: 8, height: 8)
+                case .needsAttention:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color(hex: "#F59E0B"))
+                case .notSetUp:
+                    Circle().strokeBorder(Color.secondary.opacity(0.6), lineWidth: 1.4).frame(width: 8, height: 8)
+                }
+            }
+            .frame(width: 14)
+
+            Text(label)
+                .font(.subheadline)
+                .lineLimit(1)
+
+            Text(health.word)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Button(health.isConnected || health.isAttention ? "Open" : "Set up", action: open)
+                .buttonStyle(.borderless)
+                .font(.system(size: 11, weight: .medium))
+
+            if let remove {
+                Button(action: remove) {
+                    Image(systemName: "minus.circle")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Remove this account from Limit Counter")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label), \(health.word)")
     }
 
     private var headline: String {
@@ -290,6 +435,45 @@ struct ProviderSetupProviderPage: View {
                 .frame(maxWidth: 380)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// Names the new account and opens its form. The label is presentation only —
+/// see `ProviderAccountKey` — so it can be changed later without consequence.
+private struct AddAccountPopover: View {
+    @ObservedObject var model: ProviderSetupModel
+    let providerID: ProviderID
+    @Binding var isPresented: Bool
+    @State private var label = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add \(providerID.displayName) account")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            TextField("Label, e.g. Work", text: $label)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(add)
+            Text("Use a name, not an email: the label appears on the card, in the menu bar and in the widget.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Add", action: add)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+
+    private func add() {
+        model.addAccount(for: providerID, label: label)
+        isPresented = false
     }
 }
 

@@ -43,17 +43,34 @@ public final class QuotaSnapshotStore {
         return cleaned
     }
 
+    /// The provider's primary account. Callers that never asked about accounts
+    /// keep getting what they always got; a provider with only secondary
+    /// accounts stored (not a state the coordinator produces) yields the first.
     public func snapshot(for providerID: ProviderID) -> QuotaSnapshot? {
-        loadSnapshots().first { $0.providerID == providerID }
+        let matching = loadSnapshots().filter { $0.providerID == providerID }
+        return matching.first { $0.isPrimaryAccount } ?? matching.first
+    }
+
+    public func snapshot(for account: ProviderAccountKey) -> QuotaSnapshot? {
+        loadSnapshots().first { $0.accountKey == account }
+    }
+
+    /// Every stored account of one provider, primary first, then in the order
+    /// the accounts were added.
+    public func snapshots(for providerID: ProviderID) -> [QuotaSnapshot] {
+        loadSnapshots()
+            .filter { $0.providerID == providerID }
+            .sorted { ProviderAccountRegistry.nonisolatedRank(for: $0.accountKey) < ProviderAccountRegistry.nonisolatedRank(for: $1.accountKey) }
     }
 
     // MARK: - Write
 
-    /// Upserts a single provider snapshot, preserving others.
-    /// Call WidgetCenter.shared.reloadAllTimelines() after this from the main app.
+    /// Upserts a single account snapshot, preserving every other account and
+    /// provider. Call WidgetCenter.shared.reloadAllTimelines() after this from
+    /// the main app.
     public func upsert(_ snapshot: QuotaSnapshot) {
         var current = loadSnapshots()
-        current.removeAll { $0.providerID == snapshot.providerID }
+        current.removeAll { $0.accountKey == snapshot.accountKey }
         current.append(snapshot)
         save(current)
     }
@@ -65,9 +82,16 @@ public final class QuotaSnapshotStore {
 
     // MARK: - Clear
 
+    /// Removes every account of the provider.
     public func clear(providerID: ProviderID) {
         var current = loadSnapshots()
         current.removeAll { $0.providerID == providerID }
+        save(current)
+    }
+
+    public func clear(account: ProviderAccountKey) {
+        var current = loadSnapshots()
+        current.removeAll { $0.accountKey == account }
         save(current)
     }
 
@@ -734,6 +758,14 @@ public final class MeterOrderStore: ObservableObject {
         window.stableIdentity(for: providerID)
     }
 
+    /// The same identity, scoped to an account. The primary account's key is
+    /// unchanged; a secondary account's "Weekly" meter must not share a rank
+    /// with the primary's.
+    public nonisolated static func key(account: ProviderAccountKey, window: QuotaWindow) -> String {
+        let base = window.stableIdentity(for: account.providerID)
+        return account.isPrimary ? base : "\(account.rawValue)|\(base)"
+    }
+
     /// Scope for the "Standard" compact layout, where meters are grouped under
     /// their own provider and can only be reordered among their siblings.
     public nonisolated static func scopeForProvider(_ providerID: ProviderID) -> String {
@@ -867,5 +899,206 @@ public final class ProviderCardDisclosureStore: ObservableObject {
 
     private func expandedStateKey(for providerID: ProviderID) -> String {
         "\(expandedStatePrefix)\(providerID.rawValue)"
+    }
+}
+
+// MARK: - Provider Accounts
+
+/// One additional account the user added under a provider. The primary account
+/// is deliberately not a record: it needs no label, it always exists, and it is
+/// what every install that predates accounts already has.
+public struct ProviderAccountRecord: Codable, Hashable, Identifiable {
+    public let providerID: ProviderID
+    public let slot: String
+    public var label: String
+    public let createdAt: Date
+    /// Insertion order within the provider. Timestamps lose sub-second
+    /// precision on the way to disk, so two accounts added in the same second
+    /// would otherwise swap places on the next launch.
+    public let position: Int
+
+    public init(providerID: ProviderID, slot: String, label: String, createdAt: Date = Date(), position: Int = 0) {
+        self.providerID = providerID
+        self.slot = ProviderAccountKey.normalizedSlot(slot)
+        self.label = label
+        self.createdAt = createdAt
+        self.position = position
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case providerID, slot, label, createdAt, position
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        providerID = try container.decode(ProviderID.self, forKey: .providerID)
+        slot = ProviderAccountKey.normalizedSlot(try container.decode(String.self, forKey: .slot))
+        label = try container.decode(String.self, forKey: .label)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+    }
+
+    public var key: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: slot)
+    }
+
+    public var id: String { key.rawValue }
+}
+
+/// The accounts each provider tracks beyond its primary one, with the labels
+/// the user gave them. Lives in the App Group so the widget can label rows too.
+@MainActor
+public final class ProviderAccountRegistry: ObservableObject {
+    public static let shared = ProviderAccountRegistry()
+
+    private nonisolated static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+    private nonisolated static let recordsKey = "providerAccountRecords.v1"
+    private nonisolated static let maxAccountsPerProvider = 8
+
+    @Published public private(set) var records: [ProviderAccountRecord]
+
+    private let defaultsOverride: UserDefaults?
+
+    private var defaults: UserDefaults {
+        if let defaultsOverride { return defaultsOverride }
+        return UserDefaults(suiteName: Self.appGroupID) ?? .standard
+    }
+
+    public convenience init(defaults: UserDefaults) {
+        self.init(defaultsProvider: defaults)
+    }
+
+    private init(defaultsProvider: UserDefaults? = nil) {
+        self.defaultsOverride = defaultsProvider
+        self.records = Self.load(from: defaultsProvider ?? (UserDefaults(suiteName: Self.appGroupID) ?? .standard))
+    }
+
+    // MARK: Reading
+
+    /// Secondary accounts of one provider, oldest first.
+    public func accounts(for providerID: ProviderID) -> [ProviderAccountRecord] {
+        Self.accounts(for: providerID, in: records)
+    }
+
+    /// Every account key the coordinator should refresh for a provider: the
+    /// primary, then the secondaries in the order they were added.
+    public func keys(for providerID: ProviderID) -> [ProviderAccountKey] {
+        [.primary(providerID)] + accounts(for: providerID).map(\.key)
+    }
+
+    public func record(for key: ProviderAccountKey) -> ProviderAccountRecord? {
+        records.first { $0.key == key }
+    }
+
+    public func label(for key: ProviderAccountKey) -> String? {
+        record(for: key)?.label
+    }
+
+    public func canAddAccount(for providerID: ProviderID) -> Bool {
+        providerID.supportsAdditionalAccounts
+            && accounts(for: providerID).count < Self.maxAccountsPerProvider
+    }
+
+    // MARK: Writing
+
+    /// Adds a secondary account and returns it. A blank label gets a numbered
+    /// default so the card never shows an empty chip.
+    @discardableResult
+    public func addAccount(for providerID: ProviderID, label: String) -> ProviderAccountRecord? {
+        guard canAddAccount(for: providerID) else { return nil }
+        var slot = ProviderAccountKey.makeSlot()
+        while records.contains(where: { $0.providerID == providerID && $0.slot == slot }) {
+            slot = ProviderAccountKey.makeSlot()
+        }
+        let siblings = accounts(for: providerID)
+        let resolvedLabel = Self.resolvedLabel(label, existingCount: siblings.count)
+        let position = (siblings.map(\.position).max() ?? 0) + 1
+        let record = ProviderAccountRecord(providerID: providerID, slot: slot, label: resolvedLabel, position: position)
+        records.append(record)
+        save()
+        return record
+    }
+
+    public func rename(_ key: ProviderAccountKey, to label: String) {
+        guard let index = records.firstIndex(where: { $0.key == key }) else { return }
+        let resolved = Self.resolvedLabel(label, existingCount: max(0, accounts(for: key.providerID).count - 1))
+        guard records[index].label != resolved else { return }
+        records[index].label = resolved
+        save()
+    }
+
+    /// Forgets the account's label and slot. Its credential and snapshot are
+    /// the caller's to remove; the registry only owns the roster.
+    public func remove(_ key: ProviderAccountKey) {
+        let before = records.count
+        records.removeAll { $0.key == key }
+        guard records.count != before else { return }
+        save()
+    }
+
+    // MARK: Nonisolated readers (widget, coordinator ordering)
+
+    public nonisolated static func nonisolatedRecords() -> [ProviderAccountRecord] {
+        load(from: UserDefaults(suiteName: appGroupID) ?? .standard)
+    }
+
+    public nonisolated static func nonisolatedLabel(for key: ProviderAccountKey) -> String? {
+        guard !key.isPrimary else { return nil }
+        return nonisolatedRecords().first { $0.key == key }?.label
+    }
+
+    /// 0 for the primary account, then creation order. Sorting by provider
+    /// rank and then this keeps a provider's accounts together, primary on top.
+    public nonisolated static func nonisolatedRank(for key: ProviderAccountKey) -> Int {
+        rank(for: key, in: nonisolatedRecords())
+    }
+
+    public nonisolated static func rank(for key: ProviderAccountKey, in records: [ProviderAccountRecord]) -> Int {
+        guard !key.isPrimary else { return 0 }
+        let siblings = accounts(for: key.providerID, in: records)
+        guard let index = siblings.firstIndex(where: { $0.key == key }) else { return Int.max }
+        return index + 1
+    }
+
+    // MARK: Private
+
+    private nonisolated static func accounts(
+        for providerID: ProviderID,
+        in records: [ProviderAccountRecord]
+    ) -> [ProviderAccountRecord] {
+        records
+            .filter { $0.providerID == providerID }
+            .sorted { lhs, rhs in
+                if lhs.position != rhs.position { return lhs.position < rhs.position }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.slot < rhs.slot
+            }
+    }
+
+    private nonisolated static func resolvedLabel(_ label: String, existingCount: Int) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Account \(existingCount + 2)" : String(trimmed.prefix(40))
+    }
+
+    private nonisolated static func load(from defaults: UserDefaults) -> [ProviderAccountRecord] {
+        guard let data = defaults.data(forKey: recordsKey) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = (try? decoder.decode([ProviderAccountRecord].self, from: data)) ?? []
+        // A record whose provider no longer supports accounts, or whose slot
+        // is empty, cannot be addressed and is dropped rather than shown.
+        return decoded.filter { $0.providerID.supportsAdditionalAccounts && !$0.slot.isEmpty }
+    }
+
+    private func save() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if records.isEmpty {
+            defaults.removeObject(forKey: Self.recordsKey)
+        } else if let data = try? encoder.encode(records) {
+            defaults.set(data, forKey: Self.recordsKey)
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        objectWillChange.send()
     }
 }

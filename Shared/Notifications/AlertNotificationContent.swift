@@ -13,10 +13,13 @@ public enum AlertNotificationContent {
         content.body = alert.body
         content.sound = .default
         content.categoryIdentifier = categoryIdentifier
-        content.threadIdentifier = alert.providerID.rawValue
+        // One thread per account, so a Work reset does not collapse into the
+        // Personal thread. The primary account's thread id is unchanged.
+        content.threadIdentifier = alert.accountKey.rawValue
         content.interruptionLevel = .timeSensitive
         content.userInfo = [
             "providerID": alert.providerID.rawValue,
+            "accountSlot": alert.accountSlot,
             "signature": alert.signature,
             "kind": alert.kind.rawValue,
             "windowLabel": alert.windowLabel ?? ""

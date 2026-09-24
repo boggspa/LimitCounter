@@ -15,6 +15,9 @@ public enum QuotaResetEventSource: String, Codable, Hashable {
 public struct QuotaResetEvent: Codable, Identifiable, Equatable, Hashable {
     public let id: String
     public let providerID: ProviderID
+    /// Which account of the provider reset. Empty (the primary) for events
+    /// recorded before accounts existed.
+    public let accountSlot: String
     public let windowLabel: String?
     public let kind: QuotaResetKind
     public let occurredAt: Date
@@ -29,6 +32,7 @@ public struct QuotaResetEvent: Codable, Identifiable, Equatable, Hashable {
     public init(
         id: String,
         providerID: ProviderID,
+        accountSlot: String = ProviderAccountKey.primarySlot,
         windowLabel: String?,
         kind: QuotaResetKind,
         occurredAt: Date,
@@ -42,6 +46,7 @@ public struct QuotaResetEvent: Codable, Identifiable, Equatable, Hashable {
     ) {
         self.id = id
         self.providerID = providerID
+        self.accountSlot = ProviderAccountKey.normalizedSlot(accountSlot)
         self.windowLabel = windowLabel
         self.kind = kind
         self.occurredAt = occurredAt
@@ -52,6 +57,37 @@ public struct QuotaResetEvent: Codable, Identifiable, Equatable, Hashable {
         self.confidence = confidence
         self.source = source
         self.summary = summary
+    }
+
+    public var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, providerID, accountSlot, windowLabel, kind, occurredAt
+        case fromFraction, toFraction, previousResetDate, newResetDate
+        case confidence, source, summary
+    }
+
+    /// Ledger entries written before accounts existed have no slot and belong
+    /// to the primary account.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        providerID = try container.decode(ProviderID.self, forKey: .providerID)
+        accountSlot = ProviderAccountKey.normalizedSlot(
+            try container.decodeIfPresent(String.self, forKey: .accountSlot) ?? ProviderAccountKey.primarySlot
+        )
+        windowLabel = try container.decodeIfPresent(String.self, forKey: .windowLabel)
+        kind = try container.decode(QuotaResetKind.self, forKey: .kind)
+        occurredAt = try container.decode(Date.self, forKey: .occurredAt)
+        fromFraction = try container.decodeIfPresent(Double.self, forKey: .fromFraction)
+        toFraction = try container.decodeIfPresent(Double.self, forKey: .toFraction)
+        previousResetDate = try container.decodeIfPresent(Date.self, forKey: .previousResetDate)
+        newResetDate = try container.decodeIfPresent(Date.self, forKey: .newResetDate)
+        confidence = try container.decode(Double.self, forKey: .confidence)
+        source = try container.decode(QuotaResetEventSource.self, forKey: .source)
+        summary = try container.decode(String.self, forKey: .summary)
     }
 }
 
@@ -502,8 +538,9 @@ public struct QuotaResetDetector {
             )
             events.append(
                 QuotaResetEvent(
-                    id: "credit|\(snapshot.providerID.rawValue)|used|\(Int(usedAt.timeIntervalSince1970))",
+                    id: "credit|\(snapshot.accountKey.rawValue)|used|\(Int(usedAt.timeIntervalSince1970))",
                     providerID: snapshot.providerID,
+                    accountSlot: snapshot.accountSlot,
                     windowLabel: nil,
                     kind: .bankedRedeemed,
                     occurredAt: usedAt,
@@ -626,8 +663,9 @@ public struct QuotaResetDetector {
             resetKind: .scheduled
         )
         let event = QuotaResetEvent(
-            id: Self.eventID(snapshot.providerID, window.label, .scheduled, current.at),
+            id: Self.eventID(snapshot.accountKey, window.label, .scheduled, current.at),
             providerID: snapshot.providerID,
+            accountSlot: snapshot.accountSlot,
             windowLabel: window.label,
             kind: .scheduled,
             occurredAt: current.at,
@@ -689,8 +727,9 @@ public struct QuotaResetDetector {
             resetKind: kind
         )
         let event = QuotaResetEvent(
-            id: Self.eventID(snapshot.providerID, window.label, kind, pending.observedAt),
+            id: Self.eventID(snapshot.accountKey, window.label, kind, pending.observedAt),
             providerID: snapshot.providerID,
+            accountSlot: snapshot.accountSlot,
             windowLabel: window.label,
             kind: kind,
             occurredAt: pending.observedAt,
@@ -719,8 +758,11 @@ public struct QuotaResetDetector {
         }
     }
 
-    private static func eventID(_ providerID: ProviderID, _ label: String, _ kind: QuotaResetKind, _ at: Date) -> String {
-        "\(providerID.rawValue)|\(label.lowercased())|\(kind.rawValue)|\(Int(at.timeIntervalSince1970))"
+    /// Keyed by account, not provider: two accounts of one provider resetting
+    /// in the same second are two events, and the primary account's ids are
+    /// exactly what they were before accounts existed.
+    private static func eventID(_ account: ProviderAccountKey, _ label: String, _ kind: QuotaResetKind, _ at: Date) -> String {
+        "\(account.rawValue)|\(label.lowercased())|\(kind.rawValue)|\(Int(at.timeIntervalSince1970))"
     }
 
     private static func percent(_ fraction: Double) -> Int {
@@ -762,12 +804,31 @@ public struct QuotaResetDetectorStateStore {
     }
 
     public func state(for providerID: ProviderID) -> QuotaResetDetector.ProviderState? {
-        loadAll()[providerID.rawValue]
+        state(for: .primary(providerID))
     }
 
     public func save(_ state: QuotaResetDetector.ProviderState, for providerID: ProviderID) {
+        save(state, for: .primary(providerID))
+    }
+
+    /// Detector state is per account: the primary account keeps the key the
+    /// provider always had, so nothing pending is forgotten on upgrade.
+    public func state(for account: ProviderAccountKey) -> QuotaResetDetector.ProviderState? {
+        loadAll()[account.rawValue]
+    }
+
+    public func save(_ state: QuotaResetDetector.ProviderState, for account: ProviderAccountKey) {
         var all = loadAll()
-        all[providerID.rawValue] = state
+        all[account.rawValue] = state
+        guard let data = try? encoder.encode(all) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    /// Forgets one account's trail. Used when the slot changes hands: the new
+    /// account's first reading must be a baseline, never a "drop".
+    public func clear(account: ProviderAccountKey) {
+        var all = loadAll()
+        guard all.removeValue(forKey: account.rawValue) != nil else { return }
         guard let data = try? encoder.encode(all) else { return }
         defaults.set(data, forKey: key)
     }
@@ -840,8 +901,13 @@ public final class QuotaResetLedgerStore: ObservableObject {
         }
     }
 
+    /// Every account of the provider.
     public func events(for providerID: ProviderID) -> [QuotaResetEvent] {
         events.filter { $0.providerID == providerID }
+    }
+
+    public func events(for account: ProviderAccountKey) -> [QuotaResetEvent] {
+        events.filter { $0.accountKey == account }
     }
 
     /// Resets the user did not schedule or trigger, per provider, since `since`.

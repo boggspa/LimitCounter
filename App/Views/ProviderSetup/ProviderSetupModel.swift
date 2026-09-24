@@ -7,9 +7,10 @@ import Foundation
 enum ProviderSetupPage: Hashable {
     case overview
     case provider(ProviderID)
-    /// The provider's full configuration form, hosted as a page in this sheet
-    /// rather than in a window of its own.
-    case credential(ProviderID)
+    /// One account's full configuration form, hosted as a page in this sheet
+    /// rather than in a window of its own. The primary account's key is the
+    /// provider itself.
+    case credential(ProviderAccountKey)
     case preferences
 }
 
@@ -74,7 +75,8 @@ final class ProviderSetupModel: ObservableObject {
     /// rail's selection.
     var selectedProviderID: ProviderID? {
         switch page {
-        case .provider(let id), .credential(let id): return id
+        case .provider(let id): return id
+        case .credential(let account): return account.providerID
         case .overview, .preferences: return nil
         }
     }
@@ -82,6 +84,8 @@ final class ProviderSetupModel: ObservableObject {
     // MARK: State
 
     @Published private(set) var health: [ProviderID: ProviderSetupHealth] = [:]
+    /// Secondary accounts only; the primary account's health is `health`.
+    @Published private(set) var accountHealth: [ProviderAccountKey: ProviderSetupHealth] = [:]
     @Published private(set) var detected: [CredentialImportService.DetectedCredential] = []
     @Published var banner: ProviderSetupBanner?
 
@@ -93,6 +97,7 @@ final class ProviderSetupModel: ObservableObject {
     private let store: ProviderCredentialStoring
     private let visibility: ProviderVisibilityStore
     private let order: ProviderCardOrderStore
+    private let accounts: ProviderAccountRegistry
     private let home: URL
     private var bannerDismissal: Task<Void, Never>?
     /// Held for the sheet's lifetime. Recomputing one provider's health must not
@@ -104,11 +109,13 @@ final class ProviderSetupModel: ObservableObject {
         store: ProviderCredentialStoring = KeychainService.shared,
         visibility: ProviderVisibilityStore = .shared,
         order: ProviderCardOrderStore = .shared,
+        accounts: ProviderAccountRegistry = .shared,
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.store = store
         self.visibility = visibility
         self.order = order
+        self.accounts = accounts
         self.home = home
     }
 
@@ -124,15 +131,86 @@ final class ProviderSetupModel: ObservableObject {
         self.syncErrors = syncErrors
         detected = CredentialImportService.detectAvailableCredentials()
         var computed: [ProviderID: ProviderSetupHealth] = [:]
+        var computedAccounts: [ProviderAccountKey: ProviderSetupHealth] = [:]
         for providerID in enabledProviderIDs {
             computed[providerID] = resolvedHealth(for: providerID)
+            for record in accounts.accounts(for: providerID) {
+                computedAccounts[record.key] = resolvedAccountHealth(for: record.key)
+            }
         }
         health = computed
+        accountHealth = computedAccounts
     }
 
-    /// Recomputes one provider after a save, delete or import.
+    /// Recomputes one provider, and every account under it, after a save,
+    /// delete or import.
     func refreshHealth(for providerID: ProviderID) {
         health[providerID] = resolvedHealth(for: providerID)
+        for record in accounts.accounts(for: providerID) {
+            accountHealth[record.key] = resolvedAccountHealth(for: record.key)
+        }
+    }
+
+    // MARK: Additional accounts
+
+    func accounts(for providerID: ProviderID) -> [ProviderAccountRecord] {
+        accounts.accounts(for: providerID)
+    }
+
+    func canAddAccount(for providerID: ProviderID) -> Bool {
+        accounts.canAddAccount(for: providerID)
+    }
+
+    func accountHealth(for key: ProviderAccountKey) -> ProviderSetupHealth {
+        accountHealth[key] ?? .notSetUp
+    }
+
+    func accountLabel(for key: ProviderAccountKey) -> String? {
+        accounts.label(for: key)
+    }
+
+    /// Registers the account and opens its form: an account with nothing
+    /// behind it yet is not worth a row of its own until it has been set up.
+    @discardableResult
+    func addAccount(for providerID: ProviderID, label: String) -> ProviderAccountKey? {
+        guard let record = accounts.addAccount(for: providerID, label: label) else { return nil }
+        accountHealth[record.key] = .notSetUp
+        page = .credential(record.key)
+        return record.key
+    }
+
+    func renameAccount(_ key: ProviderAccountKey, to label: String) {
+        accounts.rename(key, to: label)
+    }
+
+    /// Removes the account's credential, its cached readings and its roster
+    /// entry, in that order, so a crash midway leaves a labelled account with
+    /// no secret rather than an orphaned secret.
+    func removeAccount(_ key: ProviderAccountKey) {
+        store.delete(for: key)
+        QuotaSnapshotStore.shared.clear(account: key)
+        accounts.remove(key)
+        accountHealth.removeValue(forKey: key)
+        if case .credential(let current) = page, current == key {
+            page = .provider(key.providerID)
+        }
+        refreshHealth(for: key.providerID)
+    }
+
+    /// A secondary account is configured or it is not; the coordinator files
+    /// its sync errors under the provider with the account's label in front.
+    private func resolvedAccountHealth(for key: ProviderAccountKey) -> ProviderSetupHealth {
+        guard store.hasCredential(for: key) else { return .notSetUp }
+        if let label = accounts.label(for: key),
+           let line = syncErrors[key.providerID]?
+                .components(separatedBy: "\n")
+                .first(where: { $0.hasPrefix("\(label): ") }) {
+            let message = String(line.dropFirst(label.count + 2))
+            if !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .needsAttention(message)
+            }
+        }
+        return .connected
     }
 
     /// Clears the stored error for one provider, for the cases where the user

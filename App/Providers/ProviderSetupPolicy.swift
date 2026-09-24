@@ -470,6 +470,45 @@ enum ProviderSetupPolicy {
         )
     }
 
+    /// Import copy for one account. A secondary account of a folder-based
+    /// provider is set up from a different folder than the primary, and the
+    /// copy says which one; everything else reads exactly as the primary does.
+    static func importCopy(for providerID: ProviderID, account: ProviderAccountKey) -> ImportCopy {
+        guard !account.isPrimary else { return importCopy(for: providerID) }
+        switch providerID {
+        case .claude:
+            return ImportCopy(
+                sectionTitle: "Grant This Account's Config Folder",
+                buttonTitle: "Select the CLAUDE_CONFIG_DIR folder...",
+                helpText: "Choose the config folder this account runs from — the folder your `CLAUDE_CONFIG_DIR` points at, such as `~/.claude-work`. Limit Counter names that folder's Keychain item the way Claude Code does (a hash of the folder path) and only ever reads it; Claude Code stays the only thing that signs in or renews."
+            )
+        case .openai:
+            return ImportCopy(
+                sectionTitle: "Grant This Account's CODEX_HOME Folder",
+                buttonTitle: "Select the CODEX_HOME folder...",
+                helpText: "Choose the folder this Codex account runs from — the folder your `CODEX_HOME` points at, such as `~/.codex-work`. Limit Counter follows `auth.json` token rotation inside that grant."
+            )
+        default:
+            return importCopy(for: providerID)
+        }
+    }
+
+    /// What a second account of this provider is made from, for the setup page.
+    static func additionalAccountHint(for providerID: ProviderID) -> String {
+        switch providerID {
+        case .claude:
+            return "Each account is a separate Claude Code config folder — the one you launch that account with via CLAUDE_CONFIG_DIR, such as ~/.claude-work. Limit Counter reads that account's own Claude Code sign-in and transcripts. It never switches accounts for you."
+        case .openai:
+            return "Each account is a separate CODEX_HOME folder, such as ~/.codex-work, with its own auth.json. Grant the folder and Limit Counter follows that account's session."
+        case .cursor, .kimi, .ollama, .mistral, .meta, .cerebras, .qwen, .mimo:
+            return "Each account is its own signed-in web session or key, imported here exactly as the primary account was."
+        case .gemini, .grok, .antigravity:
+            return "Each account is the separate CLI data folder that account signs in from. Grant that folder."
+        default:
+            return "Each account is its own key or token, entered here exactly as the primary account's was."
+        }
+    }
+
     private static func importSectionTitle(_ providerID: ProviderID) -> String {
         switch providerID {
         case .openai:
@@ -557,6 +596,36 @@ protocol ProviderCredentialStoring {
     @discardableResult
     func save(_ credential: ProviderCredential, for providerID: ProviderID) -> Bool
     func delete(for providerID: ProviderID)
+
+    /// Account-keyed variants. The primary account of a provider is the
+    /// provider-keyed item above; only secondary accounts need a store that
+    /// knows about slots.
+    func credential(for account: ProviderAccountKey) -> ProviderCredential?
+    func hasCredential(for account: ProviderAccountKey) -> Bool
+    @discardableResult
+    func save(_ credential: ProviderCredential, for account: ProviderAccountKey) -> Bool
+    func delete(for account: ProviderAccountKey)
+}
+
+/// A store that only knows providers behaves as if it held no secondary
+/// accounts, which keeps older fakes and single-account callers correct.
+extension ProviderCredentialStoring {
+    func credential(for account: ProviderAccountKey) -> ProviderCredential? {
+        account.isPrimary ? credential(for: account.providerID) : nil
+    }
+
+    func hasCredential(for account: ProviderAccountKey) -> Bool {
+        account.isPrimary ? hasCredential(for: account.providerID) : false
+    }
+
+    @discardableResult
+    func save(_ credential: ProviderCredential, for account: ProviderAccountKey) -> Bool {
+        account.isPrimary ? save(credential, for: account.providerID) : false
+    }
+
+    func delete(for account: ProviderAccountKey) {
+        if account.isPrimary { delete(for: account.providerID) }
+    }
 }
 
 extension KeychainService: ProviderCredentialStoring {}

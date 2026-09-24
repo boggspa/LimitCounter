@@ -69,24 +69,33 @@ public struct QuotaTimelineProvider: TimelineProvider {
         let telemetrySnapshot = visible.first(where: { $0.providerID == .codexTelemetry })
 
         var items: [QuotaSnapshot] = []
-        var consumed = Set<ProviderID>()
+        var consumed = Set<ProviderAccountKey>()
 
         // If usage is visible, show it and keep telemetry attached to it (rather than as a separate card).
         if let usage = usageSnapshot {
             items.append(usage)
-            consumed.insert(.openai)
-            if telemetrySnapshot != nil {
-                consumed.insert(.codexTelemetry)
+            consumed.insert(usage.accountKey)
+            if let telemetrySnapshot {
+                consumed.insert(telemetrySnapshot.accountKey)
             }
         }
 
-        for snap in visible where !consumed.contains(snap.providerID) {
+        // One card per account, not per provider: a second Claude account is
+        // its own card, right after the first.
+        for snap in visible where !consumed.contains(snap.accountKey) && snap.providerID != .codexTelemetry {
             items.append(snap)
-            consumed.insert(snap.providerID)
+            consumed.insert(snap.accountKey)
         }
 
-        let ordered = items.sorted {
-            ProviderCardOrderStore.nonisolatedRank(for: $0.providerID) < ProviderCardOrderStore.nonisolatedRank(for: $1.providerID)
+        let accountRecords = ProviderAccountRegistry.nonisolatedRecords()
+        let ordered = items.sorted { lhs, rhs in
+            let lhsRank = ProviderCardOrderStore.nonisolatedRank(for: lhs.providerID)
+            let rhsRank = ProviderCardOrderStore.nonisolatedRank(for: rhs.providerID)
+            if lhsRank == rhsRank {
+                return ProviderAccountRegistry.rank(for: lhs.accountKey, in: accountRecords)
+                    < ProviderAccountRegistry.rank(for: rhs.accountKey, in: accountRecords)
+            }
+            return lhsRank < rhsRank
         }
 
         guard ordered.count > 1 else { return ordered }
@@ -249,7 +258,7 @@ public struct QuotaWidgetEntryView: View {
         guard providers.count == 1, let first = metrics.first else {
             return "Limit Counter"
         }
-        return first.snapshot.displayName
+        return first.snapshot.accountDisplayName
     }
 
     private func compactLockScreenLabel(for metric: LockScreenMetric) -> String {
@@ -272,7 +281,7 @@ public struct QuotaWidgetEntryView: View {
         Group {
             if let first = entry.snapshots.first,
                let window = first.summaryWindows.first {
-                Text("\(first.displayName): \(window.leadingValueText)")
+                Text("\(first.accountDisplayName): \(window.leadingValueText)")
             } else {
                 Text("Limit Counter")
             }
@@ -528,7 +537,7 @@ public struct LargeSingleProviderView: View {
                 HStack(spacing: 10) {
                     ProviderBrandIconView(providerID: snapshot.providerID, size: 28)
                     VStack(alignment: .leading, spacing: 1) {
-                        ProviderCardTitleText(title: snapshot.displayName, accentColor: accent)
+                        ProviderCardTitleText(title: snapshot.accountDisplayName, accentColor: accent)
                         Text("Updated \(snapshot.fetchedAt.relativeString)")
                             .font(.caption2.weight(.medium))
                             .foregroundStyle(.tertiary)
@@ -1415,10 +1424,10 @@ private enum LockScreenMeterStackSelector {
         isSupplementalCodex: Bool
     ) -> String {
         guard isSupplementalCodex else {
-            if snapshot.providerID == .gemini {
+            if snapshot.providerID == .gemini, snapshot.isPrimaryAccount {
                 return "Gemini CLI"
             }
-            return snapshot.displayName
+            return snapshot.accountDisplayName
         }
 
         var label = window.label
@@ -1562,14 +1571,14 @@ public struct ProviderQuery: EntityQuery {
         let store = QuotaSnapshotStore.shared
         let snapshots = store.loadSnapshots()
         return snapshots
-            .filter { identifiers.contains($0.providerID.rawValue) }
-            .map { ProviderEntity(id: $0.providerID.rawValue, displayName: $0.displayName) }
+            .filter { identifiers.contains($0.accountKey.rawValue) }
+            .map { ProviderEntity(id: $0.accountKey.rawValue, displayName: $0.accountDisplayName) }
     }
 
     public func suggestedEntities() async throws -> [ProviderEntity] {
         let store = QuotaSnapshotStore.shared
         return store.loadSnapshots()
-            .map { ProviderEntity(id: $0.providerID.rawValue, displayName: $0.displayName) }
+            .map { ProviderEntity(id: $0.accountKey.rawValue, displayName: $0.accountDisplayName) }
     }
 }
 
@@ -1603,9 +1612,9 @@ public struct QuotaWindowQuery: EntityQuery {
         var results: [QuotaWindowEntity] = []
         for snapshot in snapshots {
             for window in snapshot.windows {
-                let compositeID = "\(snapshot.providerID.rawValue):\(window.label)"
+                let compositeID = "\(snapshot.accountKey.rawValue):\(window.label)"
                 if identifiers.contains(compositeID) {
-                    results.append(QuotaWindowEntity(id: compositeID, displayName: "\(snapshot.displayName): \(window.label)", providerID: snapshot.providerID.rawValue))
+                    results.append(QuotaWindowEntity(id: compositeID, displayName: "\(snapshot.accountDisplayName): \(window.label)", providerID: snapshot.providerID.rawValue))
                 }
             }
         }
@@ -1618,8 +1627,8 @@ public struct QuotaWindowQuery: EntityQuery {
         var results: [QuotaWindowEntity] = []
         for snapshot in snapshots {
             for window in snapshot.windows {
-                let compositeID = "\(snapshot.providerID.rawValue):\(window.label)"
-                results.append(QuotaWindowEntity(id: compositeID, displayName: "\(snapshot.displayName): \(window.label)", providerID: snapshot.providerID.rawValue))
+                let compositeID = "\(snapshot.accountKey.rawValue):\(window.label)"
+                results.append(QuotaWindowEntity(id: compositeID, displayName: "\(snapshot.accountDisplayName): \(window.label)", providerID: snapshot.providerID.rawValue))
             }
         }
         return results
@@ -1674,13 +1683,13 @@ public struct SelectQuotaTimelineProvider: AppIntentTimelineProvider {
         var results: [QuotaSnapshot] = []
 
         for metric in selectedMetrics {
-            let components = metric.id.split(separator: ":")
+            let components = metric.id.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
             guard components.count >= 2 else { continue }
 
             let providerID = String(components[0])
             let windowLabel = String(components[1])
 
-            if let snapshot = snapshots.first(where: { $0.providerID.rawValue == providerID }),
+            if let snapshot = snapshots.first(where: { $0.accountKey.rawValue == providerID }),
                let targetWindow = snapshot.windows.first(where: { $0.label == windowLabel }) {
 
                 // Create a single-window snapshot for this specific metric
@@ -1694,7 +1703,10 @@ public struct SelectQuotaTimelineProvider: AppIntentTimelineProvider {
                     balances: [],
                     signals: [],
                     fetchState: snapshot.fetchState,
-                    fetchedAt: snapshot.fetchedAt
+                    fetchedAt: snapshot.fetchedAt,
+                    accountSlot: snapshot.accountSlot,
+                    accountLabel: snapshot.accountLabel,
+                    accountFingerprint: snapshot.accountFingerprint
                 )
                 results.append(synthetic)
             }
@@ -1853,7 +1865,7 @@ private enum SelectQuotaTrioRowBuilder {
                 guard parts.count == 2 else { continue }
                 let providerRaw = String(parts[0])
                 let windowLabel = String(parts[1])
-                guard let snapshot = snapshots.first(where: { $0.providerID.rawValue == providerRaw }),
+                guard let snapshot = snapshots.first(where: { $0.accountKey.rawValue == providerRaw }),
                       let window = snapshot.windows.first(where: { $0.label == windowLabel }) else {
                     continue
                 }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import WidgetKit
 #if os(macOS)
@@ -929,14 +930,27 @@ public struct QuotaPeriodRow: Identifiable, Equatable, Hashable {
     /// which is invisible until something is being dragged — then it cancels.
     public let id: String
     public let providerID: ProviderID
+    /// Which account of the provider the row belongs to; empty for the primary.
+    public let accountSlot: String
     public let label: String
     public let window: QuotaWindow?
 
-    public init(id: String, providerID: ProviderID, label: String, window: QuotaWindow?) {
+    public init(
+        id: String,
+        providerID: ProviderID,
+        accountSlot: String = ProviderAccountKey.primarySlot,
+        label: String,
+        window: QuotaWindow?
+    ) {
         self.id = id
         self.providerID = providerID
+        self.accountSlot = accountSlot
         self.label = label
         self.window = window
+    }
+
+    public var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
     }
 }
 
@@ -964,12 +978,16 @@ public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
 
         for snapshot in snapshots {
             let windows = snapshot.summaryWindows
+            // Row ids are per account so two accounts of one provider never
+            // collapse into one row; the primary account's ids are unchanged.
+            let accountPrefix = snapshot.isPrimaryAccount ? "" : "\(snapshot.accountKey.rawValue)|"
             guard !windows.isEmpty else {
                 idleRows.append(
                     QuotaPeriodRow(
-                        id: "idle|\(snapshot.providerID.rawValue)",
+                        id: "idle|\(snapshot.accountKey.rawValue)",
                         providerID: snapshot.providerID,
-                        label: snapshot.displayName,
+                        accountSlot: snapshot.accountSlot,
+                        label: snapshot.accountDisplayName,
                         window: nil
                     )
                 )
@@ -978,8 +996,9 @@ public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
 
             for window in windows {
                 let row = QuotaPeriodRow(
-                    id: window.stableIdentity(for: snapshot.providerID),
+                    id: accountPrefix + window.stableIdentity(for: snapshot.providerID),
                     providerID: snapshot.providerID,
+                    accountSlot: snapshot.accountSlot,
                     label: snapshot.periodRowLabel(for: window),
                     window: window
                 )
@@ -1013,6 +1032,7 @@ public extension QuotaSnapshot {
     /// "Plan Quota" reads "MiMo Token Plan Quota" rather than repeating
     /// "Plan".
     func periodRowLabel(for window: QuotaWindow) -> String {
+        let displayName = accountDisplayName
         let providerWords = displayName.split(separator: " ").map(String.init)
         let labelWords = window.label.split(separator: " ").map(String.init)
 
@@ -1948,6 +1968,110 @@ public enum ProviderFetchState: String, Codable, Hashable {
     }
 }
 
+// MARK: - Provider Accounts
+
+/// One account of one provider.
+///
+/// The primary account *is* the provider: every credential, snapshot and
+/// setting written before accounts existed belongs to it, and its key's
+/// `rawValue` is the bare provider raw value, so nothing stored on disk had to
+/// move. Additional accounts get an opaque slot and a user-chosen label kept in
+/// `ProviderAccountRegistry`. Slots are identity, labels are presentation:
+/// renaming "Work" to "Client" must not orphan its credential.
+public struct ProviderAccountKey: Hashable, Codable, CustomStringConvertible {
+    public static let primarySlot = ""
+    public static let slotSeparator: Character = "#"
+
+    public let providerID: ProviderID
+    public let slot: String
+
+    public init(providerID: ProviderID, slot: String = ProviderAccountKey.primarySlot) {
+        self.providerID = providerID
+        self.slot = Self.normalizedSlot(slot)
+    }
+
+    public static func primary(_ providerID: ProviderID) -> ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID)
+    }
+
+    public var isPrimary: Bool { slot.isEmpty }
+
+    /// "claude" for the primary account, "claude#k7f2q1" for a secondary one.
+    /// Used wherever a provider raw value used to be a storage key, so the
+    /// primary account keeps reading and writing exactly what it always did.
+    public var rawValue: String {
+        isPrimary ? providerID.rawValue : "\(providerID.rawValue)\(Self.slotSeparator)\(slot)"
+    }
+
+    public init?(rawValue: String) {
+        let parts = rawValue.split(
+            separator: Self.slotSeparator,
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard let first = parts.first, let providerID = ProviderID(rawValue: String(first)) else {
+            return nil
+        }
+        let slot = parts.count > 1 ? String(parts[1]) : Self.primarySlot
+        guard slot == Self.normalizedSlot(slot), parts.count == 1 || !slot.isEmpty else {
+            return nil
+        }
+        self.init(providerID: providerID, slot: slot)
+    }
+
+    public var description: String { rawValue }
+
+    /// Slots are short, lower-case and free of the separator so they can sit
+    /// inside a keychain account name, a CloudKit record name or a defaults key.
+    public static func normalizedSlot(_ slot: String) -> String {
+        String(slot.lowercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.prefix(16))
+    }
+
+    /// A fresh slot for a new account. Six base-36 characters is plenty for a
+    /// handful of accounts per provider and stays readable in a keychain list.
+    public static func makeSlot() -> String {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyz0123456789")
+        return String((0..<6).map { _ in alphabet[Int.random(in: 0..<alphabet.count)] })
+    }
+}
+
+/// Opaque identity of the account behind a reading, for noticing that the same
+/// slot now holds a different account. Hashed so a stored snapshot never carries
+/// an email, organisation name or account UUID.
+public enum ProviderAccountFingerprint {
+    public static func make(providerID: ProviderID, components: [String]) -> String? {
+        let cleaned = components
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return nil }
+        let material = ([providerID.rawValue] + cleaned).joined(separator: "|")
+        let digest = SHA256.hash(data: Data(material.utf8))
+        return String(digest.map { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
+    /// Whether a change of fingerprint between two readings of the same slot
+    /// means a different account is now signed in. Either side missing is not
+    /// evidence of anything: providers that expose no identity never gate.
+    public static func indicatesAccountChange(previous: String?, current: String?) -> Bool {
+        guard let previous, let current, !previous.isEmpty, !current.isEmpty else { return false }
+        return previous != current
+    }
+}
+
+public extension ProviderID {
+    /// Whether more than one account of this provider can be tracked side by
+    /// side. A local desktop cache (ChatGPT) is one install, one account; the
+    /// telemetry and heatmap pseudo-providers are not accounts at all.
+    var supportsAdditionalAccounts: Bool {
+        switch self {
+        case .chatgpt, .codexTelemetry, .heatmap:
+            return false
+        default:
+            return isUserFacingInProviderLists
+        }
+    }
+}
+
 public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let id: UUID
     public let providerID: ProviderID
@@ -1963,6 +2087,62 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let fetchedAt: Date
     /// Provider-reported banked usage-limit resets, when the provider exposes them.
     public let resetCredits: QuotaResetCreditSummary?
+    /// Which of the provider's accounts this reading belongs to. Empty for the
+    /// primary account, which is also what every snapshot written before
+    /// accounts existed decodes to.
+    public let accountSlot: String
+    /// The user's own name for the account ("Work"). Never an email.
+    public let accountLabel: String?
+    /// See `ProviderAccountFingerprint`. Nil when the provider exposes no identity.
+    public let accountFingerprint: String?
+
+    public var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
+    }
+
+    public var isPrimaryAccount: Bool { accountSlot.isEmpty }
+
+    /// The label to show beside the provider name, when there is one to show.
+    public var accountBadgeText: String? {
+        guard let accountLabel else { return nil }
+        let trimmed = accountLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// "Claude Code · Work" for a labelled account, else the plain display name.
+    /// For single-line contexts (widget rows, menu bar, notifications).
+    public var accountDisplayName: String {
+        guard let badge = accountBadgeText else { return displayName }
+        return "\(displayName) · \(badge)"
+    }
+
+    /// The same reading filed under an account. The coordinator stamps every
+    /// snapshot it stores with the slot it scheduled, so a provider client that
+    /// knows nothing about accounts still lands in the right place.
+    public func withAccount(
+        slot: String,
+        label: String?,
+        fingerprint: String?
+    ) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: id,
+            providerID: providerID,
+            displayName: displayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: events,
+            analyticsBuckets: analyticsBuckets,
+            fetchState: fetchState,
+            fetchedAt: fetchedAt,
+            resetCredits: resetCredits,
+            accountSlot: slot,
+            accountLabel: label,
+            accountFingerprint: fingerprint
+        )
+    }
 
     public var displayPlanName: String? {
         guard let name = planName, !name.isEmpty else { return nil }
@@ -2099,7 +2279,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt,
-            resetCredits: resetCredits
+            resetCredits: resetCredits,
+            accountSlot: accountSlot,
+            accountLabel: accountLabel,
+            accountFingerprint: accountFingerprint
         )
     }
 
@@ -2145,7 +2328,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt,
-            resetCredits: resetCredits
+            resetCredits: resetCredits,
+            accountSlot: accountSlot,
+            accountLabel: accountLabel,
+            accountFingerprint: accountFingerprint
         )
     }
 
@@ -2163,7 +2349,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt,
-            resetCredits: resetCredits
+            resetCredits: resetCredits,
+            accountSlot: accountSlot,
+            accountLabel: accountLabel,
+            accountFingerprint: accountFingerprint
         )
     }
 
@@ -2181,7 +2370,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             analyticsBuckets: analyticsBuckets,
             fetchState: fetchState,
             fetchedAt: fetchedAt,
-            resetCredits: credits
+            resetCredits: credits,
+            accountSlot: accountSlot,
+            accountLabel: accountLabel,
+            accountFingerprint: accountFingerprint
         )
     }
 
@@ -2199,6 +2391,9 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         case fetchState
         case fetchedAt
         case resetCredits
+        case accountSlot
+        case accountLabel
+        case accountFingerprint
     }
 
     public init(
@@ -2214,7 +2409,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         analyticsBuckets: [UsageAnalyticsBucket] = [],
         fetchState: ProviderFetchState = .success,
         fetchedAt: Date = Date(),
-        resetCredits: QuotaResetCreditSummary? = nil
+        resetCredits: QuotaResetCreditSummary? = nil,
+        accountSlot: String = ProviderAccountKey.primarySlot,
+        accountLabel: String? = nil,
+        accountFingerprint: String? = nil
     ) {
         self.id = id
         self.providerID = providerID
@@ -2229,6 +2427,9 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         self.fetchState = fetchState
         self.fetchedAt = fetchedAt
         self.resetCredits = resetCredits
+        self.accountSlot = ProviderAccountKey.normalizedSlot(accountSlot)
+        self.accountLabel = accountLabel
+        self.accountFingerprint = accountFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -2254,6 +2455,13 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
 
         fetchedAt = try container.decodeIfPresent(Date.self, forKey: .fetchedAt) ?? Date()
         resetCredits = try? container.decodeIfPresent(QuotaResetCreditSummary.self, forKey: .resetCredits)
+        // Snapshots written before accounts existed carry none of these and
+        // are, by definition, the primary account's.
+        accountSlot = ProviderAccountKey.normalizedSlot(
+            (try? container.decodeIfPresent(String.self, forKey: .accountSlot)) ?? ProviderAccountKey.primarySlot
+        )
+        accountLabel = try? container.decodeIfPresent(String.self, forKey: .accountLabel)
+        accountFingerprint = try? container.decodeIfPresent(String.self, forKey: .accountFingerprint)
     }
 }
 

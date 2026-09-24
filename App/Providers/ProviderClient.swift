@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 import LocalAuthentication
@@ -1684,6 +1685,17 @@ public protocol ProviderClient {
 /// Providers that distinguish manual vs timer-driven refreshes. Callers pass
 /// `userInitiated` so the client can apply its own cadence (for example
 /// Antigravity's looping quota poll) while still serving cache between polls.
+/// A client whose caches, keychain items or local folders differ per account.
+/// The coordinator prefers this entry point when a client offers it; clients
+/// without per-account state never need to know which slot they serve.
+public protocol AccountScopedProviderClient: ProviderClient {
+    func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot
+}
+
 public protocol UserInitiatedProviderClient: ProviderClient {
     func fetchSnapshot(
         credentials: ProviderCredential?,
@@ -3699,10 +3711,12 @@ public extension CredentialImportService {
     /// Shows a file picker and imports credentials for the specified provider
     static func showImportPanel(
         for providerID: ProviderID,
+        account: ProviderAccountKey? = nil,
         completion: @escaping (Result<ImportedCredential, Error>) -> Void
     ) {
         DispatchQueue.main.async {
             let panel = NSOpenPanel()
+            let isSecondaryAccount = account.map { !$0.isPrimary } ?? false
             panel.message = {
                 switch providerID {
                 case .openai:
@@ -3805,6 +3819,27 @@ public extension CredentialImportService {
                 panel.directoryURL = home.appendingPathComponent("Downloads")
             case .ollama, .openrouter, .qwen, .mimo, .heatmap:
                 break
+            }
+
+            // A second account lives in a sibling folder of the primary's, and
+            // those folders are dot-folders the panel would otherwise hide.
+            if isSecondaryAccount {
+                panel.showsHiddenFiles = true
+                switch providerID {
+                case .claude:
+                    panel.message = "Select the Claude Code config folder for this account — the folder your CLAUDE_CONFIG_DIR points at, for example ~/.claude-work."
+                    panel.prompt = "Grant Access"
+                    panel.directoryURL = home
+                case .openai:
+                    panel.message = "Select the CODEX_HOME folder for this account, for example ~/.codex-work, so Limit Counter can follow its auth.json rotation."
+                    panel.prompt = "Grant Access"
+                    panel.directoryURL = home
+                case .gemini, .grok, .antigravity, .kimi, .mistral, .meta:
+                    panel.message = "Select the data folder the other account of \(providerID.displayName) signs in from."
+                    panel.directoryURL = home
+                default:
+                    break
+                }
             }
 
             panel.begin { result in
@@ -8394,16 +8429,29 @@ struct ClaudeOAuthUsageResponse: Decodable {
 
 struct ClaudeOAuthProfileResponse: Decodable {
     struct Organization: Decodable {
+        let uuid: String?
         let rateLimitTier: String?
         let organizationType: String?
 
         enum CodingKeys: String, CodingKey {
+            case uuid
             case rateLimitTier = "rate_limit_tier"
             case organizationType = "organization_type"
         }
     }
 
+    struct Account: Decodable {
+        let uuid: String?
+        let emailAddress: String?
+
+        enum CodingKeys: String, CodingKey {
+            case uuid
+            case emailAddress = "email_address"
+        }
+    }
+
     let organization: Organization?
+    let account: Account?
 
     var planInfo: ClaudePlanInfo? {
         ClaudePlanResolver.resolve(
@@ -8412,6 +8460,26 @@ struct ClaudeOAuthProfileResponse: Decodable {
             organizationType: organization?.organizationType
         )
     }
+
+    /// Who is signed in, hashed. The organisation and account UUIDs are the
+    /// stable pair; the email is only a fallback for a response without them.
+    /// Nothing identifying is kept: see `ProviderAccountFingerprint`.
+    var accountFingerprint: String? {
+        let ids = [organization?.uuid, account?.uuid].compactMap { $0 }
+        if !ids.isEmpty {
+            return ProviderAccountFingerprint.make(providerID: .claude, components: ids)
+        }
+        if let email = account?.emailAddress {
+            return ProviderAccountFingerprint.make(providerID: .claude, components: [email.lowercased()])
+        }
+        return nil
+    }
+}
+
+/// What one profile lookup yields: the plan, and the identity behind it.
+nonisolated struct ClaudeOAuthProfileInfo {
+    let plan: ClaudePlanInfo?
+    let accountFingerprint: String?
 }
 
 // MARK: - Claude Provider Client
@@ -8433,6 +8501,28 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
     private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
     private static let defaultPersistenceKey = "claude.oauthQuotaSnapshot.v1"
 
+    private static let accountCachesLock = NSLock()
+    nonisolated(unsafe) private static var accountCaches: [ProviderAccountKey: ClaudeOAuthResponseCache] = [:]
+
+    /// One cache per account. The primary account keeps `shared` and its
+    /// persistence key; a secondary account persists under a slot-suffixed key
+    /// and only ever migrates legacy snapshots filed under its own slot.
+    static func forAccount(_ account: ProviderAccountKey) -> ClaudeOAuthResponseCache {
+        guard !account.isPrimary else { return shared }
+        accountCachesLock.lock()
+        defer { accountCachesLock.unlock() }
+        if let existing = accountCaches[account] { return existing }
+        let cache = ClaudeOAuthResponseCache(
+            persistenceKey: "\(defaultPersistenceKey).\(account.slot)",
+            legacySnapshotLoader: {
+                QuotaSnapshotStore.shared.loadSnapshots()
+                    .first { $0.accountKey == account && $0.fetchState == .success }
+            }
+        )
+        accountCaches[account] = cache
+        return cache
+    }
+
     /// Serve cached snapshot without touching the network if newer than this.
     private let freshTTL: TimeInterval
     /// Serve in-memory stale snapshot on transient failure within this window.
@@ -8450,6 +8540,10 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var stored: (snapshot: QuotaSnapshot, fetchedAt: Date)?
+    /// The identity behind the token last profiled, keyed by a hash of that
+    /// token. Process-lifetime only: the fingerprint that matters across
+    /// launches is the one on the stored snapshot.
+    private var identity: (tokenHash: String, fingerprint: String)?
 
     init(
         freshTTL: TimeInterval = 120,                  // 2 min
@@ -8494,6 +8588,27 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
             return nil
         }
         return stored.snapshot
+    }
+
+    /// The fingerprint already established for this exact token, if any. A
+    /// token the CLI rotated, or one from a `/login` to another account, has
+    /// a different hash and profiles again.
+    func cachedFingerprint(forToken token: String) -> String? {
+        let hash = Self.tokenHash(token)
+        lock.lock(); defer { lock.unlock() }
+        guard let identity, identity.tokenHash == hash else { return nil }
+        return identity.fingerprint
+    }
+
+    func storeFingerprint(_ fingerprint: String, forToken token: String) {
+        let hash = Self.tokenHash(token)
+        lock.lock(); defer { lock.unlock() }
+        identity = (hash, fingerprint)
+    }
+
+    private static func tokenHash(_ token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Last-known-good snapshot to serve when the live fetch fails for a
@@ -8604,6 +8719,21 @@ private final class ClaudeTimeoutRaceState<Value>: @unchecked Sendable {
 
 private actor ClaudeLocalEventScanCoordinator {
     static let shared = ClaudeLocalEventScanCoordinator()
+
+    private static let instancesLock = NSLock()
+    nonisolated(unsafe) private static var instances: [ProviderAccountKey: ClaudeLocalEventScanCoordinator] = [:]
+
+    /// Each account scans its own config folder, so each keeps its own
+    /// in-flight task and cached buckets.
+    static func forAccount(_ account: ProviderAccountKey) -> ClaudeLocalEventScanCoordinator {
+        guard !account.isPrimary else { return shared }
+        instancesLock.lock()
+        defer { instancesLock.unlock() }
+        if let existing = instances[account] { return existing }
+        let coordinator = ClaudeLocalEventScanCoordinator()
+        instances[account] = coordinator
+        return coordinator
+    }
 
     private var activeTask: Task<[UsageEvent], Never>?
     private var cachedEvents: [UsageEvent] = []
@@ -8750,9 +8880,12 @@ private final class ClaudeModelLimitDiagnostics: @unchecked Sendable {
 /// `/api/oauth/usage` response itself is the live source of truth for
 /// which model-specific meters actually exist for this token — see
 /// `fetchOAuthQuota` for that gate.
-private nonisolated func resolveClaudePlanInfo(allowKeychainLookup: Bool) -> ClaudePlanInfo? {
+private nonisolated func resolveClaudePlanInfo(
+    allowKeychainLookup: Bool,
+    store: ClaudeKeychainStore
+) -> ClaudePlanInfo? {
     guard allowKeychainLookup,
-          let creds = ClaudeKeychainStore.readBackup() else {
+          let creds = store.readBackup() else {
         return nil
     }
     let raw = creds.rawOAuthDict
@@ -8950,13 +9083,129 @@ nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
 /// `security find-generic-password` several times a minute — so every one of
 /// those reads then puts up a "security wants to access key" password prompt
 /// until the user runs /login and the CLI recreates the item.
-private nonisolated enum ClaudeKeychainStore {
-    static let claudeCodeService = "Claude Code-credentials"
+/// How Claude Code names its keychain item for a given config directory.
+///
+/// Verified against the CLI (2.1.280): the service is `Claude Code-credentials`
+/// when `CLAUDE_CONFIG_DIR` is unset, and `Claude Code-credentials-<h>` when
+/// it is set, where `<h>` is the first eight hex characters of the SHA-256 of
+/// the directory string (NFC-normalised). The account is always the login
+/// user name. This is what lets a second config folder be a second account.
+nonisolated enum ClaudeConfigDirKeychain {
+    static let baseService = "Claude Code-credentials"
+
+    static func serviceName(forConfigDir configDir: String) -> String {
+        "\(baseService)-\(hashSuffix(for: configDir))"
+    }
+
+    static func hashSuffix(for configDir: String) -> String {
+        let normalized = configDir.precomposedStringWithCanonicalMapping
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        return String(digest.map { String(format: "%02x", $0) }.joined().prefix(8))
+    }
+
+    /// The item names worth trying for a config folder, best guess first.
+    ///
+    /// The CLI hashes the environment variable's exact text, which the app
+    /// never sees; it sees the folder the user granted. A trailing slash or a
+    /// symlinked home changes the hash, so a couple of spellings are tried.
+    /// The default folder (`~/.claude`) reads the bare item first, because
+    /// that is what an unset `CLAUDE_CONFIG_DIR` produces, and the hashed one
+    /// second for shells that export the default path explicitly.
+    static func serviceNameCandidates(forConfigDir configDir: String?, defaultConfigDir: String) -> [String] {
+        let trimmed = configDir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let path = trimmed.isEmpty ? defaultConfigDir : trimmed
+        let spellings = pathSpellings(path)
+        let hashed = spellings.map(serviceName(forConfigDir:))
+        if pathSpellings(defaultConfigDir).contains(where: { spellings.contains($0) }) {
+            return [baseService] + hashed
+        }
+        return hashed
+    }
+
+    private static func pathSpellings(_ path: String) -> [String] {
+        var seen: [String] = []
+        let withoutSlash = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
+        let homePath = NSHomeDirectory()
+        let realHome: String
+        if let range = homePath.range(of: "/Library/Containers/") {
+            realHome = String(homePath[..<range.lowerBound])
+        } else {
+            realHome = homePath
+        }
+        for candidate in [withoutSlash, withoutSlash + "/"] {
+            for spelled in [candidate, candidate.replacingOccurrences(of: realHome, with: "~")] where !seen.contains(spelled) {
+                seen.append(spelled)
+            }
+        }
+        return seen
+    }
+}
+
+/// Reads the two keychain entries one Claude account treats as token stores:
+///   1. Claude Code CLI's own entry for that account's config folder
+///   2. Our backup entry for that account (service "...ClaudeOAuthMirror",
+///      suffixed with the slot for secondary accounts)
+///
+/// Limit Counter only ever *reads* entry 1, and only writes entry 2. That
+/// asymmetry is load-bearing: a cross-app write to Claude Code's item resets
+/// its keychain grant, and the CLI reads that item by shelling out to
+/// `security find-generic-password` several times a minute — so every one of
+/// those reads then puts up a "security wants to access key" password prompt
+/// until the user runs /login and the CLI recreates the item.
+private nonisolated struct ClaudeKeychainStore {
+    static let claudeCodeService = ClaudeConfigDirKeychain.baseService
     static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
+
+    /// Claude Code item names to try, best guess first.
+    let cliServices: [String]
+    let backupService: String
+    /// The CLI's plaintext fallback (`<config dir>/.credentials.json`), which
+    /// it writes only when its keychain write fails. Read as a last resort.
+    let plaintextFallbackURL: URL?
+    let bookmarkData: Data?
+
+    /// The primary account with no custom folder: exactly the store every
+    /// earlier build used.
+    static let primary = ClaudeKeychainStore(
+        cliServices: [claudeCodeService],
+        backupService: backupService,
+        plaintextFallbackURL: nil,
+        bookmarkData: nil
+    )
+
+    static func forAccount(
+        _ account: ProviderAccountKey,
+        configDir: String?,
+        bookmarkData: Data?
+    ) -> ClaudeKeychainStore {
+        let defaultDir = defaultConfigDir()
+        let candidates = ClaudeConfigDirKeychain.serviceNameCandidates(
+            forConfigDir: configDir,
+            defaultConfigDir: defaultDir
+        )
+        let resolvedDir = (configDir?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        return ClaudeKeychainStore(
+            cliServices: candidates,
+            backupService: account.isPrimary ? backupService : "\(backupService).\(account.slot)",
+            plaintextFallbackURL: resolvedDir.map { URL(fileURLWithPath: $0).appendingPathComponent(".credentials.json") },
+            bookmarkData: bookmarkData
+        )
+    }
+
+    static func defaultConfigDir() -> String {
+        let homePath = NSHomeDirectory()
+        let realHome: String
+        if let range = homePath.range(of: "/Library/Containers/") {
+            realHome = String(homePath[..<range.lowerBound])
+        } else {
+            realHome = homePath
+        }
+        return realHome + "/.claude"
+    }
 
     private static var account: String { NSUserName() }
 
-    static func readBackup() -> ClaudeOAuthCredentials? { read(service: backupService) }
+    func readBackup() -> ClaudeOAuthCredentials? { Self.read(service: backupService) }
 
     /// Returns Claude Code's current credential and refreshes our cache of it.
     ///
@@ -8967,15 +9216,65 @@ private nonisolated enum ClaudeKeychainStore {
     ///
     /// Background reads cannot prompt — the budget sets
     /// `interactionNotAllowed` unless the user asked for this directly.
-    static func readClaudeCode(using readBudget: ClaudeCodeKeychainReadBudget) -> ClaudeOAuthCredentials? {
-        guard readBudget.claimRead(),
-              let cc = read(service: claudeCodeService, authenticationContext: readBudget.authenticationContext) else {
-            return nil
+    /// Item names that do not exist return without prompting, so trying the
+    /// candidates in turn costs nothing the user can see.
+    func readClaudeCode(using readBudget: ClaudeCodeKeychainReadBudget) -> ClaudeOAuthCredentials? {
+        guard readBudget.claimRead() else { return nil }
+        var found: ClaudeOAuthCredentials?
+        for service in cliServices {
+            if let cc = Self.read(service: service, authenticationContext: readBudget.authenticationContext) {
+                found = cc
+                break
+            }
         }
+        if found == nil {
+            found = readPlaintextFallback()
+        }
+        guard let cc = found else { return nil }
         if !writeBackup(cc) {
             ClaudeOAuthLog.error("Read Claude Code's credential but could not cache it; the next cycle will read the CLI's item again")
         }
         return cc
+    }
+
+    /// `<config dir>/.credentials.json`, the CLI's own plaintext fallback. Only
+    /// reachable inside the folder grant the user gave this account.
+    private func readPlaintextFallback() -> ClaudeOAuthCredentials? {
+        guard let fileURL = plaintextFallbackURL else { return nil }
+        var scopedURL: URL?
+        if let bookmarkData {
+            var isStale = false
+            scopedURL = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        }
+        let didStart = scopedURL?.startAccessingSecurityScopedResource() ?? false
+        defer { if didStart { scopedURL?.stopAccessingSecurityScopedResource() } }
+        let resolvedURL = scopedURL.map { $0.appendingPathComponent(".credentials.json") } ?? fileURL
+        guard let data = try? Data(contentsOf: resolvedURL),
+              data.count <= 64 * 1024,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return Self.credentials(fromKeychainPayload: json)
+    }
+
+    private static func credentials(fromKeychainPayload json: [String: Any]) -> ClaudeOAuthCredentials? {
+        guard let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else {
+            return nil
+        }
+        return ClaudeOAuthCredentials(
+            accessToken: token,
+            refreshToken: oauth["refreshToken"] as? String,
+            expiresAtMillis: (oauth["expiresAt"] as? NSNumber)?.doubleValue,
+            scopes: (oauth["scopes"] as? [String]) ?? [],
+            rawOAuthDict: oauth
+        )
     }
 
     private static func read(
@@ -8993,20 +9292,11 @@ private nonisolated enum ClaudeKeychainStore {
         var item: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty else {
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
 
-        return ClaudeOAuthCredentials(
-            accessToken: token,
-            refreshToken: oauth["refreshToken"] as? String,
-            expiresAtMillis: (oauth["expiresAt"] as? NSNumber)?.doubleValue,
-            scopes: (oauth["scopes"] as? [String]) ?? [],
-            rawOAuthDict: oauth
-        )
+        return credentials(fromKeychainPayload: json)
     }
 
     /// Writes the credential to **our own** mirror item, dropping the refresh
@@ -9024,7 +9314,7 @@ private nonisolated enum ClaudeKeychainStore {
     ///   code path something to renew with, which is how the two copies of
     ///   the lineage started fighting in the first place.
     @discardableResult
-    static func writeBackup(_ creds: ClaudeOAuthCredentials) -> Bool {
+    func writeBackup(_ creds: ClaudeOAuthCredentials) -> Bool {
         let payload: [String: Any] = ["claudeAiOauth": creds.mirrorPayload]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
             print("[ClaudeKeychainStore] Failed to serialize the credential mirror")
@@ -9034,7 +9324,7 @@ private nonisolated enum ClaudeKeychainStore {
         let query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: backupService,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: Self.account,
             kSecUseAuthenticationContext as String: ClaudeCodeKeychainReadBudget().authenticationContext
         ]
 
@@ -9221,6 +9511,21 @@ private enum ClaudeOAuthTokenResolution {
 private actor ClaudeOAuthTokenManager {
     static let shared = ClaudeOAuthTokenManager()
 
+    private static let instancesLock = NSLock()
+    nonisolated(unsafe) private static var instances: [ProviderAccountKey: ClaudeOAuthTokenManager] = [:]
+
+    /// One manager per account: the read throttle is per keychain item, and
+    /// two accounts reading in the same minute are two items.
+    static func forAccount(_ account: ProviderAccountKey) -> ClaudeOAuthTokenManager {
+        guard !account.isPrimary else { return shared }
+        instancesLock.lock()
+        defer { instancesLock.unlock() }
+        if let existing = instances[account] { return existing }
+        let manager = ClaudeOAuthTokenManager()
+        instances[account] = manager
+        return manager
+    }
+
     /// Read Claude Code's item again once our cached copy is this close to
     /// expiry. The CLI renews a few minutes before its own token lapses, so
     /// looking again inside the last ten minutes usually finds the fresh one.
@@ -9247,9 +9552,10 @@ private actor ClaudeOAuthTokenManager {
     /// Returns a usable access token, re-reading Claude Code's item whenever
     /// our cached copy is within `cacheBuffer` of expiry.
     func currentAccessTokenFromKeychain(
-        readBudget: ClaudeCodeKeychainReadBudget?
+        readBudget: ClaudeCodeKeychainReadBudget?,
+        store: ClaudeKeychainStore
     ) async -> ClaudeOAuthTokenResolution {
-        let cached = ClaudeKeychainStore.readBackup()
+        let cached = store.readBackup()
 
         // Steady state: the cache still has real time left, so this costs
         // neither cross-app access nor a round trip.
@@ -9260,7 +9566,7 @@ private actor ClaudeOAuthTokenManager {
         let recoveryEnabled = readBudget != nil
 
         if let budget = permittedBudget(readBudget),
-           let fromCLI = ClaudeKeychainStore.readClaudeCode(using: budget) {
+           let fromCLI = store.readClaudeCode(using: budget) {
             if !fromCLI.needsRefresh(buffer: unusableBuffer) {
                 return .token(fromCLI.accessToken)
             }
@@ -9285,10 +9591,11 @@ private actor ClaudeOAuthTokenManager {
     func accessTokenAfterOAuthFailure(
         rejectedToken: String?,
         reason: String,
-        readBudget: ClaudeCodeKeychainReadBudget?
+        readBudget: ClaudeCodeKeychainReadBudget?,
+        store: ClaudeKeychainStore
     ) async -> String? {
         guard let budget = permittedBudget(readBudget),
-              let fromCLI = ClaudeKeychainStore.readClaudeCode(using: budget),
+              let fromCLI = store.readClaudeCode(using: budget),
               fromCLI.accessToken != rejectedToken else {
             return nil
         }
@@ -9305,7 +9612,35 @@ private actor ClaudeOAuthTokenManager {
 
 /// Reads local Claude Code transcript metadata and usage snapshots.
 /// If an OAuth token is supplied, fetches live 5-hour/7-day quota meters instead.
-public struct ClaudeProviderClient: UserInitiatedProviderClient {
+/// Everything about one Claude account that differs from another: which
+/// keychain items hold its token, which caches hold its readings, and which
+/// config folder its transcripts live in.
+private nonisolated struct ClaudeAccountContext {
+    let account: ProviderAccountKey
+    let configDir: String?
+    let keychainStore: ClaudeKeychainStore
+    let cache: ClaudeOAuthResponseCache
+    let tokenManager: ClaudeOAuthTokenManager
+    let scanCoordinator: ClaudeLocalEventScanCoordinator
+
+    init(account: ProviderAccountKey, credentials: ProviderCredential?) {
+        self.account = account
+        let configDir = credentials?.normalizedCustomEndpoint
+        self.configDir = configDir
+        let bookmarkData = credentials?.extraFields?["bookmarkData"].flatMap { Data(base64Encoded: $0) }
+            ?? credentials?.bookmarkData
+        if account.isPrimary, configDir == nil {
+            keychainStore = .primary
+        } else {
+            keychainStore = .forAccount(account, configDir: configDir, bookmarkData: bookmarkData)
+        }
+        cache = .forAccount(account)
+        tokenManager = .forAccount(account)
+        scanCoordinator = .forAccount(account)
+    }
+}
+
+public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedProviderClient {
     public let providerID: ProviderID = .claude
 
     private let fileManager: FileManager
@@ -9322,6 +9657,15 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         credentials: ProviderCredential?,
         userInitiated: Bool
     ) async throws -> QuotaSnapshot {
+        try await fetchSnapshot(credentials: credentials, account: .primary(.claude), userInitiated: userInitiated)
+    }
+
+    public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
+        let context = ClaudeAccountContext(account: account, credentials: credentials)
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
         //   2. Our cached copy of Claude Code's OAuth token, while it is fresh
@@ -9342,10 +9686,11 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             // An explicit refresh is the user asking us to try properly, so
             // it lifts the throttle that spaces out background reads.
             if userInitiated {
-                await ClaudeOAuthTokenManager.shared.resetReadThrottle()
+                await context.tokenManager.resetReadThrottle()
             }
-            let resolution = await ClaudeOAuthTokenManager.shared.currentAccessTokenFromKeychain(
-                readBudget: claudeCodeReadBudget
+            let resolution = await context.tokenManager.currentAccessTokenFromKeychain(
+                readBudget: claudeCodeReadBudget,
+                store: context.keychainStore
             )
             switch resolution {
             case .token(let token):
@@ -9361,7 +9706,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             tokenAllowsKeychainPlanLookup = oauthToken != nil
         }
         if oauthToken == nil {
-            oauthToken = Self.autoDetectedOAuthTokenFile()
+            oauthToken = Self.autoDetectedOAuthTokenFile(configDir: context.configDir)
         }
         if oauthToken == nil, requiresUserInitiatedKeychainRecovery {
             let message = userInitiated
@@ -9371,19 +9716,20 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         }
         if let token = oauthToken, !token.isEmpty {
             // 1) Serve fresh cached snapshot if we hit the endpoint very recently.
-            if let cached = ClaudeOAuthResponseCache.shared.fresh() {
+            if let cached = context.cache.fresh() {
                 print("[ClaudeProvider] Serving cached OAuth snapshot (fresh)")
                 // Do not re-store cache hits here. The dashboard can refresh
                 // every 15-60s; renewing the cache on read would keep old
                 // OAuth meter values alive indefinitely.
                 return cached
             }
-            if ClaudeOAuthResponseCache.shared.isBackingOff() {
+            if context.cache.isBackingOff() {
                 throw ProviderFetchError.rateLimited
             }
             print("[ClaudeProvider] OAuth token found — fetching live quota")
             do {
                 return try await fetchOAuthSnapshotAndMerge(
+                    context: context,
                     token: token,
                     credentials: credentials,
                     allowKeychainPlanLookup: tokenAllowsKeychainPlanLookup
@@ -9392,13 +9738,15 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                 var effectiveError = error
                 if tokenAllowsKeychainRecovery,
                    error.shouldRecoverClaudeOAuthFromKeychain,
-                   let recoveredToken = await ClaudeOAuthTokenManager.shared.accessTokenAfterOAuthFailure(
+                   let recoveredToken = await context.tokenManager.accessTokenAfterOAuthFailure(
                     rejectedToken: token,
                     reason: "OAuth usage fetch failed (\(error.localizedDescription))",
-                    readBudget: claudeCodeReadBudget
+                    readBudget: claudeCodeReadBudget,
+                       store: context.keychainStore
                    ) {
                     do {
                         return try await fetchOAuthSnapshotAndMerge(
+                            context: context,
                             token: recoveredToken,
                             credentials: credentials,
                             allowKeychainPlanLookup: true
@@ -9414,9 +9762,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                         "Claude Code session expired. Only the CLI renews it — run Claude Code, then refresh manually (the first refresh may ask you to authorize Keychain access)."
                     )
                 }
-                if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
+                if let stale = context.cache.staleFallback() {
                     print("[ClaudeProvider] OAuth fetch failure (\(effectiveError)) — serving last successful OAuth snapshot to preserve meters")
-                    let events = await eventsForOAuthEnrichment(credentials: credentials)
+                    let events = await eventsForOAuthEnrichment(context: context, credentials: credentials)
                     let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
                     return mergeEvents(
                 into: stale,
@@ -9425,6 +9773,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                 }
 
                 if let localSnapshot = await loadLocalSnapshotIfAvailable(
+                    context: context,
                     credentials: credentials,
                     context: "OAuth fetch failure (\(effectiveError.localizedDescription))"
                 ) {
@@ -9436,9 +9785,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             }
         }
 
-        if let stale = ClaudeOAuthResponseCache.shared.staleFallback() {
+        if let stale = context.cache.staleFallback() {
             print("[ClaudeProvider] OAuth token unavailable — serving last successful OAuth snapshot to preserve meters")
-            let events = await eventsForOAuthEnrichment(credentials: credentials)
+            let events = await eventsForOAuthEnrichment(context: context, credentials: credentials)
             let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
             return mergeEvents(
                 into: stale,
@@ -9447,7 +9796,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         }
 
         // Fall back to local JSONL transcript parsing.
-        let localSnapshot = try await loadLocalSnapshot(credentials: credentials, qos: .userInitiated)
+        let localSnapshot = try await loadLocalSnapshot(context: context, credentials: credentials, qos: .userInitiated)
         // Inject AGBench events here too so the local fallback path is
         // symmetric with the OAuth path above.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
@@ -9459,11 +9808,13 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     }
 
     private func fetchOAuthSnapshotAndMerge(
+        context: ClaudeAccountContext,
         token: String,
         credentials: ProviderCredential?,
         allowKeychainPlanLookup: Bool
     ) async throws -> QuotaSnapshot {
         let oauthSnapshot = try await fetchOAuthQuota(
+            context: context,
             token: token,
             allowKeychainPlanLookup: allowKeychainPlanLookup
         )
@@ -9472,14 +9823,14 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         // quota response disappear if the coordinator timeout wins the race.
         let immediatelyCached = mergeEvents(
             into: oauthSnapshot,
-            events: previousClaudeEvents()
+            events: previousClaudeEvents(account: context.account)
         )
-        ClaudeOAuthResponseCache.shared.store(immediatelyCached)
+        context.cache.store(immediatelyCached)
 
         // Augment OAuth quota meters with locally-captured 2-hour buckets so
         // the activity heatmap still shows Claude usage even when the OAuth
         // path has no per-event data.
-        let events = await eventsForOAuthEnrichment(credentials: credentials)
+        let events = await eventsForOAuthEnrichment(context: context, credentials: credentials)
         // Plus AGBench's unified usage.json for any Claude runs driven
         // through TaskWraith. No-op without the bookmark.
         let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "claude")
@@ -9487,11 +9838,12 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             into: oauthSnapshot,
             events: ClaudeHeatmapEventHistory.mergingAGBench(agbenchEvents, into: events)
         )
-        ClaudeOAuthResponseCache.shared.store(merged)
+        context.cache.store(merged)
         return merged
     }
 
     private func loadLocalSnapshot(
+        context: ClaudeAccountContext,
         credentials: ProviderCredential?,
         qos: DispatchQoS.QoSClass
     ) async throws -> QuotaSnapshot {
@@ -9528,21 +9880,22 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
 
         let events = ClaudeHeatmapEventHistory.merged(
             current: rawSnapshot.events,
-            previous: previousClaudeEvents()
+            previous: previousClaudeEvents(account: context.account)
         )
         return rawSnapshot.withEvents(events)
     }
 
     private func loadLocalSnapshotIfAvailable(
+        context: ClaudeAccountContext,
         credentials: ProviderCredential?,
-        context: String
+        context reason: String
     ) async -> QuotaSnapshot? {
         do {
-            let snapshot = try await loadLocalSnapshot(credentials: credentials, qos: .utility)
-            logLocalSnapshotOutcome(snapshot, context: context)
+            let snapshot = try await loadLocalSnapshot(context: context, credentials: credentials, qos: .utility)
+            logLocalSnapshotOutcome(snapshot, context: reason)
             return snapshot
         } catch {
-            print("[ClaudeProvider] Local scan FAILED during \(context) (\(error.localizedDescription))")
+            print("[ClaudeProvider] Local scan FAILED during \(reason) (\(error.localizedDescription))")
             return nil
         }
     }
@@ -9551,26 +9904,27 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     /// `UsageEvent`s seen in `~/.claude/projects/**` so the activity heatmap
     /// still shows Claude even when the OAuth path supplies the quota meters.
     /// Returns `[]` for any error (no bookmark, no transcripts, sandbox denial).
-    private func loadLocalEvents(credentials: ProviderCredential?) async -> [UsageEvent] {
-        guard let snapshot = await loadLocalSnapshotIfAvailable(credentials: credentials, context: "OAuth enrichment") else {
+    private func loadLocalEvents(context: ClaudeAccountContext, credentials: ProviderCredential?) async -> [UsageEvent] {
+        guard let snapshot = await loadLocalSnapshotIfAvailable(context: context, credentials: credentials, context: "OAuth enrichment") else {
             return []
         }
         return snapshot.events
     }
 
-    private func eventsForOAuthEnrichment(credentials: ProviderCredential?) async -> [UsageEvent] {
+    private func eventsForOAuthEnrichment(context: ClaudeAccountContext, credentials: ProviderCredential?) async -> [UsageEvent] {
         // Keep local enrichment comfortably inside SyncCoordinator's 15s
         // provider timeout. Long scans continue in the background and persist
         // their buckets for the next refresh, so quota availability never
         // depends on transcript size.
         if let localEvents = await loadLocalEventsWithinTimeout(
+            context: context,
             credentials: credentials,
             timeoutSeconds: 4
         ), !localEvents.isEmpty {
             return localEvents
         }
 
-        let previousEvents = previousClaudeEvents()
+        let previousEvents = previousClaudeEvents(account: context.account)
         if !previousEvents.isEmpty {
             print("[ClaudeProvider] Reusing \(previousEvents.count) previous Claude heatmap buckets for live OAuth snapshot")
         }
@@ -9578,16 +9932,17 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     }
 
     private func loadLocalEventsWithinTimeout(
+        context: ClaudeAccountContext,
         credentials: ProviderCredential?,
         timeoutSeconds: TimeInterval
     ) async -> [UsageEvent]? {
-        if let cached = await ClaudeLocalEventScanCoordinator.shared.cachedEvents(maxAge: 5 * 60) {
+        if let cached = await context.scanCoordinator.cachedEvents(maxAge: 5 * 60) {
             print("[ClaudeProvider] Reusing \(cached.count) locally-scanned Claude heatmap buckets")
             return cached
         }
 
-        guard let loadTask = await ClaudeLocalEventScanCoordinator.shared.startIfIdle({
-            await loadLocalEvents(credentials: credentials)
+        guard let loadTask = await context.scanCoordinator.startIfIdle({
+            await loadLocalEvents(context: context, credentials: credentials)
         }) else {
             print("[ClaudeProvider] Local heatmap enrichment scan already in progress; reusing previous Claude heatmap buckets")
             return nil
@@ -9605,7 +9960,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
                 // next refresh.
                 if !state.resume(with: events) {
                     if !events.isEmpty {
-                        persistLateClaudeScan(events: events)
+                        persistLateClaudeScan(context: context, events: events)
                     }
                 }
             }
@@ -9627,25 +9982,12 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     /// cached fallback buckets. The card meters were already correct
     /// (they come from the live OAuth response); only the heatmap events
     /// need to be refreshed.
-    private func persistLateClaudeScan(events: [UsageEvent]) {
+    private func persistLateClaudeScan(context: ClaudeAccountContext, events: [UsageEvent]) {
         let store = QuotaSnapshotStore.shared
-        guard let existing = store.loadSnapshots().first(where: { $0.providerID == .claude }) else {
+        guard let existing = store.snapshot(for: context.account) else {
             return
         }
-        let updated = QuotaSnapshot(
-            id: existing.id,
-            providerID: existing.providerID,
-            displayName: existing.displayName,
-            planName: existing.planName,
-            windows: existing.windows,
-            stats: existing.stats,
-            balances: existing.balances,
-            signals: existing.signals,
-            events: events,
-            fetchState: existing.fetchState,
-            fetchedAt: existing.fetchedAt
-        )
-        store.upsert(updated)
+        store.upsert(existing.withEvents(events))
         print("[ClaudeProvider] Persisted \(events.count) late-arriving Claude heatmap buckets for next refresh")
     }
 
@@ -9659,10 +10001,10 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         }
     }
 
-    private func previousClaudeEvents(lookbackDays: Int = ClaudeHeatmapEventBucketer.defaultRetentionDays) -> [UsageEvent] {
+    private func previousClaudeEvents(account: ProviderAccountKey, lookbackDays: Int = ClaudeHeatmapEventBucketer.defaultRetentionDays) -> [UsageEvent] {
         let horizon = Date().addingTimeInterval(-Double(lookbackDays) * 24 * 60 * 60)
         return QuotaSnapshotStore.shared.loadSnapshots()
-            .first { $0.providerID == .claude && $0.fetchState == .success }?
+            .first { $0.accountKey == account && $0.fetchState == .success }?
             .events
             // Buckets only. Older builds appended raw per-run `.message` events
             // here on every refresh, so a persisted list can still hold tens of
@@ -9677,19 +10019,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     /// server-provided OAuth quota snapshot.
     private func mergeEvents(into snapshot: QuotaSnapshot, events: [UsageEvent]) -> QuotaSnapshot {
         guard !events.isEmpty else { return snapshot }
-        return QuotaSnapshot(
-            id: snapshot.id,
-            providerID: snapshot.providerID,
-            displayName: snapshot.displayName,
-            planName: snapshot.planName,
-            windows: snapshot.windows,
-            stats: snapshot.stats,
-            balances: snapshot.balances,
-            signals: snapshot.signals,
-            events: events,
-            fetchState: snapshot.fetchState,
-            fetchedAt: snapshot.fetchedAt
-        )
+        // `withEvents` carries the account fields; a field-by-field copy here
+        // would silently file a secondary account's reading under the primary.
+        return snapshot.withEvents(events)
     }
 
     // Claude rebuilds bounded heatmap buckets from local transcripts on each
@@ -9738,7 +10070,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     /// `claude auth login --claudeai` is impractical. Keychain-based lookup
     /// and read-only Claude Code recovery are handled by
     /// `ClaudeOAuthTokenManager`.
-    private static func autoDetectedOAuthTokenFile() -> String? {
+    private static func autoDetectedOAuthTokenFile(configDir accountConfigDir: String?) -> String? {
         let homePath = NSHomeDirectory()
         let realHome: String
         if let r = homePath.range(of: "/Library/Containers/") {
@@ -9746,7 +10078,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         } else {
             realHome = homePath
         }
-        let configDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+        let configDir = accountConfigDir
+            ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
             ?? (realHome + "/.claude")
         guard let raw = try? String(contentsOfFile: configDir + "/.oauth_token", encoding: .utf8) else {
             return nil
@@ -9758,6 +10091,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
     // MARK: - OAuth Live Quota
 
     private func fetchOAuthQuota(
+        context: ClaudeAccountContext,
         token: String,
         allowKeychainPlanLookup: Bool
     ) async throws -> QuotaSnapshot {
@@ -9780,7 +10114,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             case 200: break
             case 401, 403: throw ProviderFetchError.invalidCredential
             case 429:
-                ClaudeOAuthResponseCache.shared.deferRequests(retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
+                context.cache.deferRequests(retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
                 throw ProviderFetchError.rateLimited
             default: throw ProviderFetchError.parsingError("HTTP \(http.statusCode)")
             }
@@ -9807,14 +10141,22 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
         }
 
         // The profile endpoint shares Anthropic's tight OAuth request budget.
-        // Credential metadata is normally sufficient, so only issue the
-        // second authenticated request when no plan information exists.
-        let credentialPlan = resolveClaudePlanInfo(allowKeychainLookup: allowKeychainPlanLookup)
-        let plan: ClaudePlanInfo?
-        if let credentialPlan {
-            plan = credentialPlan
-        } else {
-            plan = await fetchOAuthPlanInfo(token: token)
+        // Credential metadata is normally sufficient for the plan, so the
+        // second authenticated request is only made when the plan is unknown
+        // or this token has not been profiled yet — once per token, and a
+        // token from a `/login` to another account is a new token.
+        var plan = resolveClaudePlanInfo(
+            allowKeychainLookup: allowKeychainPlanLookup,
+            store: context.keychainStore
+        )
+        var accountFingerprint = context.cache.cachedFingerprint(forToken: token)
+        if plan == nil || accountFingerprint == nil,
+           let profile = await fetchOAuthProfile(token: token) {
+            if plan == nil { plan = profile.plan }
+            if let fingerprint = profile.accountFingerprint {
+                accountFingerprint = fingerprint
+                context.cache.storeFingerprint(fingerprint, forToken: token)
+            }
         }
 
         let fableWeeklyWindow = usage.fableWeeklyWindow
@@ -9915,11 +10257,13 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             stats: stats,
             balances: balances,
             fetchState: .success,
-            fetchedAt: Date()
+            fetchedAt: Date(),
+            accountSlot: context.account.slot,
+            accountFingerprint: accountFingerprint
         )
     }
 
-    private func fetchOAuthPlanInfo(token: String) async -> ClaudePlanInfo? {
+    private func fetchOAuthProfile(token: String) async -> ClaudeOAuthProfileInfo? {
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else {
             return nil
         }
@@ -9936,7 +10280,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient {
             }
 
             let profile = try JSONDecoder().decode(ClaudeOAuthProfileResponse.self, from: data)
-            return profile.planInfo
+            return ClaudeOAuthProfileInfo(plan: profile.planInfo, accountFingerprint: profile.accountFingerprint)
         } catch {
             print("[ClaudeProvider] OAuth profile lookup failed; retaining credential plan metadata")
             return nil

@@ -48,66 +48,63 @@ final class SyncCoordinator {
         syncErrors = [:]
 
         let storedSnapshots = store.loadSnapshots()
-        let previousSnapshots = Dictionary(uniqueKeysWithValues: storedSnapshots.map { ($0.providerID, $0) })
+        let previousSnapshots = Dictionary(
+            storedSnapshots.map { ($0.accountKey, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         var mergedSnapshots = previousSnapshots
-        let scheduledProviders: [(providerID: ProviderID, client: any ProviderClient)] =
-            ProviderID.allCases.compactMap { providerID in
-                guard let client = clients[providerID] else { return nil }
-                return (providerID, client)
-            }
+        let scheduledAccounts = scheduledAccounts()
         let startGate = ProviderRefreshStartGate(
             spacingNanoseconds: refreshStartSpacingNanoseconds
         )
 
-        // Keep only a small number of provider requests in flight. The start
+        // Keep only a small number of account requests in flight. The start
         // gate also spaces launches within each rolling chunk so keychain and
         // network work do not arrive as a burst.
-        await withTaskGroup(of: (providerID: ProviderID, outcome: ProviderSyncOutcome).self) { group in
-            var nextProviderIndex = 0
-            let initialCount = min(maximumConcurrentRefreshes, scheduledProviders.count)
+        await withTaskGroup(of: (account: ProviderAccountKey, outcome: ProviderSyncOutcome).self) { group in
+            var nextAccountIndex = 0
+            let initialCount = min(maximumConcurrentRefreshes, scheduledAccounts.count)
 
             for _ in 0..<initialCount {
-                let scheduled = scheduledProviders[nextProviderIndex]
-                nextProviderIndex += 1
+                let scheduled = scheduledAccounts[nextAccountIndex]
+                nextAccountIndex += 1
                 group.addTask {
                     await startGate.waitForTurn()
                     let outcome = await self.syncOutcome(
-                        providerID: scheduled.providerID,
+                        account: scheduled.account,
                         client: scheduled.client,
-                        previousSnapshot: previousSnapshots[scheduled.providerID],
+                        previousSnapshot: previousSnapshots[scheduled.account],
                         userInitiated: userInitiated
                     )
-                    return (scheduled.providerID, outcome)
+                    return (scheduled.account, outcome)
                 }
             }
 
-            while let (providerID, outcome) = await group.next() {
-                mergedSnapshots[providerID] = outcome.snapshot
+            while let (account, outcome) = await group.next() {
+                mergedSnapshots[account] = outcome.snapshot
                 applySyncOutcome(outcome)
 
-                if (providerID == .openai || providerID == .codexTelemetry),
+                if account.isPrimary,
+                   (account.providerID == .openai || account.providerID == .codexTelemetry),
                    let coalesced = coalescedCodexUsageSnapshot(in: mergedSnapshots) {
-                    mergedSnapshots[.openai] = coalesced
+                    mergedSnapshots[.primary(.openai)] = coalesced
                     store.upsert(coalesced)
                 }
 
-                onProgress?(
-                    ProviderID.allCases.compactMap { mergedSnapshots[$0] },
-                    syncErrors
-                )
+                onProgress?(orderedSnapshots(mergedSnapshots), syncErrors)
 
-                if nextProviderIndex < scheduledProviders.count {
-                    let scheduled = scheduledProviders[nextProviderIndex]
-                    nextProviderIndex += 1
+                if nextAccountIndex < scheduledAccounts.count {
+                    let scheduled = scheduledAccounts[nextAccountIndex]
+                    nextAccountIndex += 1
                     group.addTask {
                         await startGate.waitForTurn()
                         let outcome = await self.syncOutcome(
-                            providerID: scheduled.providerID,
+                            account: scheduled.account,
                             client: scheduled.client,
-                            previousSnapshot: previousSnapshots[scheduled.providerID],
+                            previousSnapshot: previousSnapshots[scheduled.account],
                             userInitiated: userInitiated
                         )
-                        return (scheduled.providerID, outcome)
+                        return (scheduled.account, outcome)
                     }
                 }
             }
@@ -116,10 +113,10 @@ final class SyncCoordinator {
         // Re-run coalescence with the final pair so the atomic final ordering
         // matches every progressive update.
         if let coalesced = coalescedCodexUsageSnapshot(in: mergedSnapshots) {
-            mergedSnapshots[.openai] = coalesced
+            mergedSnapshots[.primary(.openai)] = coalesced
         }
 
-        store.replaceAll(ProviderID.allCases.compactMap { mergedSnapshots[$0] })
+        store.replaceAll(orderedSnapshots(mergedSnapshots))
 
         lastSyncDate = Date()
 
@@ -127,7 +124,7 @@ final class SyncCoordinator {
         WidgetCenter.shared.reloadAllTimelines()
     }
 
-    /// Fetches a single provider.
+    /// Fetches every account of a single provider.
     func sync(providerID: ProviderID, userInitiated: Bool = true) async {
         print("[SyncCoordinator] Starting sync for \(providerID.rawValue)")
 
@@ -142,29 +139,108 @@ final class SyncCoordinator {
             return
         }
 
-        let outcome = await syncOutcome(
-            providerID: providerID,
-            client: client,
-            previousSnapshot: store.snapshot(for: providerID),
-            userInitiated: userInitiated
-        )
-        applySyncOutcome(outcome)
+        // This provider's errors are about to be re-derived from scratch.
+        syncErrors.removeValue(forKey: providerID)
+        for account in accountKeys(for: providerID) {
+            let outcome = await syncOutcome(
+                account: account,
+                client: client,
+                previousSnapshot: store.snapshot(for: account),
+                userInitiated: userInitiated
+            )
+            applySyncOutcome(outcome)
+        }
         lastSyncDate = Date()
 
         WidgetCenter.shared.reloadAllTimelines()
         print("[SyncCoordinator] Finished sync for \(providerID.rawValue)")
     }
 
+    // MARK: - Accounts
+
+    /// Every account the sweep refreshes, in dashboard order: each registered
+    /// provider's primary account, then the secondary accounts the user added
+    /// under it. A provider that cannot hold extra accounts contributes only
+    /// its primary, whatever the registry says.
+    private func scheduledAccounts() -> [(account: ProviderAccountKey, client: any ProviderClient)] {
+        ProviderID.allCases.flatMap { providerID -> [(account: ProviderAccountKey, client: any ProviderClient)] in
+            guard let client = clients[providerID] else { return [] }
+            return accountKeys(for: providerID).map { ($0, client) }
+        }
+    }
+
+    private func accountKeys(for providerID: ProviderID) -> [ProviderAccountKey] {
+        guard providerID.supportsAdditionalAccounts else { return [.primary(providerID)] }
+        return ProviderAccountRegistry.shared.keys(for: providerID)
+    }
+
+    /// Provider order first, then primary before secondaries in the order they
+    /// were added. Snapshots for accounts no longer in the registry (removed
+    /// while a sweep was in flight) drop out here rather than lingering.
+    private func orderedSnapshots(_ merged: [ProviderAccountKey: QuotaSnapshot]) -> [QuotaSnapshot] {
+        ProviderID.allCases.flatMap { providerID -> [QuotaSnapshot] in
+            accountKeys(for: providerID).compactMap { merged[$0] }
+        }
+    }
+
+    /// Files the outcome under the account the sweep scheduled. Provider
+    /// clients know nothing about slots, so every snapshot they return — and
+    /// every placeholder written on their behalf — is stamped here.
+    private func stamped(_ outcome: ProviderSyncOutcome, credential: ProviderCredential?) -> ProviderSyncOutcome {
+        let account = outcome.account
+        let label = account.isPrimary ? nil : ProviderAccountRegistry.shared.label(for: account)
+        let fingerprint = outcome.snapshot.accountFingerprint
+            ?? Self.derivedFingerprint(for: account.providerID, credential: credential)
+        return ProviderSyncOutcome(
+            account: account,
+            snapshot: outcome.snapshot.withAccount(slot: account.slot, label: label, fingerprint: fingerprint),
+            errorMessage: outcome.errorMessage
+        )
+    }
+
+    /// Providers that report no identity of their own get one from the account
+    /// identifier the credential carries (Codex's ChatGPT account id, an OpenAI
+    /// project id, a Cursor team id). Claude's `accountIdentifier` field holds a
+    /// pasted token, never an identity, so it is excluded.
+    static func derivedFingerprint(for providerID: ProviderID, credential: ProviderCredential?) -> String? {
+        guard providerID != .claude,
+              let identifier = credential?.normalizedAccountIdentifier,
+              !identifier.isEmpty else {
+            return nil
+        }
+        return ProviderAccountFingerprint.make(providerID: providerID, components: [identifier])
+    }
+
     // MARK: - Private
 
     private func syncOutcome(
-        providerID: ProviderID,
+        account: ProviderAccountKey,
         client: any ProviderClient,
         previousSnapshot: QuotaSnapshot?,
         userInitiated: Bool
     ) async -> ProviderSyncOutcome {
-        let credential = keychain.credential(for: providerID)
-        print("[SyncCoordinator] Credential for \(providerID.rawValue): \(credential != nil ? "present" : "nil")")
+        let credential = keychain.credential(for: account)
+        return stamped(
+            await rawSyncOutcome(
+                account: account,
+                client: client,
+                credential: credential,
+                previousSnapshot: previousSnapshot,
+                userInitiated: userInitiated
+            ),
+            credential: credential
+        )
+    }
+
+    private func rawSyncOutcome(
+        account: ProviderAccountKey,
+        client: any ProviderClient,
+        credential: ProviderCredential?,
+        previousSnapshot: QuotaSnapshot?,
+        userInitiated: Bool
+    ) async -> ProviderSyncOutcome {
+        let providerID = account.providerID
+        print("[SyncCoordinator] Credential for \(account.rawValue): \(credential != nil ? "present" : "nil")")
 
         // Allow auto-discovery clients (local logs, Devin, Cursor,
         // Gemini, Grok) to proceed without stored credentials. Grok can
@@ -182,7 +258,9 @@ final class SyncCoordinator {
             || client is MistralProviderClient
             || client is CerebrasProviderClient
             || client is MetaProviderClient
-        guard credential != nil || client is MockProviderClient || canAutoDiscover else {
+        // A secondary account has no ambient source: it exists only through
+        // the credential (folder grant, session, token) the user gave it.
+        guard credential != nil || (account.isPrimary && (client is MockProviderClient || canAutoDiscover)) else {
             print("[SyncCoordinator] No credentials for \(providerID.rawValue), skipping")
             if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
                 providerID: providerID,
@@ -190,14 +268,14 @@ final class SyncCoordinator {
                 reason: "missing credentials"
             ) {
                 return ProviderSyncOutcome(
-                    providerID: providerID,
+                    account: account,
                     snapshot: preservedSnapshot,
                     errorMessage: nil
                 )
             }
 
             return ProviderSyncOutcome(
-                providerID: providerID,
+                account: account,
                 snapshot: QuotaSnapshot(
                     providerID: providerID,
                     displayName: providerID.snapshotDisplayName,
@@ -212,7 +290,7 @@ final class SyncCoordinator {
         do {
             print("[SyncCoordinator] Calling fetchSnapshot for \(providerID.rawValue)")
             let snapshot = try await fetchSnapshotWithTimeout(
-                providerID: providerID,
+                account: account,
                 client: client,
                 credentials: credential,
                 userInitiated: userInitiated
@@ -223,7 +301,7 @@ final class SyncCoordinator {
                 previousSnapshot: previousSnapshot
             )
             return ProviderSyncOutcome(
-                providerID: providerID,
+                account: account,
                 snapshot: signalDetector.enrichedSnapshot(from: historyPreservedSnapshot, previousSnapshot: previousSnapshot),
                 errorMessage: nil
             )
@@ -235,14 +313,14 @@ final class SyncCoordinator {
                 reason: "not configured"
             ) {
                 return ProviderSyncOutcome(
-                    providerID: providerID,
+                    account: account,
                     snapshot: preservedSnapshot,
                     errorMessage: nil
                 )
             }
 
             return ProviderSyncOutcome(
-                providerID: providerID,
+                account: account,
                 snapshot: QuotaSnapshot(
                     providerID: providerID,
                     displayName: providerID.displayName,
@@ -260,14 +338,14 @@ final class SyncCoordinator {
                 reason: message
             ) {
                 return ProviderSyncOutcome(
-                    providerID: providerID,
+                    account: account,
                     snapshot: preservedSnapshot,
                     errorMessage: message
                 )
             }
 
             return ProviderSyncOutcome(
-                providerID: providerID,
+                account: account,
                 snapshot: QuotaSnapshot(
                     providerID: providerID,
                     displayName: providerID.snapshotDisplayName,
@@ -288,7 +366,7 @@ final class SyncCoordinator {
                 reason: message
             ) {
                 return ProviderSyncOutcome(
-                    providerID: providerID,
+                    account: account,
                     snapshot: preservedSnapshot,
                     errorMessage: message
                 )
@@ -303,7 +381,7 @@ final class SyncCoordinator {
                 fetchState: .error
             )
             return ProviderSyncOutcome(
-                providerID: providerID,
+                account: account,
                 snapshot: errSnap,
                 errorMessage: message
             )
@@ -351,11 +429,12 @@ final class SyncCoordinator {
     }
 
     private func fetchSnapshotWithTimeout(
-        providerID: ProviderID,
+        account: ProviderAccountKey,
         client: any ProviderClient,
         credentials: ProviderCredential?,
         userInitiated: Bool
     ) async throws -> QuotaSnapshot {
+        let providerID = account.providerID
         let timeout = providerTimeout(for: providerID)
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -363,7 +442,15 @@ final class SyncCoordinator {
             let fetchTask = Task {
                 do {
                     let snapshot: QuotaSnapshot
-                    if let interactiveClient = client as? any UserInitiatedProviderClient {
+                    if let accountClient = client as? any AccountScopedProviderClient {
+                        // Clients with per-account caches or keychain items
+                        // (Claude) need to know which account this is.
+                        snapshot = try await accountClient.fetchSnapshot(
+                            credentials: credentials,
+                            account: account,
+                            userInitiated: userInitiated
+                        )
+                    } else if let interactiveClient = client as? any UserInitiatedProviderClient {
                         snapshot = try await interactiveClient.fetchSnapshot(
                             credentials: credentials,
                             userInitiated: userInitiated
@@ -490,21 +577,36 @@ final class SyncCoordinator {
         return capped
     }
 
+    /// Errors stay keyed by provider so the setup rail and dashboard need no
+    /// second key. A secondary account's message is prefixed with its label,
+    /// and a provider's errors accumulate within a sweep: one account
+    /// succeeding must not erase another account's failure.
     private func applySyncOutcome(_ outcome: ProviderSyncOutcome) {
+        let providerID = outcome.account.providerID
         if let errorMessage = outcome.errorMessage {
-            syncErrors[outcome.providerID] = errorMessage
-        } else {
-            syncErrors.removeValue(forKey: outcome.providerID)
+            let labelled: String
+            if outcome.account.isPrimary {
+                labelled = errorMessage
+            } else {
+                let label = outcome.snapshot.accountBadgeText ?? "Account"
+                labelled = "\(label): \(errorMessage)"
+            }
+            if let existing = syncErrors[providerID], !existing.isEmpty, existing != labelled,
+               !existing.components(separatedBy: "\n").contains(labelled) {
+                syncErrors[providerID] = existing + "\n" + labelled
+            } else {
+                syncErrors[providerID] = labelled
+            }
         }
 
         store.upsert(outcome.snapshot)
     }
 
     private func coalescedCodexUsageSnapshot(
-        in snapshots: [ProviderID: QuotaSnapshot]
+        in snapshots: [ProviderAccountKey: QuotaSnapshot]
     ) -> QuotaSnapshot? {
-        guard let usage = snapshots[.openai],
-              let telemetry = snapshots[.codexTelemetry] else {
+        guard let usage = snapshots[.primary(.openai)],
+              let telemetry = snapshots[.primary(.codexTelemetry)] else {
             return nil
         }
 
@@ -524,7 +626,10 @@ final class SyncCoordinator {
             events: combinedEvents,
             fetchState: usage.fetchState,
             fetchedAt: max(usage.fetchedAt, telemetry.fetchedAt),
-            resetCredits: usage.resetCredits
+            resetCredits: usage.resetCredits,
+            accountSlot: usage.accountSlot,
+            accountLabel: usage.accountLabel,
+            accountFingerprint: usage.accountFingerprint
         )
     }
 }
@@ -598,7 +703,7 @@ private struct HeatmapBucketKey: Hashable {
 }
 
 private struct ProviderSyncOutcome {
-    let providerID: ProviderID
+    let account: ProviderAccountKey
     let snapshot: QuotaSnapshot
     let errorMessage: String?
 }
@@ -638,15 +743,29 @@ private struct SnapshotSignalDetector {
             return snapshot.withSignals([])
         }
 
+        let account = snapshot.accountKey
         let stateStore = QuotaResetDetectorStateStore(defaults: defaults)
-        let outcome = detector.observe(snapshot, state: stateStore.state(for: snapshot.providerID))
-        stateStore.save(outcome.state, for: snapshot.providerID)
+
+        // The same slot now holds a different account: a Work meter at 12%
+        // replacing a Personal meter at 90% is not a reset, it is a different
+        // meter. Start the trail again and drop anything still pending.
+        if ProviderAccountFingerprint.indicatesAccountChange(
+            previous: previousSnapshot?.accountFingerprint,
+            current: snapshot.accountFingerprint
+        ) {
+            print("[SyncCoordinator] \(account.rawValue) is now a different account; resetting its reset-detector trail")
+            stateStore.clear(account: account)
+            activeSignals.removeValue(forKey: account.rawValue)
+        }
+
+        let outcome = detector.observe(snapshot, state: stateStore.state(for: account))
+        stateStore.save(outcome.state, for: account)
         QuotaResetLedgerStore.shared.record(outcome.events)
 
-        merge(outcome.signals, into: &activeSignals, providerID: snapshot.providerID)
+        merge(outcome.signals, into: &activeSignals, account: account)
         saveSignals(activeSignals)
 
-        let detectedSignals = (activeSignals[snapshot.providerID.rawValue] ?? [])
+        let detectedSignals = (activeSignals[account.rawValue] ?? [])
             .sorted { $0.detectedAt > $1.detectedAt }
 
         // Provider clients attach signals of their own — Devin's stale-cache
@@ -691,11 +810,11 @@ private struct SnapshotSignalDetector {
     private func merge(
         _ newSignals: [QuotaSignal],
         into signals: inout [String: [QuotaSignal]],
-        providerID: ProviderID
+        account: ProviderAccountKey
     ) {
         guard !newSignals.isEmpty else { return }
 
-        let providerKey = providerID.rawValue
+        let providerKey = account.rawValue
         var merged = signals[providerKey] ?? []
 
         for signal in newSignals {

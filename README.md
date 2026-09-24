@@ -17,6 +17,45 @@ Providers hand out two kinds of out-of-schedule resets, and the app tracks both.
 - **Banked resets** are credits the user redeems themselves. Codex reports them directly (`wham/usage` carries `rate_limit_reset_credits`; `wham/rate-limit-reset-credits` lists the credits and `…/history` the granted/used events behind the Codex app's "Usage limit resets" panel). Qwen shows the count on its Plan Quota card ("Reset ⓘ 1 available"), which the app reads every half hour. A banked reset shows as a pill on the provider card, a "Reset available" alert (repeated once when it is about to expire), and a "Reset used" entry in the provider detail view once redeemed.
 - **Gifted resets** are the celebratory ones ("we've reset everyone's weekly limits"). `QuotaResetDetector` (`Shared/Models/QuotaResetDetector.swift`) infers them from successive meter readings: a drop is held as *pending* until the next reading confirms it, reset-date drift on a rolling window never counts on its own, a five-hour window only resets early alongside a sibling window or a consumed credit, several windows dropping together become one *provider-wide* reset, and each window reports at most one inferred reset per day. Confirmed resets land in a 60-day ledger, feed the "N resets · 7d" tally, and play the celebration.
 
+## Multiple Accounts
+
+One person can hold more than one account with the same provider (a personal
+Claude Max and a work one, two Codex subscriptions). Limit Counter tracks them
+side by side; it never switches, rotates or pools them.
+
+- **What an account is.** The primary account of every provider is the provider
+  itself — everything a single-account install already stores. Each additional
+  account is an opaque slot under the provider with a label you choose ("Work",
+  never an email), kept in the App Group so the widget can label rows too.
+- **Where a second account comes from.** For Claude it is a second Claude Code
+  config folder — the one you launch that account with via `CLAUDE_CONFIG_DIR`,
+  such as `~/.claude-work`. Claude Code names that folder's Keychain item
+  `Claude Code-credentials-<first 8 hex of sha256(folder path)>`; Limit Counter
+  derives the same name, reads it (never writes it) and reads the folder's
+  transcripts. For Codex it is a second `CODEX_HOME` folder with its own
+  `auth.json`. Web-session and API-key providers (Cursor, Kimi, Qwen, MiMo,
+  Ollama, Mistral, Meta, OpenRouter and the rest) take a second session or key
+  exactly as the first. ChatGPT's local desktop cache is one install, one
+  account, so it takes no extra accounts.
+- **How it is stored.** Credentials, cached snapshots, reset-detector state,
+  CloudKit status records and alert signatures are keyed by account. The primary
+  account's keys are the bare provider keys, so nothing on disk or in iCloud
+  moved when accounts arrived.
+- **Account changes are not resets.** Every Claude reading carries a hashed
+  fingerprint of the signed-in organisation and account (from the profile the
+  app already fetches). When the fingerprint behind a slot changes — a `/login`
+  to another account in the same config folder — the reset detector starts that
+  slot's trail again instead of celebrating a "gifted reset" for a meter that
+  merely belongs to someone else now. Codex and the API providers fingerprint
+  from their account, project or team identifiers.
+- **Where it shows.** Each account is its own card, right after its provider's
+  primary card and carrying the label as a chip; the menu bar stacks a
+  provider's accounts under one provider chip; the widget shows one card per
+  account; notifications thread per account.
+
+Set an account up from a provider's page in Setup: *Add account*, give it a
+label, then grant its folder or import its session.
+
 ## Safety Boundary
 
 This project is intentionally designed around credentials the user explicitly provides.
