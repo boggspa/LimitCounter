@@ -471,27 +471,113 @@ nonisolated enum ModelUsageAggregation {
     }
 }
 
-/// Presentation only. Explicit routing namespaces may choose a vendor's colour,
-/// while deduplication, pricing and accounting retain the original source.
+/// TaskWraith's model-catalogue branding, mirrored from AGBench's iOS twin of its
+/// renderer (`TaskWraithUI/Theme.providerAccentHex`, `TaskWraithKit/OllamaDisplayBrands`
+/// and `PiBrandTable`, which pin `src/renderer/src/styles/theme.css`) as of 2026-09-24.
+/// A record wears the accent of the brand that served its model: a Pi or OpenRouter
+/// route its upstream, with OpenRouter's resold namespaces and its anonymous `stealth`
+/// preview slot overridden; an Ollama model its maker; anything else its runtime
+/// provider. A brand TaskWraith has no accent for gets none rather than a borrowed one.
+nonisolated enum TaskWraithBranding {
+    /// `--provider-<class>-color`, keyed by hue class.
+    static let accents: [String: String] = [
+        "gemini": "#346EEC", "codex": "#705AFF", "claude": "#B16105", "kimi": "#0073E6", "cursor": "#8C7508",
+        "ollama": "#976C52", "antigravity": "#308713", "pi": "#68768C", "muse": "#1671EA", "devin": "#4878AE",
+        "ensemble": "#986781", "grok": "#757575", "alibaba": "#8C52EF", "deep-reinforce": "#BE5809", "ibm": "#3079BC",
+        "liquid": "#D72D82", "meta": "#1671EA", "cohere": "#5E7C6F", "essential": "#8462CA", "nvidia": "#538200",
+        "openbmb": "#E22B17", "poolside": "#0C8194", "deepseek": "#4E6AEE", "zai": "#177DAA", "minimax": "#C044A4",
+        "mistral": "#D44404", "xiaomi": "#008844", "cerebras": "#BB584A", "groq": "#088482", "openrouter": "#E02948",
+        "thinkingmachines": "#C24E68", "tencent": "#4E73CA", "inception": "#7C5BE9", "nexagi": "#747A42",
+        "sakana": "#EA0C2D", "stealth": "#9E6C00", "unbiased": "#B85A35", "typesafe": "#C700E4"
+    ]
+    /// TaskWraith's legacy classes, plus Limit Counter provider ids it spells differently.
+    static let aliases: [String: String] = [
+        "openai": "codex", "google": "antigravity", "qwen": "alibaba", "ornith": "deep-reinforce",
+        "codextelemetry": "codex", "openaiapi": "codex", "chatgpt": "codex", "mimo": "xiaomi"
+    ]
+    /// TaskWraith's runtime providers: a route namespace naming one is that seat.
+    static let runtimeProviders: Set<String> = [
+        "gemini", "codex", "claude", "kimi", "grok", "cursor", "ollama", "antigravity", "pi", "muse", "mistral", "devin", "ensemble"
+    ]
+    /// Provider Hub namespaces TaskWraith's tables do not name.
+    static let routeAliases: [String: String] = [
+        "openai": "codex", "anthropic": "claude", "xai": "grok", "moonshot": "kimi", "google": "antigravity",
+        "alibaba": "alibaba", "qwen": "alibaba", "meta": "meta", "xiaomi": "xiaomi", "mimo": "xiaomi"
+    ]
+    /// `PiBrandTable.upstreams`: a Pi wire id's upstream, or OpenRouter's nested namespace.
+    static let piUpstreams: [String: String] = [
+        "deepseek": "deepseek", "zai": "zai", "qwen-token-plan": "qwen", "minimax": "minimax",
+        "xiaomi-token-plan-cn": "xiaomi", "xiaomi-token-plan-sgp": "xiaomi", "xiaomi-token-plan-ams": "xiaomi",
+        "mistral": "mistral", "groq": "groq", "cerebras": "cerebras", "openrouter": "openrouter",
+        "openrouter/z-ai": "zai", "openrouter/poolside": "poolside", "openrouter/nvidia": "nvidia", "openrouter/cohere": "cohere",
+        "openrouter/minimax": "minimax", "openrouter/thinkingmachines": "thinkingmachines", "openrouter/tencent": "tencent",
+        "openrouter/inception": "inception", "openrouter/nex-agi": "nexagi", "openrouter/sakana": "sakana",
+        "openrouter/stealth": "stealth", "openrouter/unbiased": "unbiased", "openrouter/typesafe": "typesafe"
+    ]
+    /// `OllamaDisplayBrands.all`, in its order: the first brand with a needle in the id wins.
+    static let ollamaBrands: [(hueClass: String, needles: [String])] = [
+        ("alibaba", ["qwen3", "qwen 3", "qwen"]), ("cohere", ["north-mini-code-1.0", "north mini code 1.0", "north mini code"]),
+        ("deepseek", ["deepseek-r1", "deepseek r1", "deepseek"]), ("deep-reinforce", ["ornith"]), ("essential", ["rnj-1", "rnj 1"]),
+        ("google", ["gemma4", "gemma 4", "gemma"]), ("ibm", ["granite4.1", "granite 4.1", "granite"]), ("kimi", ["kimi-"]),
+        ("liquid", ["lfm2.5", "lfm 2.5", "lfm"]), ("meta", ["muse-glimmer", "muse glimmer", "llama3.1", "llama 3.1", "llama3.2", "llama 3.2"]),
+        ("minimax", ["minimax-", "minimax "]), ("mistral", ["devstral", "ministral", "magistral", "mistral"]),
+        ("nvidia", ["nemotron3", "nemotron 3", "nemotron"]), ("openai", ["gpt-oss", "gpt oss", "openai/gpt-oss"]),
+        ("openbmb", ["minicpm-v4.5", "minicpm v4.5", "minicpm"]), ("poolside", ["laguna-xs-2.1", "laguna xs 2.1", "laguna"]),
+        ("zai", ["glm-", "glm "])
+    ]
+
+    /// `OllamaDisplayBrands.providerHueClass`: Ollama and Pi models wear their brand's class.
+    static func hueClass(provider: String, model: String?) -> String {
+        if provider == "ollama", let key = model?.lowercased(), let brand = ollamaBrands.first(where: { $0.needles.contains { key.contains($0) } }) {
+            return brand.hueClass
+        }
+        if provider == "pi", let hue = piUpstreamHueClass(model) { return hue }
+        return provider
+    }
+
+    /// `PiBrandTable.brand(forWireModelId:)`: split on the first slash; OpenRouter's own
+    /// nested namespace overrides its generic brand.
+    static func piUpstreamHueClass(_ wireID: String?) -> String? {
+        func split(_ value: Substring) -> (upstream: String, model: Substring)? {
+            guard let slash = value.firstIndex(of: "/"), slash != value.startIndex, value.index(after: slash) < value.endIndex else { return nil }
+            return (value[..<slash].lowercased(), value[value.index(after: slash)...])
+        }
+        guard let wire = wireID?.trimmingCharacters(in: .whitespacesAndNewlines), let route = split(wire[...]) else { return nil }
+        if route.upstream == "openrouter", let nested = split(route.model), let hue = piUpstreams["openrouter/\(nested.upstream)"] { return hue }
+        return piUpstreams[route.upstream]
+    }
+
+    /// The runtime provider a Limit Counter source or provider id stands for.
+    static func runtimeProvider(forSource source: String) -> String {
+        let key = source.lowercased()
+        return ["openai", "codextelemetry", "openaiapi", "chatgpt"].contains(key) ? "codex" : key
+    }
+
+    /// The accent for a hue class or provider id, or nil where TaskWraith defines none.
+    static func hex(for identity: String) -> String? {
+        let key = identity.lowercased()
+        return accents[aliases[key] ?? key]
+    }
+}
+
+/// Presentation only: the TaskWraith hue class of the brand behind a record, the way
+/// TaskWraith's model catalogue presents it. Deduplication, pricing and accounting keep
+/// the original source and model.
 nonisolated enum ModelUsageDisplayIdentity {
     static func provider(model: String?, source: String) -> String {
-        let host = source.split(separator: ":", maxSplits: 1).first.map(String.init) ?? source
-        let fallback = host == "codex" || host == "codexTelemetry" ? "openai" : host
-        // Pi is a router: its namespace names the seat and the next one names the vendor.
-        guard var model else { return fallback }
-        if model.lowercased().hasPrefix("pi/") { model.removeFirst(3) }
-        guard let slash = model.firstIndex(of: "/"),
-              model.index(after: slash) < model.endIndex else { return fallback }
-        let namespace = model[..<slash].lowercased()
-        let known = [
-            "codex": "openai", "openai": "openai", "claude": "claude", "anthropic": "claude",
-            "grok": "grok", "xai": "grok", "mistral": "mistral", "deepseek": "deepseek",
-            "gemini": "gemini", "google": "gemini", "kimi": "kimi", "moonshot": "kimi",
-            "cursor": "cursor", "cerebras": "cerebras", "ollama": "ollama", "openrouter": "openrouter",
-            "qwen": "qwen", "alibaba": "qwen", "meta": "meta", "muse": "meta",
-            "antigravity": "antigravity", "devin": "devin", "mimo": "mimo", "xiaomi": "mimo"
-        ]
-        return known[namespace] ?? fallback
+        let host = TaskWraithBranding.runtimeProvider(forSource: source.split(separator: ":", maxSplits: 1).first.map(String.init) ?? source)
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty else { return host }
+        // A routed id leads with its runtime provider (`pi/…`, `ollama/…`, `claude/…`) or,
+        // through a Provider Hub, with a Pi upstream (`openrouter/stealth/…`, `qwen-token-plan/…`).
+        if let slash = model.firstIndex(of: "/") {
+            let namespace = model[..<slash].lowercased()
+            if TaskWraithBranding.runtimeProviders.contains(namespace) {
+                return TaskWraithBranding.hueClass(provider: namespace, model: String(model[model.index(after: slash)...]))
+            }
+            if let hue = TaskWraithBranding.piUpstreamHueClass(model) { return hue }
+            if let hue = TaskWraithBranding.routeAliases[namespace] { return hue }
+        }
+        return TaskWraithBranding.hueClass(provider: host, model: model)
     }
 
     static func dominant(in rows: [ModelUsageRollup]) -> String? {

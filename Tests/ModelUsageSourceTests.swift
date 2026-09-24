@@ -682,11 +682,35 @@ struct ModelUsageSourceTests {
         expect(runTotals.runs == 2 && ModelUsageFormat.requests(runTotals.requests, runs: runTotals.runs) == "2 runs"
                && ModelUsageFormat.requests(5, runs: 2) == "5 calls & runs" && ModelUsageFormat.requests(5, runs: 0) == "5 calls",
                "Whole runs are never labelled as calls")
-        expect(TaskWraithProviderPalette.hex(for: "openai") == "#705AFF" && TaskWraithProviderPalette.hex(for: "codexTelemetry") == "#705AFF"
-               && TaskWraithProviderPalette.hex(for: "Claude") == "#B16105" && TaskWraithProviderPalette.hex(for: "qwen") == "#8C52EF",
+        expect(TaskWraithBranding.hex(for: "openai") == "#705AFF" && TaskWraithBranding.hex(for: "codexTelemetry") == "#705AFF"
+               && TaskWraithBranding.hex(for: "Claude") == "#B16105" && TaskWraithBranding.hex(for: "qwen") == "#8C52EF",
                "Provider ids and routed vendors take TaskWraith's accents, aliases included")
-        expect(TaskWraithProviderPalette.hex(for: "taskwraith") == "#986781" && TaskWraithProviderPalette.hex(for: "heatmap") == nil,
-               "Runs spanning providers wear the ensemble hue; unknown identities get no borrowed accent")
+        expect(TaskWraithBranding.hex(for: "taskwraith") == nil && TaskWraithBranding.hex(for: "heatmap") == nil,
+               "TaskWraith itself and unknown identities get no borrowed accent")
+        // TaskWraith's catalogue: a model wears the brand that served it.
+        let brands: [(model: String, source: String, brand: String)] = [
+            ("openrouter/stealth/union-alpha", "codex", "stealth"), ("pi/openrouter/stealth/union-alpha", "taskwraith", "stealth"),
+            ("openrouter/nvidia/nemotron-3-ultra", "codex", "nvidia"), ("openrouter/z-ai/glm-5.2", "codex", "zai"),
+            ("openrouter/x-ai/grok-5", "codex", "openrouter"), ("qwen-token-plan/qwen3.8-max", "codex", "qwen"),
+            ("pi/xiaomi-token-plan-sgp/mimo-v2.5", "taskwraith", "xiaomi"), ("pi/unknown/model", "taskwraith", "pi"),
+            ("ollama/deepseek-v4-pro:cloud", "codex", "deepseek"), ("ollama/gpt-oss:120b-cloud", "taskwraith", "openai"),
+            ("ollama/gemma4:31b-cloud", "codex", "google"), ("ollama/ministral-3:3b", "codex", "mistral"),
+            ("ollama/mystery:1b", "codex", "ollama"), ("qwen3.5:4b", "ollama:events", "alibaba"), ("mimo/mimo-v2.5-pro", "codex", "xiaomi"),
+            ("kimi-code/k3", "kimi", "kimi"), ("gpt-5.6-sol", "codex", "codex"), ("claude/fable", "codex", "claude"),
+            ("mistral/devstral-2512", "taskwraith", "mistral"), ("devstral-small", "mistral", "mistral")
+        ]
+        for item in brands {
+            expect(ModelUsageDisplayIdentity.provider(model: item.model, source: item.source) == item.brand, "\(item.model) in \(item.source) wears \(item.brand)")
+        }
+        expect(TaskWraithBranding.hex(for: "stealth") == "#9E6C00" && TaskWraithBranding.hex(for: "google") == "#308713"
+               && TaskWraithBranding.hex(for: "openai") == TaskWraithBranding.hex(for: "codex"), "Brand classes resolve through TaskWraith's accent table")
+        let runHour = date("2026-09-24T11:00:00Z")
+        let spanning = ModelUsageArchive(generatedAt: now, buckets: [
+            ModelUsageRollup(source: "taskwraith", model: "mistral/devstral-2512", start: runHour, seconds: 300, tokens: ModelTokenCounts(input: 900), requests: 1, runs: 1),
+            ModelUsageRollup(source: "taskwraith", model: "codex/gpt-6-sol", start: runHour, seconds: 300, tokens: ModelTokenCounts(input: 100), requests: 1, runs: 1)])
+        let runsData = ModelUsageInsightData(archive: spanning, snapshots: [])
+        expect(runsData.sources.first.flatMap { runsData.brand(of: $0, window: .day, now: now) } == "mistral",
+               "TaskWraith's runs wear the brand behind most of their tokens, not a hue of their own")
         let unnamed = QuotaSnapshot(providerID: .antigravity, displayName: "Antigravity", events: [UsageEvent(timestamp: hour, tokens: 5000, model: "gemini-api:x")])
         let unpriced = ModelUsageInsightTotals(ModelUsageInsightData(archive: .empty, snapshots: [unnamed]).selected(source: "antigravity:events", window: .day, now: now))
         expect(unpriced.tokens.unsplit == 5000 && unpriced.estimateBounds == nil, "An unknown model stays unpriced rather than borrowing a rate")

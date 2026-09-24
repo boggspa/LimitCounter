@@ -1,18 +1,13 @@
 import SwiftUI
 import Charts
 
-/// Model-usage colours: TaskWraith's provider accents, and neutral where none applies.
+/// Model-usage colours: TaskWraith's model-catalogue brand accents, neutral where it has none.
 private enum UsageColor {
     static let neutral = Color.white.opacity(0.55)
 
     static func provider(_ identity: String?) -> Color {
-        guard let identity, let hex = TaskWraithProviderPalette.hex(for: identity) else { return neutral }
+        guard let identity, let hex = TaskWraithBranding.hex(for: identity) else { return neutral }
         return Color(hex: hex)
-    }
-
-    /// A source wears its provider's accent; TaskWraith's runs span providers.
-    static func source(_ source: ModelUsageInsightSource) -> Color {
-        provider(source.provider?.rawValue ?? source.id.split(separator: ":").first.map(String.init))
     }
 }
 
@@ -30,7 +25,7 @@ struct ModelUsageDashboardView: View {
             // Until one is picked, open on the source with the most tokens in the window.
             let source = data.sources.first { $0.id == selectedSource } ?? data.busiest(1, window: window, now: timeline.date).first?.source
             let sourceID = source?.id ?? ""
-            let accent = source.map(UsageColor.source) ?? UsageColor.neutral
+            let accent = UsageColor.provider(source.flatMap { data.brand(of: $0, window: window, now: timeline.date) })
             let entries = data.selected(source: sourceID, model: selectedModel, window: window, now: timeline.date)
             let totals = ModelUsageInsightTotals(entries)
             let chartRows = data.chartRows(source: sourceID, model: selectedModel)
@@ -264,7 +259,7 @@ struct ModelUsageDashboardView: View {
                 ForEach(data.sources) { item in
                     let totals = ModelUsageInsightTotals(data.selected(source: item.id, window: window, now: now))
                     HStack(spacing: 8) {
-                        SourceMark(provider: item.provider, accent: UsageColor.source(item))
+                        SourceMark(provider: item.provider, accent: UsageColor.provider(data.brand(of: item, window: window, now: now)))
                         Text(item.title).font(.system(size: 10, weight: .semibold)).lineLimit(1)
                         Spacer(minLength: 4)
                         Text(ModelUsageFormat.estimate(totals)).font(.system(size: 10, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
@@ -432,7 +427,7 @@ private struct StackBar: View {
     }
 }
 
-/// A provider's brand mark, or a dot in the source's accent when it spans providers.
+/// A provider's brand mark, or a dot in the source's leading brand when it spans providers.
 private struct SourceMark: View {
     let provider: ProviderID?
     let accent: Color
@@ -625,7 +620,7 @@ private func heatColor(_ value: Double, maximum: Double, vendor: String? = nil) 
     return UsageColor.provider(vendor).opacity(0.15 + 0.85 * ratio)
 }
 
-/// Intensity scale plus the routed vendors whose TaskWraith hues colour the cells.
+/// Intensity scale plus the brands whose TaskWraith accents colour the cells.
 private func heatLegend(_ rows: [ModelUsageRollup]) -> some View {
     let vendors = Array(Set(rows.map { ModelUsageDisplayIdentity.provider(model: $0.model, source: $0.source) })).sorted()
     return HStack(spacing: 8) {
@@ -645,7 +640,7 @@ private func heatLegend(_ rows: [ModelUsageRollup]) -> some View {
         }
     }
     .font(.system(size: 8)).foregroundStyle(.secondary)
-    .help("Logarithmic scale. Hue: the dominant routed vendor by tokens, in TaskWraith's provider colours; unknown or unprefixed models use the host's hue.")
+    .help("Logarithmic scale. Hue: the brand behind most tokens, in TaskWraith's model-catalogue accents; unprefixed models use their host's.")
     .accessibilityElement(children: .combine)
 }
 
@@ -661,7 +656,7 @@ struct ModelUsageSummaryCard: View {
         let ranked = data.busiest(3, window: .day, now: now)
         // The whole card opens the page: a banner can cover its header.
         Button(action: action) {
-            GlassCardContainer(style: .panel, accent: ranked.first.map { UsageColor.source($0.source) } ?? .white, cornerRadius: 16) {
+            GlassCardContainer(style: .panel, accent: ranked.first.map { UsageColor.provider(data.brand(of: $0.source, window: .day, now: now)) } ?? .white, cornerRadius: 16) {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .center, spacing: 8) {
                         VStack(alignment: .leading, spacing: 1) {
@@ -677,7 +672,7 @@ struct ModelUsageSummaryCard: View {
                     } else {
                         ForEach(ranked, id: \.source.id) { source, totals in
                             HStack(spacing: 8) {
-                                SourceMark(provider: source.provider, accent: UsageColor.source(source))
+                                SourceMark(provider: source.provider, accent: UsageColor.provider(data.brand(of: source, window: .day, now: now)))
                                 Text(source.title).font(.system(size: 11, weight: .semibold)).lineLimit(1)
                                 Spacer(minLength: 4)
                                 Text(ModelUsageFormat.tokens(totals.tokens.total)).font(.system(size: 11, weight: .bold)).monospacedDigit()

@@ -212,23 +212,24 @@ public struct LLMActivityHeatmapView: View {
     private func colorForEvents(_ events: [UsageEvent]) -> Color {
         guard !events.isEmpty else { return Color.white.opacity(0.1) }
 
-        var providerWeights: [ProviderID: Double] = [:]
+        // Cells wear the TaskWraith catalogue accent of the brand behind their tokens,
+        // the same one the model usage page shows for those models.
+        var providerWeights: [String: Double] = [:]
         for event in events {
             let weight = event.tokens ?? 100
             let host = eventToProvider[event.id] ?? .openai
-            let identity = ModelUsageDisplayIdentity.provider(model: event.model, source: host.rawValue)
-            let provider = ProviderID(rawValue: identity) ?? host
-            providerWeights[provider, default: 0] += weight
+            providerWeights[ModelUsageDisplayIdentity.provider(model: event.model, source: host.rawValue), default: 0] += weight
         }
 
         guard !providerWeights.isEmpty else { return ProGlassTheme.accent }
         let totalWeight = providerWeights.values.reduce(0, +)
+        let accent = { (brand: String) in TaskWraithBranding.hex(for: brand).map { Color(hex: $0) } ?? Color.white.opacity(0.55) }
 
-        let sorted = providerWeights.sorted { $0.value > $1.value }
-        let c1 = Color(hex: sorted[0].key.accentColorHex)
+        let sorted = providerWeights.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+        let c1 = accent(sorted[0].key)
 
         if sorted.count > 1 && (sorted[1].value / totalWeight) > 0.2 {
-            let c2 = Color(hex: sorted[1].key.accentColorHex)
+            let c2 = accent(sorted[1].key)
             let ratio = sorted[1].value / (sorted[0].value + sorted[1].value)
             return c1.lerp(to: c2, amount: CGFloat(ratio))
         }

@@ -29,7 +29,7 @@ struct ModelUsageAnalyticsTests {
         expect(ModelUsageDisplayIdentity.provider(model: "grok/grok-4.6", source: "codex") == "grok", "Explicit routed Grok selects vendor colour")
         expect(ModelUsageDisplayIdentity.provider(model: "claude/opus", source: "codex") == "claude", "Routed Claude keeps its hue in Codex")
         expect(ModelUsageDisplayIdentity.provider(model: "mistral/devstral", source: "claude") == "mistral", "Routed Mistral in Claude")
-        expect(ModelUsageDisplayIdentity.provider(model: "unknown/grok", source: "codex") == "openai", "Unknown namespace keeps host hue")
+        expect(ModelUsageDisplayIdentity.provider(model: "unknown/grok", source: "codex") == "codex", "Unknown namespace keeps host hue")
         expect(ModelUsageDisplayIdentity.provider(model: "grok-4.6", source: "claude") == "claude", "Bare name is not guessed")
         expect(ModelUsageDisplayIdentity.provider(model: "gemini/gemini-pro", source: "codex") == "gemini", "Explicit Gemini mapping")
         let mixed = [ModelUsageRollup(source: "codex", model: "grok/grok-4.6", start: now, seconds: 300, tokens: .init(input: 200)), ModelUsageRollup(source: "codex", model: "gpt-6-sol", start: now, seconds: 300, tokens: .init(input: 100))]

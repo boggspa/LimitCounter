@@ -183,6 +183,17 @@ struct ModelUsageInsightData {
         }
     }
 
+    /// The hue class a source wears: its provider's, or for one spanning providers (such
+    /// as TaskWraith's runs) the brand behind most of its tokens in the window.
+    func brand(of source: ModelUsageInsightSource, window: ModelUsageWindow, now: Date) -> String? {
+        if let provider = source.provider { return TaskWraithBranding.runtimeProvider(forSource: provider.rawValue) }
+        var weights: [String: Double] = [:]
+        for row in entries where row.source == source.id && Self.contains(row, window: window, now: now) {
+            weights[ModelUsageDisplayIdentity.provider(model: row.model, source: row.source), default: 0] += row.tokens.total
+        }
+        return weights.max { $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value }?.key
+    }
+
     /// A precise record overlapping the window, or a coarse bucket that fits inside it.
     static func contains(_ row: ModelUsageInsightEntry, window: ModelUsageWindow, now: Date) -> Bool {
         row.start <= now && row.end > now.addingTimeInterval(-window.seconds)
@@ -205,34 +216,6 @@ struct ModelUsageInsightData {
             ModelUsageRollup(source: $0.source, model: $0.model, start: $0.start,
                 seconds: max(1, Int($0.end.timeIntervalSince($0.start))), tokens: $0.tokens, requests: Int($0.requests), runs: Int($0.runs))
         }
-    }
-}
-
-/// TaskWraith's provider accents, mirrored from AGBench `src/renderer/src/styles/theme.css`
-/// (2026-09-24): brand hues held at one equal-contrast luminance, with TaskWraith's
-/// overrides where brands collide. Model usage wears these instead of a generic accent;
-/// runs that span providers wear TaskWraith's ensemble hue.
-enum TaskWraithProviderPalette {
-    private static let hex: [String: String] = [
-        "gemini": "#346EEC", "codex": "#705AFF", "claude": "#B16105", "kimi": "#0073E6", "grok": "#757575",
-        "cursor": "#8C7508", "ollama": "#976C52", "antigravity": "#308713", "pi": "#68768C", "muse": "#1671EA",
-        "devin": "#4878AE", "ensemble": "#986781", "alibaba": "#8C52EF", "deep-reinforce": "#BE5809",
-        "ibm": "#3079BC", "liquid": "#D72D82", "meta": "#1671EA", "cohere": "#5E7C6F", "essential": "#8462CA",
-        "nvidia": "#538200", "openbmb": "#E22B17", "poolside": "#0C8194", "deepseek": "#4E6AEE", "zai": "#177DAA",
-        "minimax": "#C044A4", "mistral": "#D44404", "xiaomi": "#008844", "cerebras": "#BB584A", "groq": "#088482",
-        "openrouter": "#E02948", "thinkingmachines": "#C24E68", "tencent": "#4E73CA", "inception": "#7C5BE9",
-        "nexagi": "#747A42", "sakana": "#EA0C2D", "stealth": "#9E6C00", "unbiased": "#B85A35", "typesafe": "#C700E4"
-    ]
-    /// TaskWraith's own aliases, plus Limit Counter provider ids it spells differently.
-    private static let aliases: [String: String] = [
-        "qwen": "alibaba", "google": "antigravity", "openai": "codex", "ornith": "deep-reinforce", "mimo": "xiaomi",
-        "codexTelemetry": "codex", "openaiAPI": "codex", "chatgpt": "codex", "taskwraith": "ensemble"
-    ]
-
-    /// Hex for a provider id or routed vendor, or nil when TaskWraith has no accent for it.
-    static func hex(for identity: String) -> String? {
-        let key = identity.lowercased()
-        return hex[aliases[identity] ?? aliases[key] ?? key]
     }
 }
 
