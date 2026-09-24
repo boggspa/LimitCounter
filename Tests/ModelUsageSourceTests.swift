@@ -706,6 +706,11 @@ struct ModelUsageSourceTests {
         }
         expect(TaskWraithBranding.hex(for: "stealth") == "#9E6C00" && TaskWraithBranding.hex(for: "google") == "#308713"
                && TaskWraithBranding.hex(for: "openai") == TaskWraithBranding.hex(for: "codex"), "Brand classes resolve through TaskWraith's accent table")
+        let offBrand = ProviderID.allCases.filter { $0 != .heatmap && $0.accentColorHex != TaskWraithBranding.hex(for: $0.rawValue) }
+        expect(offBrand.isEmpty, "Provider cards wear TaskWraith's catalogue accents (off: \(offBrand.map(\.rawValue)))")
+        let heatmapRGB = UInt32(ProviderID.heatmap.accentColorHex.dropFirst(), radix: 16).map { [($0 >> 16) & 0xFF, ($0 >> 8) & 0xFF, $0 & 0xFF] } ?? []
+        expect(TaskWraithBranding.hex(for: "heatmap") == nil && heatmapRGB.count == 3 && heatmapRGB.max()! - heatmapRGB.min()! <= 8,
+               "The heatmap card, which TaskWraith doesn't brand, stays neutral instead of a generic blue")
         let runHour = date("2026-09-24T11:00:00Z")
         let spanning = ModelUsageArchive(generatedAt: now, buckets: [
             ModelUsageRollup(source: "taskwraith", model: "mistral/devstral-2512", start: runHour, seconds: 300, tokens: ModelTokenCounts(input: 900), requests: 1, runs: 1),

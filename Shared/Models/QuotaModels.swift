@@ -124,31 +124,31 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         }
     }
 
+    /// TaskWraith's model-catalogue brand accent (`--provider-<class>-color` in its theme.css),
+    /// so every provider surface matches the model usage page. The meter severity gradient
+    /// (orange ≥60%, red ≥90%) comes from usageColor(), independently of this accent.
+    /// ModelUsageSourceTests keeps these in step with `TaskWraithBranding`.
     public var accentColorHex: String {
         switch self {
-        case .claude:   return "#B85838" // Claude Rust
-        case .openai:   return "#4D4DFF" // Electric Indigo — same hue family as the previous #6366F1 (~240°) but saturation maxed to 100% (was 84%) for stronger contrast against Gemini's Google Blue #4285F4
-        case .openaiAPI:
-            return "#10B981" // OpenAI Green
-        case .chatgpt:  return "#10B981" // Emerald/OpenAI Green
-        case .codexTelemetry:
-            return "#4D4DFF" // Electric Indigo — same hue family as the previous #6366F1 (~240°) but saturation maxed to 100% (was 84%) for stronger contrast against Gemini's Google Blue #4285F4
-        case .devin: return "#2D5AB2" // Deep Devin Blue
-        case .cursor:   return "#EAB308" // Gold
-        case .gemini:   return "#4285F4" // Google Blue
-        case .kimi:     return "#1CA4FC" // Kimi Blue
-        case .grok:     return "#C7CCD4" // Grok Silver — monochrome to match xAI's black/white brand. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
+        case .claude:   return "#B16105"
+        case .openai, .openaiAPI, .chatgpt, .codexTelemetry:
+            return "#705AFF" // codex: TaskWraith gives OpenAI models the Codex seat's accent
+        case .devin:    return "#4878AE"
+        case .cursor:   return "#8C7508"
+        case .gemini:   return "#346EEC"
+        case .kimi:     return "#0073E6"
+        case .grok:     return "#757575"
         case .antigravity:
             return "#308713"
         case .mistral:  return "#D44404"
         case .deepseek: return "#4E6AEE"
         case .cerebras: return "#BB584A"
-        case .meta:     return "#0082FB" // Meta Blue
-        case .ollama:   return "#976C52" // Ollama Walnut Brown — low-chroma warm brown for on-device inference. Sits at the equal-contrast point (relative luminance ~0.179, ~4.58:1 against both pure white and pure black), so it stays legible in light and dark appearances. The meter severity gradient (orange ≥60%, red ≥90%) is applied by usageColor() independently of this accent, so escalation colors are preserved.
-        case .openrouter: return "#8B5CF6" // OpenRouter Purple
-        case .qwen:     return "#615CED" // Qwen Purple
-        case .mimo:     return "#008844" // Xiaomi Green
-        case .heatmap:  return "#5B8AF5" // App Blue
+        case .meta:     return "#1671EA"
+        case .ollama:   return "#976C52"
+        case .openrouter: return "#E02948"
+        case .qwen:     return "#8C52EF" // alibaba
+        case .mimo:     return "#008844" // xiaomi
+        case .heatmap:  return "#8E8E93" // TaskWraith brands no heatmap: neutral, not a borrowed blue
         }
     }
 
