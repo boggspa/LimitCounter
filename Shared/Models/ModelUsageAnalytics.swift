@@ -85,7 +85,7 @@ enum ModelUsageSourceIdentity {
     static func detail(_ source: String, files: Int) -> String {
         switch source {
         case "codex", "claude": return "\(files) logs · request deduplication · up to 366 days"
-        case "taskwraith": return "\(files) usage files · runs outside Codex and Claude transcripts · one record per run"
+        case "taskwraith": return "\(files) files · private Codex and Kimi transcripts · other runs where no provider log reaches"
         default: return "\(files) CLI logs · provider-reported tokens · up to 366 days"
         }
     }
@@ -389,7 +389,7 @@ nonisolated enum ModelUsageCalendar {
 
 nonisolated enum ModelUsageAggregation {
     /// Bump when bucketing, retention or pricing semantics change so cached rollups are rebuilt.
-    static let version = 2
+    static let version = 3
     static let fineResolutionAge: TimeInterval = 90 * 86400
     static let retention: TimeInterval = 366 * 86400
 
@@ -401,6 +401,36 @@ nonisolated enum ModelUsageAggregation {
     static func bucketStart(_ date: Date, now: Date) -> (Date, Int) {
         let seconds = date >= dayStart(now).addingTimeInterval(-fineResolutionAge) ? 300 : 3600
         return (Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / Double(seconds)) * Double(seconds)), seconds)
+    }
+
+    /// Where TaskWraith's runs of a provider are also transcribed call by call: Claude,
+    /// Gemini and Grok CLIs write to the user's own folders, while TaskWraith keeps Codex
+    /// and Kimi in private homes indexed as its own transcripts. From a key's earliest
+    /// transcript call on, run records of that provider are dropped as duplicates; before
+    /// it, or with no transcript source connected, they are the only record and are kept.
+    static func coverageKey(ofRunsFrom provider: String) -> String? {
+        switch provider {
+        case "claude", "gemini", "grok": return provider
+        case "codex", "kimi": return "\(LocalModelUsageSource.taskwraith.rawValue):\(provider)"
+        default: return nil
+        }
+    }
+
+    /// The coverage a per-call transcript record provides, if any.
+    static func coverageKey(of call: ModelUsageCall) -> String? {
+        switch call.source {
+        case "claude", "gemini", "grok": return call.source
+        case LocalModelUsageSource.taskwraith.rawValue where call.calls != 0:
+            return call.model.split(separator: "/").first.map { "\(call.source):\($0)" }
+        default: return nil
+        }
+    }
+
+    /// The coverage that would make a TaskWraith run record a duplicate, if any.
+    static func coverageKey(ofRun call: ModelUsageCall) -> String? {
+        guard call.source == LocalModelUsageSource.taskwraith.rawValue, call.calls == 0,
+              let provider = call.model.split(separator: "/").first else { return nil }
+        return coverageKey(ofRunsFrom: String(provider))
     }
 
     /// Each record is priced on its own before it joins a bucket, so an aggregate can

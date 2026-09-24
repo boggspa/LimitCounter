@@ -6,7 +6,8 @@ import CryptoKit
 actor ModelUsageLogScanner {
     static let shared = ModelUsageLogScanner()
     /// Bump a source's version when its parser changes; its files are then re-read.
-    static func parserVersion(_ source: LocalModelUsageSource) -> Int { 1 }
+    /// Bump a source's version when its parser's output changes, so cached files re-parse.
+    static func parserVersion(_ source: LocalModelUsageSource) -> Int { source == .taskwraith ? 2 : 1 }
     private let directory: URL
     /// Full ledger rollups performed; unchanged refreshes must not add to it.
     private(set) var rollupPasses = 0
@@ -81,7 +82,14 @@ actor ModelUsageLogScanner {
                               emit: (ModelUsageCall) throws -> Void) throws -> Int {
         switch source {
         case .codex, .claude: return try ModelUsageLogParser.read(url: url, source: source, fileID: fileID, emit: emit)
-        case .taskwraith: return try TaskWraithUsageParser.read(url: url, fileID: fileID, emit: emit)
+        case .taskwraith:
+            switch TaskWraithUsageParser.transcriptProvider(url) {
+            case "codex"?:
+                return try ModelUsageLogParser.read(url: url, source: .codex, fileID: fileID) { try emit(TaskWraithUsageParser.transcript($0, provider: "codex")) }
+            case "kimi"?:
+                return try KimiWireParser.read(url: url, fileID: fileID) { try emit(TaskWraithUsageParser.transcript($0, provider: "kimi")) }
+            default: return try TaskWraithUsageParser.read(url: url, fileID: fileID, emit: emit)
+            }
         case .grok: return try GrokUsageParser.read(url: url, fileID: fileID, emit: emit)
         case .gemini: return try GeminiChatParser.read(url: url, fileID: fileID, emit: emit)
         case .kimi: return try KimiWireParser.read(url: url, fileID: fileID, emit: emit)
@@ -99,6 +107,7 @@ actor ModelUsageLogScanner {
         let isFile = (try? root.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == false
         let folders: [URL]
         let accepts: (URL) -> Bool
+        var files: [(URL, Date, Int)] = []
         switch source {
         case .codex:
             folders = [root.appendingPathComponent("sessions"), root.appendingPathComponent("archived_sessions")]
@@ -110,7 +119,11 @@ actor ModelUsageLogScanner {
             // The grant may be TaskWraith's data folder or its `usage.json` alone.
             let names = TaskWraithUsageParser.files
             if isFile { return names.contains(root.lastPathComponent) ? [entry(root)].compactMap { $0 } : [] }
-            return names.compactMap { entry(root.appendingPathComponent($0)) }
+            files = names.compactMap { entry(root.appendingPathComponent($0)) }
+            let codex = root.appendingPathComponent("codex-home")
+            folders = [codex.appendingPathComponent("sessions"), codex.appendingPathComponent("archived_sessions"),
+                       root.appendingPathComponent("kimi-acp-seats-v2")]
+            accepts = { TaskWraithUsageParser.transcriptProvider($0) == "codex" ? $0.pathExtension == "jsonl" : $0.lastPathComponent == "wire.jsonl" }
         case .grok:
             // Provider setup may have granted `~/.grok`, its `bin`/`downloads`, or the binary.
             var folder = isFile ? root.deletingLastPathComponent() : root
@@ -129,7 +142,6 @@ actor ModelUsageLogScanner {
             folders = [folder.appendingPathComponent("sessions")]
             accepts = { $0.lastPathComponent == "wire.jsonl" }
         }
-        var files: [(URL, Date, Int)] = []
         var unreadable = 0
         defer { failed += unreadable }
         for folder in folders {

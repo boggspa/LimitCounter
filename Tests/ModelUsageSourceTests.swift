@@ -20,6 +20,7 @@ struct ModelUsageSourceTests {
         try await unchangedRefreshSkipsRollups()
         try streamingArrays()
         try await taskWraithImport()
+        try await taskWraithPrivateHomes()
         try await nativeCLILogs()
         print("Model usage sources: \(checks) checks passed")
     }
@@ -103,8 +104,13 @@ struct ModelUsageSourceTests {
         expect(call.timestamp == Date(timeIntervalSince1970: 1_790_000_000), "Epoch milliseconds are read exactly")
         let again = TaskWraithUsageParser.call(from: taskWraithRecord("a"), fileID: "other-file")!
         expect(again.id == call.id, "TaskWraith's record id deduplicates across checkpoint, journal and archive")
-        expect(TaskWraithUsageParser.call(from: taskWraithRecord("c", provider: "codex"), fileID: "f") == nil, "Codex runs stay with their native transcripts")
-        expect(TaskWraithUsageParser.call(from: taskWraithRecord("d", provider: "Claude"), fileID: "f") == nil, "Claude runs stay with their native transcripts")
+        let claudeRun = TaskWraithUsageParser.call(from: taskWraithRecord("d", provider: "Claude", model: "claude-opus-5-5"), fileID: "f")!
+        expect(claudeRun.model == "claude/claude-opus-5-5" && ModelUsageAggregation.coverageKey(ofRun: claudeRun) == "claude",
+               "Claude runs are kept, and dropped only where a Claude transcript covers them")
+        let codexRun = TaskWraithUsageParser.call(from: taskWraithRecord("c", provider: "codex"), fileID: "f")!
+        let cursorRun = TaskWraithUsageParser.call(from: taskWraithRecord("c2", provider: "cursor"), fileID: "f")!
+        expect(ModelUsageAggregation.coverageKey(ofRun: codexRun) == "taskwraith:codex" && ModelUsageAggregation.coverageKey(ofRun: cursorRun) == nil,
+               "Codex runs defer to TaskWraith's own Codex transcripts; Cursor runs have none")
         expect(TaskWraithUsageParser.call(from: taskWraithRecord("e", extra: ["usageKind": "reset_hint"]), fileID: "f") == nil, "Reset hints are not usage")
         expect(TaskWraithUsageParser.call(from: taskWraithRecord("g", extra: ["runCount": 4]), fileID: "f") == nil, "External-scan aggregates are not runs")
         expect(TaskWraithUsageParser.call(from: taskWraithRecord("h", input: 0, output: 0), fileID: "f") == nil, "Empty runs are skipped")
@@ -122,6 +128,10 @@ struct ModelUsageSourceTests {
         let estimated = TaskWraithUsageParser.call(from: taskWraithRecord("p", provider: "kimi", model: "kimi-k2.7-code",
             extra: ["tokenCountConfidence": "estimated", "costRateModel": "kimi-k2.7-code-highspeed"]), fileID: "f")!
         expect(estimated.inferred && estimated.rateModel == "kimi/kimi-k2.7-code-highspeed", "Estimated counts and cost-rate models are kept")
+        let projected = TaskWraithUsageParser.call(from: taskWraithRecord("p2"), fileID: "f")!
+        let itemised = TaskWraithUsageParser.call(from: taskWraithRecord("p3", provider: "kimi", model: "kimi-k3", cacheRead: 800), fileID: "f")!
+        expect(projected.inferred && !itemised.inferred && !cursorRun.inferred,
+               "An unflagged Grok run is still a projection; itemised cache tokens and reporting providers stay measured")
         let pi = TaskWraithUsageParser.call(from: taskWraithRecord("q", provider: "pi", model: "deepseek/deepseek-v4-flash"), fileID: "f")!
         expect(ModelRateCatalog.resolve(source: pi.source, model: pi.model)?.provider == "pi", "Pi runs price with Pi rows")
 
@@ -137,14 +147,70 @@ struct ModelUsageSourceTests {
         let scanner = ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger"))
         let archive = try await scanner.scan(roots: [.taskwraith: directory], now: now)
         let rows = archive.buckets.filter { $0.source == "taskwraith" }
-        expect(ModelUsageTotals(rows).runs == 3, "Checkpoint and journal copies of one run count once; Claude is skipped")
-        expect(Set(rows.map(\.model)) == ["grok/grok-4.6", "cursor/composer-2.5-fast", "mistral/devstral-small"], "Runs keep their provider namespace")
+        expect(ModelUsageTotals(rows).runs == 4, "Checkpoint and journal copies of one run count once; with no Claude log connected its run is kept")
+        expect(Set(rows.map(\.model)) == ["grok/grok-4.6", "cursor/composer-2.5-fast", "mistral/devstral-small", "claude/grok-4.6"], "Runs keep their provider namespace")
         expect(archive.coverage.first { $0.source == "taskwraith" }?.files == 2, "Both TaskWraith files are indexed")
         let fileOnly = try await ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger-file"))
             .scan(roots: [.taskwraith: directory.appendingPathComponent("usage.json")], now: now)
-        expect(ModelUsageTotals(fileOnly.buckets).runs == 2, "A grant on usage.json alone reads just that file")
+        expect(ModelUsageTotals(fileOnly.buckets).runs == 3, "A grant on usage.json alone reads just that file")
+        for (stamp, kept) in [("2026-09-21T14:00:00Z", false), ("2026-09-21T14:20:00Z", true)] {
+            let claude = directory.appendingPathComponent("claude-\(kept)")
+            try FileManager.default.createDirectory(at: claude.appendingPathComponent("projects"), withIntermediateDirectories: true)
+            try claudeLine(stamp, request: "native").write(to: claude.appendingPathComponent("projects/s.jsonl"), atomically: true, encoding: .utf8)
+            let both = try await ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger-\(kept)"))
+                .scan(roots: [.taskwraith: directory, .claude: claude], now: now)
+            let runs = both.buckets.filter { $0.source == "taskwraith" }
+            expect(runs.contains { $0.model == "claude/grok-4.6" } == kept && ModelUsageTotals(runs).runs == (kept ? 4 : 3),
+                   kept ? "A run from before the Claude transcripts begin is kept" : "A Claude transcript reaching back past the run supersedes its record")
+        }
         let json = String(decoding: try JSONEncoder().encode(archive), as: UTF8.self)
         expect(!json.contains("never read") && !json.contains("run-r1"), "Prompts, responses and run ids never leave the record")
+    }
+
+    static func taskWraithPrivateHomes() async throws {
+        let data = try temporaryDirectory("taskwraith-homes")
+        defer { try? FileManager.default.removeItem(at: data) }
+        func text(_ lines: [String], to path: String) throws {
+            let url = data.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        // TaskWraith's private Codex home: one thread whose two requests start at 12:00:05.
+        try text([#"{"timestamp":"2026-09-20T12:00:00.000Z","type":"session_meta","payload":{"id":"tw-thread","originator":"taskwraith"}}"#,
+                  #"{"timestamp":"2026-09-20T12:00:00.100Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                  #"{"timestamp":"2026-09-20T12:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50}}}}"#,
+                  #"{"timestamp":"2026-09-20T12:00:09.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2200,"cached_input_tokens":1800,"output_tokens":90},"last_token_usage":{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":40}}}}"#],
+                 to: "codex-home/sessions/2026/09/20/rollout-2026-09-20T12-00-00-tw-thread.jsonl")
+        // A Kimi seat home, measured from 13:00.
+        let seat: [String: Any] = ["type": "usage.record", "model": "kimi-code/k3", "usageScope": "turn", "time": 1_789_909_200_000,
+                                   "usage": ["inputOther": 300, "output": 20, "inputCacheRead": 700, "inputCacheCreation": 0]]
+        try text([#"{"type":"metadata","protocol_version":"1.5"}"#, String(decoding: try JSONSerialization.data(withJSONObject: seat), as: UTF8.self)],
+                 to: "kimi-acp-seats-v2/0a1b/sessions/wd_x/session_1/agents/main/wire.jsonl")
+        try text(["{}"], to: "kimi-acp-seats-v2/0a1b/credentials/kimi-code.json")
+        // Run records either side of each transcript's first call.
+        let records = [taskWraithRecord("early", provider: "codex", model: "gpt-5.5", extra: ["timestamp": 1_789_902_000_000.0]),
+                       taskWraithRecord("late", provider: "codex", model: "gpt-5.4", extra: ["timestamp": 1_789_905_610_000.0]),
+                       taskWraithRecord("before", provider: "kimi", model: "kimi-k2.7-code", extra: ["timestamp": 1_789_812_000_000.0]),
+                       taskWraithRecord("after", provider: "kimi", model: "kimi-k3", extra: ["timestamp": 1_789_912_800_000.0]),
+                       taskWraithRecord("vibe", provider: "mistral", model: "devstral-small", extra: ["timestamp": 1_789_912_800_000.0])]
+        try JSONSerialization.data(withJSONObject: records).write(to: data.appendingPathComponent("usage.json"))
+
+        var failed = 0
+        let files = ModelUsageLogScanner.logFiles(for: .taskwraith, root: data, failed: &failed).map { $0.0.lastPathComponent }
+        expect(Set(files) == ["usage.json", "rollout-2026-09-20T12-00-00-tw-thread.jsonl", "wire.jsonl"], "TaskWraith's private Codex and Kimi transcripts are found")
+        let archive = try await ModelUsageLogScanner(directory: data.appendingPathComponent("ledger"))
+            .scan(roots: [.taskwraith: data], now: date("2026-09-21T00:00:00Z"))
+        let rows = archive.buckets.filter { $0.source == "taskwraith" }
+        let codex = ModelUsageTotals(rows.filter { $0.model == "codex/gpt-5.6-sol" })
+        expect(codex.requests == 2 && codex.runs == 0 && codex.tokens == ModelTokenCounts(input: 400, cacheRead: 1800, output: 90)
+               && codex.pricedRequests == 2, "Each Codex call in TaskWraith's home counts once, measured and priced")
+        let kimi = ModelUsageTotals(rows.filter { $0.model == "kimi/kimi-code/k3" })
+        expect(kimi.requests == 1 && kimi.pricedRequests == 1 && !rows.contains { $0.model == "kimi/kimi-code/k3" && $0.inferred },
+               "A Kimi seat's measured request prices through its alias")
+        expect(Set(rows.filter { $0.runs > 0 }.map(\.model)) == ["codex/gpt-5.5", "kimi/kimi-k2.7-code", "mistral/devstral-small"],
+               "Run records stand in only before each provider's transcripts begin")
+        expect(rows.filter { $0.runs > 0 && $0.model != "codex/gpt-5.5" }.allSatisfy(\.inferred), "Projected Kimi and Mistral runs stay inferred")
+        expect(archive.buckets.allSatisfy { $0.source == "taskwraith" }, "TaskWraith's transcripts never join the user's own Codex or Kimi sources")
     }
 
     static func write(_ object: Any, to url: URL) throws {

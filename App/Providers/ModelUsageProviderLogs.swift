@@ -200,10 +200,33 @@ nonisolated enum KimiWireParser {
 
 /// TaskWraith's usage store: a `usage.json` checkpoint plus JSON Lines journal and
 /// archive artifacts. `id` is TaskWraith's own idempotency key across all three.
+/// Records of runs that a transcript also covers are dropped when rolling up; see
+/// `ModelUsageAggregation.coverageKey(ofRunsFrom:)`.
 nonisolated enum TaskWraithUsageParser {
     static let files = ["usage.json", "usage-journal.jsonl", "usage-archive.jsonl"]
-    /// TaskWraith drives these CLIs, whose native transcripts are indexed on their own.
-    static let nativeTranscriptProviders: Set<String> = ["codex", "claude"]
+    /// TaskWraith runs Codex and Kimi with private homes inside its data folder. Their
+    /// transcripts itemise every call, where a Codex run record keeps only the last
+    /// request and a Kimi record is a character estimate.
+    static let privateHomes = [(folder: "codex-home", provider: "codex"), (folder: "kimi-acp-seats-v2", provider: "kimi")]
+    /// Providers whose TaskWraith runs report no usage, so TaskWraith projects it from
+    /// characters. Records written by its renderer lose the `estimated` flag; an
+    /// estimate never itemises cache tokens, while these providers' own counts do.
+    static let projectedProviders: Set<String> = ["grok", "kimi", "mistral", "devin"]
+
+    /// The provider whose private TaskWraith home holds this transcript, if any.
+    static func transcriptProvider(_ url: URL) -> String? {
+        privateHomes.first { url.pathComponents.contains($0.folder) }?.provider
+    }
+
+    /// A call from a private TaskWraith transcript, filed under TaskWraith with the
+    /// provider namespace its run records use.
+    static func transcript(_ call: ModelUsageCall, provider: String) -> ModelUsageCall {
+        var copy = call
+        copy.source = LocalModelUsageSource.taskwraith.rawValue
+        copy.model = String("\(provider)/\(call.model)".prefix(256))
+        copy.rateModel = call.rateModel.map { String("\(provider)/\($0)".prefix(256)) }
+        return copy
+    }
 
     static func read(url: URL, fileID: String, emit: (ModelUsageCall) throws -> Void) throws -> Int {
         let consume: ([String: Any]) throws -> Void = { record in
@@ -218,7 +241,7 @@ nonisolated enum TaskWraithUsageParser {
     /// bounded rather than chosen. Prompts and responses in a record are never read.
     static func call(from record: [String: Any], fileID: String) -> ModelUsageCall? {
         guard let provider = (record["provider"] as? String)?.lowercased().trimmingCharacters(in: .whitespaces),
-              !provider.isEmpty, !provider.contains("/"), !nativeTranscriptProviders.contains(provider),
+              !provider.isEmpty, !provider.contains("/"),
               (record["usageKind"] as? String ?? "run") == "run",
               // Time-bucket aggregates of external scans are not TaskWraith runs.
               record["runCount"] == nil,
@@ -247,7 +270,8 @@ nonisolated enum TaskWraithUsageParser {
         return ModelUsageCall(id: ModelUsageLogParser.hash("taskwraith|\(identity)"), source: LocalModelUsageSource.taskwraith.rawValue,
             timestamp: Date(timeIntervalSince1970: milliseconds / 1000), model: String("\(provider)/\(model)".prefix(256)),
             tokens: tokens, rateModel: rateModel.map { String("\(provider)/\($0)".prefix(256)) }, calls: 0,
-            inferred: record["tokenCountConfidence"] as? String == "estimated")
+            inferred: record["tokenCountConfidence"] as? String == "estimated"
+                || (projectedProviders.contains(provider) && cacheRead + cacheWrite == 0))
     }
 
     static func text(_ value: Any?) -> String? {

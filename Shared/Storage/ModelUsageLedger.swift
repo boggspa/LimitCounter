@@ -158,17 +158,27 @@ nonisolated final class ModelUsageLedger {
         sqlite3_bind_double(statement, 2, now.timeIntervalSince1970)
         var result: [String: ModelUsageRollup] = [:]
         var rates: [String: ModelRate?] = [:]
+        // Run records wait until every transcript call has lowered its coverage watermark.
+        var watermarks: [String: Date] = [:]
+        var runs: [(key: String, call: ModelUsageCall)] = []
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
             if let bytes = sqlite3_column_blob(statement, 0) {
                 let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0)))
                 var call = try decoder.decode(ModelUsageCall.self, from: data)
                 call.timestamp = Date(timeIntervalSince1970: sqlite3_column_double(statement, 1))
-                ModelUsageAggregation.add(call, now: now, into: &result, rates: &rates)
+                if let key = ModelUsageAggregation.coverageKey(of: call) {
+                    watermarks[key] = min(watermarks[key] ?? call.timestamp, call.timestamp)
+                }
+                if let key = ModelUsageAggregation.coverageKey(ofRun: call) { runs.append((key, call)) }
+                else { ModelUsageAggregation.add(call, now: now, into: &result, rates: &rates) }
             }
             status = sqlite3_step(statement)
         }
         guard status == SQLITE_DONE else { throw error() }
+        for run in runs where watermarks[run.key].map({ run.call.timestamp < $0 }) ?? true {
+            ModelUsageAggregation.add(run.call, now: now, into: &result, rates: &rates)
+        }
         return result.values.sorted { $0.id < $1.id }
     }
 
