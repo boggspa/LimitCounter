@@ -1,20 +1,43 @@
 import Foundation
 
 /// Disjoint token categories. Reasoning is a subset of output, never added to total.
-nonisolated struct ModelTokenCounts: Codable, Hashable, Sendable {
+/// `unsplit` tokens were measured but their category was not reported; they count
+/// toward the total, yet support only a bounded cost range.
+nonisolated struct ModelTokenCounts: Hashable, Sendable {
     var input: Double = 0
     var cacheRead: Double = 0
     var cacheWrite: Double = 0
     var output: Double = 0
     var reasoning: Double = 0
+    var unsplit: Double = 0
 
     var prompt: Double { input + cacheRead + cacheWrite }
-    var total: Double { prompt + output }
-    var isValid: Bool { [input, cacheRead, cacheWrite, output, reasoning].allSatisfy { $0.isFinite && $0 >= 0 } }
+    var total: Double { prompt + output + unsplit }
+    var isValid: Bool { [input, cacheRead, cacheWrite, output, reasoning, unsplit].allSatisfy { $0.isFinite && $0 >= 0 } }
 
     mutating func add(_ other: Self) {
         input += other.input; cacheRead += other.cacheRead; cacheWrite += other.cacheWrite
-        output += other.output; reasoning += other.reasoning
+        output += other.output; reasoning += other.reasoning; unsplit += other.unsplit
+    }
+}
+
+/// Split-only rows encode exactly as before, so older readers keep decoding them.
+nonisolated extension ModelTokenCounts: Codable {
+    private enum CodingKeys: String, CodingKey { case input, cacheRead, cacheWrite, output, reasoning, unsplit }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(input: try values.decode(Double.self, forKey: .input), cacheRead: try values.decode(Double.self, forKey: .cacheRead),
+            cacheWrite: try values.decode(Double.self, forKey: .cacheWrite), output: try values.decode(Double.self, forKey: .output),
+            reasoning: try values.decode(Double.self, forKey: .reasoning), unsplit: try values.decodeIfPresent(Double.self, forKey: .unsplit) ?? 0)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(input, forKey: .input); try values.encode(cacheRead, forKey: .cacheRead)
+        try values.encode(cacheWrite, forKey: .cacheWrite); try values.encode(output, forKey: .output)
+        try values.encode(reasoning, forKey: .reasoning)
+        if unsplit != 0 { try values.encode(unsplit, forKey: .unsplit) }
     }
 }
 
@@ -24,12 +47,42 @@ nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable 
 }
 
 /// Local-only normalized record. IDs are one-way hashes; no prompts, paths or credentials.
-nonisolated struct ModelUsageCall: Codable, Sendable {
+nonisolated struct ModelUsageCall: Sendable {
     var id: String
     var source: String
     var timestamp: Date
     var model: String
     var tokens: ModelTokenCounts
+    /// Catalog identity used for pricing when it differs from the display model.
+    var rateModel: String? = nil
+    /// API calls this record covers; 0 when the source does not say (a whole agent run).
+    var calls = 1
+    /// Counts are a local estimate (for example characters ÷ 4), not provider-reported.
+    var inferred = false
+}
+
+nonisolated extension ModelUsageCall: Codable {
+    private enum CodingKeys: String, CodingKey { case id, source, timestamp, model, tokens, rateModel, calls, inferred }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(id: try values.decode(String.self, forKey: .id), source: try values.decode(String.self, forKey: .source),
+            timestamp: try values.decode(Date.self, forKey: .timestamp), model: try values.decode(String.self, forKey: .model),
+            tokens: try values.decode(ModelTokenCounts.self, forKey: .tokens),
+            rateModel: try values.decodeIfPresent(String.self, forKey: .rateModel),
+            calls: try values.decodeIfPresent(Int.self, forKey: .calls) ?? 1,
+            inferred: try values.decodeIfPresent(Bool.self, forKey: .inferred) ?? false)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id); try values.encode(source, forKey: .source)
+        try values.encode(timestamp, forKey: .timestamp); try values.encode(model, forKey: .model)
+        try values.encode(tokens, forKey: .tokens)
+        try values.encodeIfPresent(rateModel, forKey: .rateModel)
+        if calls != 1 { try values.encode(calls, forKey: .calls) }
+        if inferred { try values.encode(inferred, forKey: .inferred) }
+    }
 }
 
 nonisolated enum ModelUsageWindow: String, CaseIterable, Identifiable {
@@ -48,21 +101,64 @@ nonisolated enum ModelUsageWindow: String, CaseIterable, Identifiable {
 
 /// Five-minute UTC buckets for 90 days, UTC hours for the remainder of the year.
 /// Retaining hours (rather than local days) permits correct day bucketing after travel/DST.
-nonisolated struct ModelUsageRollup: Codable, Hashable, Identifiable, Sendable {
+/// Estimated token counts never share a row with measured ones.
+nonisolated struct ModelUsageRollup: Hashable, Identifiable, Sendable {
     var source: String
     var model: String
     var start: Date
     var seconds: Int
+    var inferred = false
     var tokens = ModelTokenCounts()
+    /// API calls, plus one for each record whose call count was not reported.
     var requests: Int = 0
+    /// Records whose call count was not reported, such as whole agent runs.
+    var runs: Int = 0
     var estimatedUSD: Double = 0
     var pricedTokens: Double = 0
     var pricedRequests: Int = 0
-    var id: String { "\(source)|\(model)|\(start.timeIntervalSince1970)|\(seconds)" }
+    /// API-equivalent bounds for records whose token split or prompt tier is unknown.
+    var rangeLowUSD: Double = 0
+    var rangeHighUSD: Double = 0
+    var rangedTokens: Double = 0
+    var id: String { "\(source)|\(model)|\(start.timeIntervalSince1970)|\(seconds)\(inferred ? "|inferred" : "")" }
+}
 
-    enum CodingKeys: String, CodingKey {
+/// Short keys keep a year of rows compact. Fields added in schema 2 are omitted
+/// while zero, so split-only request rows still read as schema 1.
+nonisolated extension ModelUsageRollup: Codable {
+    private enum CodingKeys: String, CodingKey {
         case source = "s", model = "m", start = "t", seconds = "d", tokens = "k"
         case requests = "n", estimatedUSD = "c", pricedTokens = "p", pricedRequests = "q"
+        case inferred = "i", runs = "r", rangeLowUSD = "lo", rangeHighUSD = "hi", rangedTokens = "rt"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(source: try values.decode(String.self, forKey: .source), model: try values.decode(String.self, forKey: .model),
+            start: try values.decode(Date.self, forKey: .start), seconds: try values.decode(Int.self, forKey: .seconds),
+            inferred: try values.decodeIfPresent(Bool.self, forKey: .inferred) ?? false,
+            tokens: try values.decode(ModelTokenCounts.self, forKey: .tokens), requests: try values.decode(Int.self, forKey: .requests),
+            runs: try values.decodeIfPresent(Int.self, forKey: .runs) ?? 0,
+            estimatedUSD: try values.decode(Double.self, forKey: .estimatedUSD), pricedTokens: try values.decode(Double.self, forKey: .pricedTokens),
+            pricedRequests: try values.decode(Int.self, forKey: .pricedRequests),
+            rangeLowUSD: try values.decodeIfPresent(Double.self, forKey: .rangeLowUSD) ?? 0,
+            rangeHighUSD: try values.decodeIfPresent(Double.self, forKey: .rangeHighUSD) ?? 0,
+            rangedTokens: try values.decodeIfPresent(Double.self, forKey: .rangedTokens) ?? 0)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(source, forKey: .source); try values.encode(model, forKey: .model)
+        try values.encode(start, forKey: .start); try values.encode(seconds, forKey: .seconds)
+        try values.encode(tokens, forKey: .tokens); try values.encode(requests, forKey: .requests)
+        try values.encode(estimatedUSD, forKey: .estimatedUSD); try values.encode(pricedTokens, forKey: .pricedTokens)
+        try values.encode(pricedRequests, forKey: .pricedRequests)
+        if inferred { try values.encode(inferred, forKey: .inferred) }
+        if runs != 0 { try values.encode(runs, forKey: .runs) }
+        if rangedTokens != 0 || rangeHighUSD != 0 {
+            try values.encode(rangeLowUSD, forKey: .rangeLowUSD); try values.encode(rangeHighUSD, forKey: .rangeHighUSD)
+            try values.encode(rangedTokens, forKey: .rangedTokens)
+        }
     }
 }
 
@@ -78,15 +174,28 @@ nonisolated struct ModelUsageCoverage: Codable, Equatable, Sendable {
 }
 
 nonisolated struct ModelUsageArchive: Codable, Equatable, Sendable {
-    static let schemaVersion = 1
+    /// Schema 2 adds unsplit/inferred rows, cost ranges and sources beyond Codex and Claude.
+    static let schemaVersion = 2
+    static let supportedVersions = 1...schemaVersion
+    /// The only sources a schema 1 reader can attribute correctly.
+    static let legacySources: Set<String> = ["codex", "claude"]
     var version = schemaVersion
-    var rateVersion = ModelRateCatalog.version
+    var rateVersion = ModelRateCatalog.revision
     var generatedAt = Date()
     var buckets: [ModelUsageRollup] = []
     var coverage: [ModelUsageCoverage] = []
 
     static let empty = ModelUsageArchive(generatedAt: .distantPast)
     var sources: [String] { Array(Set(buckets.map(\.source) + coverage.map(\.source))).sorted() }
+
+    /// Schema 1 copy for builds that map every non-Codex source to Claude.
+    var legacySubset: ModelUsageArchive {
+        var copy = self
+        copy.version = 1
+        copy.buckets = buckets.filter { Self.legacySources.contains($0.source) && !$0.inferred }
+        copy.coverage = coverage.filter { Self.legacySources.contains($0.source) }
+        return copy
+    }
 
     func hasSameContent(as other: Self) -> Bool {
         func stableCoverage(_ values: [ModelUsageCoverage]) -> [ModelUsageCoverage] {
@@ -105,14 +214,18 @@ nonisolated struct ModelUsageArchive: Codable, Equatable, Sendable {
     }
 
     func validated() throws -> Self {
-        guard version == Self.schemaVersion, buckets.count <= 500_000,
+        guard Self.supportedVersions.contains(version), buckets.count <= 500_000,
               buckets.allSatisfy({ row in
                   row.tokens.isValid && row.model.count <= 256 && row.source.count <= 80
                     && [300, 3600].contains(row.seconds) && row.requests >= 0
+                    && row.runs >= 0 && row.runs <= row.requests
                     && row.pricedRequests >= 0 && row.pricedRequests <= row.requests
                     && row.estimatedUSD.isFinite && row.estimatedUSD >= 0
                     && row.pricedTokens.isFinite && row.pricedTokens >= 0
-                    && row.pricedTokens <= row.tokens.total + 0.001
+                    && row.rangedTokens.isFinite && row.rangedTokens >= 0
+                    && row.pricedTokens + row.rangedTokens <= row.tokens.total + 0.001
+                    && row.rangeLowUSD.isFinite && row.rangeHighUSD.isFinite && row.rangeLowUSD >= 0
+                    && row.rangeLowUSD <= row.rangeHighUSD + 0.000001
               }) else { throw ModelUsageError.invalidArchive }
         return self
     }
@@ -159,17 +272,22 @@ nonisolated enum ModelUsageError: LocalizedError {
 nonisolated struct ModelUsageTotals {
     var tokens = ModelTokenCounts()
     var requests = 0
+    var runs = 0
     var estimatedUSD: Double = 0
     var pricedTokens: Double = 0
     var pricedRequests = 0
+    var rangeLowUSD: Double = 0
+    var rangeHighUSD: Double = 0
+    var rangedTokens: Double = 0
     var cacheShare: Double { tokens.prompt > 0 ? tokens.cacheRead / tokens.prompt : 0 }
     var priceCoverage: Double { tokens.total > 0 ? pricedTokens / tokens.total : 0 }
     var hasEstimate: Bool { pricedRequests > 0 }
 
     init(_ rows: [ModelUsageRollup] = []) {
         for row in rows {
-            tokens.add(row.tokens); requests += row.requests; estimatedUSD += row.estimatedUSD
+            tokens.add(row.tokens); requests += row.requests; runs += row.runs; estimatedUSD += row.estimatedUSD
             pricedTokens += row.pricedTokens; pricedRequests += row.pricedRequests
+            rangeLowUSD += row.rangeLowUSD; rangeHighUSD += row.rangeHighUSD; rangedTokens += row.rangedTokens
         }
     }
 }
@@ -214,20 +332,34 @@ nonisolated enum ModelUsageCalendar {
 }
 
 nonisolated enum ModelUsageAggregation {
+    /// Bump when bucketing, retention or pricing semantics change so cached rollups are rebuilt.
+    static let version = 2
+    static let fineResolutionAge: TimeInterval = 90 * 86400
+    static let retention: TimeInterval = 366 * 86400
+
     static func bucketStart(_ date: Date, now: Date) -> (Date, Int) {
-        let seconds = now.timeIntervalSince(date) <= 90 * 86400 ? 300 : 3600
+        let seconds = now.timeIntervalSince(date) <= fineResolutionAge ? 300 : 3600
         return (Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / Double(seconds)) * Double(seconds)), seconds)
     }
 
+    /// Each record is priced on its own before it joins a bucket, so an aggregate can
+    /// never cross a per-prompt tier that none of its calls reached.
     static func add(_ call: ModelUsageCall, now: Date, into result: inout [String: ModelUsageRollup]) {
-        guard call.tokens.isValid, call.tokens.total > 0, call.timestamp <= now,
-              call.timestamp >= now.addingTimeInterval(-366 * 86400) else { return }
+        guard call.tokens.isValid, call.tokens.total > 0, call.calls >= 0, call.timestamp <= now,
+              call.timestamp >= now.addingTimeInterval(-retention) else { return }
         let (start, seconds) = bucketStart(call.timestamp, now: now)
-        var row = ModelUsageRollup(source: call.source, model: call.model, start: start, seconds: seconds)
+        var row = ModelUsageRollup(source: call.source, model: call.model, start: start, seconds: seconds, inferred: call.inferred)
         row = result[row.id] ?? row
-        row.tokens.add(call.tokens); row.requests += 1
-        if let estimate = ModelRateCatalog.estimate(source: call.source, model: call.model, tokens: call.tokens) {
-            row.estimatedUSD += estimate; row.pricedTokens += call.tokens.total; row.pricedRequests += 1
+        let weight = max(1, call.calls)
+        row.tokens.add(call.tokens); row.requests += weight
+        if call.calls == 0 { row.runs += 1 }
+        if let cost = ModelRateCatalog.costRange(source: call.source, model: call.rateModel ?? call.model,
+                                                 tokens: call.tokens, calls: call.calls) {
+            if cost.exact {
+                row.estimatedUSD += cost.low; row.pricedTokens += call.tokens.total; row.pricedRequests += weight
+            } else {
+                row.rangeLowUSD += cost.low; row.rangeHighUSD += cost.high; row.rangedTokens += call.tokens.total
+            }
         }
         result[row.id] = row
     }
@@ -239,7 +371,10 @@ nonisolated enum ModelUsageDisplayIdentity {
     static func provider(model: String?, source: String) -> String {
         let host = source.split(separator: ":", maxSplits: 1).first.map(String.init) ?? source
         let fallback = host == "codex" || host == "codexTelemetry" ? "openai" : host
-        guard let model, let slash = model.firstIndex(of: "/"),
+        // Pi is a router: its namespace names the seat and the next one names the vendor.
+        guard var model else { return fallback }
+        if model.lowercased().hasPrefix("pi/") { model.removeFirst(3) }
+        guard let slash = model.firstIndex(of: "/"),
               model.index(after: slash) < model.endIndex else { return fallback }
         let namespace = model[..<slash].lowercased()
         let known = [

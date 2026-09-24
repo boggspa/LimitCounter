@@ -11,10 +11,13 @@ nonisolated enum ModelUsageArchiveStore {
         return root.appendingPathComponent("ModelUsage", isDirectory: true)
     }
 
+    /// Schema 2 lives beside the schema 1 file, which an older build can still read.
     static func load(from directory: URL = directory) -> ModelUsageArchive {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("rollups-v1.json")),
-              let archive = try? ModelUsageArchive.decode(data) else { return .empty }
-        return archive
+        for name in ["rollups-v2.json", "rollups-v1.json"] {
+            if let data = try? Data(contentsOf: directory.appendingPathComponent(name)),
+               let archive = try? ModelUsageArchive.decode(data) { return archive }
+        }
+        return .empty
     }
 
     static func save(_ archive: ModelUsageArchive, to directory: URL = directory) throws {
@@ -22,7 +25,7 @@ nonisolated enum ModelUsageArchiveStore {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(archive).write(to: directory.appendingPathComponent("rollups-v1.json"), options: .atomic)
+        try encoder.encode(archive).write(to: directory.appendingPathComponent("rollups-v2.json"), options: .atomic)
     }
 }
 

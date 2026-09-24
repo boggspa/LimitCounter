@@ -29,20 +29,74 @@ nonisolated struct ModelRate: Identifiable, Decodable {
     var id: String { "\(provider)/\(model)" }
     var isLocalInference: Bool { url.hasPrefix("local://") }
 
+    /// Exact API-equivalent for one call, or nil when its split or tier is unknown.
     func estimate(_ tokens: ModelTokenCounts) -> Double? {
+        guard let cost = costRange(tokens, calls: 1), cost.exact else { return nil }
+        return cost.low
+    }
+
+    /// API-equivalent bounds for one record. A single call's prompt selects its tier;
+    /// several (or an unreported number of) calls prove only the base tier, and only
+    /// while their combined prompt stays below the threshold. Unsplit tokens span the
+    /// cheapest to the dearest category. The bounds meet whenever the record is exact.
+    func costRange(_ tokens: ModelTokenCounts, calls: Int) -> ModelCostRange? {
         guard tokens.isValid, !isLocalInference, status == .estimated || status == .free else { return nil }
-        let isLong = threshold.map { tokens.prompt >= $0 } ?? false
-        let inputRate = isLong ? (longInput ?? input) : input
-        let outputRate = isLong ? (longOutput ?? output) : output
-        let cachedRate = isLong ? (longCached ?? cached ?? inputRate) : (cached ?? inputRate)
+        let base = Tier(input: input, cached: cached ?? input, output: output)
+        var tiers = [base]
+        if let threshold {
+            let longInputRate = longInput ?? input
+            let long = Tier(input: longInputRate, cached: longCached ?? cached ?? longInputRate, output: longOutput ?? output)
+            if calls == 1 && tokens.prompt >= threshold { tiers = [long] }
+            else if tokens.prompt + tokens.unsplit >= threshold { tiers = [base, long] }
+        }
+        if tiers.count == 1 && tokens.unsplit == 0 {
+            let cost = tiers[0].cost(tokens)
+            return ModelCostRange(low: cost, high: cost, exact: true)
+        }
+        let floor = Tier(input: tiers.map(\.input).min()!, cached: tiers.map(\.cached).min()!, output: tiers.map(\.output).min()!)
+        let ceiling = Tier(input: tiers.map(\.input).max()!, cached: tiers.map(\.cached).max()!, output: tiers.map(\.output).max()!)
+        let low = floor.cost(tokens) + tokens.unsplit * min(floor.input, floor.cached, floor.output) / 1_000_000
+        let high = ceiling.cost(tokens) + tokens.unsplit * max(ceiling.input, ceiling.cached, ceiling.output) / 1_000_000
+        return ModelCostRange(low: low, high: high, exact: low == high)
+    }
+
+    private struct Tier {
+        var input: Double, cached: Double, output: Double
         // TaskWraith's API-equivalent convention: cache creation uses input rate.
-        return ((tokens.input + tokens.cacheWrite) * inputRate + tokens.cacheRead * cachedRate + tokens.output * outputRate) / 1_000_000
+        func cost(_ tokens: ModelTokenCounts) -> Double {
+            ((tokens.input + tokens.cacheWrite) * input + tokens.cacheRead * cached + tokens.output * output) / 1_000_000
+        }
     }
 }
 
+/// An exact API-equivalent has equal bounds; a range is never presented as one figure.
+nonisolated struct ModelCostRange: Equatable, Sendable {
+    var low: Double
+    var high: Double
+    var exact: Bool
+}
+
 nonisolated enum ModelRateCatalog {
-    static let version = "2026-09-02"
-    static let provenance = "TaskWraith ProviderRateService · 2026-09-02"
+    static let version = "2026-09-24"
+    static let provenance = "TaskWraith ProviderRateService · 2026-09-24"
+    /// Content fingerprint of every row and mapping, so a rate edit without a date
+    /// bump still invalidates cached rollups and republishes the archive.
+    static let fingerprint = fingerprint(of: rates)
+    static func fingerprint(of rates: [ModelRate]) -> String {
+        var lines = rates.map { rate in
+            [rate.provider, rate.model, "\(rate.input)", "\(rate.output)", "\(rate.cached ?? -1)", "\(rate.threshold ?? -1)",
+             "\(rate.longInput ?? -1)", "\(rate.longOutput ?? -1)", "\(rate.longCached ?? -1)", rate.status.rawValue, rate.url]
+                .joined(separator: "|")
+        }
+        lines += routeAliases.map { "alias|\($0.key)|\($0.value.0)|\($0.value.1)" }.sorted()
+        lines += nativeAliases.map { "native|\($0.key)|\($0.value)" }.sorted()
+        lines += routedProviders.map { "route|\($0.key)|\($0.value)" }.sorted()
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in lines.joined(separator: "\n").utf8 { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        return String(hash, radix: 16)
+    }
+    /// Stored with archives and compared on refresh.
+    static var revision: String { "\(version)#\(fingerprint)" }
     private static let rateIndices = Dictionary(rates.enumerated().map {
         ("\($0.element.provider)/\($0.element.model)", $0.offset)
     }, uniquingKeysWith: { first, _ in first })
@@ -54,22 +108,33 @@ nonisolated enum ModelRateCatalog {
         "kimi/kimi-for-coding-highspeed": ("kimi", "kimi-k2.7-code-highspeed"),
         "kimi/k3": ("kimi", "kimi-k3")
     ]
+    /// Exact wire ids a provider's own CLI logs. The Grok Build CLI writes `-build`
+    /// ids for the models TaskWraith records, for the same runs, as grok-4.6/4.7.
+    private static let nativeAliases: [String: String] = [
+        "grok/grok-4.6-build": "grok-4.6",
+        "grok/grok-4.7-build": "grok-4.7"
+    ]
     private static let routedProviders = [
         "codex": "codex", "openai": "codex", "claude": "claude", "anthropic": "claude",
         "grok": "grok", "xai": "grok", "cursor": "cursor", "gemini": "gemini",
         "google": "gemini", "kimi": "kimi", "moonshot": "kimi", "mistral": "mistral",
-        "muse": "muse", "meta": "muse", "antigravity": "antigravity", "ollama": "ollama"
+        "muse": "muse", "meta": "muse", "antigravity": "antigravity", "ollama": "ollama",
+        "pi": "pi"
     ]
 
     static func resolve(source: String, model: String) -> ModelRate? {
         let name = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = source == "openaiAPI" || source == "openai" ? "codex" : source
         if let exact = exactRate(provider: provider, model: name) { return exact }
+        if let alias = nativeAliases["\(provider)/\(name)"] { return exactRate(provider: provider, model: alias) }
 
         // TaskWraith also catalogs some routed providers under Pi using the full
         // namespace. Match those exact rows before interpreting the route itself.
         if let routed = exactRate(provider: "pi", model: name) { return routed }
         if let alias = routeAliases[name] { return exactRate(provider: alias.0, model: alias.1) }
+        if let alias = nativeAliases[name], let slash = name.firstIndex(of: "/") {
+            return exactRate(provider: String(name[..<slash]), model: alias)
+        }
 
         // Only explicit Provider Hub namespaces may redirect pricing away from
         // the host app. An unfamiliar route remains unpriced.
@@ -92,6 +157,10 @@ nonisolated enum ModelRateCatalog {
 
     static func estimate(source: String, model: String, tokens: ModelTokenCounts) -> Double? {
         resolve(source: source, model: model)?.estimate(tokens)
+    }
+
+    static func costRange(source: String, model: String, tokens: ModelTokenCounts, calls: Int) -> ModelCostRange? {
+        resolve(source: source, model: model)?.costRange(tokens, calls: calls)
     }
 
     // Imported TaskWraith rates; no fallback flags. Exact context rows from 2026-09-24.

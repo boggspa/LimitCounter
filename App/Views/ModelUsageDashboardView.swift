@@ -51,7 +51,7 @@ struct ModelUsageDashboardView: View {
                         }
                     }
                     rateReference
-                    Text("API-equivalent estimates are not billed spend. Estimates use the imported \(ModelRateCatalog.version) standard-rate table, including recorded long-context tiers; historical discounts, fast mode, tools and taxes may differ. Cache writes use the input rate. Reasoning is included in output. Unknown models remain unpriced.")
+                    Text("API-equivalent estimates are hypothetical, not billed spend. Each record is priced on its own with the imported \(ModelRateCatalog.version) standard-rate table before it is added up; a long-context tier applies only when one call's prompt reached it. When a record's token split or tier is unknown the estimate is a range, never a single figure. Historical discounts, fast mode, tools and taxes may differ. Cache writes use the input rate. Reasoning is included in output. Unknown models stay unpriced; no fallback rate is used.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(18)
@@ -151,17 +151,29 @@ struct ModelUsageDashboardView: View {
 
     private func headline(_ totals: ModelUsageInsightTotals, models: Int) -> some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], spacing: 10) {
-            AnalyticsMetric(title: "Tracked tokens", value: ModelUsageFormat.tokens(totals.tokens.total), footnote: "\(window.rawValue) · \(models) models", color: .cyan)
+            if totals.inferredTokens > 0 {
+                AnalyticsMetric(title: "Measured tokens", value: ModelUsageFormat.tokens(totals.measuredTokens), footnote: "\(window.rawValue) · \(models) models", color: .cyan)
+                AnalyticsMetric(title: "Estimated tokens", value: ModelUsageFormat.tokens(totals.inferredTokens), footnote: "Inferred counts, not provider-reported", color: .gray)
+            } else {
+                AnalyticsMetric(title: "Tracked tokens", value: ModelUsageFormat.tokens(totals.tokens.total), footnote: "\(window.rawValue) · \(models) models", color: .cyan)
+            }
             AnalyticsMetric(title: "Requests", value: ModelUsageFormat.tokens(totals.requests), footnote: "Recorded calls", color: .mint)
             AnalyticsMetric(title: "Cache hit share", value: totals.cacheShare.formatted(.percent.precision(.fractionLength(1))), footnote: "Of prompt tokens", color: .purple)
-            AnalyticsMetric(title: "API equivalent", value: ModelUsageFormat.money(totals.estimatedUSD), footnote: "Estimated · \(totals.coverage.formatted(.percent.precision(.fractionLength(0)))) priced", color: .orange)
+            AnalyticsMetric(title: "API equivalent", value: ModelUsageFormat.estimate(totals), footnote: estimateFootnote(totals), color: .orange)
             if let cost = totals.actualUSD {
-                AnalyticsMetric(title: "API reported spend", value: ModelUsageFormat.money(cost), footnote: "Reported by provider", color: .green)
+                AnalyticsMetric(title: "API reported spend", value: ModelUsageFormat.money(cost), footnote: "Billed, as reported by provider", color: .green)
             }
             if let cost = totals.reportedEstimateUSD {
-                AnalyticsMetric(title: "Provider estimate", value: ModelUsageFormat.money(cost), footnote: "Source's own estimate", color: .yellow)
+                AnalyticsMetric(title: "Card estimate", value: ModelUsageFormat.money(cost), footnote: "Quota card's own method, not billed", color: .yellow)
             }
         }
+    }
+
+    private func estimateFootnote(_ totals: ModelUsageInsightTotals) -> String {
+        let percent = FloatingPointFormatStyle<Double>.Percent().precision(.fractionLength(0))
+        var text = "Not billed · \(totals.coverage.formatted(percent)) exact"
+        if totals.rangedTokens > 0 { text += " · \(totals.rangeCoverage.formatted(percent)) bounded" }
+        return text
     }
 
     private func tokenMix(_ totals: ModelUsageInsightTotals) -> some View {
@@ -169,14 +181,15 @@ struct ModelUsageDashboardView: View {
             let components: [(String, Double, Color)] = [
                 ("Fresh input", totals.tokens.input, .cyan), ("Cache read", totals.tokens.cacheRead, .purple),
                 ("Cache write", totals.tokens.cacheWrite, .pink), ("Output", totals.tokens.output, .mint)
-            ]
+            ] + (totals.tokens.unsplit > 0 ? [("Breakdown unavailable", totals.tokens.unsplit, .gray)] : [])
             GeometryReader { geometry in
+                let gaps = CGFloat(2 * max(0, components.filter { $0.1 > 0 }.count - 1))
                 HStack(spacing: 2) {
                     ForEach(components.indices, id: \.self) { index in
                         let item = components[index]
                         if item.1 > 0 {
                             Rectangle().fill(item.2.gradient)
-                                .frame(width: max(1, (geometry.size.width - 6) * item.1 / max(1, totals.tokens.total)))
+                                .frame(width: max(1, (geometry.size.width - gaps) * item.1 / max(1, totals.tokens.total)))
                         }
                     }
                 }.clipShape(Capsule())
@@ -193,6 +206,10 @@ struct ModelUsageDashboardView: View {
             if totals.tokens.reasoning > 0 {
                 Text("\(ModelUsageFormat.tokens(totals.tokens.reasoning)) reasoning tokens included in output")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+            if totals.tokens.unsplit > 0 {
+                Text("Some records report only a total. Their input, cache and output split is unknown, so they are priced as a range.")
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -252,7 +269,7 @@ struct ModelUsageDashboardView: View {
                                 let totals = ModelUsageInsightTotals(rows)
                                 VStack(alignment: .trailing, spacing: 3) {
                                     Text(rows.isEmpty ? "—" : ModelUsageFormat.tokens(totals.tokens.total)).font(.caption.weight(.semibold))
-                                    Text(ModelUsageFormat.money(totals.estimatedUSD)).font(.caption2).foregroundStyle(.orange)
+                                    Text(ModelUsageFormat.estimate(totals)).font(.caption2).foregroundStyle(.orange)
                                 }.monospacedDigit().frame(width: 105, alignment: .trailing)
                             }
                         }
@@ -295,7 +312,7 @@ struct ModelUsageDashboardView: View {
                         }
                         Spacer()
                         VStack(alignment: .trailing, spacing: 3) {
-                            Text(ModelUsageFormat.money(totals.estimatedUSD)).font(.caption.monospacedDigit())
+                            Text(ModelUsageFormat.estimate(totals)).font(.caption.monospacedDigit())
                             Text("API equivalent").font(.caption2).foregroundStyle(.secondary)
                         }
                     }.padding(.vertical, 6)
@@ -617,7 +634,7 @@ struct ModelUsageSummaryCard: View {
                             Text(source.title).font(.caption).lineLimit(1)
                             Spacer()
                             Text(ModelUsageFormat.tokens(totals.tokens.total)).font(.caption.monospacedDigit().weight(.semibold))
-                            Text(ModelUsageFormat.money(totals.estimatedUSD)).font(.caption2.monospacedDigit()).foregroundStyle(.orange)
+                            Text(ModelUsageFormat.estimate(totals)).font(.caption2.monospacedDigit()).foregroundStyle(.orange)
                         }
                     }
                     Text("24H · tokens / estimated API equivalent · not billed")

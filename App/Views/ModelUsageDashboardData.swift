@@ -16,6 +16,12 @@ struct ModelUsageInsightEntry: Identifiable {
     let actualUSD: Double?
     let reportedEstimateUSD: Double?
     let precise: Bool
+    /// API-equivalent bounds where the split or prompt tier is unknown; zero otherwise.
+    var rangeLowUSD: Double = 0
+    var rangeHighUSD: Double = 0
+    var rangedTokens: Double = 0
+    /// Token counts are a local estimate rather than provider-reported.
+    var inferred = false
 }
 
 struct ModelUsageInsightSource: Identifiable {
@@ -32,20 +38,34 @@ struct ModelUsageInsightSource: Identifiable {
 
 struct ModelUsageInsightTotals {
     var tokens = ModelTokenCounts()
+    var inferredTokens: Double = 0
     var requests: Double = 0
     var estimatedUSD: Double?
     var actualUSD: Double?
     var reportedEstimateUSD: Double?
     var pricedTokens: Double = 0
+    var rangeLowUSD: Double = 0
+    var rangeHighUSD: Double = 0
+    var rangedTokens: Double = 0
     var cacheShare: Double { tokens.prompt > 0 ? tokens.cacheRead / tokens.prompt : 0 }
     var coverage: Double { tokens.total > 0 ? pricedTokens / tokens.total : 0 }
+    var rangeCoverage: Double { tokens.total > 0 ? rangedTokens / tokens.total : 0 }
+    var measuredTokens: Double { tokens.total - inferredTokens }
+    /// Exact estimates plus the bounds of everything that could only be bounded.
+    var estimateBounds: ClosedRange<Double>? {
+        guard estimatedUSD != nil || rangedTokens > 0 else { return nil }
+        let exact = estimatedUSD ?? 0
+        return (exact + rangeLowUSD)...(exact + max(rangeLowUSD, rangeHighUSD))
+    }
 
     init(_ entries: [ModelUsageInsightEntry]) {
         for entry in entries {
             tokens.add(entry.tokens); requests += entry.requests; pricedTokens += entry.pricedTokens
+            if entry.inferred { inferredTokens += entry.tokens.total }
             if let cost = entry.estimatedUSD { estimatedUSD = (estimatedUSD ?? 0) + cost }
             if let cost = entry.actualUSD { actualUSD = (actualUSD ?? 0) + cost }
             if let cost = entry.reportedEstimateUSD { reportedEstimateUSD = (reportedEstimateUSD ?? 0) + cost }
+            rangeLowUSD += entry.rangeLowUSD; rangeHighUSD += entry.rangeHighUSD; rangedTokens += entry.rangedTokens
         }
     }
 }
@@ -72,7 +92,8 @@ struct ModelUsageInsightData {
                 .init(id: row.id, source: name, provider: provider, model: row.model, start: row.start,
                     end: row.start.addingTimeInterval(Double(row.seconds)), tokens: row.tokens, requests: Double(row.requests),
                     estimatedUSD: row.pricedRequests > 0 ? row.estimatedUSD : nil, pricedTokens: row.pricedTokens,
-                    actualUSD: nil, reportedEstimateUSD: nil, precise: true)
+                    actualUSD: nil, reportedEstimateUSD: nil, precise: true, rangeLowUSD: row.rangeLowUSD,
+                    rangeHighUSD: row.rangeHighUSD, rangedTokens: row.rangedTokens, inferred: row.inferred)
             }
         }
         var seen = Set<String>()
@@ -88,14 +109,20 @@ struct ModelUsageInsightData {
                 let counts = ModelTokenCounts(input: max(0, bucket.inputTokens), cacheRead: max(0, bucket.cachedInputTokens), output: max(0, bucket.outputTokens))
                 let provider = snapshot.providerID
                 let rateProvider = provider == .meta ? "muse" : provider.rawValue
-                let rate = ModelRateCatalog.resolve(source: rateProvider, model: model)
-                // Aggregate buckets cannot reveal whether individual calls crossed a prompt tier.
-                let estimate = counts.total > 0 && (rate?.threshold == nil || bucket.requests == 1) ? rate?.estimate(counts) : nil
+                // Aggregate buckets cannot reveal whether individual calls crossed a prompt tier,
+                // so only a single-request bucket may select one; others are bounded.
+                let cost = counts.total > 0
+                    ? ModelRateCatalog.costRange(source: rateProvider, model: model, tokens: counts, calls: bucket.requests == 1 ? 1 : 0)
+                    : nil
+                let exact = cost?.exact == true ? cost?.low : nil
                 entries.append(.init(id: "\(source):\(bucket.id)", source: source, provider: provider, model: model,
                     start: bucket.startDate, end: bucket.endDate, tokens: counts, requests: bucket.requests,
-                    estimatedUSD: estimate, pricedTokens: estimate == nil ? 0 : counts.total,
+                    estimatedUSD: exact, pricedTokens: exact == nil ? 0 : counts.total,
                     actualUSD: bucket.source == .officialAPI ? bucket.costUSD : nil,
-                    reportedEstimateUSD: bucket.source == .localEstimate ? bucket.costUSD : nil, precise: false))
+                    reportedEstimateUSD: bucket.source == .localEstimate ? bucket.costUSD : nil, precise: false,
+                    rangeLowUSD: exact == nil ? cost?.low ?? 0 : 0, rangeHighUSD: exact == nil ? cost?.high ?? 0 : 0,
+                    rangedTokens: exact == nil && cost != nil ? counts.total : 0,
+                    inferred: ModelUsageTokenBasis.isInferred(note: bucket.note)))
             }
         }
         for (id, rows) in Dictionary(grouping: entries.filter { !$0.precise }, by: \.source) {
@@ -128,7 +155,23 @@ struct ModelUsageInsightData {
     }
 }
 
+/// Producers declare their counting method in the bucket note. Character-length
+/// estimates (the Mistral Vibe card's chars ÷ 4) are inferred, not provider-reported.
+enum ModelUsageTokenBasis {
+    static func isInferred(note: String?) -> Bool {
+        guard let note = note?.lowercased().replacingOccurrences(of: " ", with: "") else { return false }
+        return note.contains("chars÷4") || note.contains("chars/4")
+    }
+}
+
 enum ModelUsageFormat {
+    /// One figure only when every priced token was priced exactly; otherwise a range.
+    static func estimate(_ totals: ModelUsageInsightTotals) -> String {
+        guard let bounds = totals.estimateBounds else { return "—" }
+        guard bounds.lowerBound != bounds.upperBound else { return money(bounds.lowerBound) }
+        return "\(money(bounds.lowerBound))–\(money(bounds.upperBound))"
+    }
+
     static func tokens(_ value: Double) -> String {
         if value >= 1_000_000_000 { return String(format: "%.2fB", value / 1_000_000_000) }
         if value >= 1_000_000 { return String(format: "%.2fM", value / 1_000_000) }
