@@ -5,7 +5,8 @@ import Foundation
 struct ModelUsageInsightEntry: Identifiable {
     let id: String
     let source: String
-    let provider: ProviderID
+    /// Nil for sources that span providers, such as TaskWraith runs.
+    let provider: ProviderID?
     let model: String
     let start: Date
     let end: Date
@@ -26,7 +27,7 @@ struct ModelUsageInsightEntry: Identifiable {
 
 struct ModelUsageInsightSource: Identifiable {
     let id: String
-    let provider: ProviderID
+    let provider: ProviderID?
     let title: String
     let detail: String
     let first: Date?
@@ -79,12 +80,12 @@ struct ModelUsageInsightData {
         var entries: [ModelUsageInsightEntry] = []
         let ledgerSources = Set(archive.buckets.map(\.source))
         for name in archive.sources {
-            let provider: ProviderID = name == "codex" ? .openai : .claude
+            let provider = ModelUsageSourceIdentity.host(name)
             let coverage = archive.coverage.first { $0.source == name }
             let rows = archive.buckets.filter { $0.source == name }
             let problems = coverage.map { $0.unreadableFiles + $0.malformedLines } ?? 0
-            sources.append(.init(id: name, provider: provider, title: name == "codex" ? "Codex local" : "Claude Code local",
-                detail: "\(coverage?.files ?? 0) logs · request deduplication · up to 365 days",
+            sources.append(.init(id: name, provider: provider, title: ModelUsageSourceIdentity.title(name),
+                detail: ModelUsageSourceIdentity.detail(name, files: coverage?.files ?? 0),
                 first: coverage?.firstEvent ?? rows.map(\.start).min(), last: coverage?.lastEvent ?? rows.map(\.start).max(),
                 scanned: coverage?.scannedAt, local: true,
                 issue: problems > 0 ? "\(coverage?.unreadableFiles ?? 0) files deferred; \(coverage?.malformedLines ?? 0) malformed lines skipped" : nil))
@@ -129,7 +130,7 @@ struct ModelUsageInsightData {
             guard let row = rows.first else { continue }
             let official = id.hasSuffix(UsageAnalyticsSource.officialAPI.rawValue)
             let label = official ? "API report" : "provider history"
-            sources.append(.init(id: id, provider: row.provider, title: "\(row.provider.displayName) · \(label)",
+            sources.append(.init(id: id, provider: row.provider, title: "\(row.provider?.displayName ?? id) · \(label)",
                 detail: "Available provider buckets; retention and resolution vary",
                 first: rows.map(\.start).min(), last: rows.map(\.end).max(),
                 scanned: snapshots.first { $0.providerID == row.provider }?.fetchedAt, local: false, issue: nil))

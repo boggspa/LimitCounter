@@ -107,7 +107,10 @@ final class CloudKitSyncService {
     private let maxCloudStatusAnalyticsBuckets = 120
     private let maxCloudStatusPayloadBytes = 750_000
     private let modelUsageRecordType = "ModelUsageArchive"
+    /// Schema 1 subset (Codex and Claude only) for builds that attribute every other
+    /// source to Claude; current builds read the schema 2 record first.
     private let modelUsageRecordID = CKRecord.ID(recordName: "model-usage-rollups-v1")
+    private let modelUsageV2RecordID = CKRecord.ID(recordName: "model-usage-rollups-v2")
 
     init() {
         database = container.privateCloudDatabase
@@ -118,38 +121,46 @@ final class CloudKitSyncService {
     /// Separate asset: never put a year's rollups into the quota/widget snapshot.
     /// The latest collecting Mac is the publisher, matching the existing status model.
     func publishModelUsage(_ archive: ModelUsageArchive) async throws {
+        try await publishModelUsage(archive, recordID: modelUsageV2RecordID, hashKey: "cloudkit.modelUsage.publishedHash.v2")
+        try await publishModelUsage(archive.legacySubset, recordID: modelUsageRecordID, hashKey: "cloudkit.modelUsage.publishedHash.v1")
+    }
+
+    private func publishModelUsage(_ archive: ModelUsageArchive, recordID: CKRecord.ID, hashKey: String) async throws {
         let payload = try archive.cloudEncoded()
         let hash = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
-        let hashKey = "cloudkit.modelUsage.publishedHash.v1"
         guard defaults.string(forKey: hashKey) != hash else { return }
         guard try await container.accountStatus() == .available else { throw CloudKitSyncError.accountUnavailable }
         let record: CKRecord
         do {
-            record = try await database.record(for: modelUsageRecordID)
+            record = try await database.record(for: recordID)
             if let date = record["generatedAt"] as? Date, date > archive.generatedAt { return }
         } catch let error as CKError where error.code == .unknownItem {
-            record = CKRecord(recordType: modelUsageRecordType, recordID: modelUsageRecordID)
+            record = CKRecord(recordType: modelUsageRecordType, recordID: recordID)
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("model-usage-\(UUID().uuidString).lzfse")
         try payload.write(to: url, options: .atomic)
         defer { try? FileManager.default.removeItem(at: url) }
         record["archive"] = CKAsset(fileURL: url)
         record["generatedAt"] = archive.generatedAt as NSDate
-        record["schemaVersion"] = ModelUsageArchive.schemaVersion as NSNumber
+        record["schemaVersion"] = archive.version as NSNumber
         record["rateVersion"] = archive.rateVersion as NSString
         _ = try await database.save(record)
         // Only record success: a failed publication remains eligible for the next refresh.
         defaults.set(hash, forKey: hashKey)
     }
 
+    /// Prefers the schema 2 record; falls back to schema 1 until a current Mac publishes.
     func fetchModelUsage() async throws -> ModelUsageArchive? {
         guard try await container.accountStatus() == .available else { throw CloudKitSyncError.accountUnavailable }
-        do {
-            let record = try await database.record(for: modelUsageRecordID)
-            guard let asset = record["archive"] as? CKAsset, let url = asset.fileURL else { return nil }
-            let data = try Data(contentsOf: url)
-            return try ModelUsageArchive.decodeCloud(data)
-        } catch let error as CKError where error.code == .unknownItem { return nil }
+        for recordID in [modelUsageV2RecordID, modelUsageRecordID] {
+            do {
+                let record = try await database.record(for: recordID)
+                guard let asset = record["archive"] as? CKAsset, let url = asset.fileURL else { continue }
+                let data = try Data(contentsOf: url)
+                return try ModelUsageArchive.decodeCloud(data)
+            } catch let error as CKError where error.code == .unknownItem { continue }
+        }
+        return nil
     }
 
     func ensureModelUsageSubscription() async throws {

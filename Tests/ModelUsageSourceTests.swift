@@ -16,8 +16,25 @@ struct ModelUsageSourceTests {
         try aggregationPricesEachRecord()
         try schemaCompatibility()
         try snapshotInsights()
+        sourceAttribution()
         try await unchangedRefreshSkipsRollups()
         print("Model usage sources: \(checks) checks passed")
+    }
+
+    static func sourceAttribution() {
+        let now = date("2026-09-24T12:00:00Z")
+        let rows = ["codex", "claude", "grok", "gemini", "kimi", "taskwraith", "future-source"].map {
+            ModelUsageRollup(source: $0, model: "m", start: now.addingTimeInterval(-600), seconds: 300, tokens: .init(input: 10), requests: 1)
+        }
+        let data = ModelUsageInsightData(archive: ModelUsageArchive(generatedAt: now, buckets: rows), snapshots: [])
+        let byID = Dictionary(uniqueKeysWithValues: data.sources.map { ($0.id, $0) })
+        expect(byID["codex"]?.provider == .openai && byID["claude"]?.provider == .claude, "Codex and Claude keep their hosts")
+        expect(byID["grok"]?.provider == .grok && byID["gemini"]?.provider == .gemini && byID["kimi"]?.provider == .kimi, "CLI ledgers keep their own hosts")
+        expect(byID["taskwraith"]?.provider == nil && byID["taskwraith"]?.title == "TaskWraith runs", "TaskWraith spans providers and claims none")
+        expect(byID["future-source"]?.provider == nil && byID["future-source"]?.title == "future-source", "An unknown source never borrows Claude's identity")
+        expect(data.sources.filter { $0.provider == .claude }.count == 1, "Only the Claude ledger is attributed to Claude")
+        expect(ModelUsageSourceIdentity.replacedSnapshotHost("taskwraith") == nil && ModelUsageSourceIdentity.replacedSnapshotHost("grok") == nil,
+               "Only request ledgers that fully cover a card replace its heatmap copy")
     }
 
     static func claudeLine(_ stamp: String, request: String) -> String {

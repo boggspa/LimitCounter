@@ -135,7 +135,7 @@ struct ModelUsageDashboardView: View {
     private func coverage(_ source: ModelUsageInsightSource) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
-                Circle().fill(Color(hex: source.provider.accentColorHex)).frame(width: 7, height: 7)
+                Circle().fill(source.provider.map { Color(hex: $0.accentColorHex) } ?? .cyan).frame(width: 7, height: 7)
                 Text(source.title).font(.caption.weight(.bold))
                 Spacer()
                 if let date = source.scanned { Text(date, style: .relative).font(.caption2).foregroundStyle(.secondary) }

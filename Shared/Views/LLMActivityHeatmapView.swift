@@ -28,16 +28,21 @@ public struct LLMActivityHeatmapView: View {
         }
         // Prefer model-aware ledger rows once available. This replaces the host's
         // total-only event copy instead of adding a second view of the same calls.
+        // Other ledger sources (TaskWraith runs, provider CLIs) already reach this map
+        // through their cards' events, so they are never added a second time.
         let cutoff = Date().addingTimeInterval(-31 * 86400)
-        let rollups = modelUsage?.buckets.filter { $0.start >= cutoff && $0.start <= Date() } ?? []
-        let sources = Set(rollups.map(\.source))
+        let rollups = modelUsage?.buckets.filter { row in
+            row.start >= cutoff && row.start <= Date() && ModelUsageSourceIdentity.replacedSnapshotHost(row.source) != nil
+        } ?? []
+        let hosts = Set(rollups.compactMap { ModelUsageSourceIdentity.replacedSnapshotHost($0.source) })
         events.removeAll { event in
             guard let host = providerMap[event.id] else { return false }
-            return (host == .openai && sources.contains("codex")) || (host == .claude && sources.contains("claude"))
+            return hosts.contains(host)
         }
         for row in rollups {
+            guard let host = ModelUsageSourceIdentity.replacedSnapshotHost(row.source) else { continue }
             let event = UsageEvent(timestamp: row.start, tokens: row.tokens.total, model: row.model, type: .bucket)
-            providerMap[event.id] = row.source == "codex" ? .openai : .claude
+            providerMap[event.id] = host
             events.append(event)
         }
         self.allEvents = events

@@ -46,6 +46,52 @@ nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable 
     var title: String { self == .codex ? "Codex" : "Claude Code" }
 }
 
+/// Attribution for archive sources on every surface (dashboard, heatmap, iPhone).
+/// A source that spans providers, or one this build does not know, claims none
+/// rather than borrowing another provider's identity.
+enum ModelUsageSourceIdentity {
+    static func host(_ source: String) -> ProviderID? {
+        switch source {
+        case "codex": return .openai
+        case "claude": return .claude
+        case "grok": return .grok
+        case "gemini": return .gemini
+        case "kimi": return .kimi
+        default: return nil
+        }
+    }
+
+    static func title(_ source: String) -> String {
+        switch source {
+        case "codex": return "Codex local"
+        case "claude": return "Claude Code local"
+        case "grok": return "Grok CLI local"
+        case "gemini": return "Gemini CLI local"
+        case "kimi": return "Kimi CLI local"
+        case "taskwraith": return "TaskWraith runs"
+        default: return source
+        }
+    }
+
+    static func detail(_ source: String, files: Int) -> String {
+        switch source {
+        case "codex", "claude": return "\(files) logs · request deduplication · up to 366 days"
+        case "taskwraith": return "\(files) usage files · runs outside Codex and Claude transcripts · one record per run"
+        default: return "\(files) CLI logs · provider-reported tokens · up to 366 days"
+        }
+    }
+
+    /// The quota-card host whose total-only event copy a request ledger replaces on
+    /// the activity heatmap. Other ledgers overlap cards in ways a swap would lose.
+    static func replacedSnapshotHost(_ source: String) -> ProviderID? {
+        switch source {
+        case "codex": return .openai
+        case "claude": return .claude
+        default: return nil
+        }
+    }
+}
+
 /// Local-only normalized record. IDs are one-way hashes; no prompts, paths or credentials.
 nonisolated struct ModelUsageCall: Sendable {
     var id: String
