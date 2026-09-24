@@ -12,7 +12,8 @@ struct ModelUsageDashboardView: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { timeline in
             let data = ModelUsageInsightData(archive: appState.modelUsage, snapshots: appState.snapshots)
-            let source = data.sources.first { $0.id == selectedSource } ?? data.sources.first
+            // Until one is picked, open on the source with the most tokens in the window.
+            let source = data.sources.first { $0.id == selectedSource } ?? data.busiest(1, window: window, now: timeline.date).first?.source
             let sourceID = source?.id ?? ""
             let entries = data.selected(source: sourceID, model: selectedModel, window: window, now: timeline.date)
             let totals = ModelUsageInsightTotals(entries)
@@ -599,9 +600,10 @@ struct ModelUsageSummaryCard: View {
 
     var body: some View {
         let data = ModelUsageInsightData(archive: appState.modelUsage, snapshots: appState.snapshots)
-        GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Button(action: action) {
+        // The whole card opens the page: a banner can cover its header.
+        Button(action: action) {
+            GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
+                VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .center, spacing: 8) {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Model usage").font(.subheadline.weight(.bold)).foregroundStyle(.white)
@@ -610,22 +612,24 @@ struct ModelUsageSummaryCard: View {
                         Spacer(minLength: 4)
                         if appState.isIndexingModelUsage { ProgressView().controlSize(.mini) }
                         Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-                    }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                .accessibilityHint("Opens model history and heatmaps")
-                if data.sources.isEmpty {
-                    Text(appState.isIndexingModelUsage ? "Indexing history…" : "No history yet").font(.system(size: 9)).foregroundStyle(.secondary)
-                } else {
-                    ForEach(data.busiest(3, window: .day, now: Date()), id: \.source.id) { source, totals in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(source.title).font(.system(size: 11, weight: .semibold)).lineLimit(1)
-                            Spacer(minLength: 4)
-                            Text(ModelUsageFormat.tokens(totals.tokens.total)).font(.system(size: 11, weight: .bold)).monospacedDigit()
-                            Text(ModelUsageFormat.estimate(totals)).font(.system(size: 10, weight: .semibold)).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    if data.sources.isEmpty {
+                        Text(appState.isIndexingModelUsage ? "Indexing history…" : "No history yet").font(.system(size: 9)).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(data.busiest(3, window: .day, now: Date()), id: \.source.id) { source, totals in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(source.title).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text(ModelUsageFormat.tokens(totals.tokens.total)).font(.system(size: 11, weight: .bold)).monospacedDigit()
+                                Text(ModelUsageFormat.estimate(totals)).font(.system(size: 10, weight: .semibold)).monospacedDigit().foregroundStyle(.secondary)
+                            }
                         }
                     }
-                }
-            }.padding(4).frame(maxWidth: .infinity, alignment: .leading)
+                }.padding(4).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 16))
         }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens model history and heatmaps")
     }
 }
