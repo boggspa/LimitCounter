@@ -343,6 +343,16 @@ final class AppStateStore: ObservableObject {
         dismissUsageAlert(alert)
     }
 
+    /// The provider credential whose existing folder grant a history source reads.
+    /// Nil for TaskWraith, whose data folder has its own shared grant.
+    private static func modelUsageGrantProvider(_ source: LocalModelUsageSource) -> ProviderID? {
+        switch source {
+        case .codex: return .codexTelemetry
+        case .claude: return .claude
+        case .taskwraith: return nil
+        }
+    }
+
     /// Runs independently of quota refresh, so a first historical backfill cannot
     /// block the menu bar or short-window meters. A second refresh reuses the task.
     func refreshModelUsage() {
@@ -354,9 +364,20 @@ final class AppStateStore: ObservableObject {
             #if os(macOS)
             var roots: [LocalModelUsageSource: URL] = [:]
             var opened: [URL] = []
-            defer { for url in opened { url.stopAccessingSecurityScopedResource() } }
+            var releases: [() -> Void] = []
+            defer {
+                for url in opened { url.stopAccessingSecurityScopedResource() }
+                for release in releases { release() }
+            }
             for source in LocalModelUsageSource.allCases {
-                let provider: ProviderID = source == .codex ? .codexTelemetry : .claude
+                guard let provider = Self.modelUsageGrantProvider(source) else {
+                    // TaskWraith's data folder has one shared grant rather than a provider credential.
+                    if source == .taskwraith, let scoped = AGBenchBookmarkStore.startAccess() {
+                        releases.append(scoped.stop)
+                        roots[source] = scoped.url
+                    }
+                    continue
+                }
                 guard let credential = analyticsKeychain.credential(for: provider) else { continue }
                 let bookmark = credential.bookmarkData ?? credential.extraFields?["bookmarkData"].flatMap { Data(base64Encoded: $0) }
                 if let bookmark {
@@ -372,7 +393,7 @@ final class AppStateStore: ObservableObject {
                 }
             }
             guard !roots.isEmpty else {
-                modelUsageStatus = "Connect local Codex or Claude folders in provider setup to index model usage."
+                modelUsageStatus = "Connect local Codex, Claude or TaskWraith folders in provider setup to index model usage."
                 return
             }
             do {

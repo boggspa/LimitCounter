@@ -5,7 +5,8 @@ import CryptoKit
 /// grant may supply roots; this type never discovers home folders or reads credentials.
 actor ModelUsageLogScanner {
     static let shared = ModelUsageLogScanner()
-    static let parserVersion = 1
+    /// Bump a source's version when its parser changes; its files are then re-read.
+    static func parserVersion(_ source: LocalModelUsageSource) -> Int { 1 }
     private let directory: URL
     /// Full ledger rollups performed; unchanged refreshes must not add to it.
     private(set) var rollupPasses = 0
@@ -19,33 +20,18 @@ actor ModelUsageLogScanner {
         var coverage = previousArchive.coverage
         for source in LocalModelUsageSource.allCases {
             guard let root = roots[source] else { continue }
-            let folders: [URL] = source == .codex
-                ? [root.appendingPathComponent("sessions"), root.appendingPathComponent("archived_sessions")]
-                : [root.lastPathComponent == "projects" ? root : root.appendingPathComponent("projects")]
-            var files: [(URL, Date, Int)] = []
             var failed = 0
-            for folder in folders {
-                guard FileManager.default.fileExists(atPath: folder.path) else { continue }
-                guard let enumerator = FileManager.default.enumerator(at: folder,
-                    includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey],
-                    options: [.skipsHiddenFiles], errorHandler: { _, _ in failed += 1; return true }) else { failed += 1; continue }
-                while let url = enumerator.nextObject() as? URL {
-                    guard url.pathExtension == "jsonl" else { continue }
-                    guard let info = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]),
-                          info.isRegularFile == true, info.isSymbolicLink != true,
-                          let modified = info.contentModificationDate, let size = info.fileSize else { continue }
-                    files.append((url, modified, size))
-                }
-            }
+            var files = Self.logFiles(for: source, root: root, failed: &failed)
             files.sort { $0.1 > $1.1 }
             for (index, file) in files.enumerated() {
                 try Task.checkCancellation()
                 if index % 25 == 0 { await progress("\(source.title) · \(index + 1) of \(files.count) logs") }
                 let key = ModelUsageLogParser.hash(file.0.standardizedFileURL.path)
-                if try ledger.isCurrent(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: Self.parserVersion) { continue }
+                let version = Self.parserVersion(source)
+                if try ledger.isCurrent(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: version) { continue }
                 do {
-                    try ledger.replaceFile(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: Self.parserVersion) { emit in
-                        let malformed = try ModelUsageLogParser.read(url: file.0, source: source, fileID: key, emit: emit)
+                    try ledger.replaceFile(source: source.rawValue, file: key, modified: file.1, bytes: file.2, version: version) { emit in
+                        let malformed = try Self.parse(file.0, source: source, fileID: key, emit: emit)
                         let after = try file.0.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
                         // A growing log is safely retried; do not cache a partial version as complete.
                         guard after.fileSize == file.2, after.contentModificationDate == file.1 else { throw ModelUsageError.incompleteFile }
@@ -64,7 +50,8 @@ actor ModelUsageLogScanner {
         // and retention step daily) or a future-dated call. Otherwise reuse the saved
         // buckets; CloudKit publication is retried by the caller either way.
         let fingerprint = [String(ModelUsageArchive.schemaVersion), String(ModelUsageAggregation.version),
-                           ModelRateCatalog.revision, String(Self.parserVersion), String(try ledger.generation())]
+                           ModelRateCatalog.revision, LocalModelUsageSource.allCases.map { "\($0.rawValue)=\(Self.parserVersion($0))" }.joined(separator: ","),
+                           String(try ledger.generation())]
             .joined(separator: "|")
         if let state = try ledger.metaValue(Self.rollupStateKey)?.split(separator: "\n").map(String.init),
            state.count == 3, state[0] == fingerprint, let validUntil = Double(state[1]),
@@ -89,6 +76,53 @@ actor ModelUsageLogScanner {
     }
 
     private static let rollupStateKey = "rollupState"
+
+    private static func parse(_ url: URL, source: LocalModelUsageSource, fileID: String,
+                              emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        switch source {
+        case .codex, .claude: return try ModelUsageLogParser.read(url: url, source: source, fileID: fileID, emit: emit)
+        case .taskwraith: return try TaskWraithUsageParser.read(url: url, fileID: fileID, emit: emit)
+        }
+    }
+
+    /// Where each source keeps its logs beneath the folder (or file) the user granted.
+    static func logFiles(for source: LocalModelUsageSource, root: URL, failed: inout Int) -> [(URL, Date, Int)] {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
+        func entry(_ url: URL) -> (URL, Date, Int)? {
+            guard let info = try? url.resourceValues(forKeys: keys), info.isRegularFile == true, info.isSymbolicLink != true,
+                  let modified = info.contentModificationDate, let size = info.fileSize else { return nil }
+            return (url, modified, size)
+        }
+        let isFile = (try? root.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == false
+        let folders: [URL]
+        let accepts: (URL) -> Bool
+        switch source {
+        case .codex:
+            folders = [root.appendingPathComponent("sessions"), root.appendingPathComponent("archived_sessions")]
+            accepts = { $0.pathExtension == "jsonl" }
+        case .claude:
+            folders = [root.lastPathComponent == "projects" ? root : root.appendingPathComponent("projects")]
+            accepts = { $0.pathExtension == "jsonl" }
+        case .taskwraith:
+            // The grant may be TaskWraith's data folder or its `usage.json` alone.
+            let names = TaskWraithUsageParser.files
+            if isFile { return names.contains(root.lastPathComponent) ? [entry(root)].compactMap { $0 } : [] }
+            return names.compactMap { entry(root.appendingPathComponent($0)) }
+        }
+        var files: [(URL, Date, Int)] = []
+        var unreadable = 0
+        defer { failed += unreadable }
+        for folder in folders {
+            guard FileManager.default.fileExists(atPath: folder.path) else { continue }
+            guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys),
+                options: [.skipsHiddenFiles], errorHandler: { _, _ in unreadable += 1; return true }) else { unreadable += 1; continue }
+            while let url = enumerator.nextObject() as? URL {
+                guard accepts(url), let file = entry(url) else { continue }
+                files.append(file)
+            }
+        }
+        return files
+    }
 
     /// Identifies the saved archive these buckets came from, so a replaced or
     /// missing file is never mistaken for the current rollup.
@@ -117,15 +151,23 @@ nonisolated enum ModelUsageLogParser {
 
     static func read(url: URL, source: LocalModelUsageSource, fileID: String,
                      emit: (ModelUsageCall) throws -> Void) throws -> Int {
+        var parser = State(source: source, fileID: fileID)
+        return try readLines(url: url) { json in
+            if let call = parser.consume(json) { try emit(call) }
+        }
+    }
+
+    /// Streams JSON Lines objects; blank lines are skipped and anything else that is
+    /// not an object is counted as malformed without stopping the file.
+    static func readLines(url: URL, _ handleObject: ([String: Any]) throws -> Void) throws -> Int {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        var parser = State(source: source, fileID: fileID)
         var buffer = Data(), malformed = 0, skipping = false
         func consume(_ line: Data) throws {
-            guard !line.isEmpty else { return }
+            guard !line.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 13 }) else { return }
             try autoreleasepool {
                 guard let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { malformed += 1; return }
-                if let call = parser.consume(json) { try emit(call) }
+                try handleObject(json)
             }
         }
         while let chunk = try handle.read(upToCount: 512 * 1024), !chunk.isEmpty {

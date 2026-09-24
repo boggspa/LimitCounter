@@ -18,6 +18,8 @@ struct ModelUsageSourceTests {
         try snapshotInsights()
         sourceAttribution()
         try await unchangedRefreshSkipsRollups()
+        try streamingArrays()
+        try await taskWraithImport()
         print("Model usage sources: \(checks) checks passed")
     }
 
@@ -35,6 +37,100 @@ struct ModelUsageSourceTests {
         expect(data.sources.filter { $0.provider == .claude }.count == 1, "Only the Claude ledger is attributed to Claude")
         expect(ModelUsageSourceIdentity.replacedSnapshotHost("taskwraith") == nil && ModelUsageSourceIdentity.replacedSnapshotHost("grok") == nil,
                "Only request ledgers that fully cover a card replace its heatmap copy")
+    }
+
+    static func temporaryDirectory(_ name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    static func streamingArrays() throws {
+        let directory = try temporaryDirectory("json-stream")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let long = String(repeating: "x", count: 700_000)
+        let array = #"[ {"a":1,"s":"} ] { [ \" \\"}, {"a":2,"nested":[{"b":[1,2]}],"long":"\#(long)"} ,{"a":3} ]"#
+        let arrayURL = directory.appendingPathComponent("array.json")
+        try array.write(to: arrayURL, atomically: true, encoding: .utf8)
+        var seen: [Int] = []
+        let arrayMalformed = try JSONArrayObjectStream.read(url: arrayURL, key: nil) { seen.append(($0["a"] as? Int) ?? -1) }
+        expect(seen == [1, 2, 3] && arrayMalformed == 0, "Top-level elements survive braces in strings and chunk boundaries")
+
+        let document = #"{"sessionId":"s","directories":["messages"],"summary":"{\"messages\":[{\"a\":9}]}","messages":[{"a":4,"tokens":{"x":[1]}},{"a":5},{"broken":}],"after":[{"a":6}]}"#
+        let documentURL = directory.appendingPathComponent("chat.json")
+        try document.write(to: documentURL, atomically: true, encoding: .utf8)
+        seen = []
+        let keyedMalformed = try JSONArrayObjectStream.read(url: documentURL, key: "messages") { seen.append(($0["a"] as? Int) ?? -1) }
+        expect(seen == [4, 5], "Only the keyed array is streamed, never look-alikes in values or other keys")
+        expect(keyedMalformed == 1, "A broken element is counted and skipped")
+        try #"[{"a":1},{"a":"#.write(to: arrayURL, atomically: true, encoding: .utf8)
+        seen = []
+        let truncated = try JSONArrayObjectStream.read(url: arrayURL, key: nil) { seen.append(($0["a"] as? Int) ?? -1) }
+        expect(seen == [1] && truncated == 1, "A truncated checkpoint keeps complete records and counts the rest")
+    }
+
+    static func taskWraithRecord(_ id: String, provider: String = "grok", model: String = "grok-4.6", input: Double = 100,
+                                 output: Double = 20, total: Double? = nil, cacheRead: Double? = nil, cacheWrite: Double? = nil,
+                                 extra: [String: Any] = [:]) -> [String: Any] {
+        var record: [String: Any] = ["id": id, "timestamp": 1_790_000_000_000.0, "provider": provider, "workspaceId": "w", "chatId": "c",
+            "runId": "run-\(id)", "usageKind": "run", "model": model, "inputTokens": input, "outputTokens": output,
+            "totalTokens": total ?? (input + output + (cacheRead ?? 0) + (cacheWrite ?? 0)), "durationMs": 10,
+            "promptText": "never read", "responseText": "never read"]
+        if let cacheRead { record["cacheReadInputTokens"] = cacheRead }
+        if let cacheWrite { record["cacheCreationInputTokens"] = cacheWrite }
+        record.merge(extra) { $1 }
+        return record
+    }
+
+    static func taskWraithImport() async throws {
+        let call = TaskWraithUsageParser.call(from: taskWraithRecord("a", input: 100, output: 20, cacheRead: 900, cacheWrite: 50), fileID: "f")!
+        expect(call.source == "taskwraith" && call.model == "grok/grok-4.6" && call.calls == 0 && !call.inferred, "A run keeps provider, model and unknown call count")
+        expect(call.tokens == ModelTokenCounts(input: 100, cacheRead: 900, cacheWrite: 50, output: 20), "Itemised fresh input and cache fields stay disjoint")
+        expect(call.timestamp == Date(timeIntervalSince1970: 1_790_000_000), "Epoch milliseconds are read exactly")
+        let again = TaskWraithUsageParser.call(from: taskWraithRecord("a"), fileID: "other-file")!
+        expect(again.id == call.id, "TaskWraith's record id deduplicates across checkpoint, journal and archive")
+        expect(TaskWraithUsageParser.call(from: taskWraithRecord("c", provider: "codex"), fileID: "f") == nil, "Codex runs stay with their native transcripts")
+        expect(TaskWraithUsageParser.call(from: taskWraithRecord("d", provider: "Claude"), fileID: "f") == nil, "Claude runs stay with their native transcripts")
+        expect(TaskWraithUsageParser.call(from: taskWraithRecord("e", extra: ["usageKind": "reset_hint"]), fileID: "f") == nil, "Reset hints are not usage")
+        expect(TaskWraithUsageParser.call(from: taskWraithRecord("g", extra: ["runCount": 4]), fileID: "f") == nil, "External-scan aggregates are not runs")
+        expect(TaskWraithUsageParser.call(from: taskWraithRecord("h", input: 0, output: 0), fileID: "f") == nil, "Empty runs are skipped")
+        var anonymous = taskWraithRecord("i"); anonymous.removeValue(forKey: "provider")
+        expect(TaskWraithUsageParser.call(from: anonymous, fileID: "f") == nil, "A record without a provider cannot be kept apart from native transcripts")
+
+        let muse = TaskWraithUsageParser.call(from: taskWraithRecord("m", provider: "muse", model: "muse-spark-1.3", input: 1000,
+            output: 100, total: 1100, cacheRead: 700), fileID: "f")!
+        expect(muse.tokens == ModelTokenCounts(input: 300, cacheRead: 700, output: 100), "Cache-inclusive input is separated once")
+        let gemini = TaskWraithUsageParser.call(from: taskWraithRecord("n", provider: "gemini", model: "gemini-3.1-pro-preview",
+            input: 100, output: 50, total: 200), fileID: "f")!
+        expect(gemini.tokens == ModelTokenCounts(input: 100, output: 50, unsplit: 50), "An unitemised excess stays unsplit, not guessed")
+        let odd = TaskWraithUsageParser.call(from: taskWraithRecord("o", input: 500, output: 500, total: 300), fileID: "f")!
+        expect(odd.tokens == ModelTokenCounts(unsplit: 300), "Contradictory parts fall back to the inclusive total alone")
+        let estimated = TaskWraithUsageParser.call(from: taskWraithRecord("p", provider: "kimi", model: "kimi-k2.7-code",
+            extra: ["tokenCountConfidence": "estimated", "costRateModel": "kimi-k2.7-code-highspeed"]), fileID: "f")!
+        expect(estimated.inferred && estimated.rateModel == "kimi/kimi-k2.7-code-highspeed", "Estimated counts and cost-rate models are kept")
+        let pi = TaskWraithUsageParser.call(from: taskWraithRecord("q", provider: "pi", model: "deepseek/deepseek-v4-flash"), fileID: "f")!
+        expect(ModelRateCatalog.resolve(source: pi.source, model: pi.model)?.provider == "pi", "Pi runs price with Pi rows")
+
+        let directory = try temporaryDirectory("taskwraith")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let checkpoint = [taskWraithRecord("r1"), taskWraithRecord("r2", provider: "cursor", model: "composer-2.5-fast"),
+                          taskWraithRecord("r3", provider: "claude")]
+        try JSONSerialization.data(withJSONObject: checkpoint).write(to: directory.appendingPathComponent("usage.json"))
+        let journal = ["", String(decoding: try JSONSerialization.data(withJSONObject: taskWraithRecord("r2", provider: "cursor", model: "composer-2.5-fast")), as: UTF8.self),
+                       String(decoding: try JSONSerialization.data(withJSONObject: taskWraithRecord("r4", provider: "mistral", model: "devstral-small")), as: UTF8.self)]
+        try journal.joined(separator: "\n").write(to: directory.appendingPathComponent("usage-journal.jsonl"), atomically: true, encoding: .utf8)
+        let now = Date(timeIntervalSince1970: 1_790_000_600)
+        let scanner = ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger"))
+        let archive = try await scanner.scan(roots: [.taskwraith: directory], now: now)
+        let rows = archive.buckets.filter { $0.source == "taskwraith" }
+        expect(ModelUsageTotals(rows).runs == 3, "Checkpoint and journal copies of one run count once; Claude is skipped")
+        expect(Set(rows.map(\.model)) == ["grok/grok-4.6", "cursor/composer-2.5-fast", "mistral/devstral-small"], "Runs keep their provider namespace")
+        expect(archive.coverage.first { $0.source == "taskwraith" }?.files == 2, "Both TaskWraith files are indexed")
+        let fileOnly = try await ModelUsageLogScanner(directory: directory.appendingPathComponent("ledger-file"))
+            .scan(roots: [.taskwraith: directory.appendingPathComponent("usage.json")], now: now)
+        expect(ModelUsageTotals(fileOnly.buckets).runs == 2, "A grant on usage.json alone reads just that file")
+        let json = String(decoding: try JSONEncoder().encode(archive), as: UTF8.self)
+        expect(!json.contains("never read") && !json.contains("run-r1"), "Prompts, responses and run ids never leave the record")
     }
 
     static func claudeLine(_ stamp: String, request: String) -> String {

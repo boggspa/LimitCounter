@@ -13,6 +13,7 @@
 		2F4FE38FCA32C57462FECAC8 /* ModelRateCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D22E20E4DCE402F868C1A4BD /* ModelRateCatalog.swift */; };
 		DCFBCC5C4EE318F78F03D896 /* ModelUsageLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23C6391C2D181426D71C0A32 /* ModelUsageLedger.swift */; };
 		801A8F2C1F7ADAA54BBCC25F /* ModelUsageLogScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA75A974458F5B1ED3ED96BE /* ModelUsageLogScanner.swift */; };
+		5C0DE11A0B2C3D4E5F601A02 /* ModelUsageProviderLogs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0DE11A0B2C3D4E5F601A01 /* ModelUsageProviderLogs.swift */; };
 		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
 		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
@@ -87,6 +88,7 @@
 		D22E20E4DCE402F868C1A4BD /* ModelRateCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelRateCatalog.swift; sourceTree = SOURCE_ROOT; };
 		23C6391C2D181426D71C0A32 /* ModelUsageLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Storage/ModelUsageLedger.swift; sourceTree = SOURCE_ROOT; };
 		AA75A974458F5B1ED3ED96BE /* ModelUsageLogScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Providers/ModelUsageLogScanner.swift; sourceTree = SOURCE_ROOT; };
+		5C0DE11A0B2C3D4E5F601A01 /* ModelUsageProviderLogs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Providers/ModelUsageProviderLogs.swift; sourceTree = SOURCE_ROOT; };
 		005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GeminiProviderClient.swift; path = App/Providers/GeminiProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaSnapshotStore.swift; path = Shared/Storage/QuotaSnapshotStore.swift; sourceTree = SOURCE_ROOT; };
 		14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.macOS.entitlements; path = Widget/AIUsageWidgetExtension.macOS.entitlements; sourceTree = SOURCE_ROOT; };
@@ -218,6 +220,7 @@
 			children = (
 				8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */,
 				AA75A974458F5B1ED3ED96BE /* ModelUsageLogScanner.swift */,
+				5C0DE11A0B2C3D4E5F601A01 /* ModelUsageProviderLogs.swift */,
 				AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */,
 				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
 				FA1200010000000000000001 /* AntigravityProviderClient.swift */,
@@ -453,6 +456,7 @@
 				2F4FE38FCA32C57462FECAC8 /* ModelRateCatalog.swift in Sources */,
 				DCFBCC5C4EE318F78F03D896 /* ModelUsageLedger.swift in Sources */,
 				801A8F2C1F7ADAA54BBCC25F /* ModelUsageLogScanner.swift in Sources */,
+				5C0DE11A0B2C3D4E5F601A02 /* ModelUsageProviderLogs.swift in Sources */,
 				8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */,
 				35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */,
 				EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */,

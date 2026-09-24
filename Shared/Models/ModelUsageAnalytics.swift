@@ -42,8 +42,14 @@ nonisolated extension ModelTokenCounts: Codable {
 }
 
 nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable {
-    case codex, claude
-    var title: String { self == .codex ? "Codex" : "Claude Code" }
+    case codex, claude, taskwraith
+    var title: String {
+        switch self {
+        case .codex: return "Codex"
+        case .claude: return "Claude Code"
+        case .taskwraith: return "TaskWraith"
+        }
+    }
 }
 
 /// Attribution for archive sources on every surface (dashboard, heatmap, iPhone).
