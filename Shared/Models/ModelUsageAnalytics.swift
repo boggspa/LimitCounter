@@ -337,24 +337,36 @@ nonisolated enum ModelUsageAggregation {
     static let fineResolutionAge: TimeInterval = 90 * 86400
     static let retention: TimeInterval = 366 * 86400
 
+    /// Resolution and retention boundaries advance a whole UTC day at a time, so rollups
+    /// stay constant between midnights unless the ledger changes or a future call arrives.
+    static func dayStart(_ now: Date) -> Date { Date(timeIntervalSince1970: floor(now.timeIntervalSince1970 / 86400) * 86400) }
+    static func retentionStart(_ now: Date) -> Date { dayStart(now).addingTimeInterval(-retention) }
+
     static func bucketStart(_ date: Date, now: Date) -> (Date, Int) {
-        let seconds = now.timeIntervalSince(date) <= fineResolutionAge ? 300 : 3600
+        let seconds = date >= dayStart(now).addingTimeInterval(-fineResolutionAge) ? 300 : 3600
         return (Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / Double(seconds)) * Double(seconds)), seconds)
     }
 
     /// Each record is priced on its own before it joins a bucket, so an aggregate can
     /// never cross a per-prompt tier that none of its calls reached.
-    static func add(_ call: ModelUsageCall, now: Date, into result: inout [String: ModelUsageRollup]) {
+    static func add(_ call: ModelUsageCall, now: Date, into result: inout [String: ModelUsageRollup],
+                    rates: inout [String: ModelRate?]) {
         guard call.tokens.isValid, call.tokens.total > 0, call.calls >= 0, call.timestamp <= now,
-              call.timestamp >= now.addingTimeInterval(-retention) else { return }
+              call.timestamp >= retentionStart(now) else { return }
         let (start, seconds) = bucketStart(call.timestamp, now: now)
         var row = ModelUsageRollup(source: call.source, model: call.model, start: start, seconds: seconds, inferred: call.inferred)
         row = result[row.id] ?? row
         let weight = max(1, call.calls)
         row.tokens.add(call.tokens); row.requests += weight
         if call.calls == 0 { row.runs += 1 }
-        if let cost = ModelRateCatalog.costRange(source: call.source, model: call.rateModel ?? call.model,
-                                                 tokens: call.tokens, calls: call.calls) {
+        // A pass meets each model thousands of times; resolve it once (misses included).
+        let rateModel = call.rateModel ?? call.model, key = "\(call.source)|\(rateModel)"
+        let rate: ModelRate?
+        if let known = rates[key] { rate = known } else {
+            rate = ModelRateCatalog.resolve(source: call.source, model: rateModel)
+            rates[key] = rate
+        }
+        if let cost = rate?.costRange(call.tokens, calls: call.calls) {
             if cost.exact {
                 row.estimatedUSD += cost.low; row.pricedTokens += call.tokens.total; row.pricedRequests += weight
             } else {

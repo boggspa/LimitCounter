@@ -56,7 +56,39 @@ nonisolated final class ModelUsageLedger {
                 PRIMARY KEY(source,file,call));
             CREATE INDEX IF NOT EXISTS calls_identity ON calls(source,call);
             CREATE INDEX IF NOT EXISTS calls_date ON calls(at);
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+    }
+
+    /// Advances whenever a file's calls are replaced; rollups built from an older
+    /// generation are stale.
+    func generation() throws -> Int { Int(try metaValue("generation") ?? "") ?? 0 }
+
+    func metaValue(_ key: String) throws -> String? {
+        let statement = try prepare("SELECT value FROM meta WHERE key=?")
+        defer { sqlite3_finalize(statement) }
+        bind(key, 1, statement)
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: text)
+    }
+
+    func setMetaValue(_ value: String, for key: String) throws {
+        let statement = try prepare("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        defer { sqlite3_finalize(statement) }
+        bind(key, 1, statement); bind(value, 2, statement)
+        try step(statement)
+    }
+
+    /// The first instant at which the passage of time alone can change `rollups(now:)`:
+    /// the next UTC midnight, when resolution and retention boundaries advance, or the
+    /// moment a call logged with a future timestamp becomes current.
+    func nextRollupChange(after now: Date) throws -> Date {
+        let midnight = ModelUsageAggregation.dayStart(now).addingTimeInterval(86400)
+        let statement = try prepare("SELECT MIN(at) FROM calls WHERE at > ?")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, now.timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return midnight }
+        return min(midnight, Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)))
     }
 
     deinit { sqlite3_close(database) }
@@ -102,6 +134,10 @@ nonisolated final class ModelUsageLedger {
             sqlite3_bind_double(metadata, 3, modified.timeIntervalSince1970)
             sqlite3_bind_int64(metadata, 4, Int64(bytes)); sqlite3_bind_int(metadata, 5, Int32(version))
             sqlite3_bind_int(metadata, 6, Int32(malformed)); try step(metadata)
+            try execute("""
+                INSERT INTO meta VALUES('generation','1')
+                ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)
+                """)
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
@@ -118,16 +154,17 @@ nonisolated final class ModelUsageLedger {
             ) WHERE rank=1
             """)
         defer { sqlite3_finalize(statement) }
-        sqlite3_bind_double(statement, 1, now.addingTimeInterval(-366 * 86400).timeIntervalSince1970)
+        sqlite3_bind_double(statement, 1, ModelUsageAggregation.retentionStart(now).timeIntervalSince1970)
         sqlite3_bind_double(statement, 2, now.timeIntervalSince1970)
         var result: [String: ModelUsageRollup] = [:]
+        var rates: [String: ModelRate?] = [:]
         var status = sqlite3_step(statement)
         while status == SQLITE_ROW {
             if let bytes = sqlite3_column_blob(statement, 0) {
                 let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0)))
                 var call = try decoder.decode(ModelUsageCall.self, from: data)
                 call.timestamp = Date(timeIntervalSince1970: sqlite3_column_double(statement, 1))
-                ModelUsageAggregation.add(call, now: now, into: &result)
+                ModelUsageAggregation.add(call, now: now, into: &result, rates: &rates)
             }
             status = sqlite3_step(statement)
         }

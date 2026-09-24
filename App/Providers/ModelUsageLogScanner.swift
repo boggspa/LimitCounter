@@ -7,15 +7,16 @@ actor ModelUsageLogScanner {
     static let shared = ModelUsageLogScanner()
     static let parserVersion = 1
     private let directory: URL
+    /// Full ledger rollups performed; unchanged refreshes must not add to it.
+    private(set) var rollupPasses = 0
 
     init(directory: URL = ModelUsageArchiveStore.directory) { self.directory = directory }
 
     func scan(roots: [LocalModelUsageSource: URL], now: Date = Date(),
               progress: @Sendable (String) async -> Void = { _ in }) async throws -> ModelUsageArchive {
         let ledger = try ModelUsageLedger(url: directory.appendingPathComponent("requests-v1.sqlite"))
-        var archive = ModelUsageArchiveStore.load(from: directory)
-        let previousArchive = archive
-        var coverage = archive.coverage
+        let previousArchive = ModelUsageArchiveStore.load(from: directory)
+        var coverage = previousArchive.coverage
         for source in LocalModelUsageSource.allCases {
             guard let root = roots[source] else { continue }
             let folders: [URL] = source == .codex
@@ -58,16 +59,54 @@ actor ModelUsageLogScanner {
                 unreadableFiles: failed, malformedLines: try ledger.malformedLines(source: source.rawValue),
                 status: files.isEmpty ? "No readable logs in the connected folder" : (failed > 0 ? "Partial scan; cached history retained" : "Local logs indexed")))
         }
-        try ledger.prune(now: now)
-        archive = ModelUsageArchive(generatedAt: now, buckets: try ledger.rollups(now: now), coverage: coverage)
-        for index in archive.coverage.indices {
-            let rows = archive.buckets.filter { $0.source == archive.coverage[index].source }
-            archive.coverage[index].firstEvent = rows.map(\.start).min()
-            archive.coverage[index].lastEvent = rows.map(\.start).max()
+        // Rollups change only with the ledger, a parser, the rate catalog or the
+        // aggregation rules, or when the clock reaches the next UTC midnight (resolution
+        // and retention step daily) or a future-dated call. Otherwise reuse the saved
+        // buckets; CloudKit publication is retried by the caller either way.
+        let fingerprint = [String(ModelUsageArchive.schemaVersion), String(ModelUsageAggregation.version),
+                           ModelRateCatalog.revision, String(Self.parserVersion), String(try ledger.generation())]
+            .joined(separator: "|")
+        if let state = try ledger.metaValue(Self.rollupStateKey)?.split(separator: "\n").map(String.init),
+           state.count == 3, state[0] == fingerprint, let validUntil = Double(state[1]),
+           now.timeIntervalSince1970 < validUntil, state[2] == Self.stamp(previousArchive) {
+            var archive = previousArchive
+            archive.coverage = Self.dated(coverage, buckets: archive.buckets)
+            if archive.hasSameContent(as: previousArchive) { return previousArchive }
+            archive.generatedAt = now
+            try ModelUsageArchiveStore.save(archive, to: directory)
+            try ledger.setMetaValue([fingerprint, state[1], Self.stamp(archive)].joined(separator: "\n"), for: Self.rollupStateKey)
+            return archive
         }
-        if archive.hasSameContent(as: previousArchive) { return previousArchive }
-        try ModelUsageArchiveStore.save(archive, to: directory)
+        rollupPasses += 1
+        try ledger.prune(now: now)
+        var archive = ModelUsageArchive(generatedAt: now, buckets: try ledger.rollups(now: now))
+        archive.coverage = Self.dated(coverage, buckets: archive.buckets)
+        let validUntil = try ledger.nextRollupChange(after: now).timeIntervalSince1970
+        if archive.hasSameContent(as: previousArchive) { archive = previousArchive }
+        else { try ModelUsageArchiveStore.save(archive, to: directory) }
+        try ledger.setMetaValue([fingerprint, String(validUntil), Self.stamp(archive)].joined(separator: "\n"), for: Self.rollupStateKey)
         return archive
+    }
+
+    private static let rollupStateKey = "rollupState"
+
+    /// Identifies the saved archive these buckets came from, so a replaced or
+    /// missing file is never mistaken for the current rollup.
+    private static func stamp(_ archive: ModelUsageArchive) -> String {
+        "\(archive.version):\(archive.generatedAt.timeIntervalSince1970):\(archive.buckets.count)"
+    }
+
+    private static func dated(_ coverage: [ModelUsageCoverage], buckets: [ModelUsageRollup]) -> [ModelUsageCoverage] {
+        var bounds: [String: (first: Date, last: Date)] = [:]
+        for row in buckets {
+            let known = bounds[row.source]
+            bounds[row.source] = (min(known?.first ?? row.start, row.start), max(known?.last ?? row.start, row.start))
+        }
+        return coverage.map { value in
+            var copy = value
+            copy.firstEvent = bounds[value.source]?.first; copy.lastEvent = bounds[value.source]?.last
+            return copy
+        }
     }
 }
 

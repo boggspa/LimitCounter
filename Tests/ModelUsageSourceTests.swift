@@ -16,7 +16,69 @@ struct ModelUsageSourceTests {
         try aggregationPricesEachRecord()
         try schemaCompatibility()
         try snapshotInsights()
+        try await unchangedRefreshSkipsRollups()
         print("Model usage sources: \(checks) checks passed")
+    }
+
+    static func claudeLine(_ stamp: String, request: String) -> String {
+        #"{"timestamp":"\#(stamp)","requestId":"\#(request)","message":{"id":"m-\#(request)","model":"claude-opus-5-5","usage":{"input_tokens":100,"output_tokens":40}}}"# + "\n"
+    }
+
+    static func unchangedRefreshSkipsRollups() async throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("model-usage-refresh-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let root = temporary.appendingPathComponent("claude")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("projects"), withIntermediateDirectories: true)
+        let log = root.appendingPathComponent("projects/session.jsonl")
+        let start = date("2026-06-01T12:00:00Z")
+        try claudeLine("2026-06-01T12:00:00Z", request: "a").write(to: log, atomically: true, encoding: .utf8)
+        let storage = temporary.appendingPathComponent("scanner")
+        let scanner = ModelUsageLogScanner(directory: storage)
+        func expectPasses(_ count: Int, _ condition: Bool, _ message: String) async {
+            let passes = await scanner.rollupPasses
+            expect(passes == count && condition, message)
+        }
+
+        let now = start.addingTimeInterval(86400)
+        let first = try await scanner.scan(roots: [.claude: root], now: now)
+        await expectPasses(1, first.buckets.first?.seconds == 300, "First scan builds rollups")
+        let second = try await scanner.scan(roots: [.claude: root], now: now.addingTimeInterval(300))
+        await expectPasses(1, true, "An unchanged refresh skips prune and rollups")
+        expect(second == first, "…and returns the saved archive untouched")
+
+        let sameDay = start.addingTimeInterval(ModelUsageAggregation.fineResolutionAge + 60)
+        let held = try await scanner.scan(roots: [.claude: root], now: sameDay)
+        await expectPasses(2, held.buckets.first?.seconds == 300, "A call just past 90 days keeps five-minute precision until midnight")
+        _ = try await scanner.scan(roots: [.claude: root], now: sameDay.addingTimeInterval(300))
+        await expectPasses(2, true, "…so later refreshes that day skip rollups")
+        let resolution = start.addingTimeInterval(ModelUsageAggregation.fineResolutionAge + 86400)
+        let coarse = try await scanner.scan(roots: [.claude: root], now: resolution)
+        await expectPasses(3, coarse.buckets.first?.seconds == 3600, "The next day's horizon rebuilds rollups at hourly resolution")
+        _ = try await scanner.scan(roots: [.claude: root], now: resolution.addingTimeInterval(300))
+        await expectPasses(3, true, "…then refreshes are steady again")
+
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd(); try handle.write(contentsOf: Data(claudeLine("2026-08-15T12:00:00Z", request: "b").utf8)); try handle.close()
+        let grown = try await scanner.scan(roots: [.claude: root], now: resolution.addingTimeInterval(600))
+        await expectPasses(4, ModelUsageTotals(grown.buckets).requests == 2, "A changed log rebuilds rollups")
+
+        try ModelUsageArchiveStore.save(ModelUsageArchive(generatedAt: resolution), to: storage)
+        let restored = try await scanner.scan(roots: [.claude: root], now: resolution.addingTimeInterval(900))
+        await expectPasses(5, ModelUsageTotals(restored.buckets).requests == 2, "A replaced archive is never trusted as current")
+
+        let expiry = start.addingTimeInterval(ModelUsageAggregation.retention + 86400)
+        let expired = try await scanner.scan(roots: [.claude: root], now: expiry)
+        await expectPasses(6, ModelUsageTotals(expired.buckets).requests == 1, "Leaving retention rebuilds rollups")
+
+        let handleFuture = try FileHandle(forWritingTo: log)
+        try handleFuture.seekToEnd()
+        try handleFuture.write(contentsOf: Data(claudeLine("2027-06-03T13:00:00Z", request: "c").utf8)); try handleFuture.close()
+        let early = try await scanner.scan(roots: [.claude: root], now: date("2027-06-03T12:02:00Z"))
+        await expectPasses(7, ModelUsageTotals(early.buckets).requests == 1, "A future call is excluded until its time")
+        _ = try await scanner.scan(roots: [.claude: root], now: date("2027-06-03T12:30:00Z"))
+        await expectPasses(7, true, "Waiting for it does not rebuild")
+        let arrived = try await scanner.scan(roots: [.claude: root], now: date("2027-06-03T13:00:30Z"))
+        await expectPasses(8, ModelUsageTotals(arrived.buckets).requests == 2, "Its arrival rebuilds rollups")
     }
 
     static func pricingBounds() throws {
@@ -70,21 +132,22 @@ struct ModelUsageSourceTests {
         let now = date("2026-09-24T12:00:00Z")
         let at = now.addingTimeInterval(-600)
         var rows: [String: ModelUsageRollup] = [:]
+        var rates: [String: ModelRate?] = [:]
         // Two 150K calls in one bucket: 300K together, yet neither call reached 200K.
         for index in 0..<2 {
             ModelUsageAggregation.add(ModelUsageCall(id: "\(index)", source: "grok", timestamp: at, model: "grok-4.6",
-                tokens: .init(input: 150_000, output: 1000)), now: now, into: &rows)
+                tokens: .init(input: 150_000, output: 1000)), now: now, into: &rows, rates: &rates)
         }
         var totals = ModelUsageTotals(Array(rows.values))
         close(totals.estimatedUSD, 2 * (0.3 + 0.006), "Bucket totals never trigger a per-prompt tier")
         expect(totals.rangedTokens == 0 && totals.requests == 2, "Per-call records stay exact")
 
         ModelUsageAggregation.add(ModelUsageCall(id: "run", source: "taskwraith", timestamp: at, model: "grok/grok-4.6",
-            tokens: .init(input: 250_000, output: 1000), calls: 0), now: now, into: &rows)
+            tokens: .init(input: 250_000, output: 1000), calls: 0), now: now, into: &rows, rates: &rates)
         ModelUsageAggregation.add(ModelUsageCall(id: "turn", source: "grok", timestamp: at, model: "grok-4.6-build",
-            tokens: .init(input: 10_000, output: 500), calls: 3), now: now, into: &rows)
+            tokens: .init(input: 10_000, output: 500), calls: 3), now: now, into: &rows, rates: &rates)
         ModelUsageAggregation.add(ModelUsageCall(id: "guess", source: "taskwraith", timestamp: at, model: "mistral/mistral-medium-3.5",
-            tokens: .init(input: 4000, output: 1000), calls: 0, inferred: true), now: now, into: &rows)
+            tokens: .init(input: 4000, output: 1000), calls: 0, inferred: true), now: now, into: &rows, rates: &rates)
         totals = ModelUsageTotals(Array(rows.values))
         close(totals.rangeLowUSD, 0.5 + 0.006, "A run over the threshold is bounded below by the base tier")
         close(totals.rangeHighUSD, 1.0 + 0.012, "…and above by the long tier")
@@ -95,7 +158,7 @@ struct ModelUsageSourceTests {
         let rateModelled = ModelUsageCall(id: "r", source: "taskwraith", timestamp: at, model: "kimi/kimi-k2.7-code",
             tokens: .init(input: 1_000_000), rateModel: "kimi/kimi-k2.7-code-highspeed", calls: 0)
         var single: [String: ModelUsageRollup] = [:]
-        ModelUsageAggregation.add(rateModelled, now: now, into: &single)
+        ModelUsageAggregation.add(rateModelled, now: now, into: &single, rates: &rates)
         close(single.values.first?.estimatedUSD, 1.9, "A recorded cost-rate model prices the record")
         expect(single.values.first?.model == "kimi/kimi-k2.7-code", "…while the display model is kept")
     }
