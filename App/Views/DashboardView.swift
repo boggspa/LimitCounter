@@ -63,13 +63,6 @@ struct DashboardView: View {
                     CodexDetailView(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot)
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { navigationPath.append(DashboardRoute.modelUsage) } label: {
-                        Label("Model usage", systemImage: "chart.xyaxis.line")
-                    }
-                }
-            }
         }
         .tint(ProGlassTheme.accent)
         .sheet(isPresented: $showSettings) {
@@ -1121,6 +1114,20 @@ struct DashboardView: View {
                     .foregroundStyle(.white)
             }
             .disabled(appState.isSyncing)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+                .padding(.vertical, 6)
+
+            controlPillButton(
+                accessibilityLabel: "Model usage"
+            ) {
+                navigationPath.append(DashboardRoute.modelUsage)
+            } label: {
+                Image(systemName: "chart.xyaxis.line")
+                    .foregroundStyle(.white)
+            }
 
             Rectangle()
                 .fill(Color.white.opacity(0.12))
