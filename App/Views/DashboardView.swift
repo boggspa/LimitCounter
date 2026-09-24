@@ -994,7 +994,9 @@ struct DashboardView: View {
     @ViewBuilder
     private func compactLayoutBody(isDesktop: Bool) -> some View {
         let snapshots = orderedCompactSnapshots()
-        ModelUsageSummaryCard { navigationPath.append(DashboardRoute.modelUsage) }
+        if !isDesktop {
+            ModelUsageSummaryCard { navigationPath.append(DashboardRoute.modelUsage) }
+        }
         if snapshots.isEmpty {
             GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
                 emptyDashboardState
