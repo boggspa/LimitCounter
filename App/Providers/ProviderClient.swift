@@ -9244,9 +9244,14 @@ private nonisolated struct ClaudeKeychainStore {
         var scopedURL: URL?
         if let bookmarkData {
             var isStale = false
+            #if os(macOS)
+            let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+            #else
+            let options: URL.BookmarkResolutionOptions = []
+            #endif
             scopedURL = try? URL(
                 resolvingBookmarkData: bookmarkData,
-                options: [.withSecurityScope],
+                options: options,
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             )
