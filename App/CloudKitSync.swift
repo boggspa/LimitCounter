@@ -118,6 +118,10 @@ final class CloudKitSyncService {
     /// Separate asset: never put a year's rollups into the quota/widget snapshot.
     /// The latest collecting Mac is the publisher, matching the existing status model.
     func publishModelUsage(_ archive: ModelUsageArchive) async throws {
+        let payload = try archive.cloudEncoded()
+        let hash = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let hashKey = "cloudkit.modelUsage.publishedHash.v1"
+        guard defaults.string(forKey: hashKey) != hash else { return }
         guard try await container.accountStatus() == .available else { throw CloudKitSyncError.accountUnavailable }
         let record: CKRecord
         do {
@@ -126,7 +130,6 @@ final class CloudKitSyncService {
         } catch let error as CKError where error.code == .unknownItem {
             record = CKRecord(recordType: modelUsageRecordType, recordID: modelUsageRecordID)
         }
-        let payload = try archive.cloudEncoded()
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("model-usage-\(UUID().uuidString).lzfse")
         try payload.write(to: url, options: .atomic)
         defer { try? FileManager.default.removeItem(at: url) }
@@ -135,6 +138,8 @@ final class CloudKitSyncService {
         record["schemaVersion"] = ModelUsageArchive.schemaVersion as NSNumber
         record["rateVersion"] = archive.rateVersion as NSString
         _ = try await database.save(record)
+        // Only record success: a failed publication remains eligible for the next refresh.
+        defaults.set(hash, forKey: hashKey)
     }
 
     func fetchModelUsage() async throws -> ModelUsageArchive? {

@@ -27,9 +27,10 @@ nonisolated struct ModelRate: Identifiable, Decodable {
     var notes: String?
     var context: Int?
     var id: String { "\(provider)/\(model)" }
+    var isLocalInference: Bool { url.hasPrefix("local://") }
 
     func estimate(_ tokens: ModelTokenCounts) -> Double? {
-        guard tokens.isValid, status == .estimated || status == .free else { return nil }
+        guard tokens.isValid, !isLocalInference, status == .estimated || status == .free else { return nil }
         let isLong = threshold.map { tokens.prompt >= $0 } ?? false
         let inputRate = isLong ? (longInput ?? input) : input
         let outputRate = isLong ? (longOutput ?? output) : output

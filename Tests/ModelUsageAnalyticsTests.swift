@@ -17,6 +17,15 @@ struct ModelUsageAnalyticsTests {
         close(ModelRateCatalog.estimate(source: "codex", model: "codex/gpt-6-sol", tokens: tokens)!, 0.0007, "Disjoint cache pricing")
         expect(ModelRateCatalog.resolve(source: "codex", model: "unknown-routed-model") == nil, "Unknown must not use fallback")
         expect(ModelRateCatalog.resolve(source: "codex", model: "vendor/gpt-6-sol") == nil, "Unknown prefix must not be stripped")
+        expect(ModelUsageDisplayIdentity.provider(model: "grok/grok-4.6", source: "codex") == "grok", "Explicit routed Grok selects vendor colour")
+        expect(ModelUsageDisplayIdentity.provider(model: "claude/opus", source: "codex") == "claude", "Routed Claude keeps its hue in Codex")
+        expect(ModelUsageDisplayIdentity.provider(model: "mistral/devstral", source: "claude") == "mistral", "Routed Mistral in Claude")
+        expect(ModelUsageDisplayIdentity.provider(model: "unknown/grok", source: "codex") == "openai", "Unknown namespace keeps host hue")
+        expect(ModelUsageDisplayIdentity.provider(model: "grok-4.6", source: "claude") == "claude", "Bare name is not guessed")
+        expect(ModelUsageDisplayIdentity.provider(model: "gemini/gemini-pro", source: "codex") == "gemini", "Explicit Gemini mapping")
+        let mixed = [ModelUsageRollup(source: "codex", model: "grok/grok-4.6", start: now, seconds: 300, tokens: .init(input: 200)), ModelUsageRollup(source: "codex", model: "gpt-6-sol", start: now, seconds: 300, tokens: .init(input: 100))]
+        expect(ModelUsageDisplayIdentity.dominant(in: mixed) == "grok", "Dominant cell colour weights model tokens")
+        expect(Set(mixed.map(\.source)) == ["codex"], "Display mapping never mutates accounting source")
         let tier = ModelTokenCounts(input: 272000, output: 1000)
         close(ModelRateCatalog.estimate(source: "codex", model: "gpt-6-sol", tokens: tier)!, 1.103, "Long prompt switches every token")
         close(ModelRateCatalog.estimate(source: "codex", model: "gpt-6-sol", tokens: .init(input: 271999, output: 1000))!, 0.553998, "Below threshold uses base rate")
@@ -80,6 +89,10 @@ struct ModelUsageAnalyticsTests {
         expect(ModelUsageAggregation.bucketStart(now.addingTimeInterval(-3600), now: now).1 == 300, "Recent history retains five minute precision")
 
         let archive = ModelUsageArchive(generatedAt: now, buckets: rows)
+        var unchanged = archive; unchanged.generatedAt = now.addingTimeInterval(60)
+        expect(unchanged.hasSameContent(as: archive), "A refresh timestamp does not trigger archive upload")
+        unchanged.rateVersion = "new-version"
+        expect(!unchanged.hasSameContent(as: archive), "Rate revision refreshes the estimate archive")
         try ModelUsageArchiveStore.save(archive, to: temporary)
         expect(ModelUsageArchiveStore.load(from: temporary) == archive, "Atomic archive round trip")
         let data = try JSONEncoder().encode(archive)
@@ -110,6 +123,38 @@ struct ModelUsageAnalyticsTests {
         let malformed = try ModelUsageLogParser.read(url: fixtures, source: .claude, fileID: "f") { parsed.append($0) }
         expect(malformed == 2 && parsed.count == 1, "Malformed lines isolated")
         close(parsed[0].tokens.total, 190, "Claude cache counts are additive")
+        let official = UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now,
+            model: "gpt-6-sol", inputTokens: 300000, outputTokens: 100, requests: 5, costUSD: nil, source: .officialAPI)
+        let cost = UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now,
+            costUSD: 9, source: .officialAPI, note: "Cost")
+        let mistral = UsageAnalyticsBucket(startDate: now.addingTimeInterval(-86400), endDate: now,
+            model: "mistral-medium-3.5", inputTokens: 10000, outputTokens: 1000, requests: 5,
+            costUSD: 0.50, source: .localEstimate)
+        let snapshots = [
+            QuotaSnapshot(providerID: .openaiAPI, displayName: "API", windows: [], analyticsBuckets: [official, cost]),
+            QuotaSnapshot(providerID: .mistral, displayName: "Mistral", windows: [], analyticsBuckets: [mistral]),
+            QuotaSnapshot(providerID: .claude, displayName: "Claude", windows: [], analyticsBuckets: [.init(startDate: now.addingTimeInterval(-60), endDate: now, model: "claude-opus-5-5", inputTokens: 999999, source: .localTelemetry)])
+        ]
+        let insights = ModelUsageInsightData(archive: archive, snapshots: snapshots)
+        expect(insights.sources.count == 3, "Provider analytics coexist with local history")
+        expect(insights.entries.filter { $0.source == "claude" }.count == 1, "Local host bucket copy is not added to request ledger")
+        let apiRows = insights.selected(source: "openaiAPI:officialAPI", window: .day, now: now)
+        let apiTotals = ModelUsageInsightTotals(apiRows)
+        expect(apiTotals.estimatedUSD == nil, "Daily aggregate cannot assume individual long-context tiers")
+        expect(apiTotals.actualUSD == 9, "Official spend is retained separately")
+        expect(insights.selected(source: "openaiAPI:officialAPI", window: .hour, now: now).isEmpty, "Daily source not attributed to one hour")
+        let mistralTotals = ModelUsageInsightTotals(insights.selected(source: "mistral:localEstimate", window: .day, now: now))
+        expect(mistralTotals.actualUSD == nil && mistralTotals.reportedEstimateUSD == 0.5, "Local estimates are not billed spend")
+        close(mistralTotals.estimatedUSD!, 0.0225, "Provider model rates apply when per-call tier is unnecessary")
+        let scanRoot = temporary.appendingPathComponent("connected")
+        try FileManager.default.createDirectory(at: scanRoot.appendingPathComponent("projects"), withIntermediateDirectories: true)
+        try fixture.write(to: scanRoot.appendingPathComponent("projects/session.jsonl"))
+        let scanner = ModelUsageLogScanner(directory: temporary.appendingPathComponent("scanner"))
+        let scanned = try await scanner.scan(roots: [.claude: scanRoot], now: now)
+        let rescanned = try await scanner.scan(roots: [.claude: scanRoot], now: now.addingTimeInterval(60))
+        expect(scanned == rescanned, "An unchanged refresh preserves archive date and compressed bytes")
+        expect(scanned.coverage.first?.malformedLines == 2, "Partial coverage is recorded")
+        expect(ModelUsageTotals(scanned.buckets).requests == 1, "Scanner indexed the fixture")
         print("Model usage analytics: \(checks) checks passed")
     }
 }

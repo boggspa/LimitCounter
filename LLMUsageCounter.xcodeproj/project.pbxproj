@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A08136729B546202562478AC /* ModelUsageDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A08136729B546202562478AD /* ModelUsageDashboardView.swift */; };
+		A08136729B546202562478AE /* ModelUsageDashboardData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A08136729B546202562478AF /* ModelUsageDashboardData.swift */; };
 		216D8AB6E134F76894E0E773 /* ModelUsageAnalytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 917535DA819A97528F602CF4 /* ModelUsageAnalytics.swift */; };
 		2F4FE38FCA32C57462FECAC8 /* ModelRateCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D22E20E4DCE402F868C1A4BD /* ModelRateCatalog.swift */; };
 		DCFBCC5C4EE318F78F03D896 /* ModelUsageLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23C6391C2D181426D71C0A32 /* ModelUsageLedger.swift */; };
@@ -79,6 +81,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A08136729B546202562478AD /* ModelUsageDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Views/ModelUsageDashboardView.swift; sourceTree = SOURCE_ROOT; };
+		A08136729B546202562478AF /* ModelUsageDashboardData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Views/ModelUsageDashboardData.swift; sourceTree = SOURCE_ROOT; };
 		917535DA819A97528F602CF4 /* ModelUsageAnalytics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelUsageAnalytics.swift; sourceTree = SOURCE_ROOT; };
 		D22E20E4DCE402F868C1A4BD /* ModelRateCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelRateCatalog.swift; sourceTree = SOURCE_ROOT; };
 		23C6391C2D181426D71C0A32 /* ModelUsageLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Storage/ModelUsageLedger.swift; sourceTree = SOURCE_ROOT; };
@@ -250,6 +254,8 @@
 				B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */,
 				6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */,
 				9C38142DE1DDB3110221F8CF /* DashboardView.swift */,
+				A08136729B546202562478AD /* ModelUsageDashboardView.swift */,
+				A08136729B546202562478AF /* ModelUsageDashboardData.swift */,
 				A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */,
 				781AD1FD17A6BE8F4DC7D597 /* SettingsView.swift */,
 				E785A420F73F9BFA69080D0E /* ProviderSetup */,
@@ -460,6 +466,8 @@
 				FA1100020000000000000002 /* SpendProviderClients.swift in Sources */,
 				D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */,
 				A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */,
+				A08136729B546202562478AC /* ModelUsageDashboardView.swift in Sources */,
+				A08136729B546202562478AE /* ModelUsageDashboardData.swift in Sources */,
 				25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */,
 				C277E330E1E1A288294467FB /* SettingsView.swift in Sources */,
 				A51F1D7A8D634C6DA9E9D6C5 /* CursorSessionImportView.swift in Sources */,

@@ -10,10 +10,13 @@ public struct LLMActivityHeatmapView: View {
     private let bucketMap: [HeatmapBucketKey: [UsageEvent]]
 
     public init(snapshots: [QuotaSnapshot]) {
+        self.init(snapshots: snapshots, modelUsage: nil)
+    }
+
+    init(snapshots: [QuotaSnapshot], modelUsage: ModelUsageArchive?) {
         // 1. Extract all events once, dropping duplicates. See
         // `UsageEventDeduplicator` for the two duplication modes this covers.
-        let events = UsageEventDeduplicator.flatten(snapshots)
-        self.allEvents = events
+        var events = UsageEventDeduplicator.flatten(snapshots)
 
         // 2. Create a fast lookup for event -> provider
         var providerMap: [UUID: ProviderID] = [:]
@@ -23,6 +26,21 @@ public struct LLMActivityHeatmapView: View {
                 providerMap[event.id] = (snapshot.providerID == .codexTelemetry ? .openai : snapshot.providerID)
             }
         }
+        // Prefer model-aware ledger rows once available. This replaces the host's
+        // total-only event copy instead of adding a second view of the same calls.
+        let cutoff = Date().addingTimeInterval(-31 * 86400)
+        let rollups = modelUsage?.buckets.filter { $0.start >= cutoff && $0.start <= Date() } ?? []
+        let sources = Set(rollups.map(\.source))
+        events.removeAll { event in
+            guard let host = providerMap[event.id] else { return false }
+            return (host == .openai && sources.contains("codex")) || (host == .claude && sources.contains("claude"))
+        }
+        for row in rollups {
+            let event = UsageEvent(timestamp: row.start, tokens: row.tokens.total, model: row.model, type: .bucket)
+            providerMap[event.id] = row.source == "codex" ? .openai : .claude
+            events.append(event)
+        }
+        self.allEvents = events
         self.eventToProvider = providerMap
 
         // 3. Pre-bucket the events by local day + 2-hour row.
@@ -174,11 +192,10 @@ public struct LLMActivityHeatmapView: View {
         var providerWeights: [ProviderID: Double] = [:]
         for event in events {
             let weight = event.tokens ?? 100
-            if let provider = eventToProvider[event.id] {
-                providerWeights[provider, default: 0] += weight
-            } else if let provider = guessProviderFromModel(event.model) {
-                providerWeights[provider, default: 0] += weight
-            }
+            let host = eventToProvider[event.id] ?? .openai
+            let identity = ModelUsageDisplayIdentity.provider(model: event.model, source: host.rawValue)
+            let provider = ProviderID(rawValue: identity) ?? host
+            providerWeights[provider, default: 0] += weight
         }
 
         guard !providerWeights.isEmpty else { return ProGlassTheme.accent }
@@ -194,20 +211,6 @@ public struct LLMActivityHeatmapView: View {
         }
 
         return c1
-    }
-
-    private func guessProviderFromModel(_ model: String?) -> ProviderID? {
-        guard let model = model?.lowercased() else { return nil }
-        if model.contains("claude") { return .claude }
-        if model.contains("gemini") { return .gemini }
-        if model.contains("codex") { return .openai }
-        if model.contains("gpt") { return .chatgpt }
-        if model.contains("kimi") { return .kimi }
-        if model.contains("cursor") { return .cursor }
-        if model.contains("devin") { return .devin }
-        if model.contains("grok") { return .grok }
-        if model.contains("muse") || model.hasPrefix("meta") { return .meta }
-        return nil
     }
 
     private func tokenTotals() -> HeatmapTokenTotals {

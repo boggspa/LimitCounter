@@ -63,6 +63,7 @@ final class MenuBarController: NSObject {
 }
 
 private struct MenuBarPopoverView: View {
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject var appState: AppStateStore
     @StateObject private var panelStore = PinnedPanelStore.shared
     @State private var selectedProviderID: ProviderID?
@@ -94,6 +95,11 @@ private struct MenuBarPopoverView: View {
                 ScrollView {
                     VStack(spacing: 12) {
                         overviewSection
+                        ModelUsageSummaryCard {
+                            appState.pendingModelUsageNavigation = true
+                            openWindow(id: "dashboard")
+                            NSApplication.shared.activate(ignoringOtherApps: true)
+                        }
 
                         if let selectedSnapshot {
                             focusedProviderSection(selectedSnapshot)

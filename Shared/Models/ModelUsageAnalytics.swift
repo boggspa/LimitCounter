@@ -88,6 +88,16 @@ nonisolated struct ModelUsageArchive: Codable, Equatable, Sendable {
     static let empty = ModelUsageArchive(generatedAt: .distantPast)
     var sources: [String] { Array(Set(buckets.map(\.source) + coverage.map(\.source))).sorted() }
 
+    func hasSameContent(as other: Self) -> Bool {
+        func stableCoverage(_ values: [ModelUsageCoverage]) -> [ModelUsageCoverage] {
+            values.map { value in
+                var copy = value; copy.scannedAt = .distantPast; return copy
+            }.sorted { $0.source < $1.source }
+        }
+        return version == other.version && rateVersion == other.rateVersion && buckets == other.buckets
+            && stableCoverage(coverage) == stableCoverage(other.coverage)
+    }
+
     func selected(source: String, now: Date, window: ModelUsageWindow) -> [ModelUsageRollup] {
         // Include a boundary bucket as a whole; the UI discloses five-minute precision.
         let cutoff = now.addingTimeInterval(-window.seconds)
@@ -220,5 +230,34 @@ nonisolated enum ModelUsageAggregation {
             row.estimatedUSD += estimate; row.pricedTokens += call.tokens.total; row.pricedRequests += 1
         }
         result[row.id] = row
+    }
+}
+
+/// Presentation only. Explicit routing namespaces may choose a vendor's colour,
+/// while deduplication, pricing and accounting retain the original source.
+nonisolated enum ModelUsageDisplayIdentity {
+    static func provider(model: String?, source: String) -> String {
+        let host = source.split(separator: ":", maxSplits: 1).first.map(String.init) ?? source
+        let fallback = host == "codex" || host == "codexTelemetry" ? "openai" : host
+        guard let model, let slash = model.firstIndex(of: "/"),
+              model.index(after: slash) < model.endIndex else { return fallback }
+        let namespace = model[..<slash].lowercased()
+        let known = [
+            "codex": "openai", "openai": "openai", "claude": "claude", "anthropic": "claude",
+            "grok": "grok", "xai": "grok", "mistral": "mistral", "deepseek": "deepseek",
+            "gemini": "gemini", "google": "gemini", "kimi": "kimi", "moonshot": "kimi",
+            "cursor": "cursor", "cerebras": "cerebras", "ollama": "ollama", "openrouter": "openrouter",
+            "qwen": "qwen", "alibaba": "qwen", "meta": "meta", "muse": "meta",
+            "antigravity": "antigravity", "devin": "devin", "mimo": "mimo", "xiaomi": "mimo"
+        ]
+        return known[namespace] ?? fallback
+    }
+
+    static func dominant(in rows: [ModelUsageRollup]) -> String? {
+        var weights: [String: Double] = [:]
+        for row in rows {
+            weights[provider(model: row.model, source: row.source), default: 0] += row.tokens.total
+        }
+        return weights.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.first?.key
     }
 }

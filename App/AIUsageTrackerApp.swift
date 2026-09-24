@@ -18,7 +18,7 @@ struct AIUsageTrackerApp: App {
     #endif
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "dashboard") {
             DashboardView()
                 .environmentObject(appState)
                 .preferredColorScheme(.dark)

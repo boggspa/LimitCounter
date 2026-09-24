@@ -14,6 +14,7 @@ actor ModelUsageLogScanner {
               progress: @Sendable (String) async -> Void = { _ in }) async throws -> ModelUsageArchive {
         let ledger = try ModelUsageLedger(url: directory.appendingPathComponent("requests-v1.sqlite"))
         var archive = ModelUsageArchiveStore.load(from: directory)
+        let previousArchive = archive
         var coverage = archive.coverage
         for source in LocalModelUsageSource.allCases {
             guard let root = roots[source] else { continue }
@@ -64,6 +65,7 @@ actor ModelUsageLogScanner {
             archive.coverage[index].firstEvent = rows.map(\.start).min()
             archive.coverage[index].lastEvent = rows.map(\.start).max()
         }
+        if archive.hasSameContent(as: previousArchive) { return previousArchive }
         try ModelUsageArchiveStore.save(archive, to: directory)
         return archive
     }

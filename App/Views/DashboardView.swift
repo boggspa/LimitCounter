@@ -55,10 +55,19 @@ struct DashboardView: View {
             #endif
             .navigationDestination(for: DashboardRoute.self) { route in
                 switch route {
+                case .modelUsage:
+                    ModelUsageDashboardView()
                 case .provider(let snapshot):
                     ProviderDetailView(snapshot: snapshot)
                 case .codexCombined(let usageSnapshot, let telemetrySnapshot):
                     CodexDetailView(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { navigationPath.append(DashboardRoute.modelUsage) } label: {
+                        Label("Model usage", systemImage: "chart.xyaxis.line")
+                    }
                 }
             }
         }
@@ -115,6 +124,18 @@ struct DashboardView: View {
             }
             appState.pendingDeepLinkProviderID = nil
         }
+        .onChange(of: appState.pendingModelUsageNavigation) { pending in
+            if pending { openModelUsage() }
+        }
+        .onAppear {
+            if appState.pendingModelUsageNavigation { openModelUsage() }
+        }
+    }
+
+    private func openModelUsage() {
+        navigationPath = NavigationPath()
+        navigationPath.append(DashboardRoute.modelUsage)
+        appState.pendingModelUsageNavigation = false
     }
 
     @ViewBuilder
@@ -368,6 +389,7 @@ struct DashboardView: View {
                 VStack(alignment: .center, spacing: 18) {
                     desktopNavigationPill
                     workspaceHeader
+                    ModelUsageSummaryCard { navigationPath.append(DashboardRoute.modelUsage) }
                     dashboardCardList(isDesktop: true)
                 }
                 .frame(maxWidth: 850)
@@ -387,7 +409,9 @@ struct DashboardView: View {
     private var desktopNavigationPill: some View {
         HStack(spacing: 2) {
             navigationPillItem(title: "Dashboard", systemImage: "rectangle.grid.2x2", isActive: true) {}
-            navigationPillItem(title: "Activity", systemImage: "waveform.path.ecg", isActive: false) {}
+            navigationPillItem(title: "Activity", systemImage: "waveform.path.ecg", isActive: false) {
+                navigationPath.append(DashboardRoute.modelUsage)
+            }
             navigationPillItem(title: "Providers", systemImage: "square.stack.3d.up", isActive: false) {
                 openSettings()
             }
@@ -652,7 +676,8 @@ struct DashboardView: View {
 
             ScrollView {
                 VStack(spacing: 12) {
-                    LLMActivityHeatmapView(snapshots: appState.snapshots)
+                    ModelUsageSummaryCard { navigationPath.append(DashboardRoute.modelUsage) }
+                    LLMActivityHeatmapView(snapshots: appState.snapshots, modelUsage: appState.modelUsage)
                         .frame(height: 232)
 
                     ForEach(iPadInsightSnapshots) { snapshot in
@@ -865,7 +890,7 @@ struct DashboardView: View {
         var consumedProviders = Set<ProviderID>()
 
         if visibilityStore.isVisible(.heatmap) {
-            cards.append(.heatmap(snapshots: appState.snapshots))
+            cards.append(.heatmap(snapshots: appState.snapshots, modelUsage: appState.modelUsage))
         }
 
         let usageSnapshot = snapshots.first(where: { $0.providerID == .openai })
@@ -965,6 +990,7 @@ struct DashboardView: View {
     @ViewBuilder
     private func compactLayoutBody(isDesktop: Bool) -> some View {
         let snapshots = orderedCompactSnapshots()
+        ModelUsageSummaryCard { navigationPath.append(DashboardRoute.modelUsage) }
         if snapshots.isEmpty {
             GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
                 emptyDashboardState
@@ -994,7 +1020,7 @@ struct DashboardView: View {
     }
 
     private var compactHeatmapCard: some View {
-        LLMActivityHeatmapView(snapshots: appState.snapshots)
+        LLMActivityHeatmapView(snapshots: appState.snapshots, modelUsage: appState.modelUsage)
             .dashboardReorderable(
                 providerID: .heatmap,
                 reorderableProviderIDs: reorderableProviderIDs,
@@ -1684,7 +1710,7 @@ private struct HeaderMetricPill: View {
 private enum DashboardCardItem: Identifiable {
     case snapshot(QuotaSnapshot)
     case combinedCodex(usageSnapshot: QuotaSnapshot, telemetrySnapshot: QuotaSnapshot)
-    case heatmap(snapshots: [QuotaSnapshot])
+    case heatmap(snapshots: [QuotaSnapshot], modelUsage: ModelUsageArchive)
 
     var id: String {
         orderProviderID.rawValue
@@ -1697,7 +1723,7 @@ private enum DashboardCardItem: Identifiable {
         case .combinedCodex(let usageSnapshot, let telemetrySnapshot):
             return .codexCombined(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot)
         case .heatmap:
-            return nil
+            return .modelUsage
         }
     }
 
@@ -1723,13 +1749,14 @@ private enum DashboardCardItem: Identifiable {
                 telemetrySnapshot: telemetrySnapshot,
                 isRefreshing: isRefreshing
             )
-        case .heatmap(let snapshots):
-            LLMActivityHeatmapView(snapshots: snapshots)
+        case .heatmap(let snapshots, let modelUsage):
+            LLMActivityHeatmapView(snapshots: snapshots, modelUsage: modelUsage)
         }
     }
 }
 
 private enum DashboardRoute: Hashable {
+    case modelUsage
     case provider(_ snapshot: QuotaSnapshot)
     case codexCombined(usageSnapshot: QuotaSnapshot, telemetrySnapshot: QuotaSnapshot)
 }
