@@ -1,7 +1,7 @@
 import Foundation
 
 /// Disjoint token categories. Reasoning is a subset of output, never added to total.
-struct ModelTokenCounts: Codable, Hashable, Sendable {
+nonisolated struct ModelTokenCounts: Codable, Hashable, Sendable {
     var input: Double = 0
     var cacheRead: Double = 0
     var cacheWrite: Double = 0
@@ -18,13 +18,13 @@ struct ModelTokenCounts: Codable, Hashable, Sendable {
     }
 }
 
-enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable {
+nonisolated enum LocalModelUsageSource: String, CaseIterable, Codable, Sendable {
     case codex, claude
     var title: String { self == .codex ? "Codex" : "Claude Code" }
 }
 
 /// Local-only normalized record. IDs are one-way hashes; no prompts, paths or credentials.
-struct ModelUsageCall: Codable, Sendable {
+nonisolated struct ModelUsageCall: Codable, Sendable {
     var id: String
     var source: String
     var timestamp: Date
@@ -32,7 +32,7 @@ struct ModelUsageCall: Codable, Sendable {
     var tokens: ModelTokenCounts
 }
 
-enum ModelUsageWindow: String, CaseIterable, Identifiable {
+nonisolated enum ModelUsageWindow: String, CaseIterable, Identifiable {
     case hour = "1H", day = "24H", week = "7D", month = "30D", quarter = "90D"
     var id: String { rawValue }
     var seconds: TimeInterval {
@@ -48,7 +48,7 @@ enum ModelUsageWindow: String, CaseIterable, Identifiable {
 
 /// Five-minute UTC buckets for 90 days, UTC hours for the remainder of the year.
 /// Retaining hours (rather than local days) permits correct day bucketing after travel/DST.
-struct ModelUsageRollup: Codable, Hashable, Identifiable, Sendable {
+nonisolated struct ModelUsageRollup: Codable, Hashable, Identifiable, Sendable {
     var source: String
     var model: String
     var start: Date
@@ -66,7 +66,7 @@ struct ModelUsageRollup: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
-struct ModelUsageCoverage: Codable, Equatable, Sendable {
+nonisolated struct ModelUsageCoverage: Codable, Equatable, Sendable {
     var source: String
     var scannedAt: Date
     var firstEvent: Date?
@@ -77,7 +77,7 @@ struct ModelUsageCoverage: Codable, Equatable, Sendable {
     var status: String
 }
 
-struct ModelUsageArchive: Codable, Equatable, Sendable {
+nonisolated struct ModelUsageArchive: Codable, Equatable, Sendable {
     static let schemaVersion = 1
     var version = schemaVersion
     var rateVersion = ModelRateCatalog.version
@@ -111,9 +111,30 @@ struct ModelUsageArchive: Codable, Equatable, Sendable {
         guard data.count <= 80_000_000 else { throw ModelUsageError.invalidArchive }
         return try JSONDecoder().decode(Self.self, from: data).validated()
     }
+
+    /// Versioned compressed transport for CKAsset, independent of quota payloads.
+    func cloudEncoded() throws -> Data {
+        _ = try validated()
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(self)
+        guard data.count <= 80_000_000 else { throw ModelUsageError.invalidArchive }
+        var result = Data("LCMA1".utf8)
+        result.append(try (data as NSData).compressed(using: .lzfse) as Data)
+        return result
+    }
+
+    static func decodeCloud(_ data: Data) throws -> Self {
+        guard data.count <= 80_000_000 else { throw ModelUsageError.invalidArchive }
+        if data.prefix(5) == Data("LCMA1".utf8) {
+            let inflated = try (Data(data.dropFirst(5)) as NSData).decompressed(using: .lzfse) as Data
+            return try decode(inflated)
+        }
+        // Accept the uncompressed first-generation JSON representation too.
+        return try decode(data)
+    }
 }
 
-enum ModelUsageError: LocalizedError {
+nonisolated enum ModelUsageError: LocalizedError {
     case invalidArchive, database(String), folderAccess, incompleteFile
     var errorDescription: String? {
         switch self {
@@ -125,7 +146,7 @@ enum ModelUsageError: LocalizedError {
     }
 }
 
-struct ModelUsageTotals {
+nonisolated struct ModelUsageTotals {
     var tokens = ModelTokenCounts()
     var requests = 0
     var estimatedUSD: Double = 0
@@ -143,14 +164,14 @@ struct ModelUsageTotals {
     }
 }
 
-struct ModelUsageDay: Identifiable {
+nonisolated struct ModelUsageDay: Identifiable {
     var date: Date
     var tokens: Double = 0
     var requests: Int = 0
     var id: Date { date }
 }
 
-enum ModelUsageCalendar {
+nonisolated enum ModelUsageCalendar {
     static func days(_ rows: [ModelUsageRollup], count: Int, now: Date, calendar: Calendar = .current) -> [ModelUsageDay] {
         let today = calendar.startOfDay(for: now)
         var totals: [Date: ModelUsageDay] = [:]
@@ -182,7 +203,7 @@ enum ModelUsageCalendar {
     }
 }
 
-enum ModelUsageAggregation {
+nonisolated enum ModelUsageAggregation {
     static func bucketStart(_ date: Date, now: Date) -> (Date, Int) {
         let seconds = now.timeIntervalSince(date) <= 90 * 86400 ? 300 : 3600
         return (Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / Double(seconds)) * Double(seconds)), seconds)

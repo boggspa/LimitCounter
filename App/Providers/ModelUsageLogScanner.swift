@@ -71,7 +71,7 @@ actor ModelUsageLogScanner {
 
 /// Streaming parser: bounded lines and no tail/file-count truncation. Per-call records
 /// survive only as token counts, model, time and hashed identity in the local ledger.
-enum ModelUsageLogParser {
+nonisolated enum ModelUsageLogParser {
     static func hash(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
 
     static func read(url: URL, source: LocalModelUsageSource, fileID: String,
@@ -103,7 +103,7 @@ enum ModelUsageLogParser {
         return malformed
     }
 
-    struct State {
+    nonisolated struct State {
         let source: LocalModelUsageSource
         let fileID: String
         var model = "Unknown model"

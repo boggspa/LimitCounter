@@ -1,6 +1,6 @@
 import Foundation
 
-enum ModelPricingStatus: String, Codable {
+nonisolated enum ModelPricingStatus: String, Codable {
     case estimated, subscription, free, pending
     var title: String {
         switch self {
@@ -12,7 +12,7 @@ enum ModelPricingStatus: String, Codable {
     }
 }
 
-struct ModelRate: Identifiable, Decodable {
+nonisolated struct ModelRate: Identifiable, Decodable {
     var provider: String
     var model: String
     var input: Double
@@ -39,7 +39,7 @@ struct ModelRate: Identifiable, Decodable {
     }
 }
 
-enum ModelRateCatalog {
+nonisolated enum ModelRateCatalog {
     static let version = "2026-09-02"
     static let provenance = "TaskWraith ProviderRateService · 2026-09-02"
 

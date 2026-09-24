@@ -85,6 +85,17 @@ struct ModelUsageAnalyticsTests {
         let data = try JSONEncoder().encode(archive)
         let decoded = try ModelUsageArchive.decode(data)
         expect(decoded == archive, "Cloud payload round trip")
+        let compressed = try archive.cloudEncoded()
+        let cloudDecoded = try ModelUsageArchive.decodeCloud(compressed)
+        expect(cloudDecoded == archive, "Compressed CloudKit archive round trip")
+        let oldTransport = try ModelUsageArchive.decodeCloud(data)
+        expect(oldTransport == archive, "Uncompressed archive backward compatibility")
+        var largeArchive = archive
+        largeArchive.buckets = (0..<10000).map { index in
+            var row = rows[0]; row.start = now.addingTimeInterval(Double(-index * 300)); return row
+        }
+        let compact = try largeArchive.cloudEncoded()
+        expect(compact.count < 300_000, "Year rollups remain compact in cloud transport")
         let json = String(decoding: data, as: UTF8.self)
         expect(!json.contains("same-request") && !json.contains("file"), "Cloud payload has no request IDs or paths")
         var future = archive; future.version = 999

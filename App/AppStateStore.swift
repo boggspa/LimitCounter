@@ -8,10 +8,18 @@ import AppKit
 @MainActor
 enum CloudSnapshotBackgroundRefresher {
     static func refreshFromCloudKit() async -> Bool {
+        var analyticsChanged = false
+        if let remote = try? await CloudKitSyncService.shared.fetchModelUsage() {
+            let cached = ModelUsageArchiveStore.load()
+            if remote.generatedAt > cached.generatedAt {
+                do { try ModelUsageArchiveStore.save(remote); analyticsChanged = true }
+                catch { /* Preserve the last successfully saved archive. */ }
+            }
+        }
         do {
             let remoteSnapshots = try await CloudKitSyncService.shared.fetchRemoteSnapshots()
             guard !remoteSnapshots.isEmpty else {
-                return false
+                return analyticsChanged
             }
 
             let store = QuotaSnapshotStore.shared
@@ -23,10 +31,10 @@ enum CloudSnapshotBackgroundRefresher {
             }
 
             WidgetCenter.shared.reloadAllTimelines()
-            return didChange
+            return didChange || analyticsChanged
         } catch {
             print("[CloudSnapshotBackgroundRefresher] Cloud fetch skipped: \(error.localizedDescription)")
-            return false
+            return analyticsChanged
         }
     }
 }
@@ -51,6 +59,11 @@ final class AppStateStore: ObservableObject {
     @Published private(set) var lastSyncDate: Date?
     @Published private(set) var syncErrors: [ProviderID: String] = [:]
     @Published private(set) var usageAlerts: [CloudAlertPayload] = []
+    @Published private(set) var modelUsage = ModelUsageArchiveStore.load()
+    @Published private(set) var isIndexingModelUsage = false
+    @Published private(set) var modelUsageStatus: String?
+    @Published private(set) var modelUsageSyncError: String?
+    @Published var pendingModelUsageNavigation = false
     @Published private var usageResetHistory: [UsageResetHistoryEntry] = []
     @Published var pendingDeepLinkProviderID: ProviderID?
     #if os(iOS)
@@ -67,6 +80,8 @@ final class AppStateStore: ObservableObject {
 
     private let syncCoordinator: SyncCoordinator
     private let store: QuotaSnapshotStore
+    private let analyticsKeychain: KeychainService
+    private var modelUsageTask: Task<Void, Never>?
     private let cloudSync = CloudKitSyncService.shared
     private var hasBootstrapped = false
     private var cloudPublishTask: Task<Void, Never>?
@@ -97,6 +112,7 @@ final class AppStateStore: ObservableObject {
         let resolvedStore = store ?? .shared
         let resolvedKeychain = keychain ?? .shared
         self.store = resolvedStore
+        self.analyticsKeychain = resolvedKeychain
         let coordinator = SyncCoordinator(store: resolvedStore, keychain: resolvedKeychain)
 
         #if os(macOS)
@@ -285,6 +301,7 @@ final class AppStateStore: ObservableObject {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
+        refreshModelUsage()
 
         #if os(macOS)
         await syncCoordinator.syncAll(userInitiated: userInitiated) { [weak self] progressiveSnapshots, progressiveErrors in
@@ -324,6 +341,67 @@ final class AppStateStore: ObservableObject {
     func openUsageAlert(_ alert: CloudAlertPayload) {
         pendingDeepLinkProviderID = alert.providerID
         dismissUsageAlert(alert)
+    }
+
+    /// Runs independently of quota refresh, so a first historical backfill cannot
+    /// block the menu bar or short-window meters. A second refresh reuses the task.
+    func refreshModelUsage() {
+        guard modelUsageTask == nil else { return }
+        modelUsageTask = Task { @MainActor in
+            defer { modelUsageTask = nil; isIndexingModelUsage = false }
+            isIndexingModelUsage = true
+            modelUsageSyncError = nil
+            #if os(macOS)
+            var roots: [LocalModelUsageSource: URL] = [:]
+            var opened: [URL] = []
+            defer { for url in opened { url.stopAccessingSecurityScopedResource() } }
+            for source in LocalModelUsageSource.allCases {
+                let provider: ProviderID = source == .codex ? .codexTelemetry : .claude
+                guard let credential = analyticsKeychain.credential(for: provider) else { continue }
+                let bookmark = credential.bookmarkData ?? credential.extraFields?["bookmarkData"].flatMap { Data(base64Encoded: $0) }
+                if let bookmark {
+                    var stale = false
+                    if let url = try? URL(resolvingBookmarkData: bookmark, options: .withSecurityScope,
+                        relativeTo: nil, bookmarkDataIsStale: &stale) {
+                        if url.startAccessingSecurityScopedResource() { opened.append(url) }
+                        roots[source] = url
+                    }
+                } else if let path = credential.customEndpoint, path.hasPrefix("/") {
+                    // This path was explicitly saved in provider setup. No home-directory search.
+                    roots[source] = URL(fileURLWithPath: path)
+                }
+            }
+            guard !roots.isEmpty else {
+                modelUsageStatus = "Connect local Codex or Claude folders in provider setup to index model usage."
+                return
+            }
+            do {
+                let archive = try await ModelUsageLogScanner.shared.scan(roots: roots) { [weak self] message in
+                    await MainActor.run { self?.modelUsageStatus = message }
+                }
+                modelUsage = archive
+                modelUsageStatus = nil
+                do { try await cloudSync.publishModelUsage(archive) }
+                catch { modelUsageSyncError = "History is saved on this Mac. iCloud analytics sync is unavailable; refresh to retry." }
+            } catch {
+                modelUsageStatus = "History indexing could not finish. Cached history is still available; refresh to retry."
+            }
+            #else
+            do {
+                // The analytics subscription is independent of existing quota alerts.
+                try? await cloudSync.ensureModelUsageSubscription()
+                if let remote = try await cloudSync.fetchModelUsage() {
+                    if remote.generatedAt >= modelUsage.generatedAt {
+                        try ModelUsageArchiveStore.save(remote)
+                        modelUsage = remote
+                    }
+                    modelUsageStatus = nil
+                } else { modelUsageStatus = "Open Limit Counter on your Mac to collect and sync model history." }
+            } catch {
+                modelUsageSyncError = "iCloud analytics is unavailable. Showing the last saved history."
+            }
+            #endif
+        }
     }
 
     func dismissUsageAlert(_ alert: CloudAlertPayload) {

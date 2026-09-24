@@ -3,7 +3,7 @@ import SQLite3
 
 /// The compact, path-free archive is shared with the app and CloudKit. The request ledger
 /// stays on the collecting Mac and is never copied into defaults or cloud status records.
-enum ModelUsageArchiveStore {
+nonisolated enum ModelUsageArchiveStore {
     static var directory: URL {
         let manager = FileManager.default
         let root = manager.containerURL(forSecurityApplicationGroupIdentifier: "group.com.chrisizatt.LLMUsageCounter")
@@ -29,7 +29,7 @@ enum ModelUsageArchiveStore {
 /// Used serially by ModelUsageLogScanner. One row per file/call permits a changed or
 /// truncated file to replace its own contribution atomically. Global ranking collapses
 /// copied transcripts while retaining the most complete response, not the first chunk.
-final class ModelUsageLedger {
+nonisolated final class ModelUsageLedger {
     private var database: OpaquePointer?
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private let encoder = JSONEncoder()

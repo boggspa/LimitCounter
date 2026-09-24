@@ -106,11 +106,56 @@ final class CloudKitSyncService {
     private let cloudStatusAnalyticsRetention: TimeInterval = 60 * 24 * 60 * 60
     private let maxCloudStatusAnalyticsBuckets = 120
     private let maxCloudStatusPayloadBytes = 750_000
+    private let modelUsageRecordType = "ModelUsageArchive"
+    private let modelUsageRecordID = CKRecord.ID(recordName: "model-usage-rollups-v1")
 
     init() {
         database = container.privateCloudDatabase
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
+    }
+
+    /// Separate asset: never put a year's rollups into the quota/widget snapshot.
+    /// The latest collecting Mac is the publisher, matching the existing status model.
+    func publishModelUsage(_ archive: ModelUsageArchive) async throws {
+        guard try await container.accountStatus() == .available else { throw CloudKitSyncError.accountUnavailable }
+        let record: CKRecord
+        do {
+            record = try await database.record(for: modelUsageRecordID)
+            if let date = record["generatedAt"] as? Date, date > archive.generatedAt { return }
+        } catch let error as CKError where error.code == .unknownItem {
+            record = CKRecord(recordType: modelUsageRecordType, recordID: modelUsageRecordID)
+        }
+        let payload = try archive.cloudEncoded()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("model-usage-\(UUID().uuidString).lzfse")
+        try payload.write(to: url, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: url) }
+        record["archive"] = CKAsset(fileURL: url)
+        record["generatedAt"] = archive.generatedAt as NSDate
+        record["schemaVersion"] = ModelUsageArchive.schemaVersion as NSNumber
+        record["rateVersion"] = archive.rateVersion as NSString
+        _ = try await database.save(record)
+    }
+
+    func fetchModelUsage() async throws -> ModelUsageArchive? {
+        guard try await container.accountStatus() == .available else { throw CloudKitSyncError.accountUnavailable }
+        do {
+            let record = try await database.record(for: modelUsageRecordID)
+            guard let asset = record["archive"] as? CKAsset, let url = asset.fileURL else { return nil }
+            let data = try Data(contentsOf: url)
+            return try ModelUsageArchive.decodeCloud(data)
+        } catch let error as CKError where error.code == .unknownItem { return nil }
+    }
+
+    func ensureModelUsageSubscription() async throws {
+        let id = "model-usage-rollups-silent-v1"
+        guard !defaults.bool(forKey: "cloudkit.\(id)") else { return }
+        let subscription = CKQuerySubscription(recordType: modelUsageRecordType, predicate: NSPredicate(value: true),
+            subscriptionID: id, options: [.firesOnRecordCreation, .firesOnRecordUpdate])
+        let info = CKSubscription.NotificationInfo(); info.shouldSendContentAvailable = true
+        subscription.notificationInfo = info
+        _ = try await database.modifySubscriptions(saving: [subscription], deleting: [])
+        defaults.set(true, forKey: "cloudkit.\(id)")
     }
 
     func ensureViewerSubscriptions() async throws {
