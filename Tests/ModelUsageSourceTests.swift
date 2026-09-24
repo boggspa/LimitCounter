@@ -237,6 +237,8 @@ struct ModelUsageSourceTests {
                "A Vibe session keeps its reported split, as one run with an unreported call count")
         expect(measured.source == "mistral" && measured.model == "mistral-medium-3.5", "…under Mistral and its active model")
         close(measured.timestamp.timeIntervalSince1970, 1_788_436_736.5, "…dated at its start")
+        close(ModelRateCatalog.costRange(source: measured.source, model: measured.model, tokens: measured.tokens, calls: 0)?.low,
+              (64904 * 1.5 + 2176 * 0.15 + 661 * 7.5) / 1_000_000, "Vibe's cache reads price at Mistral's cached-input rate, as TaskWraith's table has it")
         expect(MistralVibeSessionParser.call(from: session("v1", start: "2026-09-03T11:58:56Z"), fileID: "other", times: times)?.id == measured.id,
                "A session's identity is its id, whichever file holds it")
         let early = MistralVibeSessionParser.call(from: session("v0", start: "2026-07-26T09:40:07Z", cached: nil), fileID: "meta", times: times)!
