@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		FA1200010000000000000001 /* ModelUsageAnalytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000001 /* ModelUsageAnalytics.swift */; };
+		FA1200010000000000000002 /* ModelRateCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000002 /* ModelRateCatalog.swift */; };
+		FA1200010000000000000003 /* ModelUsageLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000003 /* ModelUsageLedger.swift */; };
+		FA1200010000000000000004 /* ModelUsageLogScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000004 /* ModelUsageLogScanner.swift */; };
 		0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52ECCBB7247196B57F543B01 /* MenuBarController.swift */; };
 		1F9EEC85B141691DB92F7A79 /* QuotaSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */; };
 		25227AAAD370B53544107D04 /* ProviderDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6F7AA1ACA8CFD5FBF70D259 /* ProviderDetailView.swift */; };
@@ -75,6 +79,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		FA1200020000000000000001 /* ModelUsageAnalytics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelUsageAnalytics.swift; sourceTree = SOURCE_ROOT; };
+		FA1200020000000000000002 /* ModelRateCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelRateCatalog.swift; sourceTree = SOURCE_ROOT; };
+		FA1200020000000000000003 /* ModelUsageLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Storage/ModelUsageLedger.swift; sourceTree = SOURCE_ROOT; };
+		FA1200020000000000000004 /* ModelUsageLogScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Providers/ModelUsageLogScanner.swift; sourceTree = SOURCE_ROOT; };
 		005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GeminiProviderClient.swift; path = App/Providers/GeminiProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaSnapshotStore.swift; path = Shared/Storage/QuotaSnapshotStore.swift; sourceTree = SOURCE_ROOT; };
 		14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; name = AIUsageWidgetExtension.macOS.entitlements; path = Widget/AIUsageWidgetExtension.macOS.entitlements; sourceTree = SOURCE_ROOT; };
@@ -162,6 +170,7 @@
 			children = (
 				0D10CF569EFBA0D390329619 /* QuotaSnapshotStore.swift */,
 				30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */,
+				FA1200020000000000000003 /* ModelUsageLedger.swift */,
 			);
 			path = Storage;
 			sourceTree = "<group>";
@@ -204,6 +213,7 @@
 			isa = PBXGroup;
 			children = (
 				8D2A9E0A7F7A4D6FB4C8D7D2 /* CodexTelemetryProviderClient.swift */,
+				FA1200020000000000000004 /* ModelUsageLogScanner.swift */,
 				AD8AD241B3C8CC6591228FB6 /* ProviderClient.swift */,
 				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
 				FA1200010000000000000001 /* AntigravityProviderClient.swift */,
@@ -272,6 +282,8 @@
 			children = (
 				C7D74721EA3E8C99B51CF09D /* MockData.swift */,
 				EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */,
+				FA1200020000000000000001 /* ModelUsageAnalytics.swift */,
+				FA1200020000000000000002 /* ModelRateCatalog.swift */,
 				EEAA000100000000000000F1 /* CloudAlertPayload.swift */,
 				A412D664FC277AE00924A744 /* QuotaResetDetector.swift */,
 			);
@@ -431,6 +443,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				F60686F0D9B2C9D255581F5B /* MockData.swift in Sources */,
+				FA1200010000000000000001 /* ModelUsageAnalytics.swift in Sources */,
+				FA1200010000000000000002 /* ModelRateCatalog.swift in Sources */,
+				FA1200010000000000000003 /* ModelUsageLedger.swift in Sources */,
+				FA1200010000000000000004 /* ModelUsageLogScanner.swift in Sources */,
 				8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */,
 				35C9EA7C7BB8D2CE2FC27BE1 /* QuotaSnapshotStore.swift in Sources */,
 				EDE1E82AC980C48281C2DF29 /* QuotaCardView.swift in Sources */,
