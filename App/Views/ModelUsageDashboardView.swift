@@ -343,7 +343,7 @@ struct ModelUsageDashboardView: View {
                         } label: {
                             VStack(alignment: .leading, spacing: 1) {
                                 HStack(spacing: 6) {
-                                    Circle().fill(UsageColor.provider(rate.provider)).frame(width: 6, height: 6)
+                                    Circle().fill(UsageColor.provider(ModelUsageDisplayIdentity.provider(model: rate.model, source: rate.provider))).frame(width: 6, height: 6)
                                     Text(rate.model).font(.system(size: 11, weight: .semibold))
                                 }
                                 Text("\(rate.provider.capitalized) · \(rate.isLocalInference ? "Local inference" : rate.status.title) · \(rate.context.map { ModelUsageFormat.tokens(Double($0)) + " context" } ?? "context not listed")")
