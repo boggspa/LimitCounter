@@ -222,6 +222,32 @@ private func testClaudeServiceNameMatchesTheCLI() throws {
     try expectEqual(explicitDefault.first, "Claude Code-credentials", "naming the default folder explicitly is still the default")
 }
 
+private func testClaudeCodeRewriteOutdatesTheCopy() throws {
+    // A /login to another account rewrites the CLI's item while our copy
+    // still has hours left; the copy must not keep answering for it.
+    let copied = Date(timeIntervalSince1970: 1_790_300_770)
+    try expect(
+        ClaudeConfigDirKeychain.claudeCodeRewroteItem(claudeCodeModifiedAt: copied.addingTimeInterval(1), copyModifiedAt: copied),
+        "a CLI write after our copy outdates it"
+    )
+    try expect(
+        !ClaudeConfigDirKeychain.claudeCodeRewroteItem(claudeCodeModifiedAt: copied, copyModifiedAt: copied),
+        "the write we copied, stamped in the same second, is not a newer one"
+    )
+    try expect(
+        !ClaudeConfigDirKeychain.claudeCodeRewroteItem(claudeCodeModifiedAt: copied.addingTimeInterval(-3_600), copyModifiedAt: copied),
+        "an item older than our copy is the one we copied"
+    )
+    try expect(
+        !ClaudeConfigDirKeychain.claudeCodeRewroteItem(claudeCodeModifiedAt: nil, copyModifiedAt: copied),
+        "with no CLI item to compare, the copy stands"
+    )
+    try expect(
+        !ClaudeConfigDirKeychain.claudeCodeRewroteItem(claudeCodeModifiedAt: copied, copyModifiedAt: nil),
+        "with no copy date to compare, nothing is outdated"
+    )
+}
+
 // MARK: - Fingerprints and detector gating
 
 private func testFingerprintGating() throws {
@@ -322,6 +348,7 @@ private enum ProviderAccountTestRunner {
         try await MainActor.run { try testRegistryAddRenameRemoveAndOrder() }
         try testProviderOnlyStoresHoldNoSecondaryAccounts()
         try testClaudeServiceNameMatchesTheCLI()
+        try testClaudeCodeRewriteOutdatesTheCopy()
         try testFingerprintGating()
         try testDetectorStateIsPerAccount()
         try testResetEventsCarryTheAccount()

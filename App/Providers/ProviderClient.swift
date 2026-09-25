@@ -9243,6 +9243,21 @@ nonisolated enum ClaudeConfigDirKeychain {
         return hashed
     }
 
+    /// Whether Claude Code has rewritten its item since Limit Counter copied
+    /// it.
+    ///
+    /// Verified against the CLI (2.1.282): every renewal and every `/login`,
+    /// including one to a different account, rewrites the item with
+    /// `security add-generic-password -U`, and `/logout` deletes it. So a
+    /// newer modification date means our copy may be stale, or not even the
+    /// same account. Keychain dates resolve to whole seconds and the copy is
+    /// only ever taken after the CLI's write, so an equal date is our copy of
+    /// that write. Without both dates there is nothing to compare.
+    static func claudeCodeRewroteItem(claudeCodeModifiedAt: Date?, copyModifiedAt: Date?) -> Bool {
+        guard let claudeCodeModifiedAt, let copyModifiedAt else { return false }
+        return claudeCodeModifiedAt > copyModifiedAt
+    }
+
     private static func pathSpellings(_ path: String) -> [String] {
         var seen: [String] = []
         let withoutSlash = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
@@ -9327,6 +9342,36 @@ private nonisolated struct ClaudeKeychainStore {
     private static var account: String { NSUserName() }
 
     func readBackup() -> ClaudeOAuthCredentials? { Self.read(service: backupService) }
+
+    /// Whether Claude Code has rewritten its item since `writeBackup` last
+    /// copied it — the only place our item is written.
+    ///
+    /// Only the two items' modification dates are read. Attributes carry no
+    /// secret, so this needs no grant on the CLI's item, cannot prompt, and
+    /// leaves the read budget for the credential itself.
+    func claudeCodeRewroteSinceBackup() -> Bool {
+        ClaudeConfigDirKeychain.claudeCodeRewroteItem(
+            claudeCodeModifiedAt: cliServices.lazy.compactMap { Self.modificationDate(service: $0) }.first,
+            copyModifiedAt: Self.modificationDate(service: backupService)
+        )
+    }
+
+    private static func modificationDate(service: String) -> Date? {
+        let query: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecUseAuthenticationContext as String: ClaudeCodeKeychainReadBudget().authenticationContext,
+            kSecMatchLimit as String:  kSecMatchLimitOne
+        ]
+        var item: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let attributes = item as? [String: Any] else {
+            return nil
+        }
+        return attributes[kSecAttrModificationDate as String] as? Date
+    }
 
     /// Returns Claude Code's current credential and refreshes our cache of it.
     ///
@@ -9676,7 +9721,8 @@ private actor ClaudeOAuthTokenManager {
     }
 
     /// Returns a usable access token, re-reading Claude Code's item whenever
-    /// our cached copy is within `cacheBuffer` of expiry.
+    /// our cached copy is within `cacheBuffer` of expiry or the CLI has
+    /// rewritten its item since we copied it.
     func currentAccessTokenFromKeychain(
         readBudget: ClaudeCodeKeychainReadBudget?,
         store: ClaudeKeychainStore
@@ -9684,8 +9730,12 @@ private actor ClaudeOAuthTokenManager {
         let cached = store.readBackup()
 
         // Steady state: the cache still has real time left, so this costs
-        // neither cross-app access nor a round trip.
-        if let cached, !cached.needsRefresh(buffer: cacheBuffer) {
+        // neither cross-app access nor a round trip — unless Claude Code has
+        // rewritten its item since we copied it. A `/login` to another
+        // account does exactly that, and our copy would otherwise keep
+        // reporting the old account until it nears expiry, hours later.
+        if let cached, !cached.needsRefresh(buffer: cacheBuffer),
+           readBudget == nil || !store.claudeCodeRewroteSinceBackup() {
             return .token(cached.accessToken)
         }
 
@@ -9795,6 +9845,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
         // Resolution order:
         //   1. Token typed/pasted in Settings (always honored as-is)
         //   2. Our cached copy of Claude Code's OAuth token, while it is fresh
+        //      and the CLI has not rewritten its item since we copied it
         //   3. A re-read of Claude Code's keychain item (silent in background)
         //   4. ~/.claude/.oauth_token file (headless / CI installs)
         let manualToken = credentials?.normalizedAccessToken
