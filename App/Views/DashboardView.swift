@@ -1908,6 +1908,17 @@ extension View {
 /// alone. Gesture state resets on both completion and cancellation, so a drag
 /// cannot leave a meter looking selected when it misses a drop target.
 private struct MeterDragHandle: View {
+    /// The handle's slot in a row. On iOS the touch area reaches past the slot,
+    /// over the meter's own bar, so a finger-sized target doesn't make compact
+    /// rows taller than their macOS twins.
+    #if os(iOS)
+    static let slot = CGSize(width: 22, height: 18)
+    static let touchArea = CGSize(width: 44, height: 32)
+    #else
+    static let slot = CGSize(width: 15, height: 18)
+    static let touchArea = slot
+    #endif
+
     let meterKey: String
     let scope: String
     let reorderableKeys: [String]
@@ -1920,12 +1931,12 @@ private struct MeterDragHandle: View {
         Image(systemName: "line.3.horizontal")
             .font(.system(size: 8, weight: .semibold))
             .foregroundStyle(isDragging ? Color.primary : Color.secondary.opacity(0.65))
-            #if os(iOS)
-            .frame(width: 44, height: 44)
-            #else
-            .frame(width: 15, height: 18)
-            #endif
-            .contentShape(Rectangle())
+            .frame(width: Self.slot.width, height: Self.slot.height)
+            .contentShape(
+                Rectangle()
+                    .size(Self.touchArea)
+                    .offset(x: (Self.slot.width - Self.touchArea.width) / 2, y: (Self.slot.height - Self.touchArea.height) / 2)
+            )
             .accessibilityLabel("Reorder \(accessibilityName)")
             .gesture(
                 DragGesture(minimumDistance: 4, coordinateSpace: .global)
@@ -2224,11 +2235,7 @@ struct PeriodCompactDashboardCardView: View {
                         accessibilityName: row.label
                     )
                 } else {
-                    #if os(iOS)
-                    Color.clear.frame(width: 44, height: 44)
-                    #else
-                    Color.clear.frame(width: 15, height: 18)
-                    #endif
+                    Color.clear.frame(width: MeterDragHandle.slot.width, height: MeterDragHandle.slot.height)
                 }
 
                 ProviderBrandIconView(providerID: row.providerID, size: 13)
