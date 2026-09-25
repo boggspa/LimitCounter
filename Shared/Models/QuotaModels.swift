@@ -289,7 +289,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .ollama:
             return "Uses your Ollama session cookie (`__Secure-session`) to read Session usage and Weekly usage meters, or the monthly included-usage dollar budget ($X of $Y), from ollama.com/settings."
         case .openrouter:
-            return "Uses an OpenRouter API key to read usage tracking and spend from the official `https://openrouter.ai/api/v1/auth/key` endpoint."
+            return "Uses an OpenRouter API key to read spend and any key spending cap from the official `https://openrouter.ai/api/v1/auth/key` endpoint. The credit meter uses the total credit you enter, or reads `/api/v1/credits` exactly when you add a management key."
         case .qwen:
             return "Uses an imported Alibaba Cloud Model Studio web session to read the personal token plan quota meter (monthly on current Standard plans, 7-day on older ones), plan metadata, and reset date. A manual percent anchor is used when no session is imported."
         case .mimo:
@@ -401,7 +401,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .ollama:
             return "Stores your Ollama `__Secure-session` cookie securely in macOS Keychain. Used only to read your usage meters from ollama.com/settings."
         case .openrouter:
-            return "Uses only the OpenRouter API key you enter to request the documented usage tracking endpoint at `https://openrouter.ai/api/v1/auth/key`."
+            return "Uses only the OpenRouter API key you enter to request the documented usage tracking endpoint at `https://openrouter.ai/api/v1/auth/key`. An optional management key is stored in Keychain and sent only to `https://openrouter.ai/api/v1/credits`."
         case .qwen:
             return "Stores your imported Alibaba Cloud Model Studio web session securely in macOS Keychain. Used only to read your token plan quota meter from the Model Studio console."
         case .mimo:

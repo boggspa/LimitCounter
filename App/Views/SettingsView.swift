@@ -1379,7 +1379,8 @@ struct ProviderCredentialView: View {
             .listRowBackground(Color.white.opacity(0.04))
 
             if providerID == .mistral || providerID == .deepseek || providerID == .cerebras
-                 || providerID == .meta || providerID == .qwen || providerID == .mimo {
+                 || providerID == .meta || providerID == .qwen || providerID == .mimo
+                 || providerID == .openrouter {
                 billingAnchorSection
              }
 
@@ -1481,7 +1482,7 @@ struct ProviderCredentialView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if providerID == .openrouter {
-                    Text("Paste your OpenRouter API key (`sk-or-v1-...`) above. Limit Counter securely saves it to macOS Keychain and requests `https://openrouter.ai/api/v1/auth/key` to track live spend, balance limits, and rate limits.")
+                    Text("Paste your OpenRouter API key (`sk-or-v1-...`) above. Limit Counter securely saves it to macOS Keychain and requests `https://openrouter.ai/api/v1/auth/key` to track live spend and any spending cap on the key. Add your loaded credit or a management key under Billing Anchor for a credit meter.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1613,6 +1614,19 @@ struct ProviderCredentialView: View {
                     text: extraFieldBinding(SpendProviderCredentialField.manualTopUpTotal)
                  )
                 Text("Limit Counter subtracts the official live remaining balance from this cumulative top-up total to derive the credit-used meter. Update it whenever you add more credit.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+             } else if providerID == .openrouter {
+                TextField(
+                    "Total credit loaded (USD)",
+                    text: extraFieldBinding(OpenRouterCredentialField.creditLoaded)
+                )
+                SecureField(
+                    "Management key (optional)",
+                    text: extraFieldBinding(OpenRouterCredentialField.managementKey)
+                )
+                Text("Enter the total credit you have loaded to see this key's spend as a credit meter, and update it after each top-up. A management key (OpenRouter → Settings → Management Keys) makes the meter exact and account-wide instead: Limit Counter reads your credits from `/api/v1/credits` and ignores the figure above. The management key stays in Keychain and is only sent to openrouter.ai.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

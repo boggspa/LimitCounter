@@ -12407,7 +12407,7 @@ public struct OllamaProviderClient: ProviderClient {
 // MARK: - OpenRouter Provider Client
 
 /// OpenRouter API response structures for the /api/v1/auth/key endpoint
-/// See: https://openrouter.ai/api/v1/auth/key
+/// See: https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key
 struct OpenRouterKeyResponse: Codable {
     let data: OpenRouterKeyData?
 }
@@ -12416,14 +12416,58 @@ struct OpenRouterKeyData: Codable {
     let label: String?
     let usage: Double?        // Total USD spent
     let limit: Double?        // USD limit (null = unlimited)
+    let limitRemaining: Double?
+    /// `daily`, `weekly` or `monthly`; `nil` for a limit that never resets.
+    let limitReset: String?
+    let usageDaily: Double?
+    let usageWeekly: Double?
+    let usageMonthly: Double?
     let isFreeTier: Bool?
+    let isManagementKey: Bool?
+    /// The older name for `isManagementKey`.
+    let isProvisioningKey: Bool?
     let rateLimit: OpenRouterRateLimit?
+
+    init(
+        label: String? = nil,
+        usage: Double? = nil,
+        limit: Double? = nil,
+        limitRemaining: Double? = nil,
+        limitReset: String? = nil,
+        usageDaily: Double? = nil,
+        usageWeekly: Double? = nil,
+        usageMonthly: Double? = nil,
+        isFreeTier: Bool? = nil,
+        isManagementKey: Bool? = nil,
+        isProvisioningKey: Bool? = nil,
+        rateLimit: OpenRouterRateLimit? = nil
+    ) {
+        self.label = label
+        self.usage = usage
+        self.limit = limit
+        self.limitRemaining = limitRemaining
+        self.limitReset = limitReset
+        self.usageDaily = usageDaily
+        self.usageWeekly = usageWeekly
+        self.usageMonthly = usageMonthly
+        self.isFreeTier = isFreeTier
+        self.isManagementKey = isManagementKey
+        self.isProvisioningKey = isProvisioningKey
+        self.rateLimit = rateLimit
+    }
 
     enum CodingKeys: String, CodingKey {
         case label
         case usage
         case limit
+        case limitRemaining = "limit_remaining"
+        case limitReset = "limit_reset"
+        case usageDaily = "usage_daily"
+        case usageWeekly = "usage_weekly"
+        case usageMonthly = "usage_monthly"
         case isFreeTier = "is_free_tier"
+        case isManagementKey = "is_management_key"
+        case isProvisioningKey = "is_provisioning_key"
         case rateLimit = "rate_limit"
     }
 }
@@ -12433,9 +12477,268 @@ struct OpenRouterRateLimit: Codable {
     let interval: String?
 }
 
+/// `GET /api/v1/credits`: everything bought and spent on the account. Only a
+/// management key may read it.
+struct OpenRouterCreditsResponse: Codable {
+    let data: OpenRouterCredits?
+}
+
+struct OpenRouterCredits: Codable, Equatable {
+    let totalCredits: Double
+    let totalUsage: Double
+
+    enum CodingKeys: String, CodingKey {
+        case totalCredits = "total_credits"
+        case totalUsage = "total_usage"
+    }
+}
+
+enum OpenRouterCredentialField {
+    /// The total credit the user loaded, stored in the same field as
+    /// DeepSeek's and Meta's top-up totals
+    /// (`SpendProviderCredentialField.manualTopUpTotal`).
+    static let creditLoaded = "manualTopUpTotal"
+    /// An optional management key, used only to read `/api/v1/credits`.
+    static let managementKey = "openRouterManagementKey"
+}
+
+/// What `/api/v1/credits` said, if it was asked.
+enum OpenRouterCreditsReading: Equatable {
+    /// No management key to ask with.
+    case unavailable
+    case read(OpenRouterCredits)
+    /// OpenRouter refused the management key.
+    case rejected
+    /// The request failed or returned something unreadable.
+    case failed
+}
+
+/// Turns OpenRouter's key and credit readings into meters.
+///
+/// Prepaid credit leads, as a "Credit used" meter like DeepSeek's and
+/// Cerebras's: exact and account-wide from `/credits` when a management key
+/// can read it, or else this key's spend against the credit the user says
+/// they loaded. A key with its own spending cap gets a meter for the cap's
+/// current period.
+enum OpenRouterSnapshotBuilder {
+    static func snapshot(
+        key: OpenRouterKeyData,
+        credits: OpenRouterCreditsReading,
+        creditLoaded: Double?,
+        now: Date = Date()
+    ) -> QuotaSnapshot {
+        let usage = max(key.usage ?? 0, 0)
+        var windows: [QuotaWindow] = []
+        var balances: [QuotaBalance] = []
+        var stats: [QuotaStat] = []
+        var signals: [QuotaSignal] = []
+
+        let creditsNote: String? = switch credits {
+        case .rejected: "OpenRouter refused the management key"
+        case .failed: "OpenRouter credits were unavailable"
+        case .unavailable, .read: nil
+        }
+
+        if case .read(let account) = credits, account.totalCredits > 0 {
+            let used = max(account.totalUsage, 0)
+            windows.append(QuotaWindow(
+                label: "Credit used",
+                windowKind: .custom,
+                used: used,
+                total: account.totalCredits,
+                unit: "USD",
+                subtitle: "Official OpenRouter account credits"
+            ))
+            balances.append(QuotaBalance(
+                label: "Credit remaining",
+                amount: max(account.totalCredits - used, 0),
+                unit: "USD",
+                subtitle: "Official OpenRouter account credits"
+            ))
+        } else if let creditLoaded, creditLoaded > 0 {
+            let subtitle = creditsNote.map { "\($0); using the credit you entered" }
+                ?? "Credit you loaded minus this key's spend"
+            windows.append(QuotaWindow(
+                label: "Credit used",
+                windowKind: .custom,
+                used: usage,
+                total: creditLoaded,
+                unit: "USD",
+                subtitle: subtitle
+            ))
+            balances.append(QuotaBalance(
+                label: "Credit remaining",
+                amount: max(creditLoaded - usage, 0),
+                unit: "USD",
+                subtitle: subtitle
+            ))
+        }
+
+        if let limit = key.limit, limit > 0 {
+            let period = OpenRouterLimitPeriod(key.limitReset)
+            let remaining = key.limitRemaining.map { min(max($0, 0), limit) }
+            // `usage` never resets, so a resetting cap reads its own period.
+            let periodUsage = period.usage(in: key) ?? usage
+            windows.append(QuotaWindow(
+                label: "Key limit",
+                windowKind: period.windowKind,
+                used: remaining.map { limit - $0 } ?? min(periodUsage, limit),
+                total: limit,
+                resetDate: period.nextReset(after: now),
+                unit: "USD",
+                subtitle: period.subtitle
+            ))
+            balances.append(QuotaBalance(
+                label: "Key limit remaining",
+                amount: remaining ?? max(limit - periodUsage, 0),
+                unit: "USD",
+                subtitle: "Spending cap on this API key"
+            ))
+        }
+
+        if windows.isEmpty {
+            windows.append(QuotaWindow(
+                label: "Total spend",
+                windowKind: .monthly,
+                used: usage,
+                total: nil,
+                resetDate: nil,
+                unit: "USD",
+                subtitle: creditsNote ?? "Official OpenRouter API"
+            ))
+        }
+
+        // OpenRouter's usage periods are UTC, and its weeks start on Monday.
+        let periodStats: [(String, Double?, String)] = [
+            ("Today", key.usageDaily, "This key, current UTC day"),
+            ("This week", key.usageWeekly, "This key, current UTC week"),
+            ("This month", key.usageMonthly, "This key, current UTC month")
+        ]
+        for (label, value, subtitle) in periodStats {
+            if let value {
+                stats.append(QuotaStat(label: label, value: max(value, 0), unit: "USD", subtitle: subtitle))
+            }
+        }
+        if !stats.isEmpty {
+            stats.append(QuotaStat(label: "All time", value: usage, unit: "USD", subtitle: "This key"))
+        }
+
+        // The legacy field is documented to always report -1 now.
+        if let rateLimit = key.rateLimit, let requests = rateLimit.requests, requests > 0,
+           let interval = rateLimit.interval {
+            stats.append(
+                QuotaStat(
+                    label: "Rate limit",
+                    value: Double(requests),
+                    unit: "req / \(interval)",
+                    subtitle: "API rate limit"
+                )
+            )
+        }
+
+        // Add free tier signal if applicable
+        if key.isFreeTier == true {
+            signals.append(
+                QuotaSignal(
+                    kind: .unexpectedRecovery,
+                    title: "Free tier",
+                    message: "This key is on the OpenRouter free tier",
+                    severity: .info
+                )
+            )
+        }
+
+        // Determine plan name
+        // Sanitize label to avoid displaying API keys - use "API Credits" if label contains key material
+        let safeLabel = key.label?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let isLikelyAPIKey = safeLabel?.hasPrefix("sk-") == true || safeLabel?.hasPrefix("sk-or-") == true
+        let planName: String? = (isLikelyAPIKey || safeLabel?.isEmpty == true) ? "API Credits" : safeLabel
+
+        return QuotaSnapshot(
+            providerID: .openrouter,
+            displayName: ProviderID.openrouter.snapshotDisplayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: [],
+            analyticsBuckets: [],
+            fetchState: .success,
+            fetchedAt: now
+        )
+    }
+}
+
+/// How often an OpenRouter key's spending cap starts over: at midnight UTC,
+/// with weeks running Monday to Sunday.
+private enum OpenRouterLimitPeriod {
+    case daily
+    case weekly
+    case monthly
+    case never
+
+    init(_ rawValue: String?) {
+        switch rawValue?.lowercased() {
+        case "daily": self = .daily
+        case "weekly": self = .weekly
+        case "monthly": self = .monthly
+        default: self = .never
+        }
+    }
+
+    var windowKind: QuotaWindowKind {
+        switch self {
+        case .daily: .daily
+        case .weekly: .weekly
+        case .monthly: .monthly
+        case .never: .custom
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .daily: "Daily spending cap on this API key"
+        case .weekly: "Weekly spending cap on this API key"
+        case .monthly: "Monthly spending cap on this API key"
+        case .never: "Spending cap on this API key"
+        }
+    }
+
+    func usage(in key: OpenRouterKeyData) -> Double? {
+        switch self {
+        case .daily: key.usageDaily
+        case .weekly: key.usageWeekly
+        case .monthly: key.usageMonthly
+        case .never: key.usage
+        }
+    }
+
+    func nextReset(after now: Date) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let utc = TimeZone(identifier: "UTC") else { return nil }
+        calendar.timeZone = utc
+        switch self {
+        case .daily:
+            return calendar.nextDate(after: now, matching: DateComponents(hour: 0, minute: 0, second: 0), matchingPolicy: .nextTime)
+        case .weekly:
+            // Weekday 2 is Monday in the Gregorian calendar.
+            return calendar.nextDate(after: now, matching: DateComponents(hour: 0, minute: 0, second: 0, weekday: 2), matchingPolicy: .nextTime)
+        case .monthly:
+            return calendar.nextDate(after: now, matching: DateComponents(day: 1, hour: 0, minute: 0, second: 0), matchingPolicy: .nextTime)
+        case .never:
+            return nil
+        }
+    }
+}
+
 public struct OpenRouterProviderClient: ProviderClient {
     public let providerID: ProviderID = .openrouter
     private let session: URLSession
+
+    /// Always openrouter.ai: the management key never goes to a custom
+    /// endpoint.
+    private static let creditsURL = URL(string: "https://openrouter.ai/api/v1/credits")!
 
     public init(session: URLSession = .shared) {
         self.session = session
@@ -12496,101 +12799,55 @@ public struct OpenRouterProviderClient: ProviderClient {
             throw ProviderFetchError.parsingError("OpenRouter response missing 'data' field")
         }
 
-        let now = Date()
-        let usageUSD = keyData.usage ?? 0
-        let limitUSD = keyData.limit
-
-        var windows: [QuotaWindow] = []
-        var balances: [QuotaBalance] = []
-        var stats: [QuotaStat] = []
-        var signals: [QuotaSignal] = []
-
-        // Build spend window
-        windows.append(
-            QuotaWindow(
-                label: "Total spend",
-                windowKind: .monthly,
-                used: usageUSD,
-                total: limitUSD,
-                resetDate: nil,
-                unit: "USD",
-                subtitle: "Official OpenRouter API"
-            )
+        let fields = credentials?.extraFields ?? [:]
+        let credits = await fetchCredits(
+            managementKey: managementKey(apiKey: token, keyData: keyData, fields: fields)
         )
-
-        // Build balances
-        if let limitUSD = limitUSD {
-            let remaining = max(0, limitUSD - usageUSD)
-            balances.append(
-                QuotaBalance(
-                    label: "Remaining budget",
-                    amount: remaining,
-                    unit: "USD",
-                    subtitle: "Limit minus spend"
-                )
-            )
-            balances.append(
-                QuotaBalance(
-                    label: "Credit limit",
-                    amount: limitUSD,
-                    unit: "USD",
-                    subtitle: "Configured budget"
-                )
-            )
-        } else {
-            // Unlimited budget
-            balances.append(
-                QuotaBalance(
-                    label: "Credit limit",
-                    amount: 0,
-                    unit: "USD",
-                    subtitle: "Unlimited"
-                )
-            )
-        }
-
-        // Build rate limit stat if available
-        if let rateLimit = keyData.rateLimit, let requests = rateLimit.requests, let interval = rateLimit.interval {
-            stats.append(
-                QuotaStat(
-                    label: "Rate limit",
-                    value: Double(requests),
-                    unit: "req / \(interval)",
-                    subtitle: "API rate limit"
-                )
-            )
-        }
-
-        // Add free tier signal if applicable
-        if keyData.isFreeTier == true {
-            signals.append(
-                QuotaSignal(
-                    kind: .unexpectedRecovery,
-                    title: "Free tier",
-                    message: "This key is on the OpenRouter free tier",
-                    severity: .info
-                )
-            )
-        }
-
-        // Determine plan name
-        // Sanitize label to avoid displaying API keys - use "API Credits" if label contains key material
-        let safeLabel = keyData.label?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        let isLikelyAPIKey = safeLabel?.hasPrefix("sk-") == true || safeLabel?.hasPrefix("sk-or-") == true
-        let planName: String? = (isLikelyAPIKey || safeLabel?.isEmpty == true) ? "API Credits" : safeLabel
-
-        return QuotaSnapshot(
-            providerID: .openrouter,
-            displayName: ProviderID.openrouter.snapshotDisplayName,
-            planName: planName,
-            windows: windows,
-            stats: stats,
-            balances: balances,
-            signals: signals,
-            events: [],
-            analyticsBuckets: [],
-            fetchState: .success,
-            fetchedAt: now
+        return OpenRouterSnapshotBuilder.snapshot(
+            key: keyData,
+            credits: credits,
+            creditLoaded: fields[OpenRouterCredentialField.creditLoaded]
+                .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) },
+            now: Date()
         )
+    }
+
+    /// The key that may read `/credits`: a management key saved for it, or
+    /// the API key itself when that is one.
+    private func managementKey(
+        apiKey: String,
+        keyData: OpenRouterKeyData,
+        fields: [String: String]
+    ) -> String? {
+        if let saved = fields[OpenRouterCredentialField.managementKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !saved.isEmpty {
+            return saved
+        }
+        if keyData.isManagementKey == true || keyData.isProvisioningKey == true {
+            return apiKey
+        }
+        return nil
+    }
+
+    private func fetchCredits(managementKey: String?) async -> OpenRouterCreditsReading {
+        guard let managementKey else { return .unavailable }
+
+        var request = URLRequest(url: Self.creditsURL, timeoutInterval: 15)
+        request.setValue("Bearer \(managementKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse else {
+            return .failed
+        }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            return .rejected
+        }
+        guard (200..<300).contains(http.statusCode),
+              data.count <= 1_048_576,
+              let credits = (try? JSONDecoder().decode(OpenRouterCreditsResponse.self, from: data))?.data else {
+            return .failed
+        }
+        return .read(credits)
     }
 }

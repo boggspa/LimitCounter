@@ -1735,6 +1735,242 @@ private func testOpenRouterParsesRateLimit() throws {
 
 
 
+/// Friday 2026-09-25 04:00 UTC.
+private let openRouterNow = date("2026-09-25T04:00:00Z")
+
+private func testOpenRouterMetersLoadedCreditAgainstKeySpend() throws {
+    let key = OpenRouterKeyData(
+        label: "sk-or-v1-abc...123",
+        usage: 2.5,
+        usageDaily: 0.25,
+        usageWeekly: 1,
+        usageMonthly: 2,
+        isFreeTier: false,
+        rateLimit: OpenRouterRateLimit(requests: -1, interval: "10s")
+    )
+    let snapshot = OpenRouterSnapshotBuilder.snapshot(
+        key: key,
+        credits: .unavailable,
+        creditLoaded: 10,
+        now: openRouterNow
+    )
+
+    try expectEqual(snapshot.windows.map(\.label), ["Credit used"], "OpenRouter loaded-credit windows")
+    let meter = snapshot.windows[0]
+    try expectEqual(meter.windowKind, .custom, "OpenRouter credit meter kind")
+    try expectClose(meter.used, 2.5, "OpenRouter credit used")
+    try expectEqual(meter.total, 10, "OpenRouter credit loaded")
+    try expectEqual(meter.unit, "USD", "OpenRouter credit unit")
+    try expectEqual(snapshot.balances.map(\.label), ["Credit remaining"], "OpenRouter balances")
+    try expectClose(snapshot.balances[0].amount, 7.5, "OpenRouter credit remaining")
+    try expectEqual(
+        snapshot.stats.map(\.label),
+        ["Today", "This week", "This month", "All time"],
+        "OpenRouter spend stats, without the deprecated -1 rate limit"
+    )
+    try expectEqual(snapshot.planName, "API Credits", "OpenRouter key-shaped label is hidden")
+    try expectEqual(
+        OpenRouterCredentialField.creditLoaded,
+        SpendProviderCredentialField.manualTopUpTotal,
+        "OpenRouter's loaded credit shares the top-up field"
+    )
+}
+
+private func testOpenRouterPrefersAccountCredits() throws {
+    let snapshot = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 2.5),
+        credits: .read(OpenRouterCredits(totalCredits: 50, totalUsage: 12.25)),
+        creditLoaded: 10,
+        now: openRouterNow
+    )
+
+    let meter = snapshot.windows[0]
+    try expectEqual(meter.label, "Credit used", "OpenRouter account meter label")
+    try expectClose(meter.used, 12.25, "OpenRouter account usage")
+    try expectEqual(meter.total, 50, "OpenRouter account credits")
+    try expectEqual(meter.subtitle, "Official OpenRouter account credits", "OpenRouter account source")
+    try expectClose(snapshot.balances[0].amount, 37.75, "OpenRouter account remaining")
+}
+
+private func testOpenRouterRefusedManagementKeyFallsBack() throws {
+    let withLoadedCredit = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 1),
+        credits: .rejected,
+        creditLoaded: 10,
+        now: openRouterNow
+    )
+    try expectEqual(withLoadedCredit.windows[0].total, 10, "refused key falls back to the loaded credit")
+    try expect(
+        withLoadedCredit.windows[0].subtitle?.contains("refused the management key") == true,
+        "the meter says the management key was refused"
+    )
+
+    let spendOnly = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 1),
+        credits: .rejected,
+        creditLoaded: nil,
+        now: openRouterNow
+    )
+    try expectEqual(spendOnly.windows.map(\.label), ["Total spend"], "refused key without loaded credit")
+    try expectEqual(
+        spendOnly.windows[0].subtitle,
+        "OpenRouter refused the management key",
+        "spend window says the management key was refused"
+    )
+}
+
+private func testOpenRouterKeyLimitFollowsItsResetPeriod() throws {
+    let monthly = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 100, limit: 20, limitRemaining: 15, limitReset: "monthly", usageMonthly: 5),
+        credits: .unavailable,
+        creditLoaded: nil,
+        now: openRouterNow
+    )
+    try expectEqual(monthly.windows.map(\.label), ["Key limit"], "capped key windows")
+    let cap = monthly.windows[0]
+    try expectEqual(cap.windowKind, .monthly, "monthly cap kind")
+    try expectClose(cap.used, 5, "a resetting cap reads its own period, not all-time usage")
+    try expectEqual(cap.total, 20, "cap total")
+    try expectEqual(cap.resetDate, date("2026-10-01T00:00:00Z"), "monthly cap resets on the 1st, UTC")
+    try expectClose(monthly.balances[0].amount, 15, "cap remaining")
+
+    let weekly = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 100, limit: 20, limitReset: "weekly", usageWeekly: 4),
+        credits: .unavailable,
+        creditLoaded: nil,
+        now: openRouterNow
+    )
+    try expectClose(weekly.windows[0].used, 4, "weekly cap without limit_remaining reads weekly usage")
+    try expectEqual(weekly.windows[0].resetDate, date("2026-09-28T00:00:00Z"), "weekly cap resets on Monday, UTC")
+
+    let daily = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 100, limit: 20, limitRemaining: 19, limitReset: "daily"),
+        credits: .unavailable,
+        creditLoaded: nil,
+        now: openRouterNow
+    )
+    try expectEqual(daily.windows[0].resetDate, date("2026-09-26T00:00:00Z"), "daily cap resets at midnight UTC")
+
+    let lifetime = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(usage: 12, limit: 20),
+        credits: .unavailable,
+        creditLoaded: 30,
+        now: openRouterNow
+    )
+    try expectEqual(lifetime.windows.map(\.label), ["Credit used", "Key limit"], "credit meter leads the cap")
+    try expectClose(lifetime.windows[1].used, 12, "a cap that never resets reads all-time usage")
+    try expect(lifetime.windows[1].resetDate == nil, "a cap that never resets has no reset date")
+}
+
+private func testOpenRouterSpendOnlyWithoutCredit() throws {
+    let snapshot = OpenRouterSnapshotBuilder.snapshot(
+        key: OpenRouterKeyData(label: "Personal", usage: 0.0117),
+        credits: .unavailable,
+        creditLoaded: nil,
+        now: openRouterNow
+    )
+    try expectEqual(snapshot.windows.map(\.label), ["Total spend"], "spend-only window")
+    try expect(snapshot.windows[0].total == nil, "spend-only window has no total")
+    try expect(snapshot.balances.isEmpty, "no placeholder \"Unlimited\" balance")
+    try expect(snapshot.stats.isEmpty, "no stats without period usage")
+    try expectEqual(snapshot.planName, "Personal", "real key label is the plan name")
+}
+
+private func testOpenRouterSendsManagementKeyOnlyToCredits() async throws {
+    var keyAuthorization: String?
+    var creditsAuthorization: String?
+    var creditsHost: String?
+    OpenRouterMockURLProtocol.handler = { request in
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        if request.url?.path == "/api/v1/credits" {
+            creditsAuthorization = request.value(forHTTPHeaderField: "Authorization")
+            creditsHost = request.url?.host
+            return (response, Data(#"{"data":{"total_credits":25,"total_usage":5.5}}"#.utf8))
+        }
+        keyAuthorization = request.value(forHTTPHeaderField: "Authorization")
+        return (response, Data(#"{"data":{"label":"sk-or-v1-abc","usage":1.5,"limit":null,"is_free_tier":false,"is_management_key":false}}"#.utf8))
+    }
+    defer { OpenRouterMockURLProtocol.handler = nil }
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OpenRouterMockURLProtocol.self]
+    let snapshot = try await OpenRouterProviderClient(
+        session: URLSession(configuration: configuration)
+    ).fetchSnapshot(credentials: ProviderCredential(
+        accessToken: "sk-or-v1-inference",
+        customEndpoint: "https://proxy.example/api/v1/auth/key",
+        extraFields: [
+            OpenRouterCredentialField.managementKey: "sk-or-v1-management",
+            OpenRouterCredentialField.creditLoaded: "10"
+        ]
+    ))
+
+    try expectEqual(keyAuthorization, "Bearer sk-or-v1-inference", "the API key reads the key endpoint")
+    try expectEqual(creditsAuthorization, "Bearer sk-or-v1-management", "the management key reads credits")
+    try expectEqual(creditsHost, "openrouter.ai", "credits never follow a custom endpoint")
+    try expectEqual(snapshot.windows[0].total, 25, "account credits win over the loaded figure")
+    try expectClose(snapshot.windows[0].used, 5.5, "account usage")
+}
+
+private func testOpenRouterManagementAPIKeyReadsItsOwnCredits() async throws {
+    var creditsAuthorization: String?
+    OpenRouterMockURLProtocol.handler = { request in
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        if request.url?.path == "/api/v1/credits" {
+            creditsAuthorization = request.value(forHTTPHeaderField: "Authorization")
+            return (response, Data(#"{"data":{"total_credits":40,"total_usage":10}}"#.utf8))
+        }
+        return (response, Data(#"{"data":{"label":"Admin","usage":0,"limit":null,"is_management_key":true}}"#.utf8))
+    }
+    defer { OpenRouterMockURLProtocol.handler = nil }
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OpenRouterMockURLProtocol.self]
+    let snapshot = try await OpenRouterProviderClient(
+        session: URLSession(configuration: configuration)
+    ).fetchSnapshot(credentials: ProviderCredential(accessToken: "sk-or-v1-admin"))
+
+    try expectEqual(creditsAuthorization, "Bearer sk-or-v1-admin", "a management API key reads its own credits")
+    try expectEqual(snapshot.windows[0].total, 40, "management API key credit meter")
+
+    // An inference key without a saved management key never asks.
+    var creditRequests = 0
+    OpenRouterMockURLProtocol.handler = { request in
+        if request.url?.path == "/api/v1/credits" { creditRequests += 1 }
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (response, Data(#"{"data":{"label":"sk-or-v1-abc","usage":1,"limit":null}}"#.utf8))
+    }
+    _ = try await OpenRouterProviderClient(
+        session: URLSession(configuration: configuration)
+    ).fetchSnapshot(credentials: ProviderCredential(accessToken: "sk-or-v1-inference"))
+    try expectEqual(creditRequests, 0, "an inference key does not call the management-only endpoint")
+}
+
+private final class OpenRouterMockURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
 private func testImportedCookieHeaderMergePreservesAndRotates() throws {
     let requestURL = URL(string: "https://admin.mistral.ai/subscription")!
     let existing = "session=old-token; theme=dark"
@@ -3516,6 +3752,13 @@ private enum AdditionalProviderUsageTestRunner {
         try testOpenRouterParsesUnlimitedKey()
         try testOpenRouterParsesFreeTier()
         try testOpenRouterParsesRateLimit()
+        try testOpenRouterMetersLoadedCreditAgainstKeySpend()
+        try testOpenRouterPrefersAccountCredits()
+        try testOpenRouterRefusedManagementKeyFallsBack()
+        try testOpenRouterKeyLimitFollowsItsResetPeriod()
+        try testOpenRouterSpendOnlyWithoutCredit()
+        try await testOpenRouterSendsManagementKeyOnlyToCredits()
+        try await testOpenRouterManagementAPIKeyReadsItsOwnCredits()
         try testImportedCookieHeaderMergePreservesAndRotates()
         try testTokenPlanParserReadsRenderedZeroUsage()
         try testTokenPlanConsoleAPIReadsFullQuota()
