@@ -48,6 +48,17 @@ enum KimiUsageTestRunner {
         try await testExpiredCLIOAuthRefreshesAndPersistsRotatedToken()
         try await testExternalRotationRecoversFromInvalidGrant()
         try await testRejectedRefreshThrowsCredentialExpired()
+        try testParsesProPlanWithoutWeeklyWindow()
+        try testParsesVivacePlanWithWeeklyWindow()
+        try testEmptyUsagesFallBackToLegacyFields()
+        try testReadsPlanNameFromUserInfo()
+        try testDerivesCLICredentialSlots()
+        try testReadsDeploymentFromCLIConfig()
+        try testLocatesCurrentCLISignIn()
+        try testImportsCLIFolderSignedInToGlobalDeployment()
+        try await testGlobalSignInRefreshesWithItsOwnHostAndLock()
+        try await testCodeMonthlyWinsOverBrowserSessionMonthly()
+        try await testMissingCLISignInAsksForFolderImport()
         print("Kimi usage tests passed")
     }
 
@@ -743,6 +754,418 @@ enum KimiUsageTestRunner {
         )
     }
 
+    private static func testParsesProPlanWithoutWeeklyWindow() throws {
+        // Shape of the live Pro reply (2026-09-25): no `limit_7d`, and the
+        // legacy `limits` entry still sent beside `usages`.
+        let payload = """
+        {
+          "limits": [
+            {
+              "detail": {
+                "limit": "100",
+                "remaining": "99",
+                "resetTime": "2099-09-25T07:08:23.538306Z",
+                "used": "1"
+              },
+              "window": {
+                "duration": 300,
+                "timeUnit": "TIME_UNIT_MINUTE"
+              }
+            }
+          ],
+          "usages": {
+            "limit_5h": {
+              "reset_time": "2099-09-25T07:08:22Z",
+              "used_ratio": 0.25
+            },
+            "limit_month_code": {
+              "reset_time": "2099-10-26T00:00:00Z",
+              "used_ratio": 0.1
+            },
+            "limit_month_total": {
+              "reset_time": "2099-10-26T00:00:00Z",
+              "used_ratio": 0.4
+            }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let snapshot = try KimiUsageNormalizer.snapshot(from: payload, planName: "Pro")
+
+        try expectEqual(snapshot.planName, "Pro", "Pro plan name")
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Monthly"], "Pro windows")
+
+        let fiveHour = try requiredWindow("5H", in: snapshot)
+        try expectEqual(fiveHour.windowKind, .sliding, "Pro 5h kind")
+        try expectEqual(fiveHour.percentageUsed, 25, "Pro 5h should use usages, not legacy limits")
+        try expectEqual(fiveHour.unit, "%", "Pro 5h unit")
+        try expectEqual(
+            fiveHour.resetDate,
+            ISO8601DateFormatter().date(from: "2099-09-25T07:08:22Z"),
+            "Pro 5h reset"
+        )
+
+        let monthly = try requiredWindow("Monthly", in: snapshot)
+        try expectEqual(monthly.windowKind, .monthly, "Pro monthly kind")
+        try expectEqual(monthly.percentageUsed, 40, "Pro monthly percentage")
+        try expectEqual(monthly.subtitle, "Kimi Code 10% · Kimi app 30%", "Pro monthly split")
+        try expectEqual(
+            monthly.resetDate,
+            ISO8601DateFormatter().date(from: "2099-10-26T00:00:00Z"),
+            "Pro monthly reset"
+        )
+    }
+
+    private static func testParsesVivacePlanWithWeeklyWindow() throws {
+        let payload = """
+        {
+          "usages": {
+            "limit_5h": { "used_ratio": "0.5", "reset_time": "2099-09-25T07:00:00Z" },
+            "limit_7d": { "used_ratio": 1, "reset_time": "2099-09-29T00:00:00Z" },
+            "limit_month_total": { "used_ratio": 0.2, "reset_time": "2099-10-10T00:00:00Z" }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let snapshot = try KimiUsageNormalizer.snapshot(from: payload)
+
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Weekly", "Monthly"], "Vivace windows")
+        try expectEqual(try requiredWindow("5H", in: snapshot).percentageUsed, 50, "string ratio")
+        let weekly = try requiredWindow("Weekly", in: snapshot)
+        try expectEqual(weekly.windowKind, .weekly, "Vivace weekly kind")
+        try expectEqual(weekly.percentageUsed, 100, "Vivace weekly percentage")
+        try expectEqual(
+            try requiredWindow("Monthly", in: snapshot).subtitle,
+            "Shared Kimi membership quota",
+            "monthly without a code split"
+        )
+    }
+
+    private static func testEmptyUsagesFallBackToLegacyFields() throws {
+        let snapshot = try KimiUsageNormalizer.snapshot(
+            from: #"{"usages":{},"usage":{"limit":100,"used":30}}"#.data(using: .utf8)!
+        )
+
+        try expectEqual(snapshot.windows.map(\.label), ["Weekly"], "legacy fallback windows")
+        try expectEqual(try requiredWindow("Weekly", in: snapshot).percentageUsed, 30, "legacy fallback weekly")
+    }
+
+    private static func testReadsPlanNameFromUserInfo() throws {
+        try expectEqual(
+            KimiUsageNormalizer.planName(
+                fromUserInfo: #"{"user_level":25,"user_level_name":"Pro","goods_version":2}"#.data(using: .utf8)!
+            ),
+            "Pro",
+            "user info plan name"
+        )
+        try expectNil(
+            KimiUsageNormalizer.planName(fromUserInfo: #"{"user_level_name":" "}"#.data(using: .utf8)!),
+            "blank user info plan name"
+        )
+    }
+
+    private static func testDerivesCLICredentialSlots() throws {
+        try expectEqual(KimiCodeEnvironment.mainlandChina.slot, "kimi-code", "kimi.com slot")
+        // Matches the file Kimi Code 2.1.1 wrote for its kimi.ai sign-in.
+        try expectEqual(KimiCodeEnvironment.global.slot, "kimi-code-env-0e4f99c69cc27850", "kimi.ai slot")
+        try expectEqual(
+            KimiCodeEnvironment(oauthHost: " https://auth.kimi.ai/ ", baseURL: "https://api.kimi.ai/coding/v1//").slot,
+            KimiCodeEnvironment.global.slot,
+            "endpoints normalise before hashing"
+        )
+        // sha256 of {"oauthHost":"https://auth.kimi.com","baseUrl":"https://api.kimi.ai/coding/v1"}
+        try expectEqual(
+            KimiCodeEnvironment.slot(oauthHost: "https://auth.kimi.com", baseURL: "https://api.kimi.ai/coding/v1"),
+            "kimi-code-env-d44abaad1d85681f",
+            "mixed deployment slot"
+        )
+        try expectEqual(
+            KimiCodeEnvironment.global.usageURL?.absoluteString,
+            "https://api.kimi.ai/coding/v1/usages",
+            "kimi.ai usage URL"
+        )
+        try expectEqual(
+            KimiCodeEnvironment.global.tokenURL?.absoluteString,
+            "https://auth.kimi.ai/api/oauth/token",
+            "kimi.ai token URL"
+        )
+    }
+
+    private static func testReadsDeploymentFromCLIConfig() throws {
+        try expectEqual(
+            KimiCodeEnvironment.configured(inConfigTOML: globalConfigTOML),
+            KimiCodeEnvironment.global,
+            "kimi.ai config"
+        )
+
+        let inlineTable = """
+        [providers."managed:kimi-code"]
+        type = "kimi"
+        base_url = 'https://api.kimi.ai/coding/v1'
+        oauth = { storage = "file", key = "oauth/kimi-code-env-0e4f99c69cc27850", oauth_host = "https://auth.kimi.ai" }
+        """
+        try expectEqual(
+            KimiCodeEnvironment.configured(inConfigTOML: inlineTable),
+            KimiCodeEnvironment.global,
+            "inline oauth table"
+        )
+
+        let mainland = """
+        [providers."managed:kimi-code"]
+        type = "kimi"
+        base_url = "https://api.kimi.com/coding/v1"
+
+        [providers."managed:kimi-code".oauth]
+        storage = "file"
+        key = "oauth/kimi-code"
+        """
+        try expectEqual(
+            KimiCodeEnvironment.configured(inConfigTOML: mainland),
+            KimiCodeEnvironment.mainlandChina,
+            "kimi.com config without oauth_host"
+        )
+
+        // The CLI derives the slot from the hosts and ignores a stored key
+        // that disagrees.
+        let staleKey = globalConfigTOML.replacingOccurrences(
+            of: "oauth/kimi-code-env-0e4f99c69cc27850",
+            with: "oauth/kimi-code"
+        )
+        try expectEqual(
+            KimiCodeEnvironment.configured(inConfigTOML: staleKey)?.slot,
+            KimiCodeEnvironment.global.slot,
+            "stale stored key"
+        )
+
+        try expectNil(
+            KimiCodeEnvironment.configured(inConfigTOML: "default_model = \"k3\"\n[thinking]\nenabled = true\n"),
+            "config without the managed provider"
+        )
+    }
+
+    private static func testLocatesCurrentCLISignIn() throws {
+        let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let credentials = root.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: credentials, withIntermediateDirectories: true)
+        try globalConfigTOML.data(using: .utf8)?.write(to: root.appendingPathComponent("config.toml"))
+        let globalFile = credentials.appendingPathComponent("kimi-code-env-0e4f99c69cc27850.json")
+        try oauthJSON(accessToken: "global-access-token", expiresAt: 4_102_444_800).write(to: globalFile)
+
+        let fromFolder = KimiCodeSignIn.locate(from: root)
+        try expectEqual(fromFolder.fileURL.lastPathComponent, globalFile.lastPathComponent, "folder sign-in")
+        try expectEqual(fromFolder.environment, .global, "folder deployment")
+        try expectEqual(fromFolder.configRoot.lastPathComponent, ".kimi-code", "folder config root")
+
+        // A credential saved before the move still names kimi-code.json.
+        let fromStaleFile = KimiCodeSignIn.locate(from: credentials.appendingPathComponent("kimi-code.json"))
+        try expectEqual(fromStaleFile.fileURL.lastPathComponent, globalFile.lastPathComponent, "stale file follows the CLI")
+        try expectEqual(fromStaleFile.environment, .global, "stale file deployment")
+
+        let fromCredentialsFolder = KimiCodeSignIn.locate(from: credentials)
+        try expectEqual(fromCredentialsFolder.environment, .global, "credentials folder deployment")
+
+        // Without a readable config, the newest known sign-in decides.
+        let bare = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let bareCredentials = bare.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: bareCredentials, withIntermediateDirectories: true)
+        let bareGlobal = bareCredentials.appendingPathComponent("kimi-code-env-0e4f99c69cc27850.json")
+        let bareMainland = bareCredentials.appendingPathComponent("kimi-code.json")
+        try oauthJSON(accessToken: "global", expiresAt: 4_102_444_800).write(to: bareGlobal)
+        try expectEqual(KimiCodeSignIn.locate(from: bare).environment, .global, "only the kimi.ai sign-in")
+
+        try oauthJSON(accessToken: "mainland", expiresAt: 4_102_444_800).write(to: bareMainland)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -3_600)],
+            ofItemAtPath: bareGlobal.path
+        )
+        try expectEqual(KimiCodeSignIn.locate(from: bare).environment, .mainlandChina, "newer kimi.com sign-in")
+    }
+
+    private static func testImportsCLIFolderSignedInToGlobalDeployment() throws {
+        let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let credentials = root.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: credentials, withIntermediateDirectories: true)
+        try globalConfigTOML.data(using: .utf8)?.write(to: root.appendingPathComponent("config.toml"))
+        let globalFile = credentials.appendingPathComponent("kimi-code-env-0e4f99c69cc27850.json")
+        try oauthJSON(accessToken: "global-access-token", expiresAt: 4_102_444_800).write(to: globalFile)
+
+        let imported = try CredentialImportService.importFromURL(root, for: .kimi)
+
+        try expectNil(imported.accessToken, "global folder import should not store access token")
+        try expectEqual(imported.customEndpoint, globalFile.path, "global folder import path")
+        try expectEqual(imported.extraFields?["kimiAuthMode"], "oauthFile", "global folder auth mode")
+        try expectEqual(imported.extraFields?["kimiCredentialSource"], "directory", "global folder source")
+    }
+
+    private static func testGlobalSignInRefreshesWithItsOwnHostAndLock() async throws {
+        let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let credentials = root.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: credentials, withIntermediateDirectories: true)
+        try globalConfigTOML.data(using: .utf8)?.write(to: root.appendingPathComponent("config.toml"))
+        let globalFile = credentials.appendingPathComponent("kimi-code-env-0e4f99c69cc27850.json")
+        try oauthJSON(
+            accessToken: "expired-global-token",
+            refreshToken: "global-refresh-token",
+            expiresAt: 1,
+            expiresIn: 900
+        ).write(to: globalFile)
+        let slotLock = root.appendingPathComponent("oauth/kimi-code-env-0e4f99c69cc27850.lock")
+
+        var refreshURL: String?
+        var lockHeldDuringRefresh = false
+        var usageURL: String?
+        var userInfoAuthorization: String?
+        KimiMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path == "/api/oauth/token" {
+                refreshURL = request.url?.absoluteString
+                lockHeldDuringRefresh = FileManager.default.fileExists(atPath: slotLock.path)
+                return (
+                    response,
+                    #"{"access_token":"rotated-global-token","refresh_token":"rotated-global-refresh","expires_in":900}"#
+                        .data(using: .utf8)!
+                )
+            }
+            usageURL = request.url?.absoluteString
+            return (response, proUsagesJSON)
+        }
+        KimiMockURLProtocol.userInfoHandler = { request in
+            userInfoAuthorization = request.value(forHTTPHeaderField: "Authorization")
+            try expectEqual(request.url?.host, "api.kimi.ai", "user info host")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, #"{"user_id":"redacted","user_level":25,"user_level_name":"Pro"}"#.data(using: .utf8)!)
+        }
+        defer {
+            KimiMockURLProtocol.requestHandler = nil
+            KimiMockURLProtocol.userInfoHandler = nil
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        // Saved before Kimi Code moved the sign-in to its kimi.ai slot.
+        let credential = ProviderCredential(
+            customEndpoint: credentials.appendingPathComponent("kimi-code.json").path,
+            extraFields: ["kimiAuthMode": "oauthFile", "kimiCredentialSource": "directory"]
+        )
+        let snapshot = try await KimiProviderClient(
+            session: URLSession(configuration: configuration)
+        ).fetchSnapshot(credentials: credential)
+
+        try expectEqual(refreshURL, "https://auth.kimi.ai/api/oauth/token", "kimi.ai refresh endpoint")
+        try expect(lockHeldDuringRefresh, "refresh should hold the kimi.ai slot's lock")
+        try expect(
+            FileManager.default.fileExists(atPath: root.appendingPathComponent("oauth/kimi-code-env-0e4f99c69cc27850").path),
+            "slot lock target"
+        )
+        try expect(!FileManager.default.fileExists(atPath: slotLock.path), "slot lock released")
+        try expectEqual(usageURL, "https://api.kimi.ai/coding/v1/usages", "kimi.ai usage endpoint")
+        try expectEqual(userInfoAuthorization, "Bearer rotated-global-token", "user info authorization")
+        try expectEqual(snapshot.planName, "Pro", "plan from user info")
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Monthly"], "Pro windows from the live fetch")
+
+        let persisted = try JSONSerialization.jsonObject(with: Data(contentsOf: globalFile)) as? [String: Any]
+        try expectEqual(persisted?["access_token"] as? String, "rotated-global-token", "persisted kimi.ai token")
+        try expect(
+            !FileManager.default.fileExists(atPath: credentials.appendingPathComponent("kimi-code.json").path),
+            "the old slot should not be recreated"
+        )
+    }
+
+    private static func testCodeMonthlyWinsOverBrowserSessionMonthly() async throws {
+        var browserRequests = 0
+        KimiMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path.contains("GetSubscriptionStats") == true {
+                browserRequests += 1
+                return (
+                    response,
+                    #"{"subscription_balance":{"amount_used_ratio":0.9,"expire_time":"2099-08-24T00:00:00Z"}}"#
+                        .data(using: .utf8)!
+                )
+            }
+            return (response, proUsagesJSON)
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let snapshot = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in true }
+        ).fetchSnapshot(
+            credentials: ProviderCredential(
+                accessToken: "code-access-token",
+                extraFields: ["kimiWebAccessToken": "web-access-token"]
+            )
+        )
+
+        try expectEqual(browserRequests, 0, "browser session should not be asked when Kimi Code has a monthly window")
+        try expectEqual(try requiredWindow("Monthly", in: snapshot).percentageUsed, 40, "Kimi Code monthly")
+        try expectNil(snapshot.planName, "plan name without user info")
+    }
+
+    private static func testMissingCLISignInAsksForFolderImport() async throws {
+        let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let credentials = root.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: credentials, withIntermediateDirectories: true)
+        try globalConfigTOML.data(using: .utf8)?.write(to: root.appendingPathComponent("config.toml"))
+
+        let credential = ProviderCredential(
+            customEndpoint: credentials.appendingPathComponent("kimi-code.json").path,
+            extraFields: ["kimiAuthMode": "oauthFile"]
+        )
+        do {
+            _ = try await KimiProviderClient().fetchSnapshot(credentials: credential)
+            throw TestFailure.failed("a missing CLI sign-in should throw")
+        } catch ProviderFetchError.credentialExpired(let message) {
+            try expect(message.contains("kimi-code-env-0e4f99c69cc27850.json"), "missing sign-in names the slot")
+            try expect(message.contains("import `~/.kimi-code`"), "missing sign-in asks for a folder import")
+        }
+    }
+
+    /// The managed-provider part of the `config.toml` Kimi Code 2.1.1 wrote
+    /// for a kimi.ai sign-in, with a multi-line array and a multi-line string
+    /// that must not be read as tables.
+    private static let globalConfigTOML = """
+    # Kimi Code configuration
+    default_model = "kimi-code/k3"
+    system_prompt_suffix = \"\"\"
+    [providers."managed:kimi-code"]
+    base_url = "https://example.invalid"
+    \"\"\"
+
+    [providers."managed:kimi-code"]
+    type = "kimi"
+    api_key = ""
+    base_url = "https://api.kimi.ai/coding/v1" # global
+
+    [providers."managed:kimi-code".oauth]
+    storage = "file"
+    key = "oauth/kimi-code-env-0e4f99c69cc27850"
+    oauth_host = "https://auth.kimi.ai"
+
+    [models."kimi-code/k3"]
+    provider = "managed:kimi-code"
+    capabilities = [
+      "thinking",
+      ["nested", "]"],
+    ]
+    base_url = "https://example.invalid/not-the-provider"
+
+    [services.moonshot_search]
+    base_url = "https://api.kimi.ai/coding/v1/search"
+    """
+
+    private static let proUsagesJSON = """
+    {
+      "usages": {
+        "limit_5h": { "reset_time": "2099-09-25T07:08:22Z", "used_ratio": 0.05 },
+        "limit_month_code": { "reset_time": "2099-10-26T00:00:00Z", "used_ratio": 0.1 },
+        "limit_month_total": { "reset_time": "2099-10-26T00:00:00Z", "used_ratio": 0.4 }
+      }
+    }
+    """.data(using: .utf8)!
+
     private static func temporaryFile(named name: String, contents: String) throws -> URL {
         let directory = try temporaryDirectory()
         let url = directory.appendingPathComponent(name)
@@ -796,13 +1219,21 @@ private func requestBodyString(_ request: URLRequest) -> String {
 
 private final class KimiMockURLProtocol: URLProtocol {
     static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    /// Answers the `/me` request each usage fetch makes beside `/usages`;
+    /// `nil` answers 404, like an endpoint without one.
+    static var userInfoHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let requestHandler = Self.requestHandler else {
+        let handler = request.url?.lastPathComponent == "me"
+            ? Self.userInfoHandler ?? { request in
+                (HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+            }
+            : Self.requestHandler
+        guard let requestHandler = handler else {
             client?.urlProtocol(self, didFailWithError: TestFailure.failed("missing Kimi request handler"))
             return
         }

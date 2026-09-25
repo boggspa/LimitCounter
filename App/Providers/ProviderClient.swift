@@ -2953,9 +2953,7 @@ public enum CredentialImportService {
         let detectedKimiRoot = kimiRoots
             .map { home.appendingPathComponent($0, isDirectory: true) }
             .first(where: {
-                FileManager.default.fileExists(
-                    atPath: $0.appendingPathComponent("credentials/kimi-code.json").path
-                )
+                FileManager.default.fileExists(atPath: KimiCodeSignIn.locate(from: $0).fileURL.path)
             })
         if let kimiRoot = detectedKimiRoot {
             detected.append(DetectedCredential(
@@ -3150,15 +3148,17 @@ public enum CredentialImportService {
         }
 
         if providerID == .kimi, url.hasDirectoryPath {
-            let credentialsFile = kimiOAuthFileURL(fromSelectedDirectory: url)
-            guard FileManager.default.fileExists(atPath: credentialsFile.path) else {
-                throw ImportError.missingRequiredField("credentials/kimi-code.json")
+            // The folder, not this file, is what later fetches follow, so a
+            // CLI that signs in to another Kimi deployment is picked up.
+            let signIn = KimiCodeSignIn.locate(from: url)
+            guard FileManager.default.fileExists(atPath: signIn.fileURL.path) else {
+                throw ImportError.missingRequiredField("credentials/\(signIn.environment.credentialFileName)")
             }
 
             return ImportedCredential(
                 accessToken: nil,
                 accountIdentifier: nil,
-                customEndpoint: credentialsFile.path,
+                customEndpoint: signIn.fileURL.path,
                 extraFields: [
                     "kimiAuthMode": "oauthFile",
                     "kimiCredentialSource": "directory"
@@ -3644,16 +3644,6 @@ public enum CredentialImportService {
         )
     }
 
-    private static func kimiOAuthFileURL(fromSelectedDirectory url: URL) -> URL {
-        if url.lastPathComponent == "credentials" {
-            return url.appendingPathComponent("kimi-code.json")
-        }
-
-        return url
-            .appendingPathComponent("credentials", isDirectory: true)
-            .appendingPathComponent("kimi-code.json")
-    }
-
     private static func detectedHomeDirectory() -> URL? {
         #if os(macOS)
         let homePath = NSHomeDirectory()
@@ -3931,6 +3921,406 @@ public extension CredentialImportService {
 
 // MARK: - Kimi Code Provider Client
 
+/// A Kimi Code deployment: where its OAuth tokens are renewed, where its
+/// coding API lives, and the CLI credential slot that holds its sign-in.
+///
+/// Kimi Code 2.1 keeps one sign-in per deployment. The mainland-China service
+/// (kimi.com) keeps the original `credentials/kimi-code.json`; any other,
+/// including the global kimi.ai service, gets `kimi-code-env-<hash>.json`.
+nonisolated struct KimiCodeEnvironment: Equatable {
+    let oauthHost: String
+    let baseURL: String
+    /// The credential file's name without `.json`.
+    let slot: String
+
+    static let mainlandChina = KimiCodeEnvironment(
+        oauthHost: mainlandOAuthHost,
+        baseURL: mainlandBaseURL
+    )
+    static let global = KimiCodeEnvironment(
+        oauthHost: "https://auth.kimi.ai",
+        baseURL: "https://api.kimi.ai/coding/v1"
+    )
+
+    private static let mainlandOAuthHost = "https://auth.kimi.com"
+    private static let mainlandBaseURL = "https://api.kimi.com/coding/v1"
+
+    init(oauthHost: String, baseURL: String) {
+        let oauthHost = Self.normalized(oauthHost)
+        let baseURL = Self.normalized(baseURL)
+        self.oauthHost = oauthHost
+        self.baseURL = baseURL
+        slot = Self.slot(oauthHost: oauthHost, baseURL: baseURL)
+    }
+
+    var credentialFileName: String { "\(slot).json" }
+    var tokenURL: URL? { URL(string: "\(oauthHost)/api/oauth/token") }
+    var usageURL: URL? { URL(string: "\(baseURL)/usages") }
+
+    /// The deployment `config.toml` points the CLI at: its managed Kimi Code
+    /// provider's `oauth_host` and `base_url`, each defaulting to kimi.com.
+    /// `nil` when the file configures neither.
+    ///
+    /// The slot comes from those two values alone. The CLI stores the slot's
+    /// name beside them, but ignores it whenever it disagrees.
+    static func configured(inConfigTOML text: String) -> KimiCodeEnvironment? {
+        let provider = KimiConfigTOML.managedKimiCodeProvider(in: text)
+        guard provider.baseURL != nil || provider.oauthHost != nil else { return nil }
+        return KimiCodeEnvironment(
+            oauthHost: provider.oauthHost ?? mainlandOAuthHost,
+            baseURL: provider.baseURL ?? mainlandBaseURL
+        )
+    }
+
+    /// The known deployment whose sign-in the CLI saved most recently, for a
+    /// config folder whose `config.toml` cannot be read.
+    static func newestSignIn(inCredentialsDirectory directory: URL) -> KimiCodeEnvironment? {
+        [mainlandChina, global]
+            .compactMap { environment -> (KimiCodeEnvironment, Date)? in
+                let url = directory.appendingPathComponent(environment.credentialFileName)
+                guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+                return (environment, modified ?? .distantPast)
+            }
+            .max { $0.1 < $1.1 }?
+            .0
+    }
+
+    /// The known deployment a credential slot belongs to.
+    static func known(slot: String) -> KimiCodeEnvironment? {
+        [mainlandChina, global].first { $0.slot == slot }
+    }
+
+    /// The Kimi Code CLI's `resolveKimiCodeOAuthKey`, without its `oauth/`
+    /// prefix: `kimi-code` for kimi.com, and otherwise `kimi-code-env-` plus
+    /// the first 16 hex digits of SHA-256 over
+    /// `JSON.stringify({ oauthHost, baseUrl })`.
+    static func slot(oauthHost: String, baseURL: String) -> String {
+        let oauthHost = normalized(oauthHost)
+        let baseURL = normalized(baseURL)
+        if oauthHost == mainlandOAuthHost, baseURL == mainlandBaseURL {
+            return "kimi-code"
+        }
+        let key = "{\"oauthHost\":\(jsonString(oauthHost)),\"baseUrl\":\(jsonString(baseURL))}"
+        let digest = SHA256.hash(data: Data(key.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "kimi-code-env-\(digest.prefix(16))"
+    }
+
+    private static func normalized(_ endpoint: String) -> String {
+        var value = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("/") {
+            value.removeLast()
+        }
+        return value
+    }
+
+    /// A JSON string literal as `JSON.stringify` writes it.
+    private static func jsonString(_ value: String) -> String {
+        var escaped = "\""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\"": escaped += "\\\""
+            case "\\": escaped += "\\\\"
+            case "\n": escaped += "\\n"
+            case "\r": escaped += "\\r"
+            case "\t": escaped += "\\t"
+            case "\u{08}": escaped += "\\b"
+            case "\u{0C}": escaped += "\\f"
+            default:
+                if scalar.value < 0x20 {
+                    escaped += String(format: "\\u%04x", scalar.value)
+                } else {
+                    escaped.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return escaped + "\""
+    }
+}
+
+/// A Kimi Code CLI sign-in: its token file, and the deployment it is for.
+nonisolated struct KimiCodeSignIn: Equatable {
+    let fileURL: URL
+    let environment: KimiCodeEnvironment
+
+    /// The CLI folder the token file sits in, e.g. `~/.kimi-code`.
+    var configRoot: URL {
+        let parent = fileURL.deletingLastPathComponent()
+        return parent.lastPathComponent == "credentials"
+            ? parent.deletingLastPathComponent()
+            : parent
+    }
+
+    /// The sign-in the CLI uses now, found from a location Limit Counter
+    /// was given: the CLI's folder, its `credentials` folder, or one of the
+    /// token files in there.
+    ///
+    /// A token file inside a CLI folder is not taken at its word: after the
+    /// CLI moves to a different deployment the old slot's file goes stale or
+    /// disappears, so the folder's current slot wins whenever it has a file.
+    static func locate(from url: URL) -> KimiCodeSignIn {
+        if url.hasDirectoryPath {
+            let credentials = url.lastPathComponent == "credentials"
+                ? url
+                : url.appendingPathComponent("credentials", isDirectory: true)
+            let environment = currentEnvironment(
+                configRoot: credentials.deletingLastPathComponent(),
+                credentials: credentials
+            )
+            return KimiCodeSignIn(
+                fileURL: credentials.appendingPathComponent(environment.credentialFileName),
+                environment: environment
+            )
+        }
+
+        let slot = url.deletingPathExtension().lastPathComponent
+        let fileEnvironment = KimiCodeEnvironment.known(slot: slot)
+        let credentials = url.deletingLastPathComponent()
+        guard credentials.lastPathComponent == "credentials", isCLITokenFileName(url.lastPathComponent) else {
+            return KimiCodeSignIn(fileURL: url, environment: fileEnvironment ?? .mainlandChina)
+        }
+
+        let current = currentEnvironment(
+            configRoot: credentials.deletingLastPathComponent(),
+            credentials: credentials
+        )
+        let currentFile = credentials.appendingPathComponent(current.credentialFileName)
+        if currentFile != url,
+           !FileManager.default.fileExists(atPath: currentFile.path),
+           FileManager.default.fileExists(atPath: url.path) {
+            return KimiCodeSignIn(fileURL: url, environment: fileEnvironment ?? current)
+        }
+        return KimiCodeSignIn(fileURL: currentFile, environment: current)
+    }
+
+    /// Whether a file name is one of the CLI's token slots.
+    static func isCLITokenFileName(_ name: String) -> Bool {
+        name.hasPrefix("kimi-code") && name.hasSuffix(".json")
+    }
+
+    private static func currentEnvironment(configRoot: URL, credentials: URL) -> KimiCodeEnvironment {
+        if let text = try? String(
+            contentsOf: configRoot.appendingPathComponent("config.toml"),
+            encoding: .utf8
+        ),
+           let configured = KimiCodeEnvironment.configured(inConfigTOML: text) {
+            return configured
+        }
+        return KimiCodeEnvironment.newestSignIn(inCredentialsDirectory: credentials) ?? .mainlandChina
+    }
+}
+
+/// Reads the few `config.toml` strings that choose Kimi Code's deployment.
+///
+/// Not a TOML parser: it follows table headers, dotted keys, one-level inline
+/// tables and plain strings, and steps over multi-line strings and arrays so
+/// their contents are never mistaken for tables.
+nonisolated enum KimiConfigTOML {
+    struct ManagedProvider: Equatable {
+        var baseURL: String?
+        var oauthHost: String?
+    }
+
+    private static let providerPath = ["providers", "managed:kimi-code"]
+
+    static func managedKimiCodeProvider(in text: String) -> ManagedProvider {
+        var provider = ManagedProvider()
+        var table: [String] = []
+        var multilineStringDelimiter: String?
+        var openBrackets = 0
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            if let delimiter = multilineStringDelimiter {
+                if rawLine.contains(delimiter) {
+                    multilineStringDelimiter = nil
+                }
+                continue
+            }
+            if openBrackets > 0 {
+                openBrackets += bracketBalance(rawLine)
+                continue
+            }
+
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") {
+                continue
+            }
+            if line.hasPrefix("[") {
+                // `[[...]]` starts an array of tables: nothing read here.
+                table = line.hasPrefix("[[") ? ["[["] : headerPath(line)
+                continue
+            }
+            guard let equals = firstIndexOutsideQuotes(of: "=", in: line) else {
+                continue
+            }
+
+            let key = table + dottedKey(String(line[..<equals]))
+            let value = String(line[line.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
+            for delimiter in ["\"\"\"", "'''"] where value.hasPrefix(delimiter) {
+                if !value.dropFirst(3).contains(delimiter) {
+                    multilineStringDelimiter = delimiter
+                }
+            }
+            if multilineStringDelimiter != nil {
+                continue
+            }
+            if value.hasPrefix("[") {
+                openBrackets = bracketBalance(value)
+                continue
+            }
+            if value.hasPrefix("{") {
+                for (innerKey, innerValue) in inlineTable(value) {
+                    record(innerValue, at: key + innerKey, in: &provider)
+                }
+                continue
+            }
+            if let string = stringValue(value) {
+                record(string, at: key, in: &provider)
+            }
+        }
+        return provider
+    }
+
+    private static func record(_ value: String, at key: [String], in provider: inout ManagedProvider) {
+        switch key {
+        case providerPath + ["base_url"]:
+            provider.baseURL = value
+        case providerPath + ["oauth", "oauth_host"]:
+            provider.oauthHost = value
+        default:
+            break
+        }
+    }
+
+    private static func headerPath(_ line: String) -> [String] {
+        guard let close = firstIndexOutsideQuotes(of: "]", in: line) else { return [] }
+        return dottedKey(String(line[line.index(after: line.startIndex)..<close]))
+    }
+
+    /// `providers."managed:kimi-code".oauth` → its parts, quotes removed.
+    private static func dottedKey(_ key: String) -> [String] {
+        splitOutsideQuotes(key, on: ".").map {
+            let part = $0.trimmingCharacters(in: .whitespaces)
+            return stringValue(part) ?? part
+        }
+    }
+
+    /// The `key = value` pairs of an inline table such as
+    /// `{ storage = "file", oauth_host = "https://auth.kimi.ai" }`.
+    private static func inlineTable(_ value: String) -> [([String], String)] {
+        guard let close = value.lastIndex(of: "}") else { return [] }
+        let body = String(value[value.index(after: value.startIndex)..<close])
+        return splitOutsideQuotes(body, on: ",").compactMap { pair in
+            guard let equals = firstIndexOutsideQuotes(of: "=", in: pair),
+                  let string = stringValue(
+                    String(pair[pair.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
+                  ) else {
+                return nil
+            }
+            return (dottedKey(String(pair[..<equals])), string)
+        }
+    }
+
+    /// A basic (`"…"`) or literal (`'…'`) string at the start of `value`.
+    private static func stringValue(_ value: String) -> String? {
+        if value.hasPrefix("'") {
+            let body = value.dropFirst()
+            guard let close = body.firstIndex(of: "'") else { return nil }
+            return String(body[..<close])
+        }
+        guard value.hasPrefix("\"") else { return nil }
+
+        var result = ""
+        var escaping = false
+        for character in value.dropFirst() {
+            if escaping {
+                switch character {
+                case "n": result.append("\n")
+                case "t": result.append("\t")
+                case "r": result.append("\r")
+                default: result.append(character)
+                }
+                escaping = false
+            } else if character == "\\" {
+                escaping = true
+            } else if character == "\"" {
+                return result
+            } else {
+                result.append(character)
+            }
+        }
+        return nil
+    }
+
+    /// How many more `[` than `]` a line opens, outside strings and comments.
+    private static func bracketBalance(_ line: String) -> Int {
+        var balance = 0
+        scanOutsideQuotes(line) { character, _ in
+            if character == "[" { balance += 1 }
+            if character == "]" { balance -= 1 }
+            return character == "#"
+        }
+        return balance
+    }
+
+    private static func firstIndexOutsideQuotes(of target: Character, in text: String) -> String.Index? {
+        var found: String.Index?
+        scanOutsideQuotes(text) { character, index in
+            if character == target {
+                found = index
+                return true
+            }
+            return false
+        }
+        return found
+    }
+
+    private static func splitOutsideQuotes(_ text: String, on separator: Character) -> [String] {
+        var parts: [String] = []
+        var start = text.startIndex
+        scanOutsideQuotes(text) { character, index in
+            if character == separator {
+                parts.append(String(text[start..<index]))
+                start = text.index(after: index)
+            }
+            return false
+        }
+        parts.append(String(text[start...]))
+        return parts
+    }
+
+    /// Calls `visit` for each character outside a quoted string until it
+    /// returns `true`.
+    private static func scanOutsideQuotes(
+        _ text: String,
+        _ visit: (Character, String.Index) -> Bool
+    ) {
+        var quote: Character?
+        var escaping = false
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+            if let open = quote {
+                if escaping {
+                    escaping = false
+                } else if open == "\"", character == "\\" {
+                    escaping = true
+                } else if character == open {
+                    quote = nil
+                }
+            } else if character == "\"" || character == "'" {
+                quote = character
+            } else if visit(character, index) {
+                return
+            }
+            index = text.index(after: index)
+        }
+    }
+}
+
 nonisolated struct KimiWebSessionTokens: Equatable {
     let accessToken: String
     let refreshToken: String?
@@ -4163,12 +4553,17 @@ public struct KimiProviderClient: ProviderClient {
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         guard let credentials else { throw ProviderFetchError.notConfigured }
-        async let monthlyUsage = try webMembershipClient.fetchMonthlyUsage(credentials: credentials)
 
-        let accessToken = try await resolvedAccessToken(from: credentials)
+        let authorization = try await resolvedAuthorization(from: credentials)
+        let accessToken = authorization.accessToken
         guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
 
-        let usageURL = try resolvedUsageURL(from: credentials)
+        let usageURL = try resolvedUsageURL(from: credentials, environment: authorization.environment)
+        // The usage payload stopped naming the plan; `/me` beside it does.
+        async let planName = fetchPlanName(
+            from: usageURL.deletingLastPathComponent().appendingPathComponent("me"),
+            accessToken: accessToken
+        )
         var request = URLRequest(url: usageURL)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -4191,8 +4586,20 @@ public struct KimiProviderClient: ProviderClient {
 
         switch httpResponse.statusCode {
         case 200..<300:
-            let apiSnapshot = try KimiUsageNormalizer.snapshot(from: data, fetchedAt: Date())
-            let snapshotWithMonthly = mergeMonthlyUsage(try await monthlyUsage, into: apiSnapshot)
+            let apiSnapshot = try KimiUsageNormalizer.snapshot(
+                from: data,
+                fetchedAt: Date(),
+                planName: await planName
+            )
+            // Kimi Code's own monthly window is the signed-in account's. The
+            // browser session only fills in for a payload without one: it
+            // can belong to a different Kimi account.
+            let snapshotWithMonthly = apiSnapshot.windows.contains { $0.windowKind == .monthly }
+                ? apiSnapshot
+                : mergeMonthlyUsage(
+                    try await webMembershipClient.fetchMonthlyUsage(credentials: credentials),
+                    into: apiSnapshot
+                )
             // Best-effort augmentation: read local Kimi CLI session logs.
             // so per-turn activity events surface on the heatmap. Returns [] if
             // the sandbox denies the read (typical when the user only granted a
@@ -4337,16 +4744,15 @@ public struct KimiProviderClient: ProviderClient {
         )
     }
 
-    private func resolvedAccessToken(from credentials: ProviderCredential) async throws -> String {
-        if shouldUseOAuthFile(credentials),
-           let token = try await accessTokenFromOAuthFile(credentials) {
-            return token
+    private func resolvedAuthorization(from credentials: ProviderCredential) async throws -> KimiAuthorization {
+        if shouldUseOAuthFile(credentials) {
+            return try await authorizationFromOAuthFile(credentials)
         }
 
         guard let token = credentials.normalizedAccessToken else {
             throw ProviderFetchError.notConfigured
         }
-        return token
+        return KimiAuthorization(accessToken: token, environment: nil)
     }
 
     private func shouldUseOAuthFile(_ credentials: ProviderCredential) -> Bool {
@@ -4359,10 +4765,10 @@ public struct KimiProviderClient: ProviderClient {
             return false
         }
 
-        return endpoint.hasSuffix("kimi-code.json")
+        return KimiCodeSignIn.isCLITokenFileName(URL(fileURLWithPath: endpoint).lastPathComponent)
     }
 
-    private func accessTokenFromOAuthFile(_ credentials: ProviderCredential) async throws -> String? {
+    private func authorizationFromOAuthFile(_ credentials: ProviderCredential) async throws -> KimiAuthorization {
         guard let access = resolvedOAuthFileAccess(from: credentials) else {
             throw ProviderFetchError.notConfigured
         }
@@ -4374,36 +4780,39 @@ public struct KimiProviderClient: ProviderClient {
             }
         }
 
-        let migratedURL = migratedOAuthFileURL(from: access.fileURL)
-        let url: URL
+        // Located inside the grant: the folder's `config.toml` says which
+        // deployment, and so which token file, the CLI is using now.
+        let selected = KimiCodeSignIn.locate(from: access.selectedURL)
+        let migrated = migratedSignIn(from: selected)
+        let signIn: KimiCodeSignIn
         if credentials.kimiBookmarkData == nil,
-           let migratedURL,
-           FileManager.default.isReadableFile(atPath: migratedURL.path) {
-            url = migratedURL
+           let migrated,
+           FileManager.default.isReadableFile(atPath: migrated.fileURL.path) {
+            signIn = migrated
         } else {
-            url = access.fileURL
+            signIn = selected
         }
 
-        return try await KimiOAuthRefreshCoordinator.shared.accessToken(
-            fileURL: url,
+        let accessToken = try await KimiOAuthRefreshCoordinator.shared.accessToken(
+            signIn: signIn,
             session: session,
-            refreshDisabledMessage: migratedURL != nil && url == access.fileURL
+            refreshDisabledMessage: migrated != nil && signIn == selected
                 ? "Kimi Code moved its live session to ~/.kimi-code. Import ~/.kimi-code in Kimi settings so Limit Counter can resume refreshes."
                 : nil
         )
+        return KimiAuthorization(accessToken: accessToken, environment: signIn.environment)
     }
 
-    private func migratedOAuthFileURL(from selectedURL: URL) -> URL? {
-        let selectedRoot = selectedURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        guard selectedRoot.lastPathComponent == ".kimi" else { return nil }
+    /// The same sign-in in `~/.kimi-code`, for one still selected in the
+    /// `~/.kimi` folder Kimi Code 0.26 moved away from.
+    private func migratedSignIn(from signIn: KimiCodeSignIn) -> KimiCodeSignIn? {
+        guard signIn.configRoot.lastPathComponent == ".kimi" else { return nil }
 
-        return selectedRoot
-            .deletingLastPathComponent()
-            .appendingPathComponent(".kimi-code", isDirectory: true)
-            .appendingPathComponent("credentials", isDirectory: true)
-            .appendingPathComponent("kimi-code.json")
+        return KimiCodeSignIn.locate(
+            from: signIn.configRoot
+                .deletingLastPathComponent()
+                .appendingPathComponent(".kimi-code", isDirectory: true)
+        )
     }
 
     private func resolvedOAuthFileAccess(from credentials: ProviderCredential) -> KimiOAuthFileAccess? {
@@ -4415,23 +4824,7 @@ public struct KimiProviderClient: ProviderClient {
                 options: .withSecurityScope,
                 bookmarkDataIsStale: &isStale
             ) {
-                if resolvedURL.hasDirectoryPath {
-                    if resolvedURL.lastPathComponent == "credentials" {
-                        return KimiOAuthFileAccess(
-                            fileURL: resolvedURL.appendingPathComponent("kimi-code.json"),
-                            scopeURL: resolvedURL
-                        )
-                    }
-
-                    return KimiOAuthFileAccess(
-                        fileURL: resolvedURL
-                            .appendingPathComponent("credentials", isDirectory: true)
-                            .appendingPathComponent("kimi-code.json"),
-                        scopeURL: resolvedURL
-                    )
-                }
-
-                return KimiOAuthFileAccess(fileURL: resolvedURL, scopeURL: resolvedURL)
+                return KimiOAuthFileAccess(selectedURL: resolvedURL, scopeURL: resolvedURL)
             }
             #endif
         }
@@ -4440,10 +4833,28 @@ public struct KimiProviderClient: ProviderClient {
             return nil
         }
         let fileURL = URL(fileURLWithPath: path)
-        return KimiOAuthFileAccess(fileURL: fileURL, scopeURL: fileURL)
+        return KimiOAuthFileAccess(selectedURL: fileURL, scopeURL: fileURL)
     }
 
-    private func resolvedUsageURL(from credentials: ProviderCredential) throws -> URL {
+    /// The plan Kimi shows the signed-in account, such as "Pro", or `nil`
+    /// when `/me` does not answer.
+    private func fetchPlanName(from url: URL, accessToken: String) async -> String? {
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else {
+            return nil
+        }
+        return KimiUsageNormalizer.planName(fromUserInfo: data)
+    }
+
+    private func resolvedUsageURL(
+        from credentials: ProviderCredential,
+        environment: KimiCodeEnvironment?
+    ) throws -> URL {
         if !shouldUseOAuthFile(credentials),
            let customEndpoint = credentials.normalizedCustomEndpoint,
            customEndpoint.hasPrefix("http") {
@@ -4457,8 +4868,14 @@ public struct KimiProviderClient: ProviderClient {
             return baseURL.appendingPathComponent("usages")
         }
 
-        return URL(string: "https://api.kimi.com/coding/v1/usages")!
+        return environment?.usageURL ?? URL(string: "https://api.kimi.com/coding/v1/usages")!
     }
+}
+
+private nonisolated struct KimiAuthorization {
+    let accessToken: String
+    /// The deployment a CLI sign-in belongs to; `nil` for a Console API key.
+    let environment: KimiCodeEnvironment?
 }
 
 private extension ProviderCredential {
@@ -4474,7 +4891,8 @@ private extension ProviderCredential {
 }
 
 private nonisolated struct KimiOAuthFileAccess {
-    let fileURL: URL
+    /// The folder or file the user granted, for `KimiCodeSignIn.locate`.
+    let selectedURL: URL
     let scopeURL: URL
 }
 
@@ -4519,16 +4937,16 @@ private nonisolated enum KimiOAuthRefreshFailure: Error {
 private actor KimiOAuthRefreshCoordinator {
     static let shared = KimiOAuthRefreshCoordinator()
 
-    private static let oauthHost = URL(string: "https://auth.kimi.com/api/oauth/token")!
     private static let clientID = "17e5f671-d194-4dfb-9706-5516cb48c098"
     private static let minimumRefreshLeeway: TimeInterval = 5 * 60
     private static let lockWaitTimeout: TimeInterval = 15
 
     func accessToken(
-        fileURL: URL,
+        signIn: KimiCodeSignIn,
         session: URLSession,
         refreshDisabledMessage: String?
     ) async throws -> String {
+        let fileURL = signIn.fileURL
         let initial = try loadOAuthFile(at: fileURL)
         guard !initial.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderFetchError.invalidCredential
@@ -4549,8 +4967,8 @@ private actor KimiOAuthRefreshCoordinator {
             )
         }
 
-        let configRoot = configRootURL(for: fileURL)
-        let lockURL = try await acquireRefreshLock(configRoot: configRoot)
+        let configRoot = signIn.configRoot
+        let lockURL = try await acquireRefreshLock(configRoot: configRoot, slot: signIn.environment.slot)
         let heartbeat = heartbeatLock(at: lockURL)
         defer {
             heartbeat.cancel()
@@ -4575,6 +4993,7 @@ private actor KimiOAuthRefreshCoordinator {
         do {
             refreshed = try await refresh(
                 refreshToken: activeRefreshToken,
+                environment: signIn.environment,
                 configRoot: configRoot,
                 session: session
             )
@@ -4607,6 +5026,10 @@ private actor KimiOAuthRefreshCoordinator {
         let data: Data
         do {
             data = try Data(contentsOf: url)
+        } catch CocoaError.fileReadNoSuchFile, CocoaError.fileNoSuchFile {
+            throw ProviderFetchError.credentialExpired(
+                "Kimi Code CLI has no sign-in at `credentials/\(url.lastPathComponent)`. Run `/login` in Kimi Code, then import `~/.kimi-code` again in Kimi settings."
+            )
         } catch {
             throw ProviderFetchError.networkError(underlying: error)
         }
@@ -4618,18 +5041,13 @@ private actor KimiOAuthRefreshCoordinator {
         }
     }
 
-    private func configRootURL(for fileURL: URL) -> URL {
-        let parent = fileURL.deletingLastPathComponent()
-        return parent.lastPathComponent == "credentials"
-            ? parent.deletingLastPathComponent()
-            : parent
-    }
-
-    private func acquireRefreshLock(configRoot: URL) async throws -> URL {
+    /// Takes the lock the CLI's own refresh takes for this slot:
+    /// `oauth/<slot>.lock`, a directory kept fresh by `heartbeatLock`.
+    private func acquireRefreshLock(configRoot: URL, slot: String) async throws -> URL {
         let fileManager = FileManager.default
         let oauthDirectory = configRoot.appendingPathComponent("oauth", isDirectory: true)
-        let lockTarget = oauthDirectory.appendingPathComponent("kimi-code")
-        let lockURL = oauthDirectory.appendingPathComponent("kimi-code.lock", isDirectory: true)
+        let lockTarget = oauthDirectory.appendingPathComponent(slot)
+        let lockURL = oauthDirectory.appendingPathComponent("\(slot).lock", isDirectory: true)
 
         do {
             try fileManager.createDirectory(
@@ -4717,10 +5135,15 @@ private actor KimiOAuthRefreshCoordinator {
 
     private func refresh(
         refreshToken: String,
+        environment: KimiCodeEnvironment,
         configRoot: URL,
         session: URLSession
     ) async throws -> KimiOAuthRefreshResponse {
-        var request = URLRequest(url: Self.oauthHost)
+        // A sign-in only renews with the deployment that issued it.
+        guard let tokenURL = environment.tokenURL else {
+            throw ProviderFetchError.parsingError("Kimi Code's OAuth host is not a valid URL.")
+        }
+        var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = 30
@@ -5086,41 +5509,31 @@ enum KimiLocalTranscriptReader {
 }
 
 enum KimiUsageNormalizer {
-    static func snapshot(from data: Data, fetchedAt: Date = Date()) throws -> QuotaSnapshot {
+    /// `planName`, from `/me`, wins over any plan the payload names.
+    static func snapshot(
+        from data: Data,
+        fetchedAt: Date = Date(),
+        planName: String? = nil
+    ) throws -> QuotaSnapshot {
         guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ProviderFetchError.parsingError("Kimi usage response was not a JSON object.")
         }
-        return try snapshot(from: payload, fetchedAt: fetchedAt)
+        return try snapshot(from: payload, fetchedAt: fetchedAt, planName: planName)
     }
 
-    static func snapshot(from payload: [String: Any], fetchedAt: Date = Date()) throws -> QuotaSnapshot {
-        var windows: [QuotaWindow] = []
-
-        if let limits = payload["limits"] as? [[String: Any]] {
-            for limit in limits {
-                let detail = (limit["detail"] as? [String: Any]) ?? limit
-                let window = limit["window"] as? [String: Any]
-                let label = labelForLimitWindow(window)
-                let subtitle = subtitleForLimitWindow(window)
-                if let quotaWindow = quotaWindow(
-                    label: label,
-                    kind: .sliding,
-                    detail: detail,
-                    subtitle: subtitle
-                ) {
-                    windows.append(quotaWindow)
-                }
-            }
-        }
-
-        if let usage = payload["usage"] as? [String: Any],
-           let weeklyWindow = quotaWindow(
-                label: "Weekly",
-                kind: .weekly,
-                detail: usage,
-                subtitle: "Kimi Code membership quota"
-           ) {
-            windows.append(weeklyWindow)
+    static func snapshot(
+        from payload: [String: Any],
+        fetchedAt: Date = Date(),
+        planName: String? = nil
+    ) throws -> QuotaSnapshot {
+        // `usages` holds exactly the windows the plan has: Pro and the entry
+        // plan get 5h and monthly, Allegretto and Vivace add weekly. The
+        // older `limits`/`usage` fields still arrive beside it, but Kimi
+        // Code's own `/usage` no longer reads them, so they only stand in
+        // for a payload without `usages`.
+        var windows = planWindows(from: payload["usages"])
+        if windows.isEmpty {
+            windows = legacyWindows(from: payload)
         }
 
         guard !windows.isEmpty else {
@@ -5158,13 +5571,131 @@ enum KimiUsageNormalizer {
         return QuotaSnapshot(
             providerID: .kimi,
             displayName: "Kimi Code",
-            planName: planName(from: payload),
+            planName: planName ?? self.planName(from: payload),
             windows: windows,
             stats: stats,
             balances: balances,
             fetchState: .success,
             fetchedAt: fetchedAt
         )
+    }
+
+    /// The plan name in a `/me` response, such as "Pro".
+    static func planName(fromUserInfo data: Data) -> String? {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return string(payload["user_level_name"])
+    }
+
+    /// The windows in `usages`, in the order Kimi Code lists them. Each entry
+    /// is `{ used_ratio, reset_time }`; one the plan lacks is left out.
+    private static func planWindows(from value: Any?) -> [QuotaWindow] {
+        guard let usages = value as? [String: Any] else { return [] }
+
+        var windows: [QuotaWindow] = []
+        if let entry = usageEntry(usages["limit_5h"]) {
+            windows.append(percentWindow(
+                label: "5H",
+                kind: .sliding,
+                entry: entry,
+                subtitle: "Rolling 5h quota"
+            ))
+        }
+        if let entry = usageEntry(usages["limit_7d"]) {
+            windows.append(percentWindow(
+                label: "Weekly",
+                kind: .weekly,
+                entry: entry,
+                subtitle: "Kimi Code membership quota"
+            ))
+        }
+        if let entry = usageEntry(usages["limit_month_total"]) {
+            windows.append(percentWindow(
+                label: "Monthly",
+                kind: .monthly,
+                entry: entry,
+                subtitle: monthlySubtitle(
+                    totalRatio: entry.usedRatio,
+                    codeRatio: usageEntry(usages["limit_month_code"])?.usedRatio
+                )
+            ))
+        }
+        return windows
+    }
+
+    private static func usageEntry(_ value: Any?) -> (usedRatio: Double, resetDate: Date?)? {
+        guard let entry = value as? [String: Any],
+              let usedRatio = number(entry["used_ratio"]),
+              usedRatio.isFinite else {
+            return nil
+        }
+        return (usedRatio, date(entry["reset_time"]))
+    }
+
+    private static func percentWindow(
+        label: String,
+        kind: QuotaWindowKind,
+        entry: (usedRatio: Double, resetDate: Date?),
+        subtitle: String
+    ) -> QuotaWindow {
+        QuotaWindow(
+            label: label,
+            windowKind: kind,
+            used: clampedRatio(entry.usedRatio) * 100,
+            total: 100,
+            resetDate: entry.resetDate,
+            unit: "%",
+            subtitle: subtitle
+        )
+    }
+
+    /// The monthly quota is shared with the Kimi app, so the window says how
+    /// it splits, rounded as Kimi Code's `/usage` rounds it.
+    private static func monthlySubtitle(totalRatio: Double, codeRatio: Double?) -> String {
+        guard let codeRatio else { return "Shared Kimi membership quota" }
+        let code = clampedRatio(codeRatio)
+        let app = clampedRatio(((totalRatio - code) * 1_000_000).rounded() / 1_000_000)
+        return "Kimi Code \(Int((code * 100).rounded()))% · Kimi app \(Int((app * 100).rounded()))%"
+    }
+
+    private static func clampedRatio(_ ratio: Double) -> Double {
+        min(max(ratio, 0), 1)
+    }
+
+    /// Windows from the payload Kimi Code sent before `usages`: rolling
+    /// `limits` in quota units, and `usage` as the weekly quota.
+    private static func legacyWindows(from payload: [String: Any]) -> [QuotaWindow] {
+        var windows: [QuotaWindow] = []
+
+        if let limits = payload["limits"] as? [[String: Any]] {
+            for limit in limits {
+                let detail = (limit["detail"] as? [String: Any]) ?? limit
+                let window = limit["window"] as? [String: Any]
+                let label = labelForLimitWindow(window)
+                let subtitle = subtitleForLimitWindow(window)
+                if let quotaWindow = quotaWindow(
+                    label: label,
+                    kind: .sliding,
+                    detail: detail,
+                    subtitle: subtitle
+                ) {
+                    windows.append(quotaWindow)
+                }
+            }
+        }
+
+        if let usage = payload["usage"] as? [String: Any],
+           let weeklyWindow = quotaWindow(
+                label: "Weekly",
+                kind: .weekly,
+                detail: usage,
+                subtitle: "Kimi Code membership quota"
+           ) {
+            windows.append(weeklyWindow)
+        }
+
+        return windows
     }
 
     private static func quotaWindow(

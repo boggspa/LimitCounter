@@ -292,32 +292,26 @@ public enum MockData {
         QuotaSnapshot(
             providerID: .kimi,
             displayName: "Kimi Code",
-            planName: "Moderato",
+            planName: "Pro",
             windows: [
-                QuotaWindow(
-                    label: "Weekly",
-                    windowKind: .weekly,
-                    used: 420,
-                    total: 2_000,
-                    resetDate: Date().addingTimeInterval(4 * 24 * 3600),
-                    unit: "quota",
-                    subtitle: "Kimi Code membership quota"
-                ),
                 QuotaWindow(
                     label: "5H",
                     windowKind: .sliding,
-                    used: 61,
-                    total: 200,
+                    used: 31,
+                    total: 100,
                     resetDate: Date().addingTimeInterval(2 * 3600 + 30 * 60),
-                    unit: "quota",
+                    unit: "%",
                     subtitle: "Rolling 5h quota"
+                ),
+                QuotaWindow(
+                    label: "Monthly",
+                    windowKind: .monthly,
+                    used: 21,
+                    total: 100,
+                    resetDate: Date().addingTimeInterval(18 * 24 * 3600),
+                    unit: "%",
+                    subtitle: "Kimi Code 17% · Kimi app 4%"
                 )
-            ],
-            stats: [
-                QuotaStat(label: "Parallel Limit", value: 2, unit: "tasks", subtitle: "Concurrent Kimi Code requests")
-            ],
-            balances: [
-                QuotaBalance(label: "Total Quota", amount: 1_580, unit: "quota", subtitle: "2K total membership quota")
             ],
             fetchState: .success
         )
