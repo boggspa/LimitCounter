@@ -921,11 +921,27 @@ enum MistralAnchorWatermarkStore {
     }
 
     private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
-    private static let signatureKey = "mistral.manualAnchor.signature"
-    private static let localCostKey = "mistral.manualAnchor.localCostUSD"
-    private static let localMonthKey = "mistral.manualAnchor.localCostMonth"
-    private static let accumulatedCostKey = "mistral.manualAnchor.accumulatedLocalCostUSD"
-    private static let hasBaselineKey = "mistral.manualAnchor.hasLocalBaseline"
+
+    /// One account's watermark. The primary account keeps the keys it has
+    /// always used; a second account's anchor must not advance the first's.
+    private struct Keys {
+        let signature: String
+        let localCost: String
+        let localMonth: String
+        let accumulatedCost: String
+        let hasBaseline: String
+
+        init(account: ProviderAccountKey) {
+            let suffix = account.isPrimary ? "" : "#\(account.slot)"
+            signature = "mistral.manualAnchor.signature\(suffix)"
+            localCost = "mistral.manualAnchor.localCostUSD\(suffix)"
+            localMonth = "mistral.manualAnchor.localCostMonth\(suffix)"
+            accumulatedCost = "mistral.manualAnchor.accumulatedLocalCostUSD\(suffix)"
+            hasBaseline = "mistral.manualAnchor.hasLocalBaseline\(suffix)"
+        }
+
+        var all: [String] { [signature, localCost, localMonth, accumulatedCost, hasBaseline] }
+    }
 
     private static let unitsPerUSD: [String: Double] = [
         "USD": 1,
@@ -940,24 +956,26 @@ enum MistralAnchorWatermarkStore {
         signature: String,
         initialLocalIncrementUSD: Double = 0,
         now: Date = Date(),
+        account: ProviderAccountKey = .primary(.mistral),
         defaults overrideDefaults: UserDefaults? = nil
     ) -> Adjustment {
         guard let conversionRate = unitsPerUSD[currency.uppercased()] else {
             return Adjustment(spend: anchoredSpend, localIncrement: 0)
         }
         let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
-        guard defaults.string(forKey: signatureKey) == signature else {
-            defaults.set(signature, forKey: signatureKey)
+        let keys = Keys(account: account)
+        guard defaults.string(forKey: keys.signature) == signature else {
+            defaults.set(signature, forKey: keys.signature)
             let recoveredIncrement = max(initialLocalIncrementUSD, 0)
-            defaults.set(recoveredIncrement, forKey: accumulatedCostKey)
+            defaults.set(recoveredIncrement, forKey: keys.accumulatedCost)
             if let currentLocalSpendUSD {
-                defaults.set(currentLocalSpendUSD, forKey: localCostKey)
-                defaults.set(monthKey(for: now), forKey: localMonthKey)
-                defaults.set(true, forKey: hasBaselineKey)
+                defaults.set(currentLocalSpendUSD, forKey: keys.localCost)
+                defaults.set(monthKey(for: now), forKey: keys.localMonth)
+                defaults.set(true, forKey: keys.hasBaseline)
             } else {
-                defaults.removeObject(forKey: localCostKey)
-                defaults.removeObject(forKey: localMonthKey)
-                defaults.set(false, forKey: hasBaselineKey)
+                defaults.removeObject(forKey: keys.localCost)
+                defaults.removeObject(forKey: keys.localMonth)
+                defaults.set(false, forKey: keys.hasBaseline)
             }
             return result(
                 anchoredSpend: anchoredSpend,
@@ -966,7 +984,7 @@ enum MistralAnchorWatermarkStore {
             )
         }
 
-        var accumulated = defaults.double(forKey: accumulatedCostKey)
+        var accumulated = defaults.double(forKey: keys.accumulatedCost)
         guard let currentLocalSpendUSD else {
             return result(
                 anchoredSpend: anchoredSpend,
@@ -975,18 +993,18 @@ enum MistralAnchorWatermarkStore {
             )
         }
         let currentMonth = monthKey(for: now)
-        guard defaults.bool(forKey: hasBaselineKey) else {
-            if defaults.object(forKey: localCostKey) != nil {
-                let legacyBaseline = defaults.double(forKey: localCostKey)
+        guard defaults.bool(forKey: keys.hasBaseline) else {
+            if defaults.object(forKey: keys.localCost) != nil {
+                let legacyBaseline = defaults.double(forKey: keys.localCost)
                 accumulated += max(currentLocalSpendUSD - legacyBaseline, 0)
-                defaults.set(accumulated, forKey: accumulatedCostKey)
+                defaults.set(accumulated, forKey: keys.accumulatedCost)
             } else if initialLocalIncrementUSD > accumulated {
                 accumulated = initialLocalIncrementUSD
-                defaults.set(accumulated, forKey: accumulatedCostKey)
+                defaults.set(accumulated, forKey: keys.accumulatedCost)
             }
-            defaults.set(currentLocalSpendUSD, forKey: localCostKey)
-            defaults.set(currentMonth, forKey: localMonthKey)
-            defaults.set(true, forKey: hasBaselineKey)
+            defaults.set(currentLocalSpendUSD, forKey: keys.localCost)
+            defaults.set(currentMonth, forKey: keys.localMonth)
+            defaults.set(true, forKey: keys.hasBaseline)
             return result(
                 anchoredSpend: anchoredSpend,
                 accumulatedUSD: accumulated,
@@ -994,9 +1012,9 @@ enum MistralAnchorWatermarkStore {
             )
         }
 
-        let previousLocalCost = defaults.double(forKey: localCostKey)
+        let previousLocalCost = defaults.double(forKey: keys.localCost)
         let storedLocalCost: Double
-        if defaults.string(forKey: localMonthKey) == currentMonth {
+        if defaults.string(forKey: keys.localMonth) == currentMonth {
             accumulated += max(currentLocalSpendUSD - previousLocalCost, 0)
             storedLocalCost = max(currentLocalSpendUSD, previousLocalCost)
         } else {
@@ -1005,9 +1023,9 @@ enum MistralAnchorWatermarkStore {
             accumulated += currentLocalSpendUSD
             storedLocalCost = currentLocalSpendUSD
         }
-        defaults.set(storedLocalCost, forKey: localCostKey)
-        defaults.set(currentMonth, forKey: localMonthKey)
-        defaults.set(accumulated, forKey: accumulatedCostKey)
+        defaults.set(storedLocalCost, forKey: keys.localCost)
+        defaults.set(currentMonth, forKey: keys.localMonth)
+        defaults.set(accumulated, forKey: keys.accumulatedCost)
         return result(
             anchoredSpend: anchoredSpend,
             accumulatedUSD: accumulated,
@@ -1022,6 +1040,7 @@ enum MistralAnchorWatermarkStore {
         signature: String,
         initialLocalIncrementUSD: Double = 0,
         now: Date = Date(),
+        account: ProviderAccountKey = .primary(.mistral),
         defaults overrideDefaults: UserDefaults? = nil
     ) -> Double {
         adjustment(
@@ -1031,8 +1050,17 @@ enum MistralAnchorWatermarkStore {
             signature: signature,
             initialLocalIncrementUSD: initialLocalIncrementUSD,
             now: now,
+            account: account,
             defaults: overrideDefaults
         ).spend
+    }
+
+    /// Forgets a removed account's watermark.
+    static func clear(for account: ProviderAccountKey, defaults overrideDefaults: UserDefaults? = nil) {
+        let defaults = overrideDefaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        for key in Keys(account: account).all {
+            defaults.removeObject(forKey: key)
+        }
     }
 
     private static func result(
@@ -1058,7 +1086,7 @@ enum MistralAnchorWatermarkStore {
 
 // MARK: - Mistral Web Subscription Client
 
-public struct MistralWebSubscriptionResult: Sendable {
+public nonisolated struct MistralWebSubscriptionResult: Sendable, Codable, Equatable {
     public let planName: String?
     public let apiSpent: Double?
     public let apiAllowance: Double?
@@ -1201,27 +1229,77 @@ private nonisolated func persistImportedCookieHeader(
     providerID: ProviderID,
     field: String
 ) async -> Bool {
-    let didPersist = await MainActor.run {
-        KeychainService.shared.updateExtraFields(
+    await persistImportedCookieHeader(cookieHeader, account: .primary(providerID), field: field)
+}
+
+/// Saves a rotated session into the keychain item of the account that sent
+/// it. Filed under the provider alone, a second account's rotation replaced
+/// the first account's session with its own.
+private nonisolated func persistImportedCookieHeader(
+    _ cookieHeader: String,
+    account: ProviderAccountKey,
+    field: String
+) async -> Bool {
+    await MainActor.run {
+        let didPersist = KeychainService.shared.updateExtraFields(
             [field: cookieHeader],
-            for: providerID
+            for: account
         )
+        if !didPersist {
+            print("[ImportedCookieHeader] Failed to persist rotated cookies for \(account.rawValue)")
+        }
+        return didPersist
     }
-    if !didPersist {
-        print("[ImportedCookieHeader] Failed to persist rotated cookies for \(providerID.rawValue)")
+}
+
+/// What one read of admin.mistral.ai/subscription found.
+public nonisolated enum MistralWebSubscriptionOutcome: Sendable, Equatable {
+    case reading(MistralWebSubscriptionResult)
+    /// The page wanted a sign-in: the imported session ended or was revoked,
+    /// and only a fresh import brings it back.
+    case signedOut
+    /// Anything else that left no reading — a network failure, an error
+    /// status, a page the parser does not recognise, or rotated cookies the
+    /// keychain would not take. Worth retrying; not the user's to fix.
+    case unreadable(String)
+
+    public var reading: MistralWebSubscriptionResult? {
+        if case .reading(let reading) = self { return reading }
+        return nil
     }
-    return didPersist
 }
 
 public struct MistralWebSubscriptionClient: Sendable {
-    public init() {}
+    static let subscriptionURL = URL(string: "https://admin.mistral.ai/subscription")!
+
+    private let makeSession: @Sendable () -> URLSession
+
+    public init() {
+        self.init(makeSession: { URLSession(configuration: Self.cookieInertConfiguration()) })
+    }
+
+    init(makeSession: @escaping @Sendable () -> URLSession) {
+        self.makeSession = makeSession
+    }
+
+    /// admin.mistral.ai rotates session cookies via Set-Cookie, and a shared
+    /// cookie jar would override the imported Keychain header on every fetch
+    /// after the first.
+    nonisolated static func cookieInertConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.timeoutIntervalForRequest = 15
+        return configuration
+    }
 
     public func fetch(
         cookieHeader: String,
         now: Date,
         persistCookieHeader: ((String) async -> Bool)? = nil
-    ) async -> MistralWebSubscriptionResult? {
-        guard let url = URL(string: "https://admin.mistral.ai/subscription") else { return nil }
+    ) async -> MistralWebSubscriptionOutcome {
+        let url = Self.subscriptionURL
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.httpMethod = "GET"
         request.httpShouldHandleCookies = false
@@ -1232,22 +1310,33 @@ public struct MistralWebSubscriptionClient: Sendable {
         )
         request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
 
-        // Cookie-inert session: admin.mistral.ai rotates session cookies via
-        // Set-Cookie, and the shared cookie jar would override the imported
-        // Keychain header on every fetch after the first.
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpShouldSetCookies = false
-        configuration.httpCookieAcceptPolicy = .never
-        configuration.httpCookieStorage = nil
-        configuration.timeoutIntervalForRequest = 15
-        let session = URLSession(configuration: configuration)
+        let session = makeSession()
         defer { session.finishTasksAndInvalidate() }
 
-        guard let (data, response) = try? await session.data(for: request),
-              let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode),
-              let html = String(data: data, encoding: .utf8) else {
-            return nil
+        let data: Data
+        let httpResponse: HTTPURLResponse
+        do {
+            let (body, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else {
+                return .unreadable("admin.mistral.ai sent no HTTP response")
+            }
+            data = body
+            httpResponse = response
+        } catch {
+            return .unreadable(error.localizedDescription)
+        }
+
+        if [401, 403].contains(httpResponse.statusCode) || Self.isSignInRedirect(httpResponse.url) {
+            return .signedOut
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            return .unreadable("admin.mistral.ai answered HTTP \(httpResponse.statusCode)")
+        }
+        guard let html = String(data: data, encoding: .utf8) else {
+            return .unreadable("admin.mistral.ai sent a page that is not UTF-8 text")
+        }
+        if Self.isSignInPage(html: html) {
+            return .signedOut
         }
 
         if let rotatedHeader = ImportedCookieHeaderMerger.mergedHeader(
@@ -1259,11 +1348,14 @@ public struct MistralWebSubscriptionClient: Sendable {
             guard let persistCookieHeader,
                   await persistCookieHeader(rotatedHeader) else {
                 print("[MistralWebSubscriptionClient] Rotated cookies were received but could not be persisted")
-                return nil
+                return .unreadable("Mistral rotated this session, and the new cookies could not be saved to Keychain")
             }
         }
 
-        return Self.parse(html: html, now: now)
+        guard let reading = Self.parse(html: html, now: now) else {
+            return .unreadable("The subscription page had no usage meters Limit Counter recognises")
+        }
+        return .reading(reading)
     }
 
     // MARK: Parsing
@@ -1293,9 +1385,33 @@ public struct MistralWebSubscriptionClient: Sendable {
     /// when no stop label follows an occurrence.
     private static let maximumBlockLength = 800
 
+    /// Whether the request for the subscription page ended at Mistral's
+    /// sign-in service (auth.mistral.ai, v2.auth.mistral.ai), where a lapsed
+    /// session is sent. Any other host is a moved page, not a sign-out.
+    static func isSignInRedirect(_ finalURL: URL?) -> Bool {
+        guard let finalURL,
+              let host = finalURL.host?.lowercased(),
+              host != subscriptionURL.host?.lowercased() else {
+            return false
+        }
+        let path = finalURL.path.lowercased()
+        return host.hasPrefix("auth.") || host.contains(".auth.")
+            || ["login", "signin", "sign-in"].contains { path.contains($0) }
+    }
+
+    /// Whether admin.mistral.ai answered with its sign-in form instead of the
+    /// subscription page.
+    static func isSignInPage(html: String) -> Bool {
+        isSignInPage(renderedText: normalizedRenderedText(from: html))
+    }
+
+    private static func isSignInPage(renderedText: String) -> Bool {
+        renderedText.range(of: "Sign in to your account", options: .caseInsensitive) != nil
+    }
+
     public static func parse(html: String, now: Date) -> MistralWebSubscriptionResult? {
         let renderedText = normalizedRenderedText(from: html)
-        if renderedText.range(of: "Sign in to your account", options: .caseInsensitive) != nil {
+        if isSignInPage(renderedText: renderedText) {
             return nil
         }
 
@@ -1570,6 +1686,35 @@ nonisolated struct BrowserMeterResult<Value: Codable & Sendable>: Sendable {
         return ProviderFetchError.parsingError(
             failure.hasPrefix(prefix) ? String(failure.dropFirst(prefix.count)) : failure
         )
+    }
+}
+
+/// Which WebKit store holds an account's browser sign-in.
+///
+/// A primary account keeps WebKit's default store, where every sign-in made
+/// before accounts existed already lives. A secondary account of a provider
+/// listed here signs in to a store of its own, so importing it cannot sign the
+/// primary out — on Mistral, signing out to switch accounts ended the other
+/// account's session on the server. Providers whose background readers render
+/// the dashboard with the default store stay off the list until those readers
+/// take the account's store too, or a second account would read the first.
+enum ProviderWebSessionStore {
+    static let providersWithAccountStores: Set<ProviderID> = [.mistral]
+
+    /// Stable across launches, derived from the account key; `nil` means
+    /// WebKit's default store.
+    static func identifier(for account: ProviderAccountKey) -> UUID? {
+        guard !account.isPrimary, providersWithAccountStores.contains(account.providerID) else {
+            return nil
+        }
+        let digest = SHA256.hash(data: Data("LimitCounter.webSessionStore.v1|\(account.rawValue)".utf8))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50 // name-based version
+        bytes[8] = (bytes[8] & 0x3F) | 0x80 // RFC 4122 variant
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 }
 
@@ -2146,15 +2291,152 @@ public struct WebBillingClient: Sendable {
      }
 }
 
-public struct MistralProviderClient: ProviderClient {
+/// The last subscription-page reading of each Mistral account: parsed numbers
+/// only, never cookies or page HTML. When the page cannot be read — the
+/// session ended, the network failed — the account shows this reading, marked
+/// stale, instead of dropping its API meter or borrowing another account's.
+enum MistralWebReadingCache {
+    struct Entry: Codable, Equatable {
+        let reading: MistralWebSubscriptionResult
+        let fetchedAt: Date
+    }
+
+    private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
+
+    static func key(for account: ProviderAccountKey) -> String {
+        "mistral.webReading.v1.\(account.rawValue)"
+    }
+
+    static func load(for account: ProviderAccountKey, defaults: UserDefaults? = nil) -> Entry? {
+        let defaults = defaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        guard let data = defaults.data(forKey: key(for: account)) else { return nil }
+        return try? JSONDecoder().decode(Entry.self, from: data)
+    }
+
+    static func save(
+        _ reading: MistralWebSubscriptionResult,
+        fetchedAt: Date,
+        for account: ProviderAccountKey,
+        defaults: UserDefaults? = nil
+    ) {
+        let defaults = defaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        guard let data = try? JSONEncoder().encode(Entry(reading: reading, fetchedAt: fetchedAt)) else { return }
+        defaults.set(data, forKey: key(for: account))
+    }
+
+    static func clear(for account: ProviderAccountKey, defaults: UserDefaults? = nil) {
+        let defaults = defaults ?? UserDefaults(suiteName: appGroupID) ?? .standard
+        defaults.removeObject(forKey: key(for: account))
+    }
+}
+
+public struct MistralProviderClient: AccountScopedProviderClient {
     public let providerID: ProviderID = .mistral
 
-    public init() {}
+    private let webClient: MistralWebSubscriptionClient
+    private let readingDefaults: UserDefaults?
+
+    public init() {
+        self.init(webClient: MistralWebSubscriptionClient(), readingDefaults: nil)
+    }
+
+    /// `readingDefaults` holds the last web readings and the anchor
+    /// watermarks; `nil` is the app group.
+    init(webClient: MistralWebSubscriptionClient, readingDefaults: UserDefaults?) {
+        self.webClient = webClient
+        self.readingDefaults = readingDefaults
+    }
 
     struct MeterAssembly {
         let windows: [QuotaWindow]
         let signals: [QuotaSignal]
         let planName: String?
+    }
+
+    /// The web reading an account's meters use, and what the card says about
+    /// it. A reading from this fetch is used as it is. Otherwise the account's
+    /// last reading stands in — a stale tombstone — until its billing period
+    /// resets, with a signal naming when it was taken and, when the session
+    /// ended, that only a fresh import of this account brings it back.
+    struct WebReadingResolution {
+        let reading: MistralWebSubscriptionResult?
+        /// When `reading` came from the cache, the moment it was taken.
+        let staleSince: Date?
+        let signals: [QuotaSignal]
+        let signedOut: Bool
+    }
+
+    /// A transient miss is not worth a signal until the reading standing in
+    /// for it is this old; the card's age stamp already shows it.
+    static let staleReadingSignalAge: TimeInterval = 60 * 60
+
+    static func resolveWebReading(
+        outcome: MistralWebSubscriptionOutcome?,
+        cached: MistralWebReadingCache.Entry?,
+        now: Date
+    ) -> WebReadingResolution {
+        guard let outcome else {
+            return WebReadingResolution(reading: nil, staleSince: nil, signals: [], signedOut: false)
+        }
+        if let reading = outcome.reading {
+            return WebReadingResolution(reading: reading, staleSince: nil, signals: [], signedOut: false)
+        }
+
+        let standIn = cached.flatMap { isCurrent($0, now: now) ? $0 : nil }
+        let takenAt = standIn.map { " These meters are the reading from \(readingStamp($0.fetchedAt))." } ?? ""
+        var signals: [QuotaSignal] = []
+        switch outcome {
+        case .signedOut:
+            signals.append(
+                QuotaSignal(
+                    kind: .scheduledReset,
+                    title: "Mistral sign-in expired",
+                    message: "admin.mistral.ai signed this account out, so its meters cannot refresh.\(takenAt) Import this account's session again in Settings to reconnect it.",
+                    severity: .warning,
+                    confidence: 1,
+                    detectedAt: now
+                )
+            )
+        case .unreadable(let reason):
+            if let standIn, now.timeIntervalSince(standIn.fetchedAt) >= staleReadingSignalAge {
+                signals.append(
+                    QuotaSignal(
+                        kind: .scheduledReset,
+                        title: "Mistral reading is stale",
+                        message: "The subscription page could not be read: \(reason).\(takenAt)",
+                        severity: .info,
+                        confidence: 1,
+                        detectedAt: now
+                    )
+                )
+            }
+        case .reading:
+            break
+        }
+        return WebReadingResolution(
+            reading: standIn?.reading,
+            staleSince: standIn?.fetchedAt,
+            signals: signals,
+            signedOut: outcome == .signedOut
+        )
+    }
+
+    /// A reading describes one billing period; once that period resets, its
+    /// numbers belong to a month that is over. Without a reset date it is
+    /// trusted for the calendar month (UTC) it was taken in.
+    static func isCurrent(_ entry: MistralWebReadingCache.Entry, now: Date) -> Bool {
+        if let periodEnd = entry.reading.periodEnd {
+            return periodEnd > now
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        return calendar.isDate(entry.fetchedAt, equalTo: now, toGranularity: .month)
+    }
+
+    /// Absolute, so the message — and the CloudKit status hash built from it —
+    /// stays the same on every fetch that falls back to the same reading.
+    private static func readingStamp(_ date: Date) -> String {
+        date.formatted(.dateTime.day().month(.abbreviated).hour().minute())
     }
 
     /// Builds the API and Vibe meters, choosing the best source per meter:
@@ -2169,6 +2451,8 @@ public struct MistralProviderClient: ProviderClient {
         fallbackManualAllowance: Double? = nil,
         budgetUSD: Double? = nil,
         now: Date,
+        account: ProviderAccountKey = .primary(.mistral),
+        staleWebReadingNote: String? = nil,
         watermarkDefaults: UserDefaults? = nil
     ) -> MeterAssembly {
         let rawManualVibeAllowance = positiveDouble(fields[SpendProviderCredentialField.manualAllowance])
@@ -2240,7 +2524,7 @@ public struct MistralProviderClient: ProviderClient {
                     total: apiAllowance,
                     resetDate: webResult.periodEnd ?? manualReset,
                     unit: webResult.currency,
-                    subtitle: "Available via the API and Studio"
+                    subtitle: staleWebReadingNote ?? "Available via the API and Studio"
                 )
             )
         } else if let admin, let vibeSpend = admin.vibeSpend {
@@ -2286,7 +2570,7 @@ public struct MistralProviderClient: ProviderClient {
                     total: vibeAllowance,
                     resetDate: webResult.periodEnd ?? manualReset,
                     unit: webResult.currency,
-                    subtitle: "Vibe Code includes extra monthly usage"
+                    subtitle: staleWebReadingNote ?? "Vibe Code includes extra monthly usage"
                 )
             )
         } else if let admin, let vibeSpend = admin.vibeSpend {
@@ -2334,6 +2618,7 @@ public struct MistralProviderClient: ProviderClient {
                         local?.costUSD(since: $0) ?? 0
                     } ?? 0,
                     now: now,
+                    account: account,
                     defaults: watermarkDefaults
                 )
                 windows.append(
@@ -2379,9 +2664,22 @@ public struct MistralProviderClient: ProviderClient {
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        try await fetchSnapshot(credentials: credentials, account: .primary(.mistral), userInitiated: false)
+    }
+
+    public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
         let now = Date()
+        // ~/.vibe records sessions but not the account that ran them, so it
+        // belongs to the primary account; a second account reads a folder
+        // only when it was given one of its own.
         #if os(macOS)
-        let fallback = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vibe", isDirectory: true)
+        let fallback: URL? = account.isPrimary
+            ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vibe", isDirectory: true)
+            : nil
         #else
         let fallback: URL? = nil
         #endif
@@ -2396,14 +2694,14 @@ public struct MistralProviderClient: ProviderClient {
             nil
         }
         let webSessionCookie = fields["mistralCookieHeader"] ?? fields["mistralCookie"]
-        let webResult: MistralWebSubscriptionResult? = if let webSessionCookie, !webSessionCookie.isEmpty {
-            await MistralWebSubscriptionClient().fetch(
+        let webOutcome: MistralWebSubscriptionOutcome? = if let webSessionCookie, !webSessionCookie.isEmpty {
+            await webClient.fetch(
                 cookieHeader: webSessionCookie,
                 now: now,
                 persistCookieHeader: {
                     await persistImportedCookieHeader(
                         $0,
-                        providerID: .mistral,
+                        account: account,
                         field: "mistralCookieHeader"
                     )
                 }
@@ -2412,25 +2710,43 @@ public struct MistralProviderClient: ProviderClient {
             nil
         }
 
-        if let webSessionCookie, !webSessionCookie.isEmpty {
-            if let webResult {
-                print("[MistralProvider] Web parse api=\(webResult.apiSpent.map { String($0) } ?? "nil") vibe=\(webResult.vibeSpent.map { String($0) } ?? "nil")")
-            } else {
-                print("[MistralProvider] Web parse yielded no meters (signed out, network failure, or page layout change)")
-            }
+        switch webOutcome {
+        case .reading(let reading):
+            MistralWebReadingCache.save(reading, fetchedAt: now, for: account, defaults: readingDefaults)
+            print("[MistralProvider] \(account.rawValue) web parse api=\(reading.apiSpent.map { String($0) } ?? "nil") vibe=\(reading.vibeSpent.map { String($0) } ?? "nil")")
+        case .signedOut:
+            print("[MistralProvider] \(account.rawValue) web session signed out")
+        case .unreadable(let reason):
+            print("[MistralProvider] \(account.rawValue) web page unreadable: \(reason)")
+        case nil:
+            break
         }
+        let web = Self.resolveWebReading(
+            outcome: webOutcome,
+            cached: webOutcome?.reading == nil
+                ? MistralWebReadingCache.load(for: account, defaults: readingDefaults)
+                : nil,
+            now: now
+        )
 
         let assembly = Self.assembleMeters(
-            webResult: webResult,
+            webResult: web.reading,
             admin: admin,
             local: local,
             fields: fields,
             fallbackManualAllowance: positiveDouble(credentials?.normalizedAccountIdentifier),
-            budgetUSD: ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .mistral),
-            now: now
+            // The monthly budget is set once per provider, for the primary
+            // account; it says nothing about another account's plan.
+            budgetUSD: account.isPrimary
+                ? ProviderMonthlyBudgetStore.nonisolatedBudgetUSD(for: .mistral)
+                : nil,
+            now: now,
+            account: account,
+            staleWebReadingNote: web.staleSince.map { "Last reading \(Self.readingStamp($0))" },
+            watermarkDefaults: readingDefaults
         )
         let windows = assembly.windows
-        let signals = assembly.signals
+        let signals = web.signals + assembly.signals
         var stats: [QuotaStat] = []
 
         if let admin, let vibeSpend = admin.vibeSpend {
@@ -2457,7 +2773,16 @@ public struct MistralProviderClient: ProviderClient {
             ])
         }
 
-        guard !windows.isEmpty || local != nil else { throw ProviderFetchError.notConfigured }
+        guard !windows.isEmpty || local != nil else {
+            // Nothing current to stand in: the coordinator keeps the last
+            // snapshot on screen and files this against the account.
+            if web.signedOut {
+                throw ProviderFetchError.credentialExpired(
+                    "admin.mistral.ai signed this account out. Import its session again in Settings."
+                )
+            }
+            throw ProviderFetchError.notConfigured
+        }
         return QuotaSnapshot(
             providerID: .mistral,
             displayName: ProviderID.mistral.snapshotDisplayName,
@@ -2468,7 +2793,9 @@ public struct MistralProviderClient: ProviderClient {
             events: local?.events ?? [],
             analyticsBuckets: local?.analyticsBuckets ?? [],
             fetchState: .success,
-            fetchedAt: now
+            // Meters standing in from an earlier reading are that old, and the
+            // card's age stamp should say so.
+            fetchedAt: web.staleSince ?? now
         )
     }
 }

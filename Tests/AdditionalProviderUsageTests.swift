@@ -3700,6 +3700,281 @@ private func testAGBenchUsageRowsAreReparsedOnlyWhenTheFileChanges() throws {
     try expectEqual(kimiTokens(), [12_345], "a rewritten usage.json is re-parsed")
 }
 
+// MARK: - Mistral accounts
+
+private final class MistralMockURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private func mistralMockWebClient() -> MistralWebSubscriptionClient {
+    MistralWebSubscriptionClient(makeSession: {
+        let configuration = MistralWebSubscriptionClient.cookieInertConfiguration()
+        configuration.protocolClasses = [MistralMockURLProtocol.self]
+        return URLSession(configuration: configuration)
+    })
+}
+
+private func mistralSubscriptionPage(plan: String, api: (String, String), vibe: (String, String)) -> String {
+    """
+    <html><body><main>
+    <p>CURRENT PLAN</p><h2>\(plan) <span>Active</span></h2>
+    <h4>Included API usage</h4>
+    <div><span>€\(api.0)</span><span>€\(api.1)</span></div>
+    <p>Resets in 6 days</p>
+    <h4>Included Vibe Code usage</h4>
+    <div><span>€\(vibe.0)</span><span>€\(vibe.1)</span></div>
+    <p>Resets in 6 days</p>
+    <h3>PAY-AS-YOU-GO &amp; SPENDING LIMIT</h3>
+    </main></body></html>
+    """
+}
+
+private func mistralPageResponse(
+    _ request: URLRequest,
+    status: Int = 200,
+    url: URL? = nil,
+    headers: [String: String] = [:],
+    body: String
+) -> (HTTPURLResponse, Data) {
+    var fields = ["Content-Type": "text/html; charset=utf-8"]
+    fields.merge(headers) { _, new in new }
+    return (
+        HTTPURLResponse(url: url ?? request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: fields)!,
+        Data(body.utf8)
+    )
+}
+
+private let mistralSignInPage = """
+<html><body><h1>Sign in to your account</h1><form action="/login"><input name="email"/></form></body></html>
+"""
+
+private func testMistralWebFetchRecognisesASignedOutSession() async throws {
+    defer { MistralMockURLProtocol.handler = nil }
+    let client = mistralMockWebClient()
+    let now = date("2026-09-25T06:00:00Z")
+
+    MistralMockURLProtocol.handler = { mistralPageResponse($0, body: mistralSignInPage) }
+    try expectEqual(await client.fetch(cookieHeader: "ory_session=gone", now: now), .signedOut, "sign-in form")
+
+    MistralMockURLProtocol.handler = {
+        mistralPageResponse($0, url: URL(string: "https://v2.auth.mistral.ai/ui/login?flow=1")!, body: "<html><body>Log in</body></html>")
+    }
+    try expectEqual(await client.fetch(cookieHeader: "ory_session=gone", now: now), .signedOut, "sent to the sign-in service")
+
+    MistralMockURLProtocol.handler = {
+        mistralPageResponse($0, url: URL(string: "https://console.mistral.ai/billing")!, body: "<html><body>Billing</body></html>")
+    }
+    guard case .unreadable = await client.fetch(cookieHeader: "ory_session=live", now: now) else {
+        throw AdditionalProviderTestError.failure("a page moved to another host is not a sign-out")
+    }
+
+    MistralMockURLProtocol.handler = { mistralPageResponse($0, status: 401, body: "") }
+    try expectEqual(await client.fetch(cookieHeader: "ory_session=gone", now: now), .signedOut, "HTTP 401")
+
+    MistralMockURLProtocol.handler = { mistralPageResponse($0, status: 502, body: "Bad gateway") }
+    guard case .unreadable = await client.fetch(cookieHeader: "ory_session=live", now: now) else {
+        throw AdditionalProviderTestError.failure("a server error is a miss to retry, not a sign-out")
+    }
+
+    MistralMockURLProtocol.handler = { mistralPageResponse($0, body: "<html><body><h1>Subscription</h1></body></html>") }
+    guard case .unreadable = await client.fetch(cookieHeader: "ory_session=live", now: now) else {
+        throw AdditionalProviderTestError.failure("a page without meters is a miss to retry, not a sign-out")
+    }
+}
+
+private final class RotatedHeaderBox {
+    var headers: [String] = []
+}
+
+private func testMistralWebFetchHandsRotatedCookiesToItsCaller() async throws {
+    defer { MistralMockURLProtocol.handler = nil }
+    let client = mistralMockWebClient()
+    let now = date("2026-09-25T06:00:00Z")
+    let page = mistralSubscriptionPage(plan: "Pro", api: ("3.20", "25.5"), vibe: ("41.00", "255"))
+    MistralMockURLProtocol.handler = {
+        mistralPageResponse(
+            $0,
+            headers: ["Set-Cookie": "ory_session=rotated; Domain=.mistral.ai; Path=/; Max-Age=3600; Secure; HttpOnly"],
+            body: page
+        )
+    }
+
+    let saved = RotatedHeaderBox()
+    let outcome = await client.fetch(cookieHeader: "ory_session=old; theme=dark", now: now) {
+        saved.headers.append($0)
+        return true
+    }
+    try expectClose(outcome.reading?.apiSpent ?? -1, 3.2, "the page still parses")
+    try expectEqual(saved.headers, ["ory_session=rotated; theme=dark"], "rotation goes to the caller, which files it under the account")
+
+    let refused = await client.fetch(cookieHeader: "ory_session=old; theme=dark", now: now) { _ in false }
+    guard case .unreadable = refused else {
+        throw AdditionalProviderTestError.failure("a rotation Keychain refused must not pass for a durable session")
+    }
+}
+
+private func testMistralStaleTombstoneRules() throws {
+    let now = date("2026-09-25T06:00:00Z")
+    let reading = MistralWebSubscriptionResult(
+        planName: "Pro", apiSpent: 3, apiAllowance: 25.5, vibeSpent: 40, vibeAllowance: 255,
+        currency: "EUR", periodEnd: date("2026-10-01T00:00:00Z")
+    )
+    let fresh = MistralWebReadingCache.Entry(reading: reading, fetchedAt: now.addingTimeInterval(-10 * 60))
+    let hoursOld = MistralWebReadingCache.Entry(reading: reading, fetchedAt: now.addingTimeInterval(-3 * 3600))
+    let lastMonth = MistralWebReadingCache.Entry(
+        reading: MistralWebSubscriptionResult(
+            planName: "Pro", apiSpent: 20, apiAllowance: 25.5, vibeSpent: 200, vibeAllowance: 255,
+            currency: "EUR", periodEnd: date("2026-09-01T00:00:00Z")
+        ),
+        fetchedAt: date("2026-08-30T12:00:00Z")
+    )
+
+    let noSession = MistralProviderClient.resolveWebReading(outcome: nil, cached: fresh, now: now)
+    try expect(noSession.reading == nil && noSession.signals.isEmpty, "no imported session: nothing stands in")
+
+    let live = MistralProviderClient.resolveWebReading(outcome: .reading(reading), cached: hoursOld, now: now)
+    try expect(live.reading == reading && live.staleSince == nil && live.signals.isEmpty, "a live reading is used as it is")
+
+    let blip = MistralProviderClient.resolveWebReading(outcome: .unreadable("timed out"), cached: fresh, now: now)
+    try expect(blip.reading == reading, "a transient miss keeps the last reading")
+    try expectEqual(blip.staleSince, fresh.fetchedAt, "and dates the meters to it")
+    try expect(blip.signals.isEmpty && !blip.signedOut, "a recent reading needs no signal")
+
+    let stale = MistralProviderClient.resolveWebReading(outcome: .unreadable("timed out"), cached: hoursOld, now: now)
+    try expect(stale.reading == reading, "an old reading still stands in")
+    try expectEqual(stale.signals.map(\.severity), [.info], "an hour-old stand-in is flagged")
+    try expect(stale.signals.first?.message.contains("timed out") == true, "with the reason")
+
+    let tombstone = MistralProviderClient.resolveWebReading(outcome: .signedOut, cached: fresh, now: now)
+    try expect(tombstone.reading == reading && tombstone.signedOut, "a signed-out account keeps its last reading")
+    try expectEqual(tombstone.signals.map(\.title), ["Mistral sign-in expired"], "and says why it will not refresh")
+    try expectEqual(tombstone.signals.first?.severity, .warning, "as a warning")
+    try expect(tombstone.signals.first?.message.contains("These meters are the reading from") == true, "naming the reading's age")
+    try expect(tombstone.signals.first?.resetKind == nil, "never read as a reset")
+
+    let expired = MistralProviderClient.resolveWebReading(outcome: .signedOut, cached: lastMonth, now: now)
+    try expect(expired.reading == nil && expired.staleSince == nil, "last period's numbers do not stand in for this one")
+    try expectEqual(expired.signals.map(\.title), ["Mistral sign-in expired"], "the sign-out is still reported")
+    try expect(expired.signals.first?.message.contains("These meters") == false, "without claiming meters it does not show")
+
+    let undated = MistralWebReadingCache.Entry(
+        reading: MistralWebSubscriptionResult(
+            planName: nil, apiSpent: 1, apiAllowance: nil, vibeSpent: nil, vibeAllowance: nil,
+            currency: "EUR", periodEnd: nil
+        ),
+        fetchedAt: date("2026-09-02T00:00:00Z")
+    )
+    try expect(MistralProviderClient.isCurrent(undated, now: now), "an undated reading holds for its month")
+    try expect(!MistralProviderClient.isCurrent(undated, now: date("2026-10-01T00:00:01Z")), "and not past it")
+}
+
+private func testMistralSecondaryAccountReadsOnlyItsOwnSession() async throws {
+    defer { MistralMockURLProtocol.handler = nil }
+    let suiteName = "limit-counter-mistral-accounts-tests-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let secondary = ProviderAccountKey(providerID: .mistral, slot: "tw1234")
+    let client = MistralProviderClient(webClient: mistralMockWebClient(), readingDefaults: defaults)
+    let credential = ProviderCredential(extraFields: ["mistralCookieHeader": "ory_session=second"])
+    let pro = mistralSubscriptionPage(plan: "Pro", api: ("3.20", "25.5"), vibe: ("41.00", "255"))
+    let free = mistralSubscriptionPage(plan: "Free", api: ("2.10", "8.5"), vibe: ("8.50", "8.5"))
+    MistralMockURLProtocol.handler = { request in
+        let cookie = request.value(forHTTPHeaderField: "Cookie") ?? ""
+        return mistralPageResponse(request, body: cookie.contains("ory_session=second") ? free : pro)
+    }
+
+    let snapshot = try await client.fetchSnapshot(credentials: credential, account: secondary, userInitiated: false)
+    try expectEqual(snapshot.planName, "Free", "the second account's own plan")
+    try expectClose(snapshot.windows.first { $0.label == "API usage" }?.used ?? -1, 2.1, "its own API meter")
+    try expectClose(snapshot.windows.first { $0.label == "Vibe Code usage" }?.total ?? -1, 8.5, "its own Vibe allowance")
+    try expect(!snapshot.stats.contains { $0.label == "Local 30D cost" }, "~/.vibe is the primary account's, not this one's")
+    try expect(MistralWebReadingCache.load(for: secondary, defaults: defaults) != nil, "the reading is kept for this account")
+    try expect(MistralWebReadingCache.load(for: .primary(.mistral), defaults: defaults) == nil, "and not for the primary")
+
+    MistralMockURLProtocol.handler = { mistralPageResponse($0, body: mistralSignInPage) }
+    let tombstone = try await client.fetchSnapshot(credentials: credential, account: secondary, userInitiated: false)
+    try expectClose(tombstone.windows.first { $0.label == "API usage" }?.used ?? -1, 2.1, "signed out: the last reading stands in")
+    try expect(tombstone.windows.allSatisfy { $0.subtitle?.hasPrefix("Last reading") == true }, "each meter says it is a past reading")
+    try expectEqual(tombstone.fetchedAt, snapshot.fetchedAt, "the card is dated to that reading")
+    try expectEqual(tombstone.signals.map(\.title), ["Mistral sign-in expired"], "and asks for a fresh import")
+
+    MistralWebReadingCache.clear(for: secondary, defaults: defaults)
+    do {
+        _ = try await client.fetchSnapshot(credentials: credential, account: secondary, userInitiated: false)
+        throw AdditionalProviderTestError.failure("a signed-out account with nothing to show must report the sign-out")
+    } catch ProviderFetchError.credentialExpired {
+        // The coordinator keeps the previous snapshot and files the message under the account.
+    }
+}
+
+private func testMistralAnchorWatermarkIsKeptPerAccount() throws {
+    let suiteName = "limit-counter-mistral-watermark-accounts-\(UUID().uuidString)"
+    let defaults = try UserDefaults(suiteName: suiteName)
+        ?? { throw AdditionalProviderTestError.failure("Could not create isolated defaults") }()
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let secondary = ProviderAccountKey(providerID: .mistral, slot: "tw1234")
+    let july = date("2026-07-10T12:00:00Z")
+
+    _ = MistralAnchorWatermarkStore.adjustedSpend(
+        anchoredSpend: 10, currentLocalSpendUSD: 5, currency: "USD",
+        signature: "primary-anchor", now: july, defaults: defaults
+    )
+    _ = MistralAnchorWatermarkStore.adjustedSpend(
+        anchoredSpend: 1, currentLocalSpendUSD: 50, currency: "USD",
+        signature: "secondary-anchor", now: july, account: secondary, defaults: defaults
+    )
+    try expectEqual(defaults.string(forKey: "mistral.manualAnchor.signature"), "primary-anchor", "the primary keeps its original keys")
+    try expectEqual(defaults.string(forKey: "mistral.manualAnchor.signature#tw1234"), "secondary-anchor", "a second account gets its own")
+
+    let primaryLater = MistralAnchorWatermarkStore.adjustedSpend(
+        anchoredSpend: 10, currentLocalSpendUSD: 7, currency: "USD",
+        signature: "primary-anchor", now: july, defaults: defaults
+    )
+    try expectClose(primaryLater, 12, "the primary advances by its own local spend only")
+
+    MistralAnchorWatermarkStore.clear(for: secondary, defaults: defaults)
+    try expect(defaults.string(forKey: "mistral.manualAnchor.signature#tw1234") == nil, "a removed account's watermark goes")
+    try expectEqual(defaults.string(forKey: "mistral.manualAnchor.signature"), "primary-anchor", "and only that account's")
+}
+
+private func testMistralAccountsSignInToSeparateWebStores() throws {
+    try expect(ProviderWebSessionStore.identifier(for: .primary(.mistral)) == nil, "the primary keeps WebKit's default store")
+    let first = ProviderAccountKey(providerID: .mistral, slot: "tw1234")
+    let second = ProviderAccountKey(providerID: .mistral, slot: "zz9999")
+    let identifier = try ProviderWebSessionStore.identifier(for: first)
+        ?? { throw AdditionalProviderTestError.failure("a second Mistral account needs a store of its own") }()
+    try expectEqual(ProviderWebSessionStore.identifier(for: first), identifier, "derived, so the same store every launch")
+    try expectEqual(identifier.uuidString, "54199951-0BB7-5E22-8B61-FEF48D13F967", "the derivation never changes under a signed-in store")
+    try expect(ProviderWebSessionStore.identifier(for: second) != identifier, "each account signs in on its own")
+    try expect(
+        ProviderWebSessionStore.identifier(for: ProviderAccountKey(providerID: .cerebras, slot: "tw1234")) == nil,
+        "providers whose background readers use the default store keep it"
+    )
+}
+
 @main
 private enum AdditionalProviderUsageTestRunner {
     static func main() async throws {
@@ -3734,6 +4009,12 @@ private enum AdditionalProviderUsageTestRunner {
         try testMistralAssemblyPrefersFullWebResultOverAnchor()
         try testMistralAssemblyKeepsAdminCombinedTotalWithoutWeb()
         try testMistralAssemblyFallsBackToLocalEstimateWithoutAnchor()
+        try await testMistralWebFetchRecognisesASignedOutSession()
+        try await testMistralWebFetchHandsRotatedCookiesToItsCaller()
+        try testMistralStaleTombstoneRules()
+        try await testMistralSecondaryAccountReadsOnlyItsOwnSession()
+        try testMistralAnchorWatermarkIsKeptPerAccount()
+        try testMistralAccountsSignInToSeparateWebStores()
         try testDeepSeekBalanceAndObservedSpendSemantics()
         try testTaskWraithPricingIsProviderScopedAndEstimated()
         try testMuseCostEstimatorMatchesSparkSessionTotals()

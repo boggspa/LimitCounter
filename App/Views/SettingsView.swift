@@ -964,7 +964,7 @@ struct ProviderCredentialView: View {
             case .ollama:
                 OllamaSessionImportView(onImport: handle, onClose: back)
             case .mistral:
-                MistralSessionImportView(onImport: handle, onClose: back)
+                MistralSessionImportView(account: account, onImport: handle, onClose: back)
             case .metaWeb:
                 MetaWebSessionImportView(onImport: handle, onClose: back)
             case .museSubscription:
@@ -2105,6 +2105,11 @@ struct ProviderCredentialView: View {
         if providerID == .claude, !account.isPrimary {
             ClaudeOAuthCredentialPolicy.setClaudeCodeKeychainFallbackEnabled(true, in: &merged.extraFields)
         }
+        // A new session may be a different Mistral account, whose meters the
+        // previous session's last reading must not stand in for.
+        if providerID == .mistral {
+            MistralWebReadingCache.clear(for: account)
+        }
         apply(merged)
         return saveCredentialWithExtraFields(merged.extraFields)
     }
@@ -2128,6 +2133,8 @@ struct ProviderCredentialView: View {
             QwenWebSessionImportModel.clearStoredWebsiteData()
         } else if providerID == .mimo {
             MimoWebSessionImportModel.clearStoredWebsiteData()
+        } else if providerID == .mistral {
+            MistralWebReadingCache.clear(for: account)
         }
         KeychainService.shared.delete(for: account)
         accessToken = ""

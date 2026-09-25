@@ -18,9 +18,14 @@ final class SignInBrowser: NSObject, ObservableObject {
     /// Open popups, oldest first; the last is frontmost.
     @Published private(set) var popups: [SignInPopup] = []
 
-    override init() {
+    /// `dataStore` is the cookie jar the sign-in lands in, `nil` for WebKit's
+    /// default. With one store for everything, a provider's second account
+    /// signed in over its first: the importer showed whoever signed in last,
+    /// and signing out there to switch ended the other account's session on
+    /// the server.
+    init(dataStore: WKWebsiteDataStore? = nil) {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = dataStore ?? .default()
         webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.uiDelegate = self
@@ -33,6 +38,25 @@ final class SignInBrowser: NSObject, ObservableObject {
     func close(_ popup: SignInPopup) {
         popup.webView.evaluateJavaScript("window.close()")
         remove(popup.webView)
+    }
+
+    /// Drops this store's cookies and site data for `domains`, then loads
+    /// `startURL` so the site asks for a sign-in again. Nothing is sent to the
+    /// site: its own "Log out" ends the session on the server, and with it the
+    /// copy of that session an account already imported.
+    func forgetSignIn(forDomains domains: [String], thenLoad startURL: URL) async {
+        let store = webView.configuration.websiteDataStore
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        let records = await store.dataRecords(ofTypes: types).filter {
+            SignInSiteData.belongs($0.displayName, to: domains)
+        }
+        if !records.isEmpty {
+            await store.removeData(ofTypes: types, for: records)
+        }
+        for popup in popups {
+            close(popup)
+        }
+        webView.load(URLRequest(url: startURL))
     }
 
     private func remove(_ webView: WKWebView) {
@@ -172,6 +196,20 @@ nonisolated enum SignInAccountChooser {
         "accounts.google.com": ["/o/oauth2/auth", "/o/oauth2/v2/auth"],
         "github.com": ["/login/oauth/authorize"]
     ]
+}
+
+/// Which of a data store's records belong to a site, by the registrable
+/// domain WebKit names each record after ("mistral.ai" for every
+/// *.mistral.ai cookie and storage area).
+nonisolated enum SignInSiteData {
+    static func belongs(_ recordName: String, to domains: [String]) -> Bool {
+        let name = recordName.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !name.isEmpty else { return false }
+        return domains.contains { domain in
+            let domain = domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return !domain.isEmpty && (name == domain || name.hasSuffix("." + domain))
+        }
+    }
 }
 
 /// Where a popup sits over the page that opened it.

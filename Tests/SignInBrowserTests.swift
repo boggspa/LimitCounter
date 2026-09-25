@@ -194,6 +194,17 @@ private func testPopupsStayInsideTheMargins() throws {
     }
 }
 
+private func testSiteDataMatchesTheSiteAndItsSubdomainsOnly() throws {
+    let mistral = ["mistral.ai"]
+    try expect(SignInSiteData.belongs("mistral.ai", to: mistral), "the site's own record")
+    try expect(SignInSiteData.belongs("admin.mistral.ai", to: mistral), "a subdomain's record")
+    try expect(SignInSiteData.belongs("MISTRAL.AI", to: [".Mistral.ai"]), "case and leading dots are ignored")
+    try expect(!SignInSiteData.belongs("notmistral.ai", to: mistral), "a lookalike domain is someone else's")
+    try expect(!SignInSiteData.belongs("google.com", to: mistral), "the identity provider's sign-in stays")
+    try expect(!SignInSiteData.belongs("mistral.ai", to: [""]), "an empty domain matches nothing")
+    try expect(!SignInSiteData.belongs("", to: mistral), "an unnamed record matches nothing")
+}
+
 // MARK: - Runner
 
 @main
@@ -211,6 +222,7 @@ private enum SignInBrowserTestRunner {
         try testUnsizedPopupFillsTheImporter()
         try testNestedPopupsStepDownAndRight()
         try testPopupsStayInsideTheMargins()
+        try testSiteDataMatchesTheSiteAndItsSubdomainsOnly()
         print("Sign-in browser tests passed")
     }
 }

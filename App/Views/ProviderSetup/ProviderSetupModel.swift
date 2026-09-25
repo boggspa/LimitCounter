@@ -185,10 +185,16 @@ final class ProviderSetupModel: ObservableObject {
 
     /// Removes the account's credential, its cached readings and its roster
     /// entry, in that order, so a crash midway leaves a labelled account with
-    /// no secret rather than an orphaned secret.
+    /// no secret rather than an orphaned secret. Its own browser sign-in
+    /// store, if it had one, goes with it.
     func removeAccount(_ key: ProviderAccountKey) {
         store.delete(for: key)
         QuotaSnapshotStore.shared.clear(account: key)
+        if key.providerID == .mistral {
+            MistralWebReadingCache.clear(for: key)
+            MistralAnchorWatermarkStore.clear(for: key)
+        }
+        Task { await ProviderWebSessionStore.removeStore(for: key) }
         accounts.remove(key)
         accountHealth.removeValue(forKey: key)
         if case .credential(let current) = page, current == key {

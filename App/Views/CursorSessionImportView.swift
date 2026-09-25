@@ -185,6 +185,26 @@ final class CursorSessionImportModel {
     }
 }
 
+extension ProviderWebSessionStore {
+    /// The WebKit store an account's importer signs in to.
+    static func dataStore(for account: ProviderAccountKey) -> WKWebsiteDataStore {
+        guard let identifier = identifier(for: account) else { return .default() }
+        return WKWebsiteDataStore(forIdentifier: identifier)
+    }
+
+    /// Deletes a removed account's own store, sign-in and all. A primary
+    /// account's store is WebKit's default, shared with every other importer,
+    /// and is left alone.
+    static func removeStore(for account: ProviderAccountKey) async {
+        guard let identifier = identifier(for: account) else { return }
+        do {
+            try await WKWebsiteDataStore.remove(forIdentifier: identifier)
+        } catch {
+            print("[ProviderWebSessionStore] Could not remove the sign-in store for \(account.rawValue): \(error.localizedDescription)")
+        }
+    }
+}
+
 private enum CursorSessionImportError: LocalizedError {
     case noCookiesFound
 
@@ -566,10 +586,26 @@ struct MistralSessionImportView: View {
     private func close() {
         if let onClose { onClose() } else { dismiss() }
     }
-    @State private var model = MistralSessionImportModel()
+    private let signsInSeparately: Bool
+    @State private var model: MistralSessionImportModel
     @State private var isImporting = false
+    @State private var isForgettingSignIn = false
     @State private var importError: String?
     @State private var showImportError = false
+
+    /// `account` picks the browser store the sign-in lands in: a second
+    /// Mistral account signs in on its own, so importing it cannot sign the
+    /// other out.
+    init(
+        account: ProviderAccountKey = .primary(.mistral),
+        onImport: @escaping (Result<CredentialImportService.ImportedCredential, Error>) -> Void,
+        onClose: (() -> Void)? = nil
+    ) {
+        self.onImport = onImport
+        self.onClose = onClose
+        signsInSeparately = ProviderWebSessionStore.identifier(for: account) != nil
+        _model = State(initialValue: MistralSessionImportModel(account: account))
+    }
 
     private let startURL = URL(string: "https://admin.mistral.ai/subscription")!
 
@@ -622,6 +658,13 @@ struct MistralSessionImportView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
+
+            Text(signsInSeparately
+                ? "This account signs in separately from your other Mistral accounts, so signing in here leaves them signed in."
+                : "To switch Mistral accounts, choose Use Another Account. Mistral's own Log out also ends the session on Mistral's side, which disconnects any account that imported it.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 20)
         }
         .padding(.bottom, 14)
     }
@@ -633,6 +676,20 @@ struct MistralSessionImportView: View {
                 .foregroundStyle(.secondary)
 
             Spacer()
+
+            // Forgets the sign-in in this browser only. Mistral's own Log out
+            // would end the session on the server, and with it any copy of
+            // that session another account already imported.
+            Button("Use Another Account") {
+                Task {
+                    isForgettingSignIn = true
+                    defer { isForgettingSignIn = false }
+                    await model.forgetSignIn(thenLoad: startURL)
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isImporting || isForgettingSignIn)
+            .help("Signs this browser out of Mistral without logging the session out on Mistral's servers.")
 
             Button("Cancel") {
                 close()
@@ -653,7 +710,7 @@ struct MistralSessionImportView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(hex: ProviderID.mistral.accentColorHex))
-            .disabled(isImporting)
+            .disabled(isImporting || isForgettingSignIn)
         }
         .padding(20)
     }
@@ -684,19 +741,28 @@ struct MistralSessionImportView: View {
 
 @MainActor
 final class MistralSessionImportModel {
-    let browser = SignInBrowser()
+    static let siteDomains = ["mistral.ai"]
+
+    let browser: SignInBrowser
     var webView: WKWebView { browser.webView }
+
+    init(account: ProviderAccountKey) {
+        browser = SignInBrowser(dataStore: ProviderWebSessionStore.dataStore(for: account))
+    }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
         webView.load(URLRequest(url: startURL))
     }
 
+    func forgetSignIn(thenLoad startURL: URL) async {
+        await browser.forgetSignIn(forDomains: Self.siteDomains, thenLoad: startURL)
+    }
+
     func captureCookieHeader() async throws -> String {
         let cookies = try await webView.allCookies()
         let relevantCookies = cookies.filter { cookie in
-            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            return domain == "mistral.ai" || domain.hasSuffix(".mistral.ai")
+            SignInSiteData.belongs(cookie.domain, to: Self.siteDomains)
         }
 
         guard !relevantCookies.isEmpty else {
