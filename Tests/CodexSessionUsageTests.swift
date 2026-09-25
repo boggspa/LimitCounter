@@ -293,8 +293,12 @@ private func jwt(account: String, user: String, expiresAt: Date) -> String {
     return "\(encode(["alg": "none"])).\(encode(claims)).sig"
 }
 
-private final class PersistedCredentials: @unchecked Sendable {
+private final class PersistedCredentials: CodexCredentialSaving, @unchecked Sendable {
     var saved: [(ProviderCredential, ProviderAccountKey)] = []
+
+    func save(_ credential: ProviderCredential, for account: ProviderAccountKey) {
+        saved.append((credential, account))
+    }
 }
 
 private struct CodexAccountHarness {
@@ -331,11 +335,10 @@ private struct CodexAccountHarness {
         defer { CodexMockURLProtocol.responseData = nil }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CodexMockURLProtocol.self]
-        let persisted = persisted
         return try await CodexSessionProviderClient(
             session: URLSession(configuration: configuration),
             readingDefaults: defaults,
-            persistCredential: { credential, account in persisted.saved.append((credential, account)) }
+            credentialSaver: persisted
         ).fetchSnapshot(credentials: credential, account: account, userInitiated: false)
     }
 

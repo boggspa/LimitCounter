@@ -6220,29 +6220,52 @@ enum CodexAccountIdentityRegistry {
     }
 }
 
+/// Where a Codex account's rotated token and pin are saved. A protocol, not
+/// a stored `@Sendable async` closure: converting the keychain closure under
+/// the app's default MainActor isolation handed it a corrupt account key and
+/// crashed the first sync that saved a token.
+protocol CodexCredentialSaving {
+    @MainActor func save(_ credential: ProviderCredential, for account: ProviderAccountKey)
+}
+
+/// Writes a rotated token and the pin back over the same grant only: an
+/// account re-imported meanwhile keeps its new grant.
+struct KeychainCodexCredentialSaver: CodexCredentialSaving {
+    @MainActor func save(_ credential: ProviderCredential, for account: ProviderAccountKey) {
+        guard let current = KeychainService.shared.credential(for: account),
+              current.customEndpoint == credential.customEndpoint,
+              let currentPin = CodexAccountPin.pinned(in: current),
+              let newPin = CodexAccountPin.pinned(in: credential),
+              currentPin.isSameAccount(as: newPin) else {
+            return
+        }
+        if !KeychainService.shared.save(credential, for: account) {
+            print("[CodexSessionProvider] Failed to save the rotated Codex session for \(account.rawValue)")
+        }
+    }
+}
+
 /// Fetches Codex usage via the ChatGPT-authenticated session (the "wham/usage" endpoint).
 /// Returns 5-hour and 7-day rolling windows used by the Codex CLI.
 public struct CodexSessionProviderClient: AccountScopedProviderClient {
     public let providerID: ProviderID = .openai
 
-    typealias CredentialPersister = @Sendable (ProviderCredential, ProviderAccountKey) async -> Void
-
     private let session: URLSession
     private let decoder = JSONDecoder()
     private let endpointURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     private let readingDefaults: UserDefaults?
-    private let persistCredential: CredentialPersister
+    private let credentialSaver: any CodexCredentialSaving
 
     public init(session: URLSession = .shared) {
-        self.init(session: session, readingDefaults: nil, persistCredential: Self.persistToKeychain)
+        self.init(session: session, readingDefaults: nil, credentialSaver: KeychainCodexCredentialSaver())
     }
 
     /// `readingDefaults` holds the verified readings and the identity
     /// registry; `nil` is the app group.
-    init(session: URLSession, readingDefaults: UserDefaults?, persistCredential: @escaping CredentialPersister) {
+    init(session: URLSession, readingDefaults: UserDefaults?, credentialSaver: any CodexCredentialSaving) {
         self.session = session
         self.readingDefaults = readingDefaults
-        self.persistCredential = persistCredential
+        self.credentialSaver = credentialSaver
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
@@ -6271,10 +6294,8 @@ public struct CodexSessionProviderClient: AccountScopedProviderClient {
             guard let identity else { return snapshot }
             if rotatedToken || !CodexAccountPin.isPinned(stored),
                let token = credential.normalizedAccessToken {
-                await persistCredential(
-                    CodexAccountPin.updated(stored, accessToken: token, identity: identity),
-                    account
-                )
+                let updated = CodexAccountPin.updated(stored, accessToken: token, identity: identity)
+                await credentialSaver.save(updated, for: account)
             }
             return verified(snapshot, identity: identity, account: account, now: now, defaults: defaults)
 
@@ -6408,23 +6429,6 @@ public struct CodexSessionProviderClient: AccountScopedProviderClient {
 
     private static func stamp(_ date: Date) -> String {
         date.formatted(.dateTime.day().month(.abbreviated).hour().minute())
-    }
-
-    /// Writes a rotated token and the pin back over the same grant only: an
-    /// account re-imported meanwhile keeps its new grant.
-    nonisolated static let persistToKeychain: CredentialPersister = { @Sendable credential, account in
-        await MainActor.run {
-            guard let current = KeychainService.shared.credential(for: account),
-                  current.customEndpoint == credential.customEndpoint,
-                  let currentPin = CodexAccountPin.pinned(in: current),
-                  let newPin = CodexAccountPin.pinned(in: credential),
-                  currentPin.isSameAccount(as: newPin) else {
-                return
-            }
-            if !KeychainService.shared.save(credential, for: account) {
-                print("[CodexSessionProvider] Failed to save the rotated Codex session for \(account.rawValue)")
-            }
-        }
     }
 
     private func fetchUsage(credentials: ProviderCredential) async throws -> QuotaSnapshot {
