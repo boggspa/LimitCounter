@@ -852,6 +852,7 @@ public final class ProviderCardOrderStore: ObservableObject {
         .openrouter,
         .qwen,
         .mimo,
+        .minimax,
         // The activity heatmap is a footer-style card by default, but
         // it is draggable like any other card.
         .heatmap

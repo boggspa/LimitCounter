@@ -29,6 +29,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case openrouter
     case qwen
     case mimo
+    case minimax
     case heatmap
 
     public static var userFacingCases: [ProviderID] {
@@ -76,6 +77,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .openrouter: return "OpenRouter"
         case .qwen:     return "Qwen Token Plan"
         case .mimo:     return "MiMo Token Plan"
+        case .minimax:  return "MiniMax"
         case .heatmap:  return "Activity Heatmap"
         }
     }
@@ -91,7 +93,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Codex Telemetry"
         case .claude, .devin, .cursor, .gemini, .kimi, .grok,
-                .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .heatmap:
+                .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return displayName
         }
     }
@@ -120,6 +122,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .openrouter: return "arrow.left.arrow.right.circle.fill"
         case .qwen:     return "q.circle.fill"
         case .mimo:     return "m.circle.fill"
+        case .minimax:  return "waveform"
         case .heatmap:  return "calendar.badge.clock"
         }
     }
@@ -148,6 +151,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .openrouter: return "#E02948"
         case .qwen:     return "#8C52EF" // alibaba
         case .mimo:     return "#008844" // xiaomi
+        case .minimax:  return "#C044A4"
         case .heatmap:  return "#8E8E93" // TaskWraith brands no heatmap: neutral, not a borrowed blue
         }
     }
@@ -192,7 +196,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderQwenLogo"
         case .mimo:
             return "ProviderMiMoLogo"
-        case .heatmap:
+        case .minimax, .heatmap:
             return ""
         }
     }
@@ -202,7 +206,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .chatgpt, .codexTelemetry:
             return .prototype
         case .claude, .openai, .openaiAPI, .devin, .cursor, .gemini, .kimi,
-                .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo:
+                .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax:
             return .session
         case .heatmap:
             return .session
@@ -249,6 +253,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Qwen Model Studio token plan"
         case .mimo:
             return "Xiaomi MiMo Token Plan"
+        case .minimax:
+            return "MiniMax Token Plan usage"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -294,6 +300,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Uses an imported Alibaba Cloud Model Studio web session to read the personal token plan quota meter (monthly on current Standard plans, 7-day on older ones), plan metadata, and reset date. A manual percent anchor is used when no session is imported."
         case .mimo:
             return "Uses an imported Xiaomi MiMo console web session to read the plan quota meter and renewal metadata from platform.xiaomimimo.com."
+        case .minimax:
+            return "Uses your MiniMax Subscription Key to read the shared 5-hour and weekly Token Plan quota and reset times from MiniMax's usage API."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -339,6 +347,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Qwen Model Studio web session"
         case .mimo:
             return "Xiaomi MiMo web session"
+        case .minimax:
+            return "MiniMax Subscription Key (sk-cp)"
         case .heatmap:
             return ""
          }
@@ -349,7 +359,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .claude:
             return "OAuth token (optional)"
         case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
-              .codexTelemetry, .meta, .ollama, .openrouter, .qwen, .mimo, .heatmap:
+              .codexTelemetry, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return nil
         case .mistral:
             return "Vibe Code budget (optional)"
@@ -406,6 +416,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Stores your imported Alibaba Cloud Model Studio web session securely in macOS Keychain. Used only to read your token plan quota meter from the Model Studio console."
         case .mimo:
             return "Stores your imported Xiaomi MiMo console web session securely in macOS Keychain. Used only to read your plan quota meter from platform.xiaomimimo.com."
+        case .minimax:
+            return "Stores the Subscription Key you enter in Keychain and sends it only to MiniMax's official quota API. Refreshing reads usage without sending model prompts."
         case .heatmap:
             return "Aggregates only locally available data."
           }
@@ -495,7 +507,7 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),
                 AppIconCandidate(bundleIdentifier: "ai.ollama.ollama", applicationNames: ["Ollama.app"])
             ]
-        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .qwen, .mimo, .heatmap:
+        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return []
         }
     }
@@ -786,7 +798,7 @@ public struct QuotaWindow: Codable, Identifiable, Equatable, Hashable {
         case .gemini:
             if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
             if descriptor.contains("weekly") { return 7 }
-        case .kimi:
+        case .kimi, .minimax:
             if descriptor.contains("5h") || descriptor.contains("5-hour") || descriptor.contains("5 hour") || descriptor.contains("session") { return 5 }
             if descriptor.contains("weekly") { return 7 }
             if descriptor.contains("monthly") { return 4 }

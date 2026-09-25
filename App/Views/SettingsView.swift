@@ -1339,6 +1339,17 @@ struct ProviderCredentialView: View {
                               .textInputAutocapitalization(.never)
                           #endif
                       }
+                  } else if providerID == .minimax {
+                    SecureField(providerID.primaryCredentialLabel, text: $accessToken)
+                        .autocorrectionDisabled()
+                    #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                    #endif
+                    Link("Open MiniMax Plan Details", destination: URL(string: "https://platform.minimax.io/console/plan")!)
+                    Text("Copy the Subscription Key (sk-cp) from Plan Details. The 5-hour and weekly meters share your Token Plan quota across tools and models. A pay-as-you-go API key does not report subscription usage.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                   } else if providerID == .claude {
                     TextField(providerID.primaryCredentialLabel, text: $accessToken)
                          .autocorrectionDisabled()

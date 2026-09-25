@@ -57,6 +57,7 @@
 		F9DF3457A4B87B2347A864E3 /* QuotaResetDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A412D664FC277AE00924A744 /* QuotaResetDetector.swift */; };
 		FA1100010000000000000001 /* AntigravityProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200010000000000000001 /* AntigravityProviderClient.swift */; };
 		FA1100020000000000000002 /* SpendProviderClients.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200020000000000000002 /* SpendProviderClients.swift */; };
+		FA1100030000000000000003 /* MiniMaxProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA1200030000000000000003 /* MiniMaxProviderClient.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -133,6 +134,7 @@
 		EEAA000400000000000000F4 /* MacLocalNotificationPublisher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MacLocalNotificationPublisher.swift; path = App/MacLocalNotificationPublisher.swift; sourceTree = SOURCE_ROOT; };
 		FA1200010000000000000001 /* AntigravityProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AntigravityProviderClient.swift; path = App/Providers/AntigravityProviderClient.swift; sourceTree = SOURCE_ROOT; };
 		FA1200020000000000000002 /* SpendProviderClients.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SpendProviderClients.swift; path = App/Providers/SpendProviderClients.swift; sourceTree = SOURCE_ROOT; };
+		FA1200030000000000000003 /* MiniMaxProviderClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MiniMaxProviderClient.swift; path = App/Providers/MiniMaxProviderClient.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -230,6 +232,7 @@
 				005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */,
 				FA1200010000000000000001 /* AntigravityProviderClient.swift */,
 				FA1200020000000000000002 /* SpendProviderClients.swift */,
+				FA1200030000000000000003 /* MiniMaxProviderClient.swift */,
 				426990F3B946E045978B05CF /* ProviderSetupPolicy.swift */,
 			);
 			path = Providers;
@@ -475,6 +478,7 @@
 				F3E1249C0FB38DD68321D303 /* ProviderClient.swift in Sources */,
 				FA1100010000000000000001 /* AntigravityProviderClient.swift in Sources */,
 				FA1100020000000000000002 /* SpendProviderClients.swift in Sources */,
+				FA1100030000000000000003 /* MiniMaxProviderClient.swift in Sources */,
 				D2004072E4759F9F5EA478AA /* KeychainService.swift in Sources */,
 				A6E2239C5393436B99DF7012 /* DashboardView.swift in Sources */,
 				A08136729B546202562478AC /* ModelUsageDashboardView.swift in Sources */,

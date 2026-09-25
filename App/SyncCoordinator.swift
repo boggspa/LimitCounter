@@ -417,7 +417,7 @@ final class SyncCoordinator {
             // refresh, and token-race failures must not erase the last good
             // quota snapshot while the user repairs or retries the session.
             shouldPreserve = true
-        case .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .qwen, .mimo:
+        case .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .qwen, .mimo, .minimax:
             // Local probes, imported sessions, reports, and billing APIs can all miss a
             // refresh transiently. Keep the last truthful reading visible.
             shouldPreserve = true
@@ -490,7 +490,7 @@ final class SyncCoordinator {
         case .claude, .chatgpt, .gemini, .ollama:
             return 15
         case .openai, .openaiAPI, .devin, .cursor, .kimi, .grok,
-               .mistral, .deepseek, .cerebras, .meta, .openrouter:
+               .mistral, .deepseek, .cerebras, .meta, .openrouter, .minimax:
             return 20
         case .qwen, .mimo:
             return 25
