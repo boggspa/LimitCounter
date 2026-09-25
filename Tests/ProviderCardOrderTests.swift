@@ -34,6 +34,10 @@ enum ProviderCardOrderTestRunner {
             try testCardCanReachTheFinalSlot()
             try testHeatmapIsDraggable()
             try testOrderPersists()
+            try testSecondaryAccountSitsAfterItsPrimary()
+            try testSecondaryAccountCardMovesOnItsOwn()
+            try testMoveToGapKeepsHiddenCardsInPlace()
+            try testAccountEntriesSurviveAndUnreadableOnesAreDropped()
         }
         print("Provider card order tests passed")
     }
@@ -166,6 +170,96 @@ enum ProviderCardOrderTestRunner {
 
         let restored = ProviderCardOrderStore(defaults: defaults)
         try orderExpectEqual(restored.orderedCards, expected, "card order must round-trip through storage")
+    }
+
+    private static let claudeWork = ProviderAccountKey(providerID: .claude, slot: "vtptrp")
+
+    @MainActor
+    private static func testSecondaryAccountSitsAfterItsPrimary() throws {
+        let store = ProviderCardOrderStore(defaults: isolatedDefaults())
+
+        try orderExpectEqual(
+            store.sortedCards([claudeWork, .primary(.gemini), .primary(.claude), .primary(.openai)]),
+            [.primary(.openai), .primary(.claude), claudeWork, .primary(.gemini)],
+            "an account that was never dragged follows its provider's primary"
+        )
+    }
+
+    @MainActor
+    private static func testSecondaryAccountCardMovesOnItsOwn() throws {
+        let defaults = isolatedDefaults()
+        let store = ProviderCardOrderStore(defaults: defaults)
+        let visible: [ProviderAccountKey] = [.primary(.openai), .primary(.claude), claudeWork, .primary(.gemini)]
+
+        store.move(claudeWork, toGap: 0, among: visible)
+        try orderExpectEqual(
+            store.sortedCards(visible),
+            [claudeWork, .primary(.openai), .primary(.claude), .primary(.gemini)],
+            "a second account's card moves without its primary"
+        )
+
+        store.move(.primary(.openai), toGap: 3, among: visible)
+        try orderExpectEqual(
+            store.sortedCards(visible),
+            [claudeWork, .primary(.claude), .primary(.gemini), .primary(.openai)],
+            "the last gap is the bottom"
+        )
+
+        let restored = ProviderCardOrderStore(defaults: defaults)
+        try orderExpectEqual(restored.sortedCards(visible), store.sortedCards(visible), "account order must round-trip")
+        try orderExpect(
+            (defaults.array(forKey: orderedProvidersKey) as? [String])?.contains(claudeWork.rawValue) == true,
+            "the dragged account is saved by its account key"
+        )
+    }
+
+    @MainActor
+    private static func testMoveToGapKeepsHiddenCardsInPlace() throws {
+        let store = ProviderCardOrderStore(defaults: isolatedDefaults())
+        let visible: [ProviderAccountKey] = [.primary(.openai), .primary(.claude), .primary(.gemini)]
+        let hiddenIndex = try index(of: .openaiAPI, in: store.orderedCards)
+
+        store.move(.primary(.gemini), toGap: 0, among: visible)
+
+        try orderExpectEqual(
+            store.sortedCards(visible),
+            [.primary(.gemini), .primary(.openai), .primary(.claude)],
+            "gap 0 is the top of what is on screen"
+        )
+        try orderExpectEqual(
+            try index(of: .openaiAPI, in: store.orderedCards),
+            hiddenIndex,
+            "a card that is not on screen keeps its place"
+        )
+    }
+
+    @MainActor
+    private static func testAccountEntriesSurviveAndUnreadableOnesAreDropped() throws {
+        let defaults = isolatedDefaults()
+        defaults.set(
+            ["claude", claudeWork.rawValue, "claude#", "nonsense#x", "codexTelemetry#abc", "openai"],
+            forKey: orderedProvidersKey
+        )
+        let store = ProviderCardOrderStore(defaults: defaults)
+
+        try orderExpectEqual(
+            Array(store.orderedCards.prefix(2)),
+            [.claude, .openai],
+            "providers keep their saved order around account entries"
+        )
+        try orderExpectEqual(
+            store.sortedCards([.primary(.openai), claudeWork, .primary(.claude)]),
+            [.primary(.claude), claudeWork, .primary(.openai)],
+            "a saved account entry keeps its place"
+        )
+
+        store.move(.primary(.openai), toGap: 0, among: [.primary(.openai), claudeWork, .primary(.claude)])
+        let saved = defaults.array(forKey: orderedProvidersKey) as? [String] ?? []
+        try orderExpect(saved.contains(claudeWork.rawValue), "account entries survive a save")
+        for unreadable in ["claude#", "nonsense#x", "codexTelemetry#abc"] {
+            try orderExpect(!saved.contains(unreadable), "\(unreadable) must be dropped")
+        }
+        try orderExpectEqual(saved.count, Set(saved).count, "saved order must not repeat an entry")
     }
 
     private static func index(of providerID: ProviderID, in order: [ProviderID]) throws -> Int {

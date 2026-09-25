@@ -879,45 +879,36 @@ struct DashboardView: View {
         appState.visibleSnapshots.filter { visibilityStore.isVisible($0.providerID) }
     }
 
+    /// One card per account. Codex's local telemetry belongs to its primary
+    /// account, so only that card combines the two; any other Codex account
+    /// gets a card of its own rather than being dropped.
     private var dashboardCards: [DashboardCardItem] {
         let snapshots = visibleSnapshots
         let allSnapshots = appState.snapshots
 
         var cards: [DashboardCardItem] = []
-        var consumedProviders = Set<ProviderID>()
 
         if visibilityStore.isVisible(.heatmap) {
             cards.append(.heatmap(snapshots: appState.snapshots, modelUsage: appState.modelUsage))
         }
 
-        let usageSnapshot = snapshots.first(where: { $0.providerID == .openai })
+        let usageSnapshot = snapshots.first { $0.providerID == .openai && $0.isPrimaryAccount }
         let telemetrySnapshot = allSnapshots.first {
             $0.providerID == .codexTelemetry && $0.fetchState == .success && $0.hasContent
         }
-
-        if let usageSnapshot {
-            if let telemetrySnapshot {
-                cards.append(.combinedCodex(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot))
-                consumedProviders.insert(.openai)
-                consumedProviders.insert(.codexTelemetry)
-            } else {
-                cards.append(.snapshot(usageSnapshot))
-                consumedProviders.insert(.openai)
-            }
+        var combinedAccount: ProviderAccountKey?
+        if let usageSnapshot, let telemetrySnapshot {
+            cards.append(.combinedCodex(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot))
+            combinedAccount = usageSnapshot.accountKey
         }
 
-        for snapshot in snapshots where !consumedProviders.contains(snapshot.providerID) && snapshot.providerID != .codexTelemetry {
+        for snapshot in snapshots
+        where snapshot.providerID != .codexTelemetry && snapshot.accountKey != combinedAccount {
             cards.append(.snapshot(snapshot))
         }
 
-        return cards.sorted { lhs, rhs in
-            let lhsRank = orderStore.rank(for: lhs.orderProviderID)
-            let rhsRank = orderStore.rank(for: rhs.orderProviderID)
-            if lhsRank == rhsRank {
-                return lhs.orderProviderID.rawValue < rhs.orderProviderID.rawValue
-            }
-            return lhsRank < rhsRank
-        }
+        let cardsByKey = Dictionary(cards.map { ($0.orderKey, $0) }, uniquingKeysWith: { first, _ in first })
+        return orderStore.sortedCards(Array(cardsByKey.keys)).compactMap { cardsByKey[$0] }
     }
 
     private func snapshotFor(_ providerID: ProviderID) -> QuotaSnapshot? {
@@ -1040,16 +1031,12 @@ struct DashboardView: View {
     /// produces — respecting `ProviderCardOrderStore` ranks and the
     /// alphabetical tiebreaker.
     private func orderedCompactSnapshots() -> [QuotaSnapshot] {
-        visibleSnapshots
-            .filter { $0.providerID != .codexTelemetry }
-            .sorted { lhs, rhs in
-                let lhsRank = orderStore.rank(for: lhs.providerID)
-                let rhsRank = orderStore.rank(for: rhs.providerID)
-                if lhsRank == rhsRank {
-                    return lhs.providerID.rawValue < rhs.providerID.rawValue
-                }
-                return lhsRank < rhsRank
-            }
+        let snapshots = visibleSnapshots.filter { $0.providerID != .codexTelemetry }
+        let snapshotsByKey = Dictionary(
+            snapshots.map { ($0.accountKey, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return orderStore.sortedCards(Array(snapshotsByKey.keys)).compactMap { snapshotsByKey[$0] }
     }
 
     @ViewBuilder
@@ -1725,8 +1712,22 @@ private enum DashboardCardItem: Identifiable {
     case combinedCodex(usageSnapshot: QuotaSnapshot, telemetrySnapshot: QuotaSnapshot)
     case heatmap(snapshots: [QuotaSnapshot], modelUsage: ModelUsageArchive)
 
+    /// Per account: two accounts of one provider are two cards, and a
+    /// shared id made SwiftUI draw one account's card in both places.
     var id: String {
-        orderProviderID.rawValue
+        orderKey.rawValue
+    }
+
+    /// The account the card belongs to, which is also its place in the order.
+    var orderKey: ProviderAccountKey {
+        switch self {
+        case .snapshot(let snapshot):
+            return snapshot.providerID == .codexTelemetry ? .primary(.openai) : snapshot.accountKey
+        case .combinedCodex(let usageSnapshot, _):
+            return usageSnapshot.accountKey
+        case .heatmap:
+            return .primary(.heatmap)
+        }
     }
 
     var navigationRoute: DashboardRoute? {
@@ -1988,7 +1989,7 @@ struct CompactDashboardCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(snapshots) { snapshot in
+            ForEach(snapshots, id: \.accountKey.rawValue) { snapshot in
                 providerBlock(snapshot)
                     .contentShape(Rectangle())
                     .onDrop(
@@ -1999,7 +2000,7 @@ struct CompactDashboardCardView: View {
                             orderStore: orderStore
                         )
                     )
-                if snapshot.id != snapshots.last?.id {
+                if snapshot.accountKey != snapshots.last?.accountKey {
                     Divider().overlay(Color.white.opacity(0.08))
                 }
             }
@@ -2013,10 +2014,12 @@ struct CompactDashboardCardView: View {
     @ViewBuilder
     private func providerBlock(_ snapshot: QuotaSnapshot) -> some View {
         let accent = Color(hex: snapshot.providerID.accentColorHex)
-        let scope = MeterOrderStore.scopeForProvider(snapshot.providerID)
+        // Keyed and scoped per account: two Codex accounts' "Weekly" rows
+        // are different meters, with orders of their own.
+        let scope = MeterOrderStore.scopeForProvider(snapshot.accountKey)
         let naturalMeters = snapshot.summaryWindows.map {
             OrderedMeter(
-                id: MeterOrderStore.key(providerID: snapshot.providerID, window: $0),
+                id: MeterOrderStore.key(account: snapshot.accountKey, window: $0),
                 window: $0
             )
         }
@@ -2028,9 +2031,10 @@ struct CompactDashboardCardView: View {
                 ProviderBrandIconView(providerID: snapshot.providerID, size: 18)
                     .frame(width: 22, height: 22)
 
-                Text(snapshot.displayName)
+                Text(snapshot.accountDisplayName)
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(.primary)
+                    .lineLimit(1)
 
                 if let plan = snapshot.displayPlanName, !plan.isEmpty, plan != snapshot.displayName {
                     Text(plan)
@@ -2174,18 +2178,15 @@ struct PeriodCompactDashboardCardView: View {
     @ViewBuilder
     private func sectionBlock(_ section: QuotaPeriodSection) -> some View {
         let scope = MeterOrderStore.scopeForPeriod(section.group)
+        // Keyed per account, as the rows' own ids are. A provider-only key
+        // gave two accounts' "Weekly" rows one name, and the saved order then
+        // showed the first account's row in both places.
         let naturalMeterRows = section.rows.filter { $0.window != nil }
-        let meterKeys = naturalMeterRows.compactMap { row -> String? in
-            guard let window = row.window else { return nil }
-            return MeterOrderStore.key(providerID: row.providerID, window: window)
-        }
+        let meterKeys = naturalMeterRows.compactMap(MeterOrderStore.key(for:))
         let orderedMeterRows = meterOrderStore.ordered(
             naturalMeterRows,
             scope: scope,
-            key: { row in
-                guard let window = row.window else { return "" }
-                return MeterOrderStore.key(providerID: row.providerID, window: window)
-            }
+            key: { MeterOrderStore.key(for: $0) ?? $0.id }
         )
         let idleRows = section.rows.filter { $0.window == nil }
         let rows = orderedMeterRows + idleRows
@@ -2207,8 +2208,7 @@ struct PeriodCompactDashboardCardView: View {
             .padding(.bottom, 1)
 
             ForEach(rows) { row in
-                if let window = row.window {
-                    let meterKey = MeterOrderStore.key(providerID: row.providerID, window: window)
+                if let meterKey = MeterOrderStore.key(for: row) {
                     meterRow(row, scope: scope, reorderableKeys: meterKeys)
                         .contentShape(Rectangle())
                         .meterReorderTarget(meterKey)
@@ -2225,9 +2225,9 @@ struct PeriodCompactDashboardCardView: View {
 
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
-                if let window = row.window {
+                if let meterKey = MeterOrderStore.key(for: row) {
                     MeterDragHandle(
-                        meterKey: MeterOrderStore.key(providerID: row.providerID, window: window),
+                        meterKey: meterKey,
                         scope: scope,
                         reorderableKeys: reorderableKeys,
                         rowFrames: meterRowFrames,

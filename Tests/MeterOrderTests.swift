@@ -41,6 +41,12 @@ enum MeterOrderTestRunner {
             try testResetRestoresOnlyThatScope()
             try testKeySurvivesAFreshWindowID()
             try testKeyIgnoresCaseAndSurroundingWhitespace()
+            try testRepeatedSavedKeysNeverHideOrRepeatAMeter()
+            try testTwoAccountsOfOneProviderSurviveAPeriodDrag()
+            try testMoveNeverSavesARepeatedKey()
+            try testMoveToGapLandsExactly()
+            try testSecondaryAccountKeyAndScopeFormat()
+            try testSecondaryBlockDragLeavesPrimaryOrder()
         }
         print("Meter order tests passed")
     }
@@ -417,6 +423,182 @@ enum MeterOrderTestRunner {
             "qwen|7-day quota|weekly|%",
             "meter key format"
         )
+    }
+
+    /// The saved Weekly order that made both Codex accounts show the first
+    /// account's meter: builds that keyed meters by provider alone saved each
+    /// provider's key once per account.
+    @MainActor
+    private static func testRepeatedSavedKeysNeverHideOrRepeatAMeter() throws {
+        let (defaults, suite) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(
+            [weeklyScope: [legacyClaudeWeekly, legacyCodexWeekly, legacyCodexWeekly, legacyClaudeWeekly]],
+            forKey: meterOrderKey
+        )
+        let store = MeterOrderStore(defaults: defaults)
+
+        let rows = try twoAccountWeeklyRows()
+        let shown = store.ordered(rows, scope: weeklyScope) { MeterOrderStore.key(for: $0) ?? $0.id }
+
+        try meterExpectEqual(
+            shown.map(\.id),
+            [rows[2].id, rows[0].id, rows[1].id, rows[3].id],
+            "saved rows lead once each, then every account's unsaved rows in natural order"
+        )
+        try meterExpectEqual(
+            shown.first { $0.accountSlot == "umnoxf" }?.window?.used,
+            0,
+            "the second Codex account must show its own reading, not the first's"
+        )
+        try meterExpectEqual(
+            shown.first { $0.accountSlot == "vtptrp" }?.window?.used,
+            5,
+            "the second Claude account must show its own reading, not the first's"
+        )
+    }
+
+    @MainActor
+    private static func testTwoAccountsOfOneProviderSurviveAPeriodDrag() throws {
+        let (defaults, suite) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(
+            [weeklyScope: [legacyClaudeWeekly, legacyCodexWeekly, legacyCodexWeekly, legacyClaudeWeekly]],
+            forKey: meterOrderKey
+        )
+        let store = MeterOrderStore(defaults: defaults)
+        let rows = try twoAccountWeeklyRows()
+        let keys = rows.compactMap(MeterOrderStore.key(for:))
+
+        // Drag the second Codex account's meter to the top.
+        store.move(keys[1], toGap: 0, scope: weeklyScope, natural: keys)
+
+        let saved = storedOrder(in: defaults)?[weeklyScope] ?? []
+        try meterExpectEqual(Set(saved).count, saved.count, "a drag must save each meter once")
+        try meterExpectEqual(Set(saved), Set(keys), "the saved order names every account's meter")
+        let shown = store.ordered(rows, scope: weeklyScope) { MeterOrderStore.key(for: $0) ?? $0.id }
+        try meterExpectEqual(shown.first?.accountSlot, "umnoxf", "the dragged account's meter leads")
+        try meterExpectEqual(
+            shown.filter { $0.providerID == .openai }.map { $0.window?.used },
+            [0, 168],
+            "each Codex account keeps its own reading after the drag"
+        )
+    }
+
+    @MainActor
+    private static func testMoveNeverSavesARepeatedKey() throws {
+        let (defaults, suite) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = MeterOrderStore(defaults: defaults)
+
+        store.move(claudeWeekly, toGap: 0, scope: weeklyScope, natural: [openaiWeekly, claudeWeekly, openaiWeekly, kimiWeekly])
+
+        try meterExpectEqual(
+            storedOrder(in: defaults)?[weeklyScope],
+            [claudeWeekly, openaiWeekly, kimiWeekly],
+            "a repeated natural key must be saved once"
+        )
+    }
+
+    @MainActor
+    private static func testMoveToGapLandsExactly() throws {
+        let (defaults, suite) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = MeterOrderStore(defaults: defaults)
+        let shown = { store.ordered(weeklySection, scope: weeklyScope) { $0 } }
+
+        store.move(openaiWeekly, toGap: 2, scope: weeklyScope, natural: weeklySection)
+        try meterExpectEqual(shown(), [claudeWeekly, kimiWeekly, openaiWeekly, qwenSevenDay], "gap 2 is between the second and third others")
+
+        store.move(qwenSevenDay, toGap: 0, scope: weeklyScope, natural: weeklySection)
+        try meterExpectEqual(shown(), [qwenSevenDay, claudeWeekly, kimiWeekly, openaiWeekly], "gap 0 is the top")
+
+        store.move(claudeWeekly, toGap: 3, scope: weeklyScope, natural: weeklySection)
+        try meterExpectEqual(shown(), [qwenSevenDay, kimiWeekly, openaiWeekly, claudeWeekly], "the last gap is the bottom")
+
+        let marker = plantWriteMarker(in: defaults)
+        store.move(kimiWeekly, toGap: 1, scope: weeklyScope, natural: weeklySection)
+        try meterExpectEqual(storedOrder(in: defaults), marker, "dropping a meter back into its own gap must not write")
+    }
+
+    /// Keys and scopes are persisted, so their shape is storage format: the
+    /// primary account's must not change, and another account's must equal
+    /// the id its period row already carries.
+    @MainActor
+    private static func testSecondaryAccountKeyAndScopeFormat() throws {
+        let weekly = QuotaWindow(label: "Weekly", windowKind: .weekly, used: 168, total: 168, unit: "hrs")
+        let primary = ProviderAccountKey.primary(.openai)
+        let second = ProviderAccountKey(providerID: .openai, slot: "umnoxf")
+
+        try meterExpectEqual(MeterOrderStore.key(account: primary, window: weekly), "openai|weekly|weekly|hrs", "primary key")
+        try meterExpectEqual(MeterOrderStore.scopeForProvider(primary), "provider:openai", "primary scope")
+        try meterExpectEqual(
+            MeterOrderStore.key(account: second, window: weekly),
+            "openai#umnoxf|openai|weekly|weekly|hrs",
+            "second account key"
+        )
+        try meterExpectEqual(MeterOrderStore.scopeForProvider(second), "provider:openai#umnoxf", "second account scope")
+
+        let rows = try twoAccountWeeklyRows()
+        for row in rows {
+            try meterExpectEqual(MeterOrderStore.key(for: row), row.id, "a row's key must be its id")
+        }
+    }
+
+    @MainActor
+    private static func testSecondaryBlockDragLeavesPrimaryOrder() throws {
+        let (defaults, suite) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = MeterOrderStore(defaults: defaults)
+        let fiveHour = window("5H", .session)
+        let weekly = window("Weekly", .weekly)
+        let primary = ProviderAccountKey.primary(.claude)
+        let second = ProviderAccountKey(providerID: .claude, slot: "vtptrp")
+        let primaryKeys = [fiveHour, weekly].map { MeterOrderStore.key(account: primary, window: $0) }
+        let secondKeys = [fiveHour, weekly].map { MeterOrderStore.key(account: second, window: $0) }
+
+        store.move(primaryKeys[1], toGap: 0, scope: MeterOrderStore.scopeForProvider(primary), natural: primaryKeys)
+        let primaryOrder = storedOrder(in: defaults)?[MeterOrderStore.scopeForProvider(primary)]
+        store.move(secondKeys[1], toGap: 0, scope: MeterOrderStore.scopeForProvider(second), natural: secondKeys)
+        store.move(secondKeys[1], toGap: 1, scope: MeterOrderStore.scopeForProvider(second), natural: secondKeys)
+
+        try meterExpectEqual(
+            storedOrder(in: defaults)?[MeterOrderStore.scopeForProvider(primary)],
+            primaryOrder,
+            "a drag in one account's block must leave the other's order alone"
+        )
+    }
+
+    private static let legacyCodexWeekly = MeterOrderStore.key(
+        providerID: .openai,
+        window: QuotaWindow(label: "Weekly", windowKind: .weekly, used: 168, total: 168, unit: "hrs")
+    )
+    private static let legacyClaudeWeekly = meterKey(.claude, "Weekly", .weekly)
+
+    /// Two Codex accounts on different plans and two Claude accounts, the
+    /// way `QuotaPeriodSection.sections(from:)` lays out their Weekly rows.
+    private static func twoAccountWeeklyRows() throws -> [QuotaPeriodRow] {
+        func account(_ providerID: ProviderID, _ slot: String, _ window: QuotaWindow) -> QuotaSnapshot {
+            QuotaSnapshot(
+                providerID: providerID,
+                displayName: providerID.displayName,
+                planName: nil,
+                windows: [window],
+                fetchState: .success
+            )
+            .withAccount(slot: slot, label: slot.isEmpty ? nil : "Boggspa TW", fingerprint: nil)
+        }
+        let snapshots = [
+            account(.openai, "", QuotaWindow(label: "Weekly", windowKind: .weekly, used: 168, total: 168, unit: "hrs")),
+            account(.openai, "umnoxf", QuotaWindow(label: "Weekly", windowKind: .weekly, used: 0, total: 168, unit: "hrs")),
+            account(.claude, "", QuotaWindow(label: "Weekly", windowKind: .weekly, used: 96, total: 100, unit: "%")),
+            account(.claude, "vtptrp", QuotaWindow(label: "Weekly", windowKind: .weekly, used: 5, total: 100, unit: "%"))
+        ]
+        guard let rows = QuotaPeriodSection.sections(from: snapshots).first(where: { $0.group == .weekly })?.rows,
+              rows.count == 4 else {
+            throw MeterOrderTestFailure.failed("fixture: expected four Weekly rows")
+        }
+        return rows
     }
 
     private static let meterOrderKey = "dashboardMeterOrder"

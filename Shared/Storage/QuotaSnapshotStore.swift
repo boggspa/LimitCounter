@@ -648,7 +648,16 @@ public final class ProviderCardOrderStore: ObservableObject {
     private let orderedProvidersKey = "dashboardCardProviderOrder"
     private let defaultsOverride: UserDefaults?
 
-    @Published private var orderedProviderIDs: [ProviderID]
+    /// Every orderable provider once, plus any other account the user has
+    /// dragged a card of, by `ProviderAccountKey.rawValue`. A provider's own
+    /// entry is its primary account, so the list reads exactly as it did
+    /// before accounts existed; the widget and menu bar still read providers
+    /// from it and skip the account entries.
+    @Published private var orderedKeys: [String]
+
+    private var orderedProviderIDs: [ProviderID] {
+        orderedKeys.compactMap(ProviderID.init(rawValue:))
+    }
 
     private var defaults: UserDefaults {
         if let defaultsOverride { return defaultsOverride }
@@ -663,15 +672,70 @@ public final class ProviderCardOrderStore: ObservableObject {
         self.defaultsOverride = defaultsProvider
         let resolvedDefaults = defaultsProvider ?? (UserDefaults(suiteName: appGroupID) ?? .standard)
         let stored = resolvedDefaults.array(forKey: orderedProvidersKey) as? [String] ?? []
-        self.orderedProviderIDs = Self.normalizedOrder(
-            from: stored.compactMap(ProviderID.init(rawValue:))
-        )
+        self.orderedKeys = Self.normalizedKeys(from: stored)
     }
 
     /// The full, normalized card order — every orderable dashboard
     /// card, newest providers included, in the order the user sees.
     public var orderedCards: [ProviderID] {
         orderedProviderIDs
+    }
+
+    /// `cards`, one per account, in dashboard order.
+    ///
+    /// A provider's primary account sits at the provider's place. Another
+    /// account sits wherever its card was last dropped, and until then
+    /// straight after its provider's primary.
+    public func sortedCards(_ cards: [ProviderAccountKey]) -> [ProviderAccountKey] {
+        let positions = Dictionary(
+            orderedKeys.enumerated().map { ($1, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        func position(_ card: ProviderAccountKey) -> Double {
+            if let index = positions[card.rawValue] { return Double(index) }
+            if let index = positions[card.providerID.rawValue] { return Double(index) + 0.5 }
+            return .greatestFiniteMagnitude
+        }
+        return cards.enumerated().sorted { lhs, rhs in
+            let (left, right) = (position(lhs.element), position(rhs.element))
+            if left != right { return left < right }
+            if lhs.element.slot != rhs.element.slot { return lhs.element.slot < rhs.element.slot }
+            return lhs.offset < rhs.offset
+        }
+        .map(\.element)
+    }
+
+    /// Moves `card` into a gap between the cards on screen: before the
+    /// `gap`-th of the *other* cards in `visible`, or after the last of them
+    /// when `gap` is past the end. Cards that are not on screen keep their
+    /// places in the saved order.
+    public func move(_ card: ProviderAccountKey, toGap gap: Int, among visible: [ProviderAccountKey]) {
+        let current = sortedCards(Array(Set(visible)))
+        guard current.contains(card) else { return }
+
+        var others = current.filter { $0 != card }
+        others.insert(card, at: min(max(gap, 0), others.count))
+        guard others != current else { return }
+
+        // Give every card on screen an entry of its own, in the order they
+        // show, so the new order can be written slot for slot.
+        var keys = orderedKeys
+        for (index, visibleCard) in current.enumerated() where !keys.contains(visibleCard.rawValue) {
+            let previous = index > 0 ? keys.firstIndex(of: current[index - 1].rawValue) : nil
+            let providerEntry = keys.firstIndex(of: visibleCard.providerID.rawValue)
+            let insertion = previous.map { $0 + 1 } ?? providerEntry.map { $0 + 1 } ?? keys.count
+            keys.insert(visibleCard.rawValue, at: insertion)
+        }
+        let visibleKeys = Set(current.map(\.rawValue))
+        let slots = keys.indices.filter { visibleKeys.contains(keys[$0]) }
+        for (slot, movedCard) in zip(slots, others) {
+            keys[slot] = movedCard.rawValue
+        }
+
+        let normalized = Self.normalizedKeys(from: keys)
+        guard normalized != orderedKeys else { return }
+        orderedKeys = normalized
+        save()
     }
 
     public func rank(for providerID: ProviderID) -> Int {
@@ -702,34 +766,54 @@ public final class ProviderCardOrderStore: ObservableObject {
     public func move(_ providerID: ProviderID, toward targetProviderID: ProviderID) {
         guard providerID != targetProviderID else { return }
 
-        var updatedOrder = Self.normalizedOrder(from: orderedProviderIDs)
+        let providers = orderedProviderIDs
         guard
-            let sourceIndex = updatedOrder.firstIndex(of: providerID),
-            let targetIndex = updatedOrder.firstIndex(of: targetProviderID)
+            let sourceIndex = providers.firstIndex(of: providerID),
+            let targetIndex = providers.firstIndex(of: targetProviderID)
         else {
             return
         }
-
-        let isMovingDown = sourceIndex < targetIndex
-        updatedOrder.remove(at: sourceIndex)
-        guard let landingIndex = updatedOrder.firstIndex(of: targetProviderID) else { return }
-        let insertionIndex = isMovingDown ? updatedOrder.index(after: landingIndex) : landingIndex
-        updatedOrder.insert(providerID, at: insertionIndex)
-
-        guard updatedOrder != orderedProviderIDs else { return }
-        orderedProviderIDs = updatedOrder
-        save()
+        let others = providers.filter { $0 != providerID }
+        guard let landingIndex = others.firstIndex(of: targetProviderID) else { return }
+        move(
+            .primary(providerID),
+            toGap: sourceIndex < targetIndex ? landingIndex + 1 : landingIndex,
+            among: providers.map(ProviderAccountKey.primary)
+        )
     }
 
     public func syncKnownProviders(_ providerIDs: [ProviderID]) {
-        let mergedOrder = Self.normalizedOrder(from: orderedProviderIDs + providerIDs)
-        guard mergedOrder != orderedProviderIDs else { return }
-        orderedProviderIDs = mergedOrder
+        let mergedOrder = Self.normalizedKeys(from: orderedKeys + providerIDs.map(\.rawValue))
+        guard mergedOrder != orderedKeys else { return }
+        orderedKeys = mergedOrder
         save()
     }
 
     private func save() {
-        defaults.set(orderedProviderIDs.map(\.rawValue), forKey: orderedProvidersKey)
+        defaults.set(orderedKeys, forKey: orderedProvidersKey)
+    }
+
+    /// `normalizedOrder` for the saved list, keeping the entries of other
+    /// accounts where they are and dropping anything unreadable.
+    private static func normalizedKeys(from keys: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        for key in keys where !seen.contains(key) {
+            if let providerID = ProviderID(rawValue: key) {
+                guard providerID.isOrderableDashboardCard else { continue }
+            } else {
+                guard let account = ProviderAccountKey(rawValue: key),
+                      !account.isPrimary,
+                      account.providerID.isOrderableDashboardCard else { continue }
+            }
+            seen.insert(key)
+            normalized.append(key)
+        }
+        for providerID in normalizedOrder(from: []) where !seen.contains(providerID.rawValue) {
+            seen.insert(providerID.rawValue)
+            normalized.append(providerID.rawValue)
+        }
+        return normalized
     }
 
     /// Produces the canonical order: the user's saved order first, then
@@ -830,10 +914,24 @@ public final class MeterOrderStore: ObservableObject {
         return account.isPrimary ? base : "\(account.rawValue)|\(base)"
     }
 
+    /// A period-layout row's identity: `key(account:window:)`, which is the
+    /// row's own id. `nil` for a provider's "no usage yet" row.
+    public static func key(for row: QuotaPeriodRow) -> String? {
+        guard let window = row.window else { return nil }
+        return key(account: row.accountKey, window: window)
+    }
+
     /// Scope for the "Standard" compact layout, where meters are grouped under
     /// their own provider and can only be reordered among their siblings.
     public nonisolated static func scopeForProvider(_ providerID: ProviderID) -> String {
         "provider:\(providerID.rawValue)"
+    }
+
+    /// The same scope for one account's block. The primary account's is the
+    /// provider's, so orders saved before accounts existed still apply; each
+    /// other account's block keeps an order of its own.
+    public static func scopeForProvider(_ account: ProviderAccountKey) -> String {
+        "provider:\(account.rawValue)"
     }
 
     /// Scope for the "Period" compact layout, where meters from every provider
@@ -849,14 +947,28 @@ public final class MeterOrderStore: ObservableObject {
     /// natural order. That second half is what keeps a meter a provider adds
     /// later — or one that only appears once a session is connected — from
     /// vanishing because it has no saved rank.
+    ///
+    /// Every natural item comes back exactly once. Builds before meter keys
+    /// named the account saved some keys twice, one per account; placing
+    /// items by position rather than by key keeps such a list from showing
+    /// the first account's meter twice and hiding the second's.
     public func ordered<T>(_ natural: [T], scope: String, key: (T) -> String) -> [T] {
         let saved = ordersByScope[scope] ?? []
         guard !saved.isEmpty else { return natural }
 
-        let byKey = Dictionary(natural.map { (key($0), $0) }, uniquingKeysWith: { first, _ in first })
-        var reordered: [T] = saved.compactMap { byKey[$0] }
-        let placed = Set(saved)
-        reordered.append(contentsOf: natural.filter { !placed.contains(key($0)) })
+        var unplacedPositions: [String: [Int]] = [:]
+        for (index, item) in natural.enumerated() {
+            unplacedPositions[key(item), default: []].append(index)
+        }
+        var placed = Set<Int>()
+        var reordered: [T] = []
+        for savedKey in saved {
+            guard let index = unplacedPositions[savedKey]?.first else { continue }
+            unplacedPositions[savedKey]?.removeFirst()
+            placed.insert(index)
+            reordered.append(natural[index])
+        }
+        reordered.append(contentsOf: natural.indices.filter { !placed.contains($0) }.map { natural[$0] })
         return reordered
     }
 
@@ -873,23 +985,33 @@ public final class MeterOrderStore: ObservableObject {
     /// longer reported cannot be carried forward, and an unknown key or target
     /// is a no-op rather than an insertion at the end.
     public func move(_ key: String, toward target: String, scope: String, natural: [String]) {
+        let natural = Self.uniqued(natural)
         guard key != target, natural.contains(key), natural.contains(target) else { return }
+
+        let current = ordered(natural, scope: scope, key: { $0 })
+        guard
+            let sourceIndex = current.firstIndex(of: key),
+            let targetIndex = current.firstIndex(of: target),
+            let landingIndex = current.filter({ $0 != key }).firstIndex(of: target)
+        else {
+            return
+        }
+        move(key, toGap: sourceIndex < targetIndex ? landingIndex + 1 : landingIndex, scope: scope, natural: natural)
+    }
+
+    /// Moves `key` into the gap before the `gap`-th of the *other* meters as
+    /// they show now, or after the last of them when `gap` is past the end.
+    /// `natural` is the caller's default order, as for `move(_:toward:)`.
+    public func move(_ key: String, toGap gap: Int, scope: String, natural: [String]) {
+        // A repeated key could only ever save a list that hides a meter.
+        let natural = Self.uniqued(natural)
+        guard natural.contains(key) else { return }
 
         // Start from the default order with the user's ranks applied, so the
         // saved list never accumulates meters that have since disappeared.
         var updated = ordered(natural, scope: scope, key: { $0 })
-        guard
-            let sourceIndex = updated.firstIndex(of: key),
-            let targetIndex = updated.firstIndex(of: target)
-        else {
-            return
-        }
-
-        let isMovingDown = sourceIndex < targetIndex
-        updated.remove(at: sourceIndex)
-        guard let landingIndex = updated.firstIndex(of: target) else { return }
-        let insertionIndex = isMovingDown ? updated.index(after: landingIndex) : landingIndex
-        updated.insert(key, at: insertionIndex)
+        updated.removeAll { $0 == key }
+        updated.insert(key, at: min(max(gap, 0), updated.count))
 
         guard updated != natural else {
             // The drag produced the default order, so there is nothing worth
@@ -904,6 +1026,11 @@ public final class MeterOrderStore: ObservableObject {
         guard ordersByScope[scope] != updated else { return }
         ordersByScope[scope] = updated
         save()
+    }
+
+    private static func uniqued(_ keys: [String]) -> [String] {
+        var seen = Set<String>()
+        return keys.filter { seen.insert($0).inserted }
     }
 
     /// Restores the default order for one scope, leaving every other scope and
