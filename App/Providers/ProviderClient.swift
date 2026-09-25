@@ -10295,6 +10295,30 @@ nonisolated enum ClaudeConfigDirKeychain {
         }
         return seen
     }
+
+    /// The command that runs Claude Code as one account. The CLI renews only
+    /// the item for the `CLAUDE_CONFIG_DIR` it runs with, so a bare `claude`
+    /// never renews a second account's sign-in. The folder is written from
+    /// `~` where it can be: the shell expands it to the same text the item's
+    /// hash was taken over.
+    static func cliCommand(forConfigDir configDir: String?, defaultConfigDir: String) -> String {
+        let trimmed = configDir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let spellings = pathSpellings(trimmed)
+        guard !trimmed.isEmpty,
+              !pathSpellings(defaultConfigDir).contains(where: { spellings.contains($0) }) else {
+            return "claude"
+        }
+        let path = trimmed.hasSuffix("/") && trimmed.count > 1 ? String(trimmed.dropLast()) : trimmed
+        let fromHome = spellings.first { $0.hasPrefix("~/") && !$0.hasSuffix("/") } ?? path
+        let written = fromHome.contains(where: \.isWhitespace) ? "\"\(path)\"" : fromHome
+        return "CLAUDE_CONFIG_DIR=\(written) claude"
+    }
+
+    /// Renews an account's sign-in without a model call: `/usage` is a local
+    /// command that needs a valid token, so the CLI renews one first.
+    static func renewCommand(forConfigDir configDir: String?, defaultConfigDir: String) -> String {
+        cliCommand(forConfigDir: configDir, defaultConfigDir: defaultConfigDir) + " -p /usage"
+    }
 }
 
 /// Reads the two keychain entries one Claude account treats as token stores:
@@ -10834,6 +10858,16 @@ private nonisolated struct ClaudeAccountContext {
         tokenManager = .forAccount(account)
         scanCoordinator = .forAccount(account)
     }
+
+    /// Runs Claude Code as this account.
+    var cliCommand: String {
+        ClaudeConfigDirKeychain.cliCommand(forConfigDir: configDir, defaultConfigDir: ClaudeKeychainStore.defaultConfigDir())
+    }
+
+    /// Renews this account's sign-in without spending quota.
+    var renewCommand: String {
+        ClaudeConfigDirKeychain.renewCommand(forConfigDir: configDir, defaultConfigDir: ClaudeKeychainStore.defaultConfigDir())
+    }
 }
 
 public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedProviderClient {
@@ -10906,9 +10940,10 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
             oauthToken = Self.autoDetectedOAuthTokenFile(configDir: context.configDir)
         }
         if oauthToken == nil, requiresUserInitiatedKeychainRecovery {
+            let renew = context.renewCommand
             let message = userInitiated
-                ? "No usable Claude Code sign-in. Run Claude Code (or /login if it asks), then refresh again."
-                : "Claude Code's sign-in has expired. Only the CLI can renew it — run Claude Code, then refresh."
+                ? "No usable Claude Code sign-in for this account. Run `\(renew)`, then refresh again. If it says you are signed out, start `\(context.cliCommand)` and use /login."
+                : "Claude Code's sign-in for this account has expired, and only its CLI can renew it. Run `\(renew)` (it uses no quota), then refresh."
             throw ProviderFetchError.credentialExpired(message)
         }
         if let token = oauthToken, !token.isEmpty {
@@ -10956,7 +10991,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
 
                 if case .invalidCredential = effectiveError {
                     throw ProviderFetchError.credentialExpired(
-                        "Claude Code session expired. Only the CLI renews it — run Claude Code, then refresh manually (the first refresh may ask you to authorize Keychain access)."
+                        "Claude Code's session for this account expired, and only its CLI renews it. Run `\(context.renewCommand)` (it uses no quota), then refresh manually (the first refresh may ask you to authorize Keychain access)."
                     )
                 }
                 if let stale = context.cache.staleFallback() {

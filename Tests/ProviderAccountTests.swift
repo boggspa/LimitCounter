@@ -222,6 +222,43 @@ private func testClaudeServiceNameMatchesTheCLI() throws {
     try expectEqual(explicitDefault.first, "Claude Code-credentials", "naming the default folder explicitly is still the default")
 }
 
+private func testClaudeRenewCommandNamesTheAccountsConfigDir() throws {
+    // A bare `claude` renews only the default folder's item, so a second
+    // account's lapsed-token message has to name its own folder.
+    let home = NSHomeDirectory()
+    let defaultDir = home + "/.claude"
+    try expectEqual(
+        ClaudeConfigDirKeychain.renewCommand(forConfigDir: nil, defaultConfigDir: defaultDir),
+        "claude -p /usage",
+        "the primary account renews with a bare claude"
+    )
+    try expectEqual(
+        ClaudeConfigDirKeychain.renewCommand(forConfigDir: defaultDir + "/", defaultConfigDir: defaultDir),
+        "claude -p /usage",
+        "naming the default folder explicitly is still the bare command"
+    )
+    try expectEqual(
+        ClaudeConfigDirKeychain.renewCommand(forConfigDir: home + "/.claude-work", defaultConfigDir: defaultDir),
+        "CLAUDE_CONFIG_DIR=~/.claude-work claude -p /usage",
+        "a second account names its folder from home"
+    )
+    try expectEqual(
+        ClaudeConfigDirKeychain.cliCommand(forConfigDir: home + "/.claude-work/", defaultConfigDir: defaultDir),
+        "CLAUDE_CONFIG_DIR=~/.claude-work claude",
+        "without the trailing slash the CLI's item was hashed over"
+    )
+    try expectEqual(
+        ClaudeConfigDirKeychain.cliCommand(forConfigDir: "/Volumes/Work/claude", defaultConfigDir: defaultDir),
+        "CLAUDE_CONFIG_DIR=/Volumes/Work/claude claude",
+        "a folder outside home keeps its full path"
+    )
+    try expectEqual(
+        ClaudeConfigDirKeychain.cliCommand(forConfigDir: home + "/Claude Work", defaultConfigDir: defaultDir),
+        "CLAUDE_CONFIG_DIR=\"\(home)/Claude Work\" claude",
+        "a path with spaces is quoted in full, since ~ does not expand inside quotes"
+    )
+}
+
 private func testClaudeCodeRewriteOutdatesTheCopy() throws {
     // A /login to another account rewrites the CLI's item while our copy
     // still has hours left; the copy must not keep answering for it.
@@ -348,6 +385,7 @@ private enum ProviderAccountTestRunner {
         try await MainActor.run { try testRegistryAddRenameRemoveAndOrder() }
         try testProviderOnlyStoresHoldNoSecondaryAccounts()
         try testClaudeServiceNameMatchesTheCLI()
+        try testClaudeRenewCommandNamesTheAccountsConfigDir()
         try testClaudeCodeRewriteOutdatesTheCopy()
         try testFingerprintGating()
         try testDetectorStateIsPerAccount()
