@@ -59,29 +59,46 @@ private func testCodexSessionCredentialReaderFollowsDirectoryRotation() throws {
         .appendingPathComponent("limit-counter-codex-auth-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let authURL = root.appendingPathComponent("auth.json")
     try """
-    {"tokens":{"access_token":"rotated-token","account_id":"rotated-account"}}
-    """.write(
-        to: root.appendingPathComponent("auth.json"),
-        atomically: true,
-        encoding: .utf8
-    )
+    {"tokens":{"access_token":"rotated-token","account_id":"granted-account"}}
+    """.write(to: authURL, atomically: true, encoding: .utf8)
 
     let stored = ProviderCredential(
         accessToken: "stale-token",
-        accountIdentifier: "stale-account",
+        accountIdentifier: "granted-account",
         customEndpoint: root.path,
         extraFields: ["codexAuthSource": "directory"]
     )
-    let refreshed = CodexSessionCredentialReader.refreshedCredential(from: stored)
+    let authFile = CodexSessionCredentialReader.readAuthFile(for: stored)
+    try expectEqual(authFile?.accessToken, "rotated-token", "Codex reads the granted folder's auth.json")
+    guard case .use(let refreshed, _, let rotatedToken) = CodexSessionCredentialReader.resolve(
+        stored,
+        authFile: authFile,
+        now: Date()
+    ) else {
+        throw AdditionalProviderTestError.failure("a rotated token of the same account should be followed")
+    }
+    try expectEqual(refreshed.accessToken, "rotated-token", "Codex rotated access token")
+    try expectEqual(refreshed.accountIdentifier, "granted-account", "Codex rotated account")
+    try expect(rotatedToken, "the rotation is reported so the stored token can follow it")
 
-    try expectEqual(refreshed?.accessToken, "rotated-token", "Codex rotated access token")
-    try expectEqual(refreshed?.accountIdentifier, "rotated-account", "Codex rotated account")
+    // The folder signed in to someone else (the Codex desktop app and a bare
+    // `codex login` both use ~/.codex): never adopt it.
+    try """
+    {"tokens":{"access_token":"other-token","account_id":"other-account"}}
+    """.write(to: authURL, atomically: true, encoding: .utf8)
+    guard case .switched = CodexSessionCredentialReader.resolve(
+        stored,
+        authFile: CodexSessionCredentialReader.readAuthFile(for: stored),
+        now: Date()
+    ) else {
+        throw AdditionalProviderTestError.failure("a folder signed in to another ChatGPT account must not be followed")
+    }
 
     let pasted = ProviderCredential(accessToken: "pasted-token", accountIdentifier: "pasted-account")
-    let pastedRefresh = CodexSessionCredentialReader.refreshedCredential(from: pasted)
     try expect(
-        pastedRefresh.map { _ in false } ?? true,
+        CodexSessionCredentialReader.readAuthFile(for: pasted) == nil,
         "pasted Codex credentials should remain independent of local files"
     )
 }

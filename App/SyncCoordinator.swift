@@ -360,7 +360,10 @@ final class SyncCoordinator {
                 ?? error.localizedDescription
             print("[SyncCoordinator] Error for \(providerID.rawValue): \(message)")
 
-            if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
+            // A Codex folder now signed in to another account: the previous
+            // snapshot may already be that account's, so it is not kept.
+            if !(error is CodexAccountSwitchedError),
+               let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
                 providerID: providerID,
                 previousSnapshot: previousSnapshot,
                 reason: message

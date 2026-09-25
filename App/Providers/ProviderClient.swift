@@ -5876,8 +5876,180 @@ public enum CodexImportService {
 
 // MARK: - Codex Session Client
 
-nonisolated enum CodexSessionCredentialReader {
-    static func refreshedCredential(from credentials: ProviderCredential) -> ProviderCredential? {
+/// Who a Codex token belongs to, read from the ChatGPT claims the access token
+/// carries. `accountID` is the ChatGPT workspace, which everyone in a Team
+/// workspace shares; `accountUserID` is the person within it.
+nonisolated struct CodexAccountIdentity: Equatable, Codable {
+    let accountID: String
+    let accountUserID: String?
+    /// Not part of who the account is: a rotated token has a new expiry.
+    var expiresAt: Date?
+
+    init(accountID: String, accountUserID: String?, expiresAt: Date? = nil) {
+        self.accountID = accountID
+        self.accountUserID = accountUserID
+        self.expiresAt = expiresAt
+    }
+
+    static func decode(accessToken: String) -> CodexAccountIdentity? {
+        let parts = accessToken.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        guard let data = Data(base64Encoded: payload),
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let auth = claims["https://api.openai.com/auth"] as? [String: Any],
+              let accountID = nonEmpty(auth["chatgpt_account_id"]) else {
+            return nil
+        }
+        return CodexAccountIdentity(
+            accountID: accountID,
+            accountUserID: nonEmpty(auth["chatgpt_account_user_id"]),
+            expiresAt: (claims["exp"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+        )
+    }
+
+    /// The same person in the same workspace. When either side has no
+    /// per-person id, only the workspace can be compared.
+    func isSameAccount(as other: CodexAccountIdentity) -> Bool {
+        guard accountID == other.accountID else { return false }
+        guard let mine = accountUserID, let theirs = other.accountUserID else { return true }
+        return mine == theirs
+    }
+
+    private static func nonEmpty(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// The ChatGPT account each Codex account in the app was granted as. A
+/// granted folder is only followed while its `auth.json` still belongs to
+/// that account: the Codex desktop app and a bare `codex login` sign in to
+/// `~/.codex` whatever `CODEX_HOME` other accounts use, and adopting the new
+/// sign-in showed a second account's quota under the first account's name.
+enum CodexAccountPin {
+    static let accountIDKey = "codexPinnedAccountID"
+    static let accountUserIDKey = "codexPinnedAccountUserID"
+
+    /// Pinned fields win. A grant from before pinning is pinned by the token
+    /// it stored when it was granted, then by the account id it stored.
+    static func pinned(in credential: ProviderCredential) -> CodexAccountIdentity? {
+        let fields = credential.extraFields ?? [:]
+        if let accountID = fields[accountIDKey], !accountID.isEmpty {
+            let userID = fields[accountUserIDKey].flatMap { $0.isEmpty ? nil : $0 }
+            return CodexAccountIdentity(accountID: accountID, accountUserID: userID)
+        }
+        if let token = credential.normalizedAccessToken,
+           let identity = CodexAccountIdentity.decode(accessToken: token) {
+            return CodexAccountIdentity(accountID: identity.accountID, accountUserID: identity.accountUserID)
+        }
+        if let accountID = credential.normalizedAccountIdentifier {
+            return CodexAccountIdentity(accountID: accountID, accountUserID: nil)
+        }
+        return nil
+    }
+
+    static func isPinned(_ credential: ProviderCredential) -> Bool {
+        !(credential.extraFields?[accountIDKey] ?? "").isEmpty
+    }
+
+    /// The stored credential with a newer token of the same account, and the
+    /// pin written out. The stored token is the account's own fallback once
+    /// its folder is signed in to someone else, so it is kept current.
+    static func updated(
+        _ stored: ProviderCredential,
+        accessToken: String,
+        identity: CodexAccountIdentity
+    ) -> ProviderCredential {
+        var fields = stored.extraFields ?? [:]
+        fields[accountIDKey] = identity.accountID
+        if let userID = identity.accountUserID {
+            fields[accountUserIDKey] = userID
+        }
+        return ProviderCredential(
+            accessToken: accessToken,
+            accountIdentifier: identity.accountID,
+            customEndpoint: stored.customEndpoint,
+            extraFields: fields,
+            bookmarkData: stored.bookmarkData
+        )
+    }
+}
+
+/// What a Codex account should fetch with.
+enum CodexCredentialResolution {
+    /// The credential to use. `rotatedToken` is set when the granted folder
+    /// holds a newer token of the pinned account than the stored one.
+    case use(ProviderCredential, identity: CodexAccountIdentity?, rotatedToken: Bool)
+    /// The granted folder is signed in to a different ChatGPT account.
+    /// `backup` is the account's own stored token while it is still valid.
+    case switched(
+        folder: String?,
+        pinned: CodexAccountIdentity,
+        current: CodexAccountIdentity,
+        backup: ProviderCredential?
+    )
+}
+
+enum CodexSessionCredentialReader {
+    /// A stored token this close to expiry is not worth sending.
+    static let backupExpiryMargin: TimeInterval = 5 * 60
+
+    static func resolve(
+        _ stored: ProviderCredential,
+        authFile: CodexSessionCredentialValues?,
+        now: Date
+    ) -> CodexCredentialResolution {
+        let storedIdentity = stored.normalizedAccessToken.flatMap(CodexAccountIdentity.decode(accessToken:))
+        guard let authFile else {
+            return .use(stored, identity: storedIdentity, rotatedToken: false)
+        }
+
+        let fileIdentity = CodexAccountIdentity.decode(accessToken: authFile.accessToken)
+            ?? authFile.accountIdentifier.map { CodexAccountIdentity(accountID: $0, accountUserID: nil) }
+        let rotated = ProviderCredential(
+            accessToken: authFile.accessToken,
+            accountIdentifier: fileIdentity?.accountID ?? stored.accountIdentifier,
+            customEndpoint: stored.customEndpoint,
+            extraFields: stored.extraFields,
+            bookmarkData: stored.bookmarkData
+        )
+        guard let pinned = CodexAccountPin.pinned(in: stored),
+              let fileIdentity,
+              !fileIdentity.isSameAccount(as: pinned) else {
+            return .use(
+                rotated,
+                identity: fileIdentity,
+                rotatedToken: authFile.accessToken != stored.normalizedAccessToken
+            )
+        }
+
+        var backup: ProviderCredential?
+        if let storedIdentity,
+           storedIdentity.isSameAccount(as: pinned),
+           let expiresAt = storedIdentity.expiresAt,
+           expiresAt.timeIntervalSince(now) > backupExpiryMargin {
+            backup = ProviderCredential(
+                accessToken: stored.accessToken,
+                accountIdentifier: storedIdentity.accountID,
+                customEndpoint: stored.customEndpoint,
+                extraFields: stored.extraFields,
+                bookmarkData: stored.bookmarkData
+            )
+        }
+        return .switched(
+            folder: stored.normalizedCustomEndpoint,
+            pinned: pinned,
+            current: fileIdentity,
+            backup: backup
+        )
+    }
+
+    static func readAuthFile(for credentials: ProviderCredential) -> CodexSessionCredentialValues? {
         guard let source = credentials.extraFields?["codexAuthSource"],
               source == "directory" || source == "file",
               let scopedURL = resolvedScopedURL(from: credentials, source: source) else {
@@ -5896,18 +6068,10 @@ nonisolated enum CodexSessionCredentialReader {
             : scopedURL
         guard let data = try? Data(contentsOf: authURL, options: [.mappedIfSafe]),
               data.count <= 2 * 1024 * 1024,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let values = CodexSessionCredentialParser.parse(json) else {
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-
-        return ProviderCredential(
-            accessToken: values.accessToken,
-            accountIdentifier: values.accountIdentifier ?? credentials.accountIdentifier,
-            customEndpoint: credentials.customEndpoint,
-            extraFields: credentials.extraFields,
-            bookmarkData: credentials.bookmarkData
-        )
+        return CodexSessionCredentialParser.parse(json)
     }
 
     private static func resolvedScopedURL(
@@ -5937,23 +6101,333 @@ nonisolated enum CodexSessionCredentialReader {
     }
 }
 
+/// Raised when a Codex account's granted folder is signed in to another
+/// ChatGPT account and the account has nothing of its own left to show. The
+/// coordinator must not keep the previous snapshot: once the folder switched,
+/// that snapshot may already be the other account's.
+nonisolated struct CodexAccountSwitchedError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// The last reading each Codex account fetched with a token proven to be its
+/// own: meters only, never tokens. It stands in while the account's folder is
+/// signed in to someone else, until each window resets.
+enum CodexVerifiedReadingCache {
+    struct Entry: Codable {
+        let snapshot: QuotaSnapshot
+        let identity: CodexAccountIdentity
+    }
+
+    static func key(for account: ProviderAccountKey) -> String {
+        "codex.verifiedReading.v1.\(account.rawValue)"
+    }
+
+    static func load(for account: ProviderAccountKey, defaults: UserDefaults) -> Entry? {
+        guard let data = defaults.data(forKey: key(for: account)) else { return nil }
+        return try? JSONDecoder().decode(Entry.self, from: data)
+    }
+
+    static func save(_ snapshot: QuotaSnapshot, identity: CodexAccountIdentity, for account: ProviderAccountKey, defaults: UserDefaults) {
+        let entry = Entry(snapshot: snapshot.withSignals([]), identity: identity)
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        defaults.set(data, forKey: key(for: account))
+    }
+
+    /// The cached reading of `pinned`, with windows that have since reset
+    /// dropped, dated to when it was taken. Nil when nothing current is left.
+    static func standIn(
+        for account: ProviderAccountKey,
+        pinned: CodexAccountIdentity,
+        now: Date,
+        defaults: UserDefaults
+    ) -> QuotaSnapshot? {
+        guard let entry = load(for: account, defaults: defaults),
+              entry.identity.isSameAccount(as: pinned) else {
+            return nil
+        }
+        let cached = entry.snapshot
+        let windows = cached.windows.filter { window in
+            guard let resetDate = window.resetDate else { return false }
+            return resetDate > now
+        }
+        guard !windows.isEmpty else { return nil }
+        return QuotaSnapshot(
+            id: cached.id,
+            providerID: cached.providerID,
+            displayName: cached.displayName,
+            planName: cached.planName,
+            windows: windows,
+            stats: cached.stats,
+            balances: cached.balances,
+            signals: [],
+            events: cached.events,
+            analyticsBuckets: cached.analyticsBuckets,
+            fetchState: cached.fetchState,
+            fetchedAt: cached.fetchedAt,
+            resetCredits: cached.resetCredits,
+            accountSlot: cached.accountSlot,
+            accountLabel: cached.accountLabel,
+            accountFingerprint: cached.accountFingerprint
+        )
+    }
+}
+
+/// Which ChatGPT account each Codex account last fetched as, so two accounts
+/// in the app that read the same ChatGPT account can say so instead of
+/// showing identical meters under two names.
+enum CodexAccountIdentityRegistry {
+    struct Entry: Codable {
+        let identity: CodexAccountIdentity
+        let seenAt: Date
+    }
+
+    static let key = "codex.accountIdentities.v1"
+    /// A removed account stops counting once it has not fetched for this long.
+    static let freshness: TimeInterval = 24 * 60 * 60
+
+    static func record(_ identity: CodexAccountIdentity, for account: ProviderAccountKey, now: Date, defaults: UserDefaults) {
+        var entries = load(defaults: defaults)
+        entries[account.rawValue] = Entry(identity: identity, seenAt: now)
+        entries = entries.filter { now.timeIntervalSince($0.value.seenAt) <= freshness }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    /// Other accounts that recently fetched as `identity`.
+    static func accounts(
+        matching identity: CodexAccountIdentity,
+        excluding account: ProviderAccountKey,
+        now: Date,
+        defaults: UserDefaults
+    ) -> [String] {
+        load(defaults: defaults)
+            .filter { rawValue, entry in
+                rawValue != account.rawValue
+                    && now.timeIntervalSince(entry.seenAt) <= freshness
+                    && entry.identity.isSameAccount(as: identity)
+            }
+            .keys
+            .sorted()
+    }
+
+    private static func load(defaults: UserDefaults) -> [String: Entry] {
+        guard let data = defaults.data(forKey: key),
+              let entries = try? JSONDecoder().decode([String: Entry].self, from: data) else {
+            return [:]
+        }
+        return entries
+    }
+}
+
 /// Fetches Codex usage via the ChatGPT-authenticated session (the "wham/usage" endpoint).
 /// Returns 5-hour and 7-day rolling windows used by the Codex CLI.
-public struct CodexSessionProviderClient: ProviderClient {
+public struct CodexSessionProviderClient: AccountScopedProviderClient {
     public let providerID: ProviderID = .openai
+
+    typealias CredentialPersister = @Sendable (ProviderCredential, ProviderAccountKey) async -> Void
 
     private let session: URLSession
     private let decoder = JSONDecoder()
     private let endpointURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    private let readingDefaults: UserDefaults?
+    private let persistCredential: CredentialPersister
 
     public init(session: URLSession = .shared) {
+        self.init(session: session, readingDefaults: nil, persistCredential: Self.persistToKeychain)
+    }
+
+    /// `readingDefaults` holds the verified readings and the identity
+    /// registry; `nil` is the app group.
+    init(session: URLSession, readingDefaults: UserDefaults?, persistCredential: @escaping CredentialPersister) {
         self.session = session
+        self.readingDefaults = readingDefaults
+        self.persistCredential = persistCredential
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
-        guard let storedCredentials = credentials else { throw ProviderFetchError.notConfigured }
-        let credentials = CodexSessionCredentialReader.refreshedCredential(from: storedCredentials)
-            ?? storedCredentials
+        try await fetchSnapshot(credentials: credentials, account: .primary(.openai), userInitiated: false)
+    }
+
+    public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
+        guard let stored = credentials else { throw ProviderFetchError.notConfigured }
+        let now = Date()
+        let defaults = readingDefaults
+            ?? UserDefaults(suiteName: "group.com.chrisizatt.LLMUsageCounter")
+            ?? .standard
+        let resolution = CodexSessionCredentialReader.resolve(
+            stored,
+            authFile: CodexSessionCredentialReader.readAuthFile(for: stored),
+            now: now
+        )
+
+        switch resolution {
+        case .use(let credential, let identity, let rotatedToken):
+            let snapshot = try await fetchUsage(credentials: credential)
+            guard let identity else { return snapshot }
+            if rotatedToken || !CodexAccountPin.isPinned(stored),
+               let token = credential.normalizedAccessToken {
+                await persistCredential(
+                    CodexAccountPin.updated(stored, accessToken: token, identity: identity),
+                    account
+                )
+            }
+            return verified(snapshot, identity: identity, account: account, now: now, defaults: defaults)
+
+        case .switched(let folder, let pinned, let current, let backup):
+            let currentIsTracked = !CodexAccountIdentityRegistry.accounts(
+                matching: current,
+                excluding: account,
+                now: now,
+                defaults: defaults
+            ).isEmpty
+            print("[CodexSessionProvider] \(account.rawValue): granted folder is now signed in to another ChatGPT account")
+
+            if let backup,
+               let token = backup.normalizedAccessToken,
+               let identity = CodexAccountIdentity.decode(accessToken: token) {
+                do {
+                    let snapshot = try await fetchUsage(credentials: backup)
+                    let signal = Self.switchedSignal(
+                        folder: folder,
+                        currentIsTracked: currentIsTracked,
+                        fallback: .savedSession(expiresAt: identity.expiresAt ?? now),
+                        now: now
+                    )
+                    let result = verified(snapshot, identity: identity, account: account, now: now, defaults: defaults)
+                    return result.withSignals(result.signals + [signal])
+                } catch {
+                    print("[CodexSessionProvider] \(account.rawValue): saved session failed: \(error.localizedDescription)")
+                }
+            }
+
+            if let standIn = CodexVerifiedReadingCache.standIn(
+                for: account,
+                pinned: pinned,
+                now: now,
+                defaults: defaults
+            ) {
+                let signal = Self.switchedSignal(
+                    folder: folder,
+                    currentIsTracked: currentIsTracked,
+                    fallback: .lastReading(takenAt: standIn.fetchedAt),
+                    now: now
+                )
+                return standIn.withSignals([signal])
+            }
+
+            throw CodexAccountSwitchedError(
+                message: Self.switchedSignal(
+                    folder: folder,
+                    currentIsTracked: currentIsTracked,
+                    fallback: .none,
+                    now: now
+                ).message
+            )
+        }
+    }
+
+    /// Files a reading fetched with the account's own token: cached for the
+    /// stand-in, recorded in the registry, and flagged when another Codex
+    /// account in the app reads the same ChatGPT account.
+    private func verified(
+        _ snapshot: QuotaSnapshot,
+        identity: CodexAccountIdentity,
+        account: ProviderAccountKey,
+        now: Date,
+        defaults: UserDefaults
+    ) -> QuotaSnapshot {
+        CodexVerifiedReadingCache.save(snapshot, identity: identity, for: account, defaults: defaults)
+        CodexAccountIdentityRegistry.record(identity, for: account, now: now, defaults: defaults)
+        let duplicates = CodexAccountIdentityRegistry.accounts(
+            matching: identity,
+            excluding: account,
+            now: now,
+            defaults: defaults
+        )
+        guard !duplicates.isEmpty else { return snapshot }
+        let signal = QuotaSignal(
+            kind: .scheduledReset,
+            title: "Same ChatGPT account as another Codex meter",
+            message: "This Codex account and another one here read the same ChatGPT account, so their meters match. Grant each account the CODEX_HOME folder signed in to it in Settings.",
+            severity: .warning,
+            confidence: 1,
+            detectedAt: now
+        )
+        return snapshot.withSignals(snapshot.signals + [signal])
+    }
+
+    enum SwitchedFallback {
+        case savedSession(expiresAt: Date)
+        case lastReading(takenAt: Date)
+        case none
+    }
+
+    /// Absolute dates only: the message feeds the CloudKit status hash, so it
+    /// must read the same on every fetch that falls back the same way.
+    static func switchedSignal(
+        folder: String?,
+        currentIsTracked: Bool,
+        fallback: SwitchedFallback,
+        now: Date
+    ) -> QuotaSignal {
+        let path = folder.map { Self.abbreviatedHomePath($0) }
+        let where_ = path.map { "\($0) is" } ?? "The granted Codex folder is"
+        let who = currentIsTracked
+            ? "the ChatGPT account another Codex meter here tracks"
+            : "a different ChatGPT account"
+        let fix = path.map { "Sign it back in with `CODEX_HOME=\($0) codex login`, or grant this account's own folder in Settings." }
+            ?? "Sign the folder back in to this account, or grant this account's own folder in Settings."
+        let detail: String
+        switch fallback {
+        case .savedSession(let expiresAt):
+            detail = "These meters use this account's saved session, which expires \(stamp(expiresAt))."
+        case .lastReading(let takenAt):
+            detail = "These meters are this account's reading from \(stamp(takenAt)), kept until each window resets."
+        case .none:
+            detail = "This account's quota can't be read without showing that account's."
+        }
+        return QuotaSignal(
+            kind: .scheduledReset,
+            title: "Codex folder signed in to another account",
+            message: "\(where_) now signed in to \(who). \(detail) \(fix)",
+            severity: .warning,
+            confidence: 1,
+            detectedAt: now
+        )
+    }
+
+    static func abbreviatedHomePath(_ path: String) -> String {
+        guard let range = path.range(of: #"^/Users/[^/]+"#, options: .regularExpression) else { return path }
+        return "~" + path[range.upperBound...]
+    }
+
+    private static func stamp(_ date: Date) -> String {
+        date.formatted(.dateTime.day().month(.abbreviated).hour().minute())
+    }
+
+    /// Writes a rotated token and the pin back over the same grant only: an
+    /// account re-imported meanwhile keeps its new grant.
+    nonisolated static let persistToKeychain: CredentialPersister = { @Sendable credential, account in
+        await MainActor.run {
+            guard let current = KeychainService.shared.credential(for: account),
+                  current.customEndpoint == credential.customEndpoint,
+                  let currentPin = CodexAccountPin.pinned(in: current),
+                  let newPin = CodexAccountPin.pinned(in: credential),
+                  currentPin.isSameAccount(as: newPin) else {
+                return
+            }
+            if !KeychainService.shared.save(credential, for: account) {
+                print("[CodexSessionProvider] Failed to save the rotated Codex session for \(account.rawValue)")
+            }
+        }
+    }
+
+    private func fetchUsage(credentials: ProviderCredential) async throws -> QuotaSnapshot {
         guard let accessToken = credentials.normalizedAccessToken else {
             print("[CodexSessionProvider] Missing access token")
             throw ProviderFetchError.notConfigured
