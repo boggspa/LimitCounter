@@ -27,7 +27,7 @@ struct CursorSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -132,17 +132,9 @@ struct CursorSessionImportView: View {
 }
 
 @MainActor
-final class CursorSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-    }
+final class CursorSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -173,18 +165,6 @@ final class CursorSessionImportModel: NSObject, WKUIDelegate {
         }
 
         return header
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-        }
-        return nil
     }
 
     static func clearStoredWebsiteData() {
@@ -239,28 +219,6 @@ private extension WKWebView {
     }
 }
 
-#if os(iOS)
-private struct CursorSessionWebView: UIViewRepresentable {
-    let webView: WKWebView
-
-    func makeUIView(context: Context) -> WKWebView {
-        webView
-    }
-
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-}
-#else
-private struct CursorSessionWebView: NSViewRepresentable {
-    let webView: WKWebView
-
-    func makeNSView(context: Context) -> WKWebView {
-        webView
-    }
-
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
-}
-#endif
-
 // MARK: - Kimi Session Import View
 
 struct KimiWebSessionImportView: View {
@@ -307,7 +265,7 @@ struct KimiWebSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -374,18 +332,9 @@ struct KimiWebSessionImportView: View {
 }
 
 @MainActor
-final class KimiWebSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-    private var popupWebView: WKWebView?
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-    }
+final class KimiWebSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -412,40 +361,6 @@ final class KimiWebSessionImportModel: NSObject, WKUIDelegate {
             accessToken: accessToken,
             refreshToken: refreshToken?.isEmpty == false ? refreshToken : nil
         )
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-
-        if let popupWebView {
-            popupWebView.load(navigationAction.request)
-            return nil
-        }
-
-        let popup = WKWebView(frame: .zero, configuration: configuration)
-        popup.uiDelegate = self
-        popup.allowsBackForwardNavigationGestures = true
-        popup.translatesAutoresizingMaskIntoConstraints = false
-        webView.addSubview(popup)
-        NSLayoutConstraint.activate([
-            popup.leadingAnchor.constraint(equalTo: webView.leadingAnchor),
-            popup.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
-            popup.topAnchor.constraint(equalTo: webView.topAnchor),
-            popup.bottomAnchor.constraint(equalTo: webView.bottomAnchor)
-        ])
-        popupWebView = popup
-        return popup
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        guard webView === popupWebView else { return }
-        webView.removeFromSuperview()
-        popupWebView = nil
     }
 }
 
@@ -485,7 +400,7 @@ struct OllamaSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -589,17 +504,9 @@ struct OllamaSessionImportView: View {
 }
 
 @MainActor
-final class OllamaSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-    }
+final class OllamaSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -630,18 +537,6 @@ final class OllamaSessionImportModel: NSObject, WKUIDelegate {
             .joined(separator: "; ")
 
         return header
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-        }
-        return nil
     }
 }
 
@@ -684,7 +579,7 @@ struct MistralSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -788,17 +683,9 @@ struct MistralSessionImportView: View {
 }
 
 @MainActor
-final class MistralSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-    }
+final class MistralSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -826,18 +713,6 @@ final class MistralSessionImportModel: NSObject, WKUIDelegate {
         }
 
         return header
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-        }
-        return nil
     }
 }
 
@@ -882,7 +757,7 @@ struct MetaWebSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -983,17 +858,9 @@ struct MetaWebSessionImportView: View {
 }
 
 @MainActor
-final class MetaWebSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-     }
+final class MetaWebSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -1022,18 +889,6 @@ final class MetaWebSessionImportModel: NSObject, WKUIDelegate {
          }
 
         return header
-     }
-
-    func webView(
-         _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-     ) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
-         }
-        return nil
      }
 
     static func clearStoredWebsiteData() {
@@ -1092,7 +947,7 @@ struct MuseSubscriptionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                 .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -1195,18 +1050,9 @@ extraFields: museSubscriptionImportExtraFields(
 }
 
 @MainActor
-final class MuseSubscriptionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-    private let popupHost = BrowserSessionPopupHost()
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-     }
+final class MuseSubscriptionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -1245,16 +1091,6 @@ final class MuseSubscriptionImportModel: NSObject, WKUIDelegate {
          }
 
         return header
-     }
-
-    func webView(
-         _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-     ) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-        return popupHost.open(in: webView, configuration: configuration)
      }
 }
 
@@ -1332,7 +1168,7 @@ struct CerebrasWebSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                  .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -1435,18 +1271,9 @@ extraFields: cerebrasWebSessionExtraFields(
 }
 
 @MainActor
-final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-    private let popupHost = BrowserSessionPopupHost()
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-     }
+final class CerebrasWebSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -1484,16 +1311,6 @@ final class CerebrasWebSessionImportModel: NSObject, WKUIDelegate {
          }
 
         return header
-     }
-
-    func webView(
-         _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-     ) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-        return popupHost.open(in: webView, configuration: configuration)
      }
 
     static func clearStoredWebsiteData() {
@@ -1571,38 +1388,6 @@ private func tokenPlanImportExtraFields(
     return fields
 }
 
-/// OAuth popup callbacks need their original opener and WebKit configuration.
-@MainActor
-private final class BrowserSessionPopupHost: NSObject, WKUIDelegate {
-    private var popups: [WKWebView] = []
-
-    func open(in parent: WKWebView, configuration: WKWebViewConfiguration) -> WKWebView {
-        let popup = WKWebView(frame: .zero, configuration: configuration)
-        popup.uiDelegate = self
-        popup.translatesAutoresizingMaskIntoConstraints = false
-        parent.addSubview(popup)
-        NSLayoutConstraint.activate([
-            popup.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
-            popup.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
-            popup.topAnchor.constraint(equalTo: parent.topAnchor),
-            popup.bottomAnchor.constraint(equalTo: parent.bottomAnchor)
-        ])
-        popups.append(popup)
-        return popup
-    }
-
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-        return open(in: webView, configuration: configuration)
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        webView.removeFromSuperview()
-        popups.removeAll { $0 === webView }
-    }
-}
-
 private func browserSessionImportFields(url: URL?) -> [String: String] {
     var fields = [SpendProviderCredentialField.browserSessionID: UUID().uuidString]
     if let url, url.scheme == "https" {
@@ -1639,7 +1424,7 @@ struct QwenWebSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                   .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -1743,18 +1528,9 @@ extraFields: tokenPlanImportExtraFields(
 }
 
 @MainActor
-final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-    private let popupHost = BrowserSessionPopupHost()
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-      }
+final class QwenWebSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -1794,16 +1570,6 @@ final class QwenWebSessionImportModel: NSObject, WKUIDelegate {
           }
 
         return header
-      }
-
-    func webView(
-          _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-      ) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-        return popupHost.open(in: webView, configuration: configuration)
       }
 
     static func clearStoredWebsiteData() {
@@ -1863,7 +1629,7 @@ struct MimoWebSessionImportView: View {
 
             Divider()
 
-            CursorSessionWebView(webView: model.webView)
+            SignInBrowserView(browser: model.browser)
                   .frame(minWidth: 720, minHeight: 560)
 
             Divider()
@@ -1967,18 +1733,9 @@ extraFields: tokenPlanImportExtraFields(
 }
 
 @MainActor
-final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
-    let webView: WKWebView
-    private let popupHost = BrowserSessionPopupHost()
-
-    override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-      }
+final class MimoWebSessionImportModel {
+    let browser = SignInBrowser()
+    var webView: WKWebView { browser.webView }
 
     func load(startURL: URL) {
         guard webView.url == nil else { return }
@@ -2017,16 +1774,6 @@ final class MimoWebSessionImportModel: NSObject, WKUIDelegate {
           }
 
         return header
-      }
-
-    func webView(
-          _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-      ) -> WKWebView? {
-        guard navigationAction.targetFrame == nil else { return nil }
-        return popupHost.open(in: webView, configuration: configuration)
       }
 
     static func clearStoredWebsiteData() {
