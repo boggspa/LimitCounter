@@ -196,7 +196,9 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderQwenLogo"
         case .mimo:
             return "ProviderMiMoLogo"
-        case .minimax, .heatmap:
+        case .minimax:
+            return "ProviderMiniMaxLogo" // Waveform mark from MiniMax's official logo (github.com/MiniMax-AI)
+        case .heatmap:
             return ""
         }
     }
