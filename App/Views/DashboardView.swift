@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -12,6 +11,9 @@ struct DashboardView: View {
     @StateObject private var visibilityStore = ProviderVisibilityStore.shared
     @StateObject private var orderStore = ProviderCardOrderStore.shared
     @StateObject private var layoutModeStore = DashboardLayoutModeStore.shared
+    /// Drags of whole cards; each compact block and period section runs its own.
+    @StateObject private var cardReorder = ReorderController()
+    @StateObject private var reorderAutoscroller = ReorderAutoscroller()
     @State private var showSettings = false
     #if os(macOS)
     @StateObject private var setupModel = ProviderSetupModel()
@@ -233,6 +235,7 @@ struct DashboardView: View {
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
             }
+            .reorderAutoscroll(reorderAutoscroller)
         }
     }
 
@@ -395,6 +398,7 @@ struct DashboardView: View {
                 .padding(.bottom, 112)
                 .frame(maxWidth: .infinity, alignment: .top)
             }
+            .reorderAutoscroll(reorderAutoscroller)
 
             bottomControlDock
                 .padding(.horizontal, 28)
@@ -656,8 +660,16 @@ struct DashboardView: View {
                             }
                         }
                     }
+                    .reorderStack(
+                        controller: cardReorder,
+                        order: usageMeterCards.map(\.id),
+                        accent: cardAccent,
+                        onMove: { key, gap in moveCard(key, toGap: gap, among: usageMeterCards) },
+                        phantom: cardPhantom
+                    )
                     .padding(.bottom, 8)
                 }
+                .reorderAutoscroll(reorderAutoscroller)
             }
         }
     }
@@ -955,19 +967,34 @@ struct DashboardView: View {
     }
 
     private func dashboardCardLazyStack(isDesktop: Bool) -> some View {
-        LazyVStack(spacing: isDesktop ? 12 : 10) {
-            if layoutModeStore.mode.isCompact {
+        let cards = dashboardCards
+        let isCompact = layoutModeStore.mode.isCompact
+        return LazyVStack(spacing: isDesktop ? 12 : 10) {
+            if isCompact {
                 compactLayoutBody(isDesktop: isDesktop)
-            } else if dashboardCards.isEmpty {
+            } else if cards.isEmpty {
                 GlassCardContainer(style: .panel, accent: ProGlassTheme.accent, cornerRadius: 16) {
                     emptyDashboardState
                 }
             } else {
-                ForEach(dashboardCards) { item in
+                ForEach(cards) { item in
                     dashboardCard(item)
                 }
             }
         }
+        .reorderStack(
+            controller: cardReorder,
+            order: isCompact ? compactStackOrder : cards.map(\.id),
+            accent: cardAccent,
+            onMove: { key, gap in
+                if layoutModeStore.mode.isCompact {
+                    moveCompactStackItem(key, toGap: gap)
+                } else {
+                    moveCard(key, toGap: gap, among: dashboardCards)
+                }
+            },
+            phantom: cardPhantom
+        )
         .frame(maxWidth: isDesktop ? 760 : .infinity, alignment: .topLeading)
     }
 
@@ -993,15 +1020,14 @@ struct DashboardView: View {
                 compactHeatmapCard
             }
 
-            if layoutModeStore.mode == .compactPeriod {
-                PeriodCompactDashboardCardView(snapshots: snapshots)
-            } else {
-                CompactDashboardCardView(
-                    snapshots: snapshots,
-                    reorderableProviderIDs: reorderableProviderIDs,
-                    orderStore: orderStore
-                )
+            Group {
+                if layoutModeStore.mode == .compactPeriod {
+                    PeriodCompactDashboardCardView(snapshots: snapshots)
+                } else {
+                    CompactDashboardCardView(snapshots: snapshots, orderStore: orderStore)
+                }
             }
+            .reorderItem(Self.compactMetersKey, controller: cardReorder)
 
             if showsHeatmap && !heatmapLeads {
                 compactHeatmapCard
@@ -1010,12 +1036,10 @@ struct DashboardView: View {
     }
 
     private var compactHeatmapCard: some View {
-        LLMActivityHeatmapView(snapshots: appState.snapshots, modelUsage: appState.modelUsage)
-            .dashboardReorderable(
-                providerID: .heatmap,
-                reorderableProviderIDs: reorderableProviderIDs,
-                orderStore: orderStore
-            )
+        let key = ProviderAccountKey.primary(.heatmap).rawValue
+        return LLMActivityHeatmapView(snapshots: appState.snapshots, modelUsage: appState.modelUsage)
+            .overlay(alignment: .top) { cardGrip(key: key, label: "Activity") }
+            .reorderItem(key, controller: cardReorder)
     }
 
     /// Compact mode folds every provider into a single card, so the
@@ -1024,7 +1048,57 @@ struct DashboardView: View {
     /// standard layout.
     private func heatmapSortsAboveCompactStack(_ snapshots: [QuotaSnapshot]) -> Bool {
         guard let first = snapshots.first else { return false }
-        return orderStore.rank(for: .heatmap) < orderStore.rank(for: first.providerID)
+        return orderStore.sortedCards([first.accountKey, .primary(.heatmap)]).first == .primary(.heatmap)
+    }
+
+    /// The meters card in the compact layouts' card stack; it is not dragged
+    /// itself, but the heatmap can be dropped above or below it.
+    private static let compactMetersKey = "compact-meters"
+
+    private var compactStackOrder: [String] {
+        let snapshots = orderedCompactSnapshots()
+        guard visibilityStore.isVisible(.heatmap), !snapshots.isEmpty else { return [Self.compactMetersKey] }
+        let heatmap = ProviderAccountKey.primary(.heatmap).rawValue
+        return heatmapSortsAboveCompactStack(snapshots)
+            ? [heatmap, Self.compactMetersKey]
+            : [Self.compactMetersKey, heatmap]
+    }
+
+    /// In the compact layouts only the heatmap moves, to above the meters
+    /// (gap 0) or below them.
+    private func moveCompactStackItem(_ key: String, toGap gap: Int) {
+        guard key == ProviderAccountKey.primary(.heatmap).rawValue else { return }
+        let providers = orderedCompactSnapshots().map(\.accountKey)
+        orderStore.move(
+            .primary(.heatmap),
+            toGap: gap == 0 ? 0 : providers.count,
+            among: [.primary(.heatmap)] + providers
+        )
+    }
+
+    private func moveCard(_ key: String, toGap gap: Int, among cards: [DashboardCardItem]) {
+        guard let card = ProviderAccountKey(rawValue: key) else { return }
+        orderStore.move(card, toGap: gap, among: cards.map(\.orderKey))
+    }
+
+    private func cardAccent(_ key: String) -> Color {
+        ProviderAccountKey(rawValue: key).map { Color(hex: $0.providerID.accentColorHex) } ?? ProGlassTheme.accent
+    }
+
+    @ViewBuilder
+    private func cardPhantom(_ key: String) -> some View {
+        if let card = ProviderAccountKey(rawValue: key) {
+            ReorderPhantomChip(
+                providerID: card.providerID,
+                title: dashboardCards.first { $0.orderKey == card }?.title
+                    ?? (card.providerID == .heatmap ? "Activity" : card.providerID.displayName)
+            )
+        }
+    }
+
+    private func cardGrip(key: String, label: String) -> some View {
+        ReorderGrip(key: key, label: label, style: .bar, controller: cardReorder)
+            .padding(.top, 1)
     }
 
     /// Returns visible snapshots in the same order the standard layout
@@ -1051,21 +1125,8 @@ struct DashboardView: View {
             }
         }
         .buttonStyle(.plain)
-        .dashboardReorderable(
-            providerID: item.orderProviderID,
-            reorderableProviderIDs: reorderableProviderIDs,
-            orderStore: orderStore
-        )
-    }
-
-    /// Every card currently on screen, so a drop only reorders cards
-    /// that belong to the same visible stack.
-    private var reorderableProviderIDs: Set<ProviderID> {
-        var ids = Set(visibleSnapshots.map { $0.providerID == .codexTelemetry ? .openai : $0.providerID })
-        if visibilityStore.isVisible(.heatmap) {
-            ids.insert(.heatmap)
-        }
-        return ids
+        .overlay(alignment: .top) { cardGrip(key: item.id, label: item.title) }
+        .reorderItem(item.id, controller: cardReorder)
     }
 
     private var emptyDashboardState: some View {
@@ -1718,6 +1779,18 @@ private enum DashboardCardItem: Identifiable {
         orderKey.rawValue
     }
 
+    /// What the card is called, for its grip and its phantom.
+    var title: String {
+        switch self {
+        case .snapshot(let snapshot):
+            return snapshot.accountDisplayName
+        case .combinedCodex(let usageSnapshot, _):
+            return usageSnapshot.accountDisplayName
+        case .heatmap:
+            return "Activity"
+        }
+    }
+
     /// The account the card belongs to, which is also its place in the order.
     var orderKey: ProviderAccountKey {
         switch self {
@@ -1738,17 +1811,6 @@ private enum DashboardCardItem: Identifiable {
             return .codexCombined(usageSnapshot: usageSnapshot, telemetrySnapshot: telemetrySnapshot)
         case .heatmap:
             return .modelUsage
-        }
-    }
-
-    var orderProviderID: ProviderID {
-        switch self {
-        case .snapshot(let snapshot):
-            return snapshot.providerID == .codexTelemetry ? .openai : snapshot.providerID
-        case .combinedCodex:
-            return .openai
-        case .heatmap:
-            return .heatmap
         }
     }
 
@@ -1775,91 +1837,6 @@ private enum DashboardRoute: Hashable {
     case codexCombined(usageSnapshot: QuotaSnapshot, telemetrySnapshot: QuotaSnapshot)
 }
 
-private enum DashboardProviderDrag {
-    // Encode the source in the drag itself. Native drags have no SwiftUI end
-    // callback, so keeping it in view state leaves canceled drags selected.
-    static let type = UTType(exportedAs: "com.chrisizatt.limitcounter.provider-reorder", conformingTo: .data)
-
-    static func item(for providerID: ProviderID) -> NSItemProvider {
-        let provider = NSItemProvider()
-        provider.registerDataRepresentation(forTypeIdentifier: type.identifier, visibility: .ownProcess) { completion in
-            completion(Data(providerID.rawValue.utf8), nil)
-            return nil
-        }
-        return provider
-    }
-}
-
-private struct DashboardCardDropDelegate: DropDelegate {
-    let targetProviderID: ProviderID
-    let reorderableProviderIDs: Set<ProviderID>
-    let orderStore: ProviderCardOrderStore
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard let provider = info.itemProviders(for: [DashboardProviderDrag.type.identifier]).first else {
-            return false
-        }
-        provider.loadDataRepresentation(forTypeIdentifier: DashboardProviderDrag.type.identifier) { data, _ in
-            guard
-                let data,
-                let rawValue = String(data: data, encoding: .utf8),
-                let sourceID = ProviderID(rawValue: rawValue)
-            else {
-                return
-            }
-            Task { @MainActor in
-                guard sourceID != targetProviderID, reorderableProviderIDs.contains(sourceID) else { return }
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    orderStore.move(sourceID, toward: targetProviderID)
-                }
-            }
-        }
-        return true
-    }
-}
-
-/// Shared drag-to-reorder plumbing for every dashboard surface — the
-/// standard card stack, the compact stacked-meters rows, and the
-/// activity heatmap card.
-private struct DashboardReorderModifier: ViewModifier {
-    let providerID: ProviderID
-    let reorderableProviderIDs: Set<ProviderID>
-    let orderStore: ProviderCardOrderStore
-
-    func body(content: Content) -> some View {
-        content
-            .onDrag { DashboardProviderDrag.item(for: providerID) }
-            .onDrop(
-                of: [DashboardProviderDrag.type],
-                delegate: DashboardCardDropDelegate(
-                    targetProviderID: providerID,
-                    reorderableProviderIDs: reorderableProviderIDs,
-                    orderStore: orderStore
-                )
-            )
-    }
-}
-
-extension View {
-    fileprivate func dashboardReorderable(
-        providerID: ProviderID,
-        reorderableProviderIDs: Set<ProviderID>,
-        orderStore: ProviderCardOrderStore
-    ) -> some View {
-        modifier(
-            DashboardReorderModifier(
-                providerID: providerID,
-                reorderableProviderIDs: reorderableProviderIDs,
-                orderStore: orderStore
-            )
-        )
-    }
-}
-
 /// A compact meter row paired with an identity that survives a refresh.
 ///
 /// `QuotaWindow.id` is a fresh UUID every time a provider is read, and
@@ -1871,100 +1848,6 @@ private struct OrderedMeter: Identifiable {
     let id: String
     let window: QuotaWindow
 }
-
-/// The frames are measured in the same global coordinates as the handle's
-/// gesture. Each compact card keeps its own copy, so identical meter keys in
-/// the provider and period layouts cannot interfere with one another.
-private struct MeterRowFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-    }
-}
-
-private struct MeterReorderTargetModifier: ViewModifier {
-    let meterKey: String
-
-    func body(content: Content) -> some View {
-        content
-            .background {
-                GeometryReader { geometry in
-                    Color.clear.preference(
-                        key: MeterRowFramePreferenceKey.self,
-                        value: [meterKey: geometry.frame(in: .global)]
-                    )
-                }
-            }
-    }
-}
-
-extension View {
-    fileprivate func meterReorderTarget(_ meterKey: String) -> some View {
-        modifier(MeterReorderTargetModifier(meterKey: meterKey))
-    }
-}
-
-/// A gesture on a small handle leaves scrolling and other row hit testing
-/// alone. Gesture state resets on both completion and cancellation, so a drag
-/// cannot leave a meter looking selected when it misses a drop target.
-private struct MeterDragHandle: View {
-    /// The handle's slot in a row. On iOS the touch area reaches past the slot,
-    /// over the meter's own bar, so a finger-sized target doesn't make compact
-    /// rows taller than their macOS twins.
-    #if os(iOS)
-    static let slot = CGSize(width: 22, height: 18)
-    static let touchArea = CGSize(width: 44, height: 32)
-    #else
-    static let slot = CGSize(width: 15, height: 18)
-    static let touchArea = slot
-    #endif
-
-    let meterKey: String
-    let scope: String
-    let reorderableKeys: [String]
-    let rowFrames: [String: CGRect]
-    let orderStore: MeterOrderStore
-    let accessibilityName: String
-    @GestureState private var isDragging = false
-
-    var body: some View {
-        Image(systemName: "line.3.horizontal")
-            .font(.system(size: 8, weight: .semibold))
-            .foregroundStyle(isDragging ? Color.primary : Color.secondary.opacity(0.65))
-            .frame(width: Self.slot.width, height: Self.slot.height)
-            .contentShape(
-                Rectangle()
-                    .size(Self.touchArea)
-                    .offset(x: (Self.slot.width - Self.touchArea.width) / 2, y: (Self.slot.height - Self.touchArea.height) / 2)
-            )
-            .accessibilityLabel("Reorder \(accessibilityName)")
-            .gesture(
-                DragGesture(minimumDistance: 4, coordinateSpace: .global)
-                    .updating($isDragging) { _, state, _ in state = true }
-                    .onEnded { value in
-                        guard let targetKey = target(at: value.location), targetKey != meterKey else { return }
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            orderStore.move(meterKey, toward: targetKey, scope: scope, natural: reorderableKeys)
-                        }
-                    }
-            )
-    }
-
-    private func target(at location: CGPoint) -> String? {
-        let candidates = reorderableKeys.compactMap { key -> (String, CGRect)? in
-            guard let frame = rowFrames[key] else { return nil }
-            return (key, frame)
-        }
-        guard let first = candidates.first else { return nil }
-        let bounds = candidates.dropFirst().reduce(first.1) { $0.union($1.1) }
-        guard bounds.insetBy(dx: -16, dy: -16).contains(location) else { return nil }
-        return candidates.min {
-            abs($0.1.midY - location.y) < abs($1.1.midY - location.y)
-        }?.0
-    }
-}
-
 
 // MARK: - Compact Layout
 
@@ -1982,37 +1865,40 @@ private struct MeterDragHandle: View {
 /// rolling "in 2h 44m" phrasing would re-flow as numbers wobble.
 struct CompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
-    let reorderableProviderIDs: Set<ProviderID>
     let orderStore: ProviderCardOrderStore
     @ObservedObject private var meterOrderStore = MeterOrderStore.shared
-    @State private var meterRowFrames: [String: CGRect] = [:]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ForEach(snapshots, id: \.accountKey.rawValue) { snapshot in
-                providerBlock(snapshot)
-                    .contentShape(Rectangle())
-                    .onDrop(
-                        of: [DashboardProviderDrag.type],
-                        delegate: DashboardCardDropDelegate(
-                            targetProviderID: snapshot.providerID,
-                            reorderableProviderIDs: reorderableProviderIDs,
-                            orderStore: orderStore
-                        )
-                    )
-                if snapshot.accountKey != snapshots.last?.accountKey {
-                    Divider().overlay(Color.white.opacity(0.08))
+        // Each account's block is dragged by the grip in its header; its
+        // meters by theirs, within the block.
+        ReorderableStack(
+            items: snapshots,
+            key: { $0.accountKey.rawValue },
+            spacing: 14,
+            accent: { Color(hex: $0.providerID.accentColorHex) },
+            onMove: { key, gap in
+                guard let account = ProviderAccountKey(rawValue: key) else { return }
+                orderStore.move(account, toGap: gap, among: snapshots.map(\.accountKey))
+            },
+            row: { snapshot, blockReorder in
+                VStack(alignment: .leading, spacing: 14) {
+                    providerBlock(snapshot, blockReorder: blockReorder)
+                    if snapshot.accountKey != snapshots.last?.accountKey {
+                        Divider().overlay(Color.white.opacity(0.08))
+                    }
                 }
+            },
+            phantom: { snapshot in
+                ReorderPhantomChip(providerID: snapshot.providerID, title: snapshot.accountDisplayName)
             }
-        }
+        )
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
-        .onPreferenceChange(MeterRowFramePreferenceKey.self) { meterRowFrames = $0 }
     }
 
     @ViewBuilder
-    private func providerBlock(_ snapshot: QuotaSnapshot) -> some View {
+    private func providerBlock(_ snapshot: QuotaSnapshot, blockReorder: ReorderController) -> some View {
         let accent = Color(hex: snapshot.providerID.accentColorHex)
         // Keyed and scoped per account: two Codex accounts' "Weekly" rows
         // are different meters, with orders of their own.
@@ -2028,6 +1914,13 @@ struct CompactDashboardCardView: View {
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                ReorderGrip(
+                    key: snapshot.accountKey.rawValue,
+                    label: snapshot.accountDisplayName,
+                    style: .lines,
+                    controller: blockReorder
+                )
+
                 ProviderBrandIconView(providerID: snapshot.providerID, size: 18)
                     .frame(width: 22, height: 22)
 
@@ -2049,49 +1942,47 @@ struct CompactDashboardCardView: View {
                 }
             }
             .padding(.bottom, 1)
-            .contentShape(Rectangle())
-            .onDrag { DashboardProviderDrag.item(for: snapshot.providerID) }
 
             if meters.isEmpty {
                 Text("No usage data yet")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(meters) { meter in
-                    compactMeterRow(
-                        window: meter.window,
-                        accent: accent,
-                        providerID: snapshot.providerID,
-                        meterKey: meter.id,
-                        scope: scope,
-                        reorderableKeys: meterKeys
-                    )
-                    .contentShape(Rectangle())
-                    .meterReorderTarget(meter.id)
-                }
+                ReorderableStack(
+                    items: meters,
+                    key: \.id,
+                    spacing: 6,
+                    accent: { _ in accent },
+                    onMove: { key, gap in
+                        meterOrderStore.move(key, toGap: gap, scope: scope, natural: meterKeys)
+                    },
+                    row: { meter, meterReorder in
+                        compactMeterRow(window: meter.window, accent: accent, providerID: snapshot.providerID) {
+                            ReorderGrip(key: meter.id, label: meter.window.label, style: .lines, controller: meterReorder)
+                        }
+                    },
+                    phantom: { meter in
+                        ReorderPhantomRow {
+                            compactMeterRow(window: meter.window, accent: accent, providerID: snapshot.providerID) {
+                                ReorderGripGlyph()
+                            }
+                        }
+                    }
+                )
             }
         }
     }
 
     @ViewBuilder
-    private func compactMeterRow(
+    private func compactMeterRow<Leading: View>(
         window: QuotaWindow,
         accent: Color,
         providerID: ProviderID,
-        meterKey: String,
-        scope: String,
-        reorderableKeys: [String]
+        @ViewBuilder leading: () -> Leading
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                MeterDragHandle(
-                    meterKey: meterKey,
-                    scope: scope,
-                    reorderableKeys: reorderableKeys,
-                    rowFrames: meterRowFrames,
-                    orderStore: meterOrderStore,
-                    accessibilityName: window.label
-                )
+                leading()
 
                 Text(window.label)
                     .font(.system(size: 11, weight: .semibold))
@@ -2153,7 +2044,6 @@ private func compactMeterValueText(for window: QuotaWindow, providerID: Provider
 struct PeriodCompactDashboardCardView: View {
     let snapshots: [QuotaSnapshot]
     @ObservedObject private var meterOrderStore = MeterOrderStore.shared
-    @State private var meterRowFrames: [String: CGRect] = [:]
 
     private var sections: [QuotaPeriodSection] {
         QuotaPeriodSection.sections(from: snapshots)
@@ -2172,7 +2062,6 @@ struct PeriodCompactDashboardCardView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
-        .onPreferenceChange(MeterRowFramePreferenceKey.self) { meterRowFrames = $0 }
     }
 
     @ViewBuilder
@@ -2189,7 +2078,6 @@ struct PeriodCompactDashboardCardView: View {
             key: { MeterOrderStore.key(for: $0) ?? $0.id }
         )
         let idleRows = section.rows.filter { $0.window == nil }
-        let rows = orderedMeterRows + idleRows
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -2207,36 +2095,48 @@ struct PeriodCompactDashboardCardView: View {
             }
             .padding(.bottom, 1)
 
-            ForEach(rows) { row in
-                if let meterKey = MeterOrderStore.key(for: row) {
-                    meterRow(row, scope: scope, reorderableKeys: meterKeys)
-                        .contentShape(Rectangle())
-                        .meterReorderTarget(meterKey)
-                } else {
-                    meterRow(row, scope: scope, reorderableKeys: meterKeys)
+            if !orderedMeterRows.isEmpty {
+                ReorderableStack(
+                    items: orderedMeterRows,
+                    key: { MeterOrderStore.key(for: $0) ?? $0.id },
+                    spacing: 6,
+                    accent: { Color(hex: $0.providerID.accentColorHex) },
+                    onMove: { key, gap in
+                        meterOrderStore.move(key, toGap: gap, scope: scope, natural: meterKeys)
+                    },
+                    row: { row, meterReorder in
+                        meterRow(row) {
+                            ReorderGrip(
+                                key: MeterOrderStore.key(for: row) ?? row.id,
+                                label: row.label,
+                                style: .lines,
+                                controller: meterReorder
+                            )
+                        }
+                    },
+                    phantom: { row in
+                        ReorderPhantomRow {
+                            meterRow(row) { ReorderGripGlyph() }
+                        }
+                    }
+                )
+            }
+
+            ForEach(idleRows) { row in
+                meterRow(row) {
+                    Color.clear.frame(width: ReorderGrip.lineSlot.width, height: ReorderGrip.lineSlot.height)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func meterRow(_ row: QuotaPeriodRow, scope: String, reorderableKeys: [String]) -> some View {
+    private func meterRow<Leading: View>(_ row: QuotaPeriodRow, @ViewBuilder leading: () -> Leading) -> some View {
         let accent = Color(hex: row.providerID.accentColorHex)
 
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
-                if let meterKey = MeterOrderStore.key(for: row) {
-                    MeterDragHandle(
-                        meterKey: meterKey,
-                        scope: scope,
-                        reorderableKeys: reorderableKeys,
-                        rowFrames: meterRowFrames,
-                        orderStore: meterOrderStore,
-                        accessibilityName: row.label
-                    )
-                } else {
-                    Color.clear.frame(width: MeterDragHandle.slot.width, height: MeterDragHandle.slot.height)
-                }
+                leading()
 
                 ProviderBrandIconView(providerID: row.providerID, size: 13)
                     .frame(width: 16, height: 16)

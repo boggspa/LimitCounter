@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		157AB1CE59BEC51F76EF0096 /* SignInBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 595B9804F36C4594EE1BC232 /* SignInBrowser.swift */; };
+		9F3D3B2503B512F1C3D279C4 /* DashboardReorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54E22D41E2516E3B2007F90F /* DashboardReorder.swift */; };
 		A08136729B546202562478AC /* ModelUsageDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A08136729B546202562478AD /* ModelUsageDashboardView.swift */; };
 		A08136729B546202562478AE /* ModelUsageDashboardData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A08136729B546202562478AF /* ModelUsageDashboardData.swift */; };
 		216D8AB6E134F76894E0E773 /* ModelUsageAnalytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 917535DA819A97528F602CF4 /* ModelUsageAnalytics.swift */; };
@@ -84,6 +85,7 @@
 
 /* Begin PBXFileReference section */
 		595B9804F36C4594EE1BC232 /* SignInBrowser.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SignInBrowser.swift; path = App/Views/SignInBrowser.swift; sourceTree = SOURCE_ROOT; };
+		54E22D41E2516E3B2007F90F /* DashboardReorder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = DashboardReorder.swift; path = App/Views/DashboardReorder.swift; sourceTree = SOURCE_ROOT; };
 		A08136729B546202562478AD /* ModelUsageDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Views/ModelUsageDashboardView.swift; sourceTree = SOURCE_ROOT; };
 		A08136729B546202562478AF /* ModelUsageDashboardData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Views/ModelUsageDashboardData.swift; sourceTree = SOURCE_ROOT; };
 		917535DA819A97528F602CF4 /* ModelUsageAnalytics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Models/ModelUsageAnalytics.swift; sourceTree = SOURCE_ROOT; };
@@ -260,6 +262,7 @@
 				B5DDB5C9DCE84FA98F4D0E6C /* GlassChrome.swift */,
 				6A7A20A1B4B04E1C9E1C0D5C /* CursorSessionImportView.swift */,
 				595B9804F36C4594EE1BC232 /* SignInBrowser.swift */,
+				54E22D41E2516E3B2007F90F /* DashboardReorder.swift */,
 				9C38142DE1DDB3110221F8CF /* DashboardView.swift */,
 				A08136729B546202562478AD /* ModelUsageDashboardView.swift */,
 				A08136729B546202562478AF /* ModelUsageDashboardData.swift */,
@@ -480,6 +483,7 @@
 				C277E330E1E1A288294467FB /* SettingsView.swift in Sources */,
 				A51F1D7A8D634C6DA9E9D6C5 /* CursorSessionImportView.swift in Sources */,
 				157AB1CE59BEC51F76EF0096 /* SignInBrowser.swift in Sources */,
+				9F3D3B2503B512F1C3D279C4 /* DashboardReorder.swift in Sources */,
 				B1A64D48BC5A4D97A3A61B0F /* GlassChrome.swift in Sources */,
 				760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */,
 				0E4EB4675CC62CEAB0F3B621 /* MenuBarController.swift in Sources */,
