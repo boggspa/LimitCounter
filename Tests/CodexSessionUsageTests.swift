@@ -136,6 +136,15 @@ private func testProOmitsFiveHourAndKeepsWeekly() async throws {
     try expectEqual(snapshot.windows[0].percentageUsed, 64, "Pro weekly usage")
 }
 
+private func testProLiteOmitsFiveHourAndNamesThePlan() async throws {
+    // Pro Lite, like Pro, has no 5-hour allowance; only Plus and below do.
+    let snapshot = try await fetch(planType: "prolite")
+
+    try expectEqual(snapshot.windows.map(\.label), ["Weekly"], "Pro Lite should not render a 5H window")
+    try expectEqual(snapshot.windows[0].percentageUsed, 64, "Pro Lite weekly usage")
+    try expectEqual(snapshot.planName, "Pro Lite", "Pro Lite is named as two words, not \"Prolite\"")
+}
+
 private func testLunaReserveRendersFriendlyWeeklyAllowance() async throws {
     let snapshot = try await fetch(
         planType: "pro",
@@ -243,14 +252,30 @@ private func testResetCreditParsersReadDetailsAndHistory() throws {
     try expect(empty.credits.isEmpty, "no credits")
 }
 
+private func testResetCreditCacheIsFiledPerAccount() throws {
+    // Two Codex accounts refresh through the same fetcher; one shared entry
+    // let the second show the first's banked credits, then overwrite them.
+    let personal = CodexResetCreditsFetcher.cacheKey(forAccountID: "acct-personal")
+    let work = CodexResetCreditsFetcher.cacheKey(forAccountID: "acct-work")
+    try expect(personal != work, "each ChatGPT account files its own reset-credit summary")
+    try expectEqual(personal, "codex.resetCredits.cache.v1.acct-personal", "the key extends the original one with the account id")
+    try expectEqual(
+        CodexResetCreditsFetcher.cacheKey(forAccountID: "acct-work"),
+        work,
+        "the same account finds its own summary again"
+    )
+}
+
 @main
 private enum CodexSessionUsageTestRunner {
     static func main() async throws {
         try await testPlusRendersFiveHourThenWeekly()
         try await testProOmitsFiveHourAndKeepsWeekly()
+        try await testProLiteOmitsFiveHourAndNamesThePlan()
         try await testLunaReserveRendersFriendlyWeeklyAllowance()
         try await testSparkRendersFriendlyWindowLabels()
         try testResetCreditParsersReadDetailsAndHistory()
+        try testResetCreditCacheIsFiledPerAccount()
         print("Codex session usage tests passed")
     }
 }

@@ -5501,7 +5501,7 @@ public struct CodexSessionProviderClient: ProviderClient {
 
         // The API's primary/secondary positions are not semantic. The
         // account-wide 5-hour allowance is available on Plus and lower plans,
-        // while Pro intentionally receives only a weekly window.
+        // while Pro and Pro Lite intentionally receive only a weekly window.
         if shouldDisplayAggregateFiveHourLimit(planType: payload.planType),
            let fiveHour = aggregateFiveHourWindow(in: payload) {
             aggregateWindows.append(
@@ -5681,6 +5681,8 @@ public struct CodexSessionProviderClient: ProviderClient {
             return "Plus"
         case "pro":
             return "Pro"
+        case "prolite":
+            return "Pro Lite"
         case "go":
             return "Go"
         case "free":
@@ -5837,7 +5839,7 @@ nonisolated enum CodexResetCreditsParser {
 struct CodexResetCreditsFetcher {
     static let redeemHint = "Redeem it in the Codex app (Settings → Usage & billing) or with /usage in the Codex CLI."
 
-    private static let cacheKey = "codex.resetCredits.cache.v1"
+    private static let cacheKeyPrefix = "codex.resetCredits.cache.v1"
     private static let refreshInterval: TimeInterval = 30 * 60
     private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
 
@@ -5849,13 +5851,22 @@ struct CodexResetCreditsFetcher {
         self.session = session
     }
 
+    /// Banked credits belong to one ChatGPT account, and every Codex account
+    /// refreshes through this fetcher, so each account files its own summary.
+    /// One shared entry let a second account show the first account's
+    /// credits for up to half an hour, then overwrite them with its own.
+    static func cacheKey(forAccountID accountID: String) -> String {
+        "\(cacheKeyPrefix).\(accountID)"
+    }
+
     func summary(
         usageCount: Int?,
         accessToken: String,
         accountID: String,
         now: Date = Date()
     ) async -> QuotaResetCreditSummary? {
-        let cached = Self.loadCache()
+        let cacheKey = Self.cacheKey(forAccountID: accountID)
+        let cached = Self.loadCache(forKey: cacheKey)
         let needsRefresh: Bool
         if let cached {
             needsRefresh = (usageCount != nil && usageCount != cached.availableCount)
@@ -5885,7 +5896,7 @@ struct CodexResetCreditsFetcher {
             observedAt: fetchedSomething ? now : (cached?.observedAt ?? now)
         )
         if fetchedSomething {
-            Self.saveCache(summary)
+            Self.saveCache(summary, forKey: cacheKey)
         }
         print("[CodexSessionProvider] Reset credits: \(summary.availableCount) available, \(summary.history.count) history events (details: \(details != nil), history: \(history != nil))")
         return summary
@@ -5912,14 +5923,14 @@ struct CodexResetCreditsFetcher {
         UserDefaults(suiteName: appGroupID) ?? .standard
     }
 
-    private static func loadCache() -> QuotaResetCreditSummary? {
+    private static func loadCache(forKey cacheKey: String) -> QuotaResetCreditSummary? {
         guard let data = defaults.data(forKey: cacheKey) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(QuotaResetCreditSummary.self, from: data)
     }
 
-    private static func saveCache(_ summary: QuotaResetCreditSummary) {
+    private static func saveCache(_ summary: QuotaResetCreditSummary, forKey cacheKey: String) {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(summary) else { return }
