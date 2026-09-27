@@ -23,6 +23,12 @@ func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) th
     }
 }
 
+func expectClose(_ actual: Double?, _ expected: Double, _ message: String) throws {
+    guard let actual, abs(actual - expected) < 0.000_001 else {
+        throw TestFailure.failed("\(message): expected \(expected), got \(String(describing: actual))")
+    }
+}
+
 func expectNil<T>(_ value: T?, _ message: String) throws {
     if let value {
         throw TestFailure.failed("\(message): expected nil, got \(value)")
@@ -59,6 +65,12 @@ enum KimiUsageTestRunner {
         try await testGlobalSignInRefreshesWithItsOwnHostAndLock()
         try await testCodeMonthlyWinsOverBrowserSessionMonthly()
         try await testMissingCLISignInAsksForFolderImport()
+        try testStaleUsagesFiveHourDefersToExhaustedLimits()
+        try testStaleUsagesWeeklyDefersToExhaustedUsage()
+        try testParsesWebFiveHourUsage()
+        try await testWebFiveHourReplacesCodeFiveHour()
+        try await testWebFiveHourFaultKeepsCodeFiveHour()
+        try await testWebSessionRenewsOnceForBothReadings()
         print("Kimi usage tests passed")
     }
 
@@ -1104,6 +1116,266 @@ enum KimiUsageTestRunner {
         try expectNil(snapshot.planName, "plan name without user info")
     }
 
+    private static func testStaleUsagesFiveHourDefersToExhaustedLimits() throws {
+        // Kimi Code's `/usages` has reported `used_ratio: 0` for a 5-hour
+        // window its own `limits` entry (same reset) shows spent, while Kimi
+        // answered 403 and the kimi.ai page read 100%.
+        let payload = """
+        {
+          "limits": [
+            {
+              "detail": { "limit": "100", "remaining": "0", "resetTime": "2099-09-27T14:08:23.538306123Z", "used": "100" },
+              "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" }
+            }
+          ],
+          "usages": {
+            "limit_5h": { "reset_time": "2099-09-27T14:08:23Z", "used_ratio": 0 },
+            "limit_month_total": { "reset_time": "2099-10-26T00:00:00Z", "used_ratio": 0.131 }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let snapshot = try KimiUsageNormalizer.snapshot(from: payload, planName: "Pro")
+
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Monthly"], "stale-ratio windows")
+        let fiveHour = try requiredWindow("5H", in: snapshot)
+        try expectEqual(fiveHour.percentageUsed, 100, "stale 5h ratio defers to the exhausted limits entry")
+        try expectEqual(fiveHour.unit, "%", "reconciled 5h stays a percent window")
+        try expectEqual(
+            fiveHour.resetDate,
+            ISO8601DateFormatter().date(from: "2099-09-27T14:08:23Z"),
+            "reconciled 5h keeps its reset"
+        )
+
+        // `remaining` alone is enough, and hours count as well as minutes.
+        let remainingOnly = try KimiUsageNormalizer.snapshot(
+            from: """
+            {
+              "limits": [{ "detail": { "limit": 200, "remaining": 50 }, "window": { "duration": 5, "timeUnit": "TIME_UNIT_HOUR" } }],
+              "usages": { "limit_5h": { "reset_time": "2099-09-27T14:08:23Z", "used_ratio": 0.1 } }
+            }
+            """.data(using: .utf8)!
+        )
+        try expectEqual(try requiredWindow("5H", in: remainingOnly).percentageUsed, 75, "remaining-only 5h entry")
+    }
+
+    private static func testStaleUsagesWeeklyDefersToExhaustedUsage() throws {
+        let vivace = try KimiUsageNormalizer.snapshot(
+            from: """
+            {
+              "usage": { "limit": "100", "used": "100", "resetTime": "2099-09-24T02:09:07Z" },
+              "usages": {
+                "limit_5h": { "used_ratio": 0.2, "reset_time": "2099-09-20T07:00:00Z" },
+                "limit_7d": { "used_ratio": 0, "reset_time": "2099-09-24T02:09:06Z" }
+              }
+            }
+            """.data(using: .utf8)!
+        )
+        try expectEqual(try requiredWindow("Weekly", in: vivace).percentageUsed, 100, "stale weekly ratio defers to usage")
+        try expectEqual(try requiredWindow("5H", in: vivace).percentageUsed, 20, "5h without a limits twin")
+
+        let pro = try KimiUsageNormalizer.snapshot(
+            from: """
+            {
+              "usage": { "limit": "100", "used": "100" },
+              "usages": { "limit_5h": { "used_ratio": 0.2 }, "limit_month_total": { "used_ratio": 0.3 } }
+            }
+            """.data(using: .utf8)!
+        )
+        try expectEqual(pro.windows.map(\.label), ["5H", "Monthly"], "a plan without weekly gains none from usage")
+    }
+
+    private static func testParsesWebFiveHourUsage() throws {
+        // `BillingService/GetUsages` for scope FEATURE_CODING.
+        let payload = """
+        {
+          "usages": [
+            {
+              "scope": "FEATURE_OTHER",
+              "limits": [{ "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" }, "detail": { "limit": "10", "used": "10" } }]
+            },
+            {
+              "scope": "FEATURE_CODING",
+              "detail": { "limit": "2048", "used": "214", "remaining": "1834", "resetTime": "2099-10-09T15:23:13.716839300Z" },
+              "limits": [{
+                "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+                "detail": { "limit": "200", "used": "139", "remaining": "61", "resetTime": "2099-09-27T14:08:23.717479433Z" }
+              }]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let reading = KimiWebMembershipParser.fiveHourUsage(from: payload)
+        try expectClose(reading?.usedPercent, 69.5, "web 5h percentage from the coding scope")
+        let expectedReset = ISO8601DateFormatter.fractional.date(from: "2099-09-27T14:08:23.717479Z")
+        try expectEqual(reading?.resetDate, expectedReset, "web 5h reset with nanoseconds")
+
+        try expectNil(
+            KimiWebMembershipParser.fiveHourUsage(
+                from: #"{"usages":[{"scope":"FEATURE_CODING","detail":{"limit":"2048","used":"1"}}]}"#.data(using: .utf8)!
+            ),
+            "coding scope without a 5h limit"
+        )
+        try expectNil(
+            KimiWebMembershipParser.fiveHourUsage(from: #"{"usages":{"limit_5h":{"used_ratio":1}}}"#.data(using: .utf8)!),
+            "Kimi Code /usages payload is not a web reply"
+        )
+    }
+
+    private static func testWebFiveHourReplacesCodeFiveHour() async throws {
+        var statsRequests = 0
+        var usagesBody = ""
+        KimiMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path.contains("GetSubscriptionStats") == true {
+                statsRequests += 1
+                return (response, #"{"subscription_balance":{"amount_used_ratio":0.9}}"#.data(using: .utf8)!)
+            }
+            if request.url?.path.hasSuffix("BillingService/GetUsages") == true {
+                try expectEqual(request.url?.host, "www.kimi.ai", "web usages host")
+                try expectEqual(
+                    request.value(forHTTPHeaderField: "Authorization"),
+                    "Bearer web-access-token",
+                    "web usages authorization"
+                )
+                usagesBody = requestBodyString(request)
+                return (response, webFiveHourJSON(used: 200, limit: 200, reset: "2099-09-27T14:08:23Z"))
+            }
+            return (response, proUsagesJSON)
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let snapshot = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in true }
+        ).fetchSnapshot(
+            credentials: ProviderCredential(
+                accessToken: "code-access-token",
+                extraFields: ["kimiWebAccessToken": "web-access-token"]
+            )
+        )
+
+        try expectEqual(usagesBody, #"{"scope":["FEATURE_CODING"]}"#, "web usages scope")
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Monthly"], "web 5h keeps the window order")
+        let fiveHour = try requiredWindow("5H", in: snapshot)
+        try expectEqual(fiveHour.percentageUsed, 100, "web session 5h wins over Kimi Code's")
+        try expectEqual(fiveHour.windowKind, .sliding, "web 5h kind")
+        try expectEqual(fiveHour.unit, "%", "web 5h unit")
+        try expectEqual(
+            fiveHour.resetDate,
+            ISO8601DateFormatter().date(from: "2099-09-27T14:08:23Z"),
+            "web 5h reset"
+        )
+        try expectEqual(try requiredWindow("Monthly", in: snapshot).percentageUsed, 40, "Kimi Code monthly still wins")
+        try expectEqual(statsRequests, 0, "monthly is not asked of the web session when Kimi Code has one")
+
+        // The snapshot store keeps the window in the shape it always had.
+        let encoded = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(QuotaSnapshot.self, from: encoded)
+        try expectEqual(try requiredWindow("5H", in: decoded).percentageUsed, 100, "5h survives the snapshot store")
+    }
+
+    private static func testWebFiveHourFaultKeepsCodeFiveHour() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let credentials = ProviderCredential(
+            accessToken: "code-access-token",
+            extraFields: ["kimiWebAccessToken": "web-access-token", "kimiWebRefreshToken": "web-refresh"]
+        )
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        // Kimi's billing gateway failing leaves Kimi Code's 5-hour window.
+        KimiMockURLProtocol.requestHandler = { request in
+            let failing = request.url?.path.contains("GetUsages") == true
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: failing ? 500 : 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, failing ? Data() : proUsagesJSON)
+        }
+        let unanswered = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in true }
+        ).fetchSnapshot(credentials: credentials)
+        try expectEqual(try requiredWindow("5H", in: unanswered).percentageUsed, 5, "Kimi Code 5h when the web does not answer")
+
+        // A renewal that cannot be saved must not blank the card either.
+        KimiMockURLProtocol.requestHandler = { request in
+            let path = request.url?.path ?? ""
+            if path.contains("RefreshToken") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, #"{"access_token":"rotated","refresh_token":"rotated-refresh"}"#.data(using: .utf8)!)
+            }
+            let expired = path.contains("GetUsages")
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: expired ? 401 : 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, expired ? Data() : proUsagesJSON)
+        }
+        let unsaved = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in false }
+        ).fetchSnapshot(credentials: credentials)
+        try expectEqual(try requiredWindow("5H", in: unsaved).percentageUsed, 5, "Kimi Code 5h when the renewal cannot be saved")
+    }
+
+    private static func testWebSessionRenewsOnceForBothReadings() async throws {
+        var refreshRequests = 0
+        var persisted: [KimiWebSessionTokens] = []
+        KimiMockURLProtocol.requestHandler = { request in
+            let path = request.url?.path ?? ""
+            if path.contains("RefreshToken") {
+                refreshRequests += 1
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, #"{"access_token":"rotated-web-access","refresh_token":"rotated-web-refresh"}"#.data(using: .utf8)!)
+            }
+            let fresh = request.value(forHTTPHeaderField: "Authorization") == "Bearer rotated-web-access"
+            let response = HTTPURLResponse(url: request.url!, statusCode: fresh ? 200 : 401, httpVersion: nil, headerFields: nil)!
+            guard fresh else { return (response, Data()) }
+            if path.contains("GetSubscriptionStats") {
+                return (response, #"{"subscription_balance":{"amount_used_ratio":0.131}}"#.data(using: .utf8)!)
+            }
+            return (response, webFiveHourJSON(used: 50, limit: 200, reset: "2099-09-27T14:08:23Z"))
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let client = KimiWebMembershipClient(
+            session: URLSession(configuration: configuration),
+            persistTokens: {
+                persisted.append($0)
+                return true
+            }
+        )
+        let reading = try await client.fetchUsage(
+            credentials: ProviderCredential(
+                extraFields: ["kimiWebAccessToken": "expired-web-access", "kimiWebRefreshToken": "web-refresh"]
+            ),
+            monthly: true,
+            fiveHour: true
+        )
+
+        try expectEqual(refreshRequests, 1, "one renewal serves both web readings")
+        try expectEqual(persisted.map(\.accessToken), ["rotated-web-access"], "renewed tokens saved once")
+        try expectClose(reading?.monthly?.usedPercent, 13.1, "renewed web monthly")
+        try expectEqual(reading?.fiveHour?.usedPercent, 25, "renewed web 5h")
+    }
+
+    private static func webFiveHourJSON(used: Int, limit: Int, reset: String) -> Data {
+        """
+        {"usages":[{"scope":"FEATURE_CODING","detail":{"limit":"2048","used":"1"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"\(limit)","used":"\(used)","remaining":"\(limit - used)","resetTime":"\(reset)"}}]}]}
+        """.data(using: .utf8)!
+    }
+
     private static func testMissingCLISignInAsksForFolderImport() async throws {
         let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
         let credentials = root.appendingPathComponent("credentials", isDirectory: true)
@@ -1196,6 +1468,14 @@ enum KimiUsageTestRunner {
           "token_type": "Bearer"
         }
         """.data(using: .utf8)!
+    }
+}
+
+private extension ISO8601DateFormatter {
+    static var fractional: ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
     }
 }
 

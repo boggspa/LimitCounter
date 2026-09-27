@@ -281,7 +281,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .gemini:
             return "Reads local Gemini CLI history and metadata from `~/.gemini` and turns it into usage snapshots."
         case .kimi:
-            return "Uses a Kimi Code Console API key or imported CLI OAuth folder for 5-hour and weekly quota. An optional kimi.ai web session adds the shared monthly membership-credit meter."
+            return "Uses a Kimi Code Console API key or imported CLI OAuth folder for 5-hour and weekly quota. An optional kimi.ai web session adds the shared monthly membership-credit meter and supplies the 5-hour meter when it answers."
         case .grok:
             return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
         case .antigravity:

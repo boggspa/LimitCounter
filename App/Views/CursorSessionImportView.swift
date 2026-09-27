@@ -276,7 +276,7 @@ struct KimiWebSessionImportView: View {
                     Spacer()
                 }
 
-                Text("Limit Counter stores only the web session tokens needed to read your shared monthly membership-credit percentage and reset date.")
+                Text("Limit Counter stores only the web session tokens needed to read your Kimi Code 5-hour usage and your shared monthly membership-credit percentage, with their reset times.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

@@ -1109,7 +1109,7 @@ struct ProviderCredentialView: View {
                     }
                 } else if providerID == .kimi {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Import a kimi.ai web session to add the shared monthly membership-credit meter. Kimi Code API keys and CLI OAuth folders continue to provide the separate 5-hour and weekly meters.")
+                        Text("Import a kimi.ai web session to add the shared monthly membership-credit meter and read the 5-hour meter as the kimi.ai account page shows it. Kimi Code API keys and CLI OAuth folders continue to provide the weekly meter, and the 5-hour meter when no web session answers.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

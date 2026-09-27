@@ -4331,7 +4331,38 @@ nonisolated struct KimiWebMonthlyUsageReading: Equatable {
     let resetDate: Date?
 }
 
+/// Kimi Code's rolling 5-hour window as the kimi.ai account page shows it
+/// ("5-hour usage · Code"), read from `BillingService/GetUsages`.
+nonisolated struct KimiWebFiveHourUsageReading: Equatable {
+    let usedPercent: Double
+    let resetDate: Date?
+}
+
+/// What one pass over the web session read. Either half is `nil` when it
+/// was not asked for or Kimi did not answer it.
+nonisolated struct KimiWebUsageReading: Equatable {
+    var monthly: KimiWebMonthlyUsageReading?
+    var fiveHour: KimiWebFiveHourUsageReading?
+}
+
 nonisolated enum KimiWebMembershipParser {
+    /// The `FEATURE_CODING` entry of a `GetUsages` reply, shaped
+    /// `{ usages: [{ scope, detail, limits: [{ window, detail }] }] }`; its
+    /// 300-minute `limits` entry is the 5-hour window.
+    static func fiveHourUsage(from data: Data) -> KimiWebFiveHourUsageReading? {
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usages = payload["usages"] as? [[String: Any]] else {
+            return nil
+        }
+        let coding = usages.first { string($0["scope"]) == "FEATURE_CODING" }
+            ?? (usages.count == 1 ? usages.first : nil)
+        guard let coding,
+              let reading = KimiLimitsParser.fiveHour(inLimits: coding["limits"]) else {
+            return nil
+        }
+        return KimiWebFiveHourUsageReading(usedPercent: reading.percent, resetDate: reading.resetDate)
+    }
+
     static func monthlyUsage(from data: Data) -> KimiWebMonthlyUsageReading? {
         guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let balance = dictionary(payload["subscription_balance"])
@@ -4438,32 +4469,72 @@ actor KimiWebMembershipClient {
     }
 
     func fetchMonthlyUsage(credentials: ProviderCredential) async throws -> KimiWebMonthlyUsageReading? {
-        guard let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
+        try await fetchUsage(credentials: credentials, monthly: true, fiveHour: false)?.monthly
+    }
+
+    /// Reads the asked-for windows with one access token, renewing it at most
+    /// once for all of them: the refresh token rotates on use, so the two
+    /// requests share one renewal rather than each spending its own.
+    func fetchUsage(
+        credentials: ProviderCredential,
+        monthly: Bool,
+        fiveHour: Bool
+    ) async throws -> KimiWebUsageReading? {
+        guard monthly || fiveHour,
+              let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
             return nil
         }
         let refreshToken = normalizedField("kimiWebRefreshToken", credentials: credentials)
         var tokens = KimiWebSessionTokens(accessToken: accessToken, refreshToken: refreshToken)
 
-        if let response = await fetchStats(accessToken: tokens.accessToken) {
-            if response.statusCode == 200 {
-                return KimiWebMembershipParser.monthlyUsage(from: response.data)
-            }
-            guard response.statusCode == 401,
-                  let refreshed = await refresh(tokens: tokens) else {
-                return nil
-            }
+        var pass = await read(accessToken: tokens.accessToken, monthly: monthly, fiveHour: fiveHour)
+        if pass.unauthorized, let refreshed = await refresh(tokens: tokens) {
             tokens = refreshed
             guard await persistTokens(tokens) else {
                 throw ProviderFetchError.credentialExpired(
                     "Kimi refreshed the browser session, but Limit Counter could not save the rotated tokens. Unlock Keychain and import the Kimi browser session again."
                 )
             }
-            if let retry = await fetchStats(accessToken: tokens.accessToken),
-               retry.statusCode == 200 {
-                return KimiWebMembershipParser.monthlyUsage(from: retry.data)
+            pass = await read(accessToken: tokens.accessToken, monthly: monthly, fiveHour: fiveHour)
+        }
+        let reading = pass.reading
+        return reading.monthly == nil && reading.fiveHour == nil ? nil : reading
+    }
+
+    private func read(
+        accessToken: String,
+        monthly: Bool,
+        fiveHour: Bool
+    ) async -> (reading: KimiWebUsageReading, unauthorized: Bool) {
+        var reading = KimiWebUsageReading()
+        var unauthorized = false
+        if monthly, let response = await fetchStats(accessToken: accessToken) {
+            if response.statusCode == 200 {
+                reading.monthly = KimiWebMembershipParser.monthlyUsage(from: response.data)
+            } else if response.statusCode == 401 {
+                unauthorized = true
             }
         }
-        return nil
+        if fiveHour, let response = await fetchCodingUsages(accessToken: accessToken) {
+            if response.statusCode == 200 {
+                reading.fiveHour = KimiWebMembershipParser.fiveHourUsage(from: response.data)
+            } else if response.statusCode == 401 {
+                unauthorized = true
+            }
+        }
+        return (reading, unauthorized)
+    }
+
+    /// The kimi.ai account page's "5-hour usage" comes from Kimi's billing
+    /// gateway, scoped to Kimi Code.
+    private func fetchCodingUsages(accessToken: String) async -> (statusCode: Int, data: Data)? {
+        guard let url = URL(
+            string: "https://www.kimi.ai/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages"
+        ) else { return nil }
+        var request = baseRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = Data(#"{"scope":["FEATURE_CODING"]}"#.utf8)
+        return await response(for: request)
     }
 
     private func fetchStats(accessToken: String) async -> (statusCode: Int, data: Data)? {
@@ -4594,12 +4665,28 @@ public struct KimiProviderClient: ProviderClient {
             // Kimi Code's own monthly window is the signed-in account's. The
             // browser session only fills in for a payload without one: it
             // can belong to a different Kimi account.
-            let snapshotWithMonthly = apiSnapshot.windows.contains { $0.windowKind == .monthly }
-                ? apiSnapshot
-                : mergeMonthlyUsage(
-                    try await webMembershipClient.fetchMonthlyUsage(credentials: credentials),
-                    into: apiSnapshot
+            let needsMonthly = !apiSnapshot.windows.contains { $0.windowKind == .monthly }
+            // The 5-hour window is another matter: `/usages` has been seen to
+            // report 0% for a window Kimi had already closed, while the
+            // kimi.ai account page read 100%. When a web session is stored
+            // its 5-hour reading replaces Kimi Code's; without one, or when
+            // Kimi does not answer it, Kimi Code's stays.
+            let webReading: KimiWebUsageReading?
+            do {
+                webReading = try await webMembershipClient.fetchUsage(
+                    credentials: credentials,
+                    monthly: needsMonthly,
+                    fiveHour: true
                 )
+            } catch where !needsMonthly {
+                // Only the 5-hour reading was asked for, and Kimi Code has
+                // its own: a web-session fault must not blank the card.
+                webReading = nil
+            }
+            let snapshotWithMonthly = mergeFiveHourUsage(
+                webReading?.fiveHour,
+                into: needsMonthly ? mergeMonthlyUsage(webReading?.monthly, into: apiSnapshot) : apiSnapshot
+            )
             // Best-effort augmentation: read local Kimi CLI session logs.
             // so per-turn activity events surface on the heatmap. Returns [] if
             // the sandbox denies the read (typical when the user only granted a
@@ -4624,6 +4711,45 @@ public struct KimiProviderClient: ProviderClient {
         default:
             throw ProviderFetchError.parsingError("Kimi usage endpoint returned HTTP \(httpResponse.statusCode).")
         }
+    }
+
+    /// Replaces Kimi Code's 5H window with the web session's, in the same
+    /// place and shape, so snapshot readers see only the numbers change.
+    private func mergeFiveHourUsage(
+        _ reading: KimiWebFiveHourUsageReading?,
+        into snapshot: QuotaSnapshot
+    ) -> QuotaSnapshot {
+        guard let reading else { return snapshot }
+        let fiveHourWindow = QuotaWindow(
+            label: "5H",
+            windowKind: .sliding,
+            used: reading.usedPercent,
+            total: 100,
+            resetDate: reading.resetDate,
+            unit: "%",
+            subtitle: "Rolling 5h quota"
+        )
+        var windows = snapshot.windows
+        if let index = windows.firstIndex(where: {
+            $0.windowKind == .sliding || $0.label.caseInsensitiveCompare("5H") == .orderedSame
+        }) {
+            windows[index] = fiveHourWindow
+        } else {
+            windows.insert(fiveHourWindow, at: 0)
+        }
+        return QuotaSnapshot(
+            id: snapshot.id,
+            providerID: snapshot.providerID,
+            displayName: snapshot.displayName,
+            planName: snapshot.planName,
+            windows: windows,
+            stats: snapshot.stats,
+            balances: snapshot.balances,
+            signals: snapshot.signals,
+            events: snapshot.events,
+            fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt
+        )
     }
 
     private func mergeMonthlyUsage(
@@ -5529,11 +5655,14 @@ enum KimiUsageNormalizer {
         // `usages` holds exactly the windows the plan has: Pro and the entry
         // plan get 5h and monthly, Allegretto and Vivace add weekly. The
         // older `limits`/`usage` fields still arrive beside it, but Kimi
-        // Code's own `/usage` no longer reads them, so they only stand in
-        // for a payload without `usages`.
+        // Code's own `/usage` no longer reads them, so they stand in for a
+        // payload without `usages`, and otherwise only correct a `usages`
+        // ratio they show to be stale (see `reconcilingStaleRatios`).
         var windows = planWindows(from: payload["usages"])
         if windows.isEmpty {
             windows = legacyWindows(from: payload)
+        } else {
+            windows = reconcilingStaleRatios(windows, with: payload)
         }
 
         guard !windows.isEmpty else {
@@ -5661,6 +5790,38 @@ enum KimiUsageNormalizer {
 
     private static func clampedRatio(_ ratio: Double) -> Double {
         min(max(ratio, 0), 1)
+    }
+
+    /// `usages` can report a stale `used_ratio` of 0 for a window the account
+    /// has already exhausted, while the `limits` entry beside it (same window,
+    /// same reset time) says `used == limit` and Kimi answers 403. Where a
+    /// plan window has a legacy twin, the more-exhausted of the two is shown:
+    /// the 300-minute `limits` entry for 5H, and `usage` for Weekly. A plan
+    /// without a weekly window does not gain one from `usage`.
+    private static func reconcilingStaleRatios(
+        _ windows: [QuotaWindow],
+        with payload: [String: Any]
+    ) -> [QuotaWindow] {
+        let legacyFiveHour = KimiLimitsParser.fiveHour(inLimits: payload["limits"])
+        let legacyWeekly = (payload["usage"] as? [String: Any]).flatMap(KimiLimitsParser.percent(fromDetail:))
+        return windows.map { window in
+            let legacy: (percent: Double, resetDate: Date?)?
+            switch window.windowKind {
+            case .sliding: legacy = legacyFiveHour
+            case .weekly: legacy = legacyWeekly
+            default: legacy = nil
+            }
+            guard let legacy, legacy.percent > window.used else { return window }
+            return QuotaWindow(
+                label: window.label,
+                windowKind: window.windowKind,
+                used: legacy.percent,
+                total: window.total,
+                resetDate: window.resetDate ?? legacy.resetDate,
+                unit: window.unit,
+                subtitle: window.subtitle
+            )
+        }
     }
 
     /// Windows from the payload Kimi Code sent before `usages`: rolling
@@ -5844,7 +6005,50 @@ enum KimiUsageNormalizer {
     }
 
     private static func date(_ value: Any?) -> Date? {
-        guard var value = string(value) else { return nil }
+        KimiLimitsParser.date(string(value))
+    }
+}
+
+/// The `{ window: { duration, timeUnit }, detail: { limit, used, remaining,
+/// resetTime } }` entries Kimi Code's `/usages` sends in `limits`, and the
+/// kimi.ai billing gateway's `GetUsages` sends per scope. Read without an
+/// actor, so the web session's parser can share it.
+nonisolated enum KimiLimitsParser {
+    /// The used share of the 300-minute entry in a `limits` array.
+    static func fiveHour(inLimits value: Any?) -> (percent: Double, resetDate: Date?)? {
+        guard let limits = value as? [[String: Any]] else { return nil }
+        for limit in limits {
+            guard let window = limit["window"] as? [String: Any],
+                  minutes(window) == 300,
+                  let reading = percent(fromDetail: (limit["detail"] as? [String: Any]) ?? limit) else {
+                continue
+            }
+            return reading
+        }
+        return nil
+    }
+
+    /// `used` (or `limit - remaining`) over `limit`, as a percent in 0...100.
+    static func percent(fromDetail detail: [String: Any]) -> (percent: Double, resetDate: Date?)? {
+        guard let limit = number(detail["limit"]), limit > 0 else { return nil }
+        let used: Double
+        if let explicitUsed = number(detail["used"]) {
+            used = explicitUsed
+        } else if let remaining = number(detail["remaining"]) {
+            used = limit - remaining
+        } else {
+            return nil
+        }
+        let resetValue = detail["resetTime"] ?? detail["reset_time"] ?? detail["resetAt"] ?? detail["reset_at"]
+        return (min(max(used / limit, 0), 1) * 100, date(resetValue as? String))
+    }
+
+    /// ISO 8601, with Kimi's nanosecond fractions cut to the six digits
+    /// `ISO8601DateFormatter` accepts.
+    static func date(_ text: String?) -> Date? {
+        guard var value = text?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
 
         let fractionalPattern = #"(\.\d{6})\d+(Z|[+-]\d{2}:\d{2})$"#
         if let regex = try? NSRegularExpression(pattern: fractionalPattern),
@@ -5866,6 +6070,25 @@ enum KimiUsageNormalizer {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: value)
+    }
+
+    private static func minutes(_ window: [String: Any]) -> Double? {
+        guard let duration = number(window["duration"]),
+              let unit = (window["timeUnit"] ?? window["time_unit"]) as? String else {
+            return nil
+        }
+        let upper = unit.uppercased()
+        if upper.contains("MINUTE") { return duration }
+        if upper.contains("HOUR") { return duration * 60 }
+        return nil
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
     }
 }
 
