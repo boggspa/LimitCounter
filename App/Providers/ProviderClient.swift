@@ -1755,6 +1755,13 @@ public protocol AccountScopedProviderClient: ProviderClient {
     ) async throws -> QuotaSnapshot
 }
 
+/// A client whose refresh can succeed with one of its sources down. The sync
+/// coordinator shows the reason beside the fresh snapshot, so a partial
+/// reading is never silent.
+protocol ProviderPartialRefreshReporting {
+    func takePartialRefreshWarning() async -> String?
+}
+
 public protocol UserInitiatedProviderClient: ProviderClient {
     func fetchSnapshot(
         credentials: ProviderCredential?,
@@ -4455,8 +4462,16 @@ actor KimiWebCredentialStore {
 }
 
 actor KimiWebMembershipClient {
+    /// kimi.ai's Connect gateway, which the account pages call.
+    static let webAPIBase = "https://www.kimi.ai/apiv2"
+
     private let session: URLSession
     private let persistTokens: (KimiWebSessionTokens) async -> Bool
+    /// The pair this client last renewed to, and the access token it
+    /// replaced. A credential read before that renewal still carries the
+    /// spent pair; presenting it again would fail, and the browser's copy of
+    /// the session with it.
+    private var renewal: (replaced: String, tokens: KimiWebSessionTokens)?
 
     init(
         session: URLSession = .shared,
@@ -4466,6 +4481,15 @@ actor KimiWebMembershipClient {
     ) {
         self.session = session
         self.persistTokens = persistTokens
+    }
+
+    /// Whether a kimi.ai web session is stored with this credential.
+    nonisolated static func hasWebSession(_ credentials: ProviderCredential) -> Bool {
+        guard let value = credentials.extraFields?["kimiWebAccessToken"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !value.isEmpty
     }
 
     func fetchMonthlyUsage(credentials: ProviderCredential) async throws -> KimiWebMonthlyUsageReading? {
@@ -4480,56 +4504,120 @@ actor KimiWebMembershipClient {
         monthly: Bool,
         fiveHour: Bool
     ) async throws -> KimiWebUsageReading? {
-        guard monthly || fiveHour,
-              let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
-            return nil
+        try await fetchUsageReport(credentials: credentials, monthly: monthly, fiveHour: fiveHour).reading
+    }
+
+    /// `fetchUsage`, plus why an asked-for half is missing, in words the
+    /// card can show. Throws only when rotated tokens could not be saved.
+    func fetchUsageReport(
+        credentials: ProviderCredential,
+        monthly: Bool,
+        fiveHour: Bool
+    ) async throws -> KimiWebSessionOutcome {
+        guard monthly || fiveHour else { return KimiWebSessionOutcome() }
+        guard let accessToken = normalizedField("kimiWebAccessToken", credentials: credentials) else {
+            return KimiWebSessionOutcome(failure: "no web session stored")
         }
         let refreshToken = normalizedField("kimiWebRefreshToken", credentials: credentials)
         var tokens = KimiWebSessionTokens(accessToken: accessToken, refreshToken: refreshToken)
+        if let renewal, renewal.replaced == accessToken {
+            tokens = renewal.tokens
+        }
 
         var pass = await read(accessToken: tokens.accessToken, monthly: monthly, fiveHour: fiveHour)
-        if pass.unauthorized, let refreshed = await refresh(tokens: tokens) {
-            tokens = refreshed
-            guard await persistTokens(tokens) else {
-                throw ProviderFetchError.credentialExpired(
-                    "Kimi refreshed the browser session, but Limit Counter could not save the rotated tokens. Unlock Keychain and import the Kimi browser session again."
-                )
+        var renewalProblem: String?
+        if pass.unauthorized {
+            if let refreshed = await refresh(tokens: tokens) {
+                renewal = (replaced: accessToken, tokens: refreshed)
+                tokens = refreshed
+                guard await persistTokens(tokens) else {
+                    KimiLog.error("kimi.ai web session: renewed, but the rotated tokens could not be saved to Keychain")
+                    throw ProviderFetchError.credentialExpired(
+                        "Kimi refreshed the browser session, but Limit Counter could not save the rotated tokens. Unlock Keychain and import the Kimi browser session again."
+                    )
+                }
+                KimiLog.info("kimi.ai web session: renewed and saved the rotated tokens")
+                pass = await read(accessToken: tokens.accessToken, monthly: monthly, fiveHour: fiveHour)
+                if pass.unauthorized {
+                    renewalProblem = "kimi.ai still answered 401 after renewing the session"
+                }
+            } else {
+                renewalProblem = tokens.refreshToken == nil
+                    ? "the session expired and has no refresh token; import the Kimi web session again"
+                    : "the session expired and kimi.ai refused to renew it; import the Kimi web session again"
             }
-            pass = await read(accessToken: tokens.accessToken, monthly: monthly, fiveHour: fiveHour)
         }
-        let reading = pass.reading
-        return reading.monthly == nil && reading.fiveHour == nil ? nil : reading
+        var reading: KimiWebUsageReading? = pass.reading
+        if reading?.monthly == nil, reading?.fiveHour == nil {
+            reading = nil
+        }
+        let problems = ([renewalProblem] + pass.problems.map(Optional.some)).compactMap { $0 }
+        let failure = problems.isEmpty ? nil : problems.joined(separator: "; ")
+        if let failure {
+            KimiLog.error("kimi.ai web session: \(failure)")
+        }
+        return KimiWebSessionOutcome(reading: reading, failure: failure)
     }
 
     private func read(
         accessToken: String,
         monthly: Bool,
         fiveHour: Bool
-    ) async -> (reading: KimiWebUsageReading, unauthorized: Bool) {
+    ) async -> (reading: KimiWebUsageReading, unauthorized: Bool, problems: [String]) {
         var reading = KimiWebUsageReading()
         var unauthorized = false
-        if monthly, let response = await fetchStats(accessToken: accessToken) {
-            if response.statusCode == 200 {
-                reading.monthly = KimiWebMembershipParser.monthlyUsage(from: response.data)
-            } else if response.statusCode == 401 {
+        var problems: [String] = []
+        if monthly {
+            let response = await fetchStats(accessToken: accessToken)
+            switch response?.statusCode {
+            case 200?:
+                reading.monthly = KimiWebMembershipParser.monthlyUsage(from: response!.data)
+                KimiLog.info(
+                    "\(Self.webAPIBase) GetSubscriptionStats: HTTP 200, shape \(KimiLog.redactedShape(of: response!.data))"
+                )
+                if reading.monthly == nil {
+                    problems.append("GetSubscriptionStats answered without a subscription balance")
+                }
+            case 401?:
                 unauthorized = true
+                KimiLog.info("\(Self.webAPIBase) GetSubscriptionStats: HTTP 401")
+            case let status?:
+                KimiLog.error("\(Self.webAPIBase) GetSubscriptionStats: HTTP \(status)")
+                problems.append("GetSubscriptionStats returned HTTP \(status)")
+            case nil:
+                problems.append("GetSubscriptionStats did not answer")
             }
         }
-        if fiveHour, let response = await fetchCodingUsages(accessToken: accessToken) {
-            if response.statusCode == 200 {
-                reading.fiveHour = KimiWebMembershipParser.fiveHourUsage(from: response.data)
-            } else if response.statusCode == 401 {
+        if fiveHour {
+            let response = await fetchCodingUsages(accessToken: accessToken)
+            switch response?.statusCode {
+            case 200?:
+                reading.fiveHour = KimiWebMembershipParser.fiveHourUsage(from: response!.data)
+                KimiLog.info(
+                    "\(Self.webAPIBase) GetUsages: HTTP 200, shape \(KimiLog.redactedShape(of: response!.data)), "
+                    + "5H \(reading.fiveHour.map { "\($0.usedPercent)% resets \($0.resetDate.map { ISO8601DateFormatter().string(from: $0) } ?? "?")" } ?? "not found")"
+                )
+                if reading.fiveHour == nil {
+                    problems.append("GetUsages answered without a FEATURE_CODING 5-hour window")
+                }
+            case 401?:
                 unauthorized = true
+                KimiLog.info("\(Self.webAPIBase) GetUsages: HTTP 401")
+            case let status?:
+                KimiLog.error("\(Self.webAPIBase) GetUsages: HTTP \(status)")
+                problems.append("GetUsages returned HTTP \(status)")
+            case nil:
+                problems.append("GetUsages did not answer")
             }
         }
-        return (reading, unauthorized)
+        return (reading, unauthorized, problems)
     }
 
     /// The kimi.ai account page's "5-hour usage" comes from Kimi's billing
     /// gateway, scoped to Kimi Code.
     private func fetchCodingUsages(accessToken: String) async -> (statusCode: Int, data: Data)? {
         guard let url = URL(
-            string: "https://www.kimi.ai/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages"
+            string: "\(Self.webAPIBase)/kimi.gateway.billing.v1.BillingService/GetUsages"
         ) else { return nil }
         var request = baseRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -4539,7 +4627,7 @@ actor KimiWebMembershipClient {
 
     private func fetchStats(accessToken: String) async -> (statusCode: Int, data: Data)? {
         guard let url = URL(
-            string: "https://www.kimi.ai/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+            string: "\(Self.webAPIBase)/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
         ) else { return nil }
         var request = baseRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -4555,8 +4643,9 @@ actor KimiWebMembershipClient {
         }
         var request = baseRequest(url: url)
         request.httpBody = body
-        guard let response = await response(for: request),
-              response.statusCode == 200 else {
+        let response = await response(for: request)
+        KimiLog.info("kimi.ai RefreshToken: \(response.map { "HTTP \($0.statusCode)" } ?? "no answer")")
+        guard let response, response.statusCode == 200 else {
             return nil
         }
         return KimiWebMembershipParser.refreshedTokens(
@@ -4582,8 +4671,17 @@ actor KimiWebMembershipClient {
     }
 
     private func response(for request: URLRequest) async -> (statusCode: Int, data: Data)? {
-        guard let (data, response) = try? await session.data(for: request),
-              let httpResponse = response as? HTTPURLResponse else {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            KimiLog.error(
+                "kimi.ai \(request.url?.host ?? "?")\(request.url?.path ?? ""): \(KimiLog.describe(error))"
+            )
+            return nil
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
             return nil
         }
         return (httpResponse.statusCode, data)
@@ -4598,34 +4696,351 @@ actor KimiWebMembershipClient {
     }
 }
 
-public struct KimiProviderClient: ProviderClient {
+/// What the kimi.ai web session answered, and why an asked-for half is
+/// missing when it is.
+nonisolated struct KimiWebSessionOutcome {
+    var reading: KimiWebUsageReading?
+    var failure: String?
+
+    /// This outcome with another pass's halves and reasons added.
+    func adding(_ other: KimiWebSessionOutcome) -> KimiWebSessionOutcome {
+        var combined = reading ?? KimiWebUsageReading()
+        combined.monthly = combined.monthly ?? other.reading?.monthly
+        combined.fiveHour = combined.fiveHour ?? other.reading?.fiveHour
+        let failures = [failure, other.failure].compactMap { $0 }
+        return KimiWebSessionOutcome(
+            reading: combined.monthly == nil && combined.fiveHour == nil ? nil : combined,
+            failure: failures.isEmpty ? nil : failures.joined(separator: "; ")
+        )
+    }
+}
+
+/// Holds the reason the last Kimi snapshot was written without one of its
+/// sources, until the sync coordinator collects it.
+actor KimiRefreshWarnings {
+    private var warning: String?
+
+    func set(_ warning: String?) {
+        self.warning = warning
+    }
+
+    func take() -> String? {
+        defer { warning = nil }
+        return warning
+    }
+}
+
+/// Waits a bounded time for a source without cancelling it.
+nonisolated enum KimiSourceWait {
+    /// `task`'s value, or `nil` once `seconds` pass first. The task is left
+    /// running either way.
+    static func value<T>(of task: Task<T, Never>, within seconds: TimeInterval) async -> T? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let gate = KimiResumeOnce(continuation)
+            let timer = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(seconds, 0) * 1_000_000_000))
+                gate.resume(nil)
+            }
+            Task {
+                let value = await task.value
+                gate.resume(value)
+                timer.cancel()
+            }
+        }
+    }
+}
+
+private nonisolated final class KimiResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T?, Never>?
+
+    init(_ continuation: CheckedContinuation<T?, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ value: T?) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: value)
+    }
+}
+
+/// Kimi refresh logging. `print` goes nowhere once the app is launched from
+/// Finder, so each source's outcome is logged here instead. Read it back with:
+///
+///     log show --last 1h --predicate 'subsystem == "com.chrisizatt.LLMUsageCounter" AND category == "kimi"'
+///
+/// Never pass token material to these: messages are logged `.public`.
+/// Response bodies are only ever logged through `redactedShape`, which keeps
+/// key names and value types and drops every value.
+nonisolated enum KimiLog {
+    private static let logger = Logger(
+        subsystem: "com.chrisizatt.LLMUsageCounter",
+        category: "kimi"
+    )
+
+    static func info(_ message: String) {
+        logger.notice("\(message, privacy: .public)")
+    }
+
+    static func error(_ message: String) {
+        logger.error("\(message, privacy: .public)")
+    }
+
+    /// An error as the card and the log show it, without request details.
+    static func describe(_ error: Error) -> String {
+        if let fetchError = error as? ProviderFetchError {
+            if case .networkError(let underlying) = fetchError {
+                let nsError = underlying as NSError
+                return "Network error: \(nsError.localizedDescription) (\(nsError.domain) \(nsError.code))."
+            }
+            return fetchError.errorDescription ?? "\(fetchError)"
+        }
+        let nsError = error as NSError
+        return "\(nsError.localizedDescription) (\(nsError.domain) \(nsError.code))."
+    }
+
+    /// A JSON body's structure with every value replaced by its type, e.g.
+    /// `{usages:[{limits:[{detail:{limit:string}}],scope:string}]}`.
+    static func redactedShape(of data: Data) -> String {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            return "not JSON (\(data.count) bytes)"
+        }
+        return shape(of: object, depth: 0)
+    }
+
+    private static func shape(of value: Any, depth: Int) -> String {
+        guard depth < 6 else { return "..." }
+        switch value {
+        case let dictionary as [String: Any]:
+            let fields = dictionary.keys.sorted().map { "\($0):\(shape(of: dictionary[$0]!, depth: depth + 1))" }
+            return "{\(fields.joined(separator: ","))}"
+        case let array as [Any]:
+            guard let first = array.first else { return "[]" }
+            return "[\(array.count)x\(shape(of: first, depth: depth + 1))]"
+        case is String:
+            return "string"
+        case let number as NSNumber:
+            return CFGetTypeID(number) == CFBooleanGetTypeID() ? "bool" : "number"
+        case is NSNull:
+            return "null"
+        default:
+            return "?"
+        }
+    }
+}
+
+public struct KimiProviderClient: ProviderClient, ProviderPartialRefreshReporting {
     public let providerID: ProviderID = .kimi
 
     private let session: URLSession
     private let webMembershipClient: KimiWebMembershipClient
+    /// Why the last snapshot was written without one of its sources.
+    private let refreshWarnings = KimiRefreshWarnings()
+
+    func takePartialRefreshWarning() async -> String? {
+        await refreshWarnings.take()
+    }
+
+    /// How long Kimi Code may take before the snapshot is written from the
+    /// web session alone. The web 5-hour read runs alongside it.
+    private let codeWaitSeconds: TimeInterval
+    /// The whole refresh stays under the sync coordinator's 20-second limit
+    /// for the provider, leaving time to read local activity afterwards.
+    private let refreshBudgetSeconds: TimeInterval
 
     public init(session: URLSession = .shared) {
         self.session = session
         self.webMembershipClient = KimiWebMembershipClient(
             session: session
         )
+        self.codeWaitSeconds = 11
+        self.refreshBudgetSeconds = 16
     }
 
     init(
         session: URLSession,
-        persistWebSessionTokens: @escaping (KimiWebSessionTokens) async -> Bool
+        persistWebSessionTokens: @escaping (KimiWebSessionTokens) async -> Bool,
+        codeWaitSeconds: TimeInterval = 11,
+        refreshBudgetSeconds: TimeInterval = 16
     ) {
         self.session = session
         self.webMembershipClient = KimiWebMembershipClient(
             session: session,
             persistTokens: persistWebSessionTokens
         )
+        self.codeWaitSeconds = codeWaitSeconds
+        self.refreshBudgetSeconds = refreshBudgetSeconds
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         guard let credentials else { throw ProviderFetchError.notConfigured }
+        await refreshWarnings.set(nil)
 
-        let authorization = try await resolvedAuthorization(from: credentials)
+        // Kimi Code's API (CLI sign-in or Console key) and the kimi.ai web
+        // session are independent sources, read side by side. A fault or a
+        // stall in either must never stop the other from producing a
+        // snapshot: until this was so, a Kimi CLI token renewal that failed
+        // before its request aborted the whole refresh, and the card kept
+        // its last snapshot for hours while the web session answered fine.
+        let hasWebSession = KimiWebMembershipClient.hasWebSession(credentials)
+        let webClient = webMembershipClient
+        let deadline = Date().addingTimeInterval(refreshBudgetSeconds)
+        let codeTask = Task { () -> Result<QuotaSnapshot, Error> in
+            do {
+                return .success(try await fetchCodeSnapshot(credentials: credentials))
+            } catch {
+                return .failure(error)
+            }
+        }
+        let fiveHourTask = Task { () -> KimiWebSessionOutcome in
+            guard hasWebSession else { return KimiWebSessionOutcome() }
+            return await Self.webReport(webClient, credentials: credentials, monthly: false, fiveHour: true)
+        }
+
+        // No task is cancelled when its wait runs out: a token renewal in
+        // flight must still persist its rotated token, or the next refresh
+        // presents a spent one.
+        let code = await KimiSourceWait.value(
+            of: codeTask,
+            within: min(codeWaitSeconds, deadline.timeIntervalSinceNow)
+        ) ?? .failure(ProviderFetchError.parsingError(
+            "Kimi Code did not answer within \(Int(codeWaitSeconds)) seconds."
+        ))
+        var web = await KimiSourceWait.value(of: fiveHourTask, within: deadline.timeIntervalSinceNow)
+            ?? KimiWebSessionOutcome(failure: "kimi.ai did not answer in time")
+
+        // Kimi Code's own monthly window is the signed-in account's, so the
+        // browser session is only asked for one when Kimi Code has none,
+        // including when Kimi Code did not answer at all. It is asked after
+        // the 5-hour read so a renewal that read made is reused, not spent.
+        let codeHasMonthly = (try? code.get())?.windows.contains { $0.windowKind == .monthly } ?? false
+        if hasWebSession, !codeHasMonthly {
+            let monthlyTask = Task {
+                await Self.webReport(webClient, credentials: credentials, monthly: true, fiveHour: false)
+            }
+            let monthly = await KimiSourceWait.value(of: monthlyTask, within: deadline.timeIntervalSinceNow)
+                ?? KimiWebSessionOutcome(failure: "kimi.ai did not answer the monthly reading in time")
+            web = web.adding(monthly)
+        }
+
+        let assembled = try Self.assemble(code: code, web: web, webSessionStored: hasWebSession)
+        await refreshWarnings.set(assembled.warning)
+
+        // Best-effort augmentation: read local Kimi CLI session logs.
+        // so per-turn activity events surface on the heatmap. Returns [] if
+        // the sandbox denies the read (typical when the user only granted a
+        // bookmark to `kimi-code.json` itself).
+        let cliEvents = loadLocalKimiEvents(credentials: credentials)
+        // Additional source: AGBench's unified usage.json tracks every
+        // run the user invokes through TaskWraith, including Kimi runs.
+        // For users who drive activity through AGBench this is the
+        // richer signal (61 records vs whatever wire.jsonl has on its
+        // own). No-op when the user hasn't granted the bookmark.
+        let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "kimi")
+        let combinedEvents = cliEvents + agbenchEvents
+        let merged = mergeEvents(into: assembled.snapshot, events: combinedEvents)
+        // Preserve historical events whose source `wire.jsonl` has aged
+        // past the 30-day modification-date window in
+        // `KimiLocalTranscriptReader`. Same fix as Claude.
+        return enrichEventsWithHistory(merged)
+    }
+
+    private static func webReport(
+        _ client: KimiWebMembershipClient,
+        credentials: ProviderCredential,
+        monthly: Bool,
+        fiveHour: Bool
+    ) async -> KimiWebSessionOutcome {
+        do {
+            return try await client.fetchUsageReport(
+                credentials: credentials,
+                monthly: monthly,
+                fiveHour: fiveHour
+            )
+        } catch {
+            return KimiWebSessionOutcome(failure: KimiLog.describe(error))
+        }
+    }
+
+    /// Combines what each source answered into one snapshot, plus the reason
+    /// a source was missing (shown beside the fresh card) when a source that
+    /// is set up failed. Throws only when neither source produced a reading.
+    ///
+    /// Kimi Code's monthly window is the signed-in account's and wins over
+    /// the browser session's, which may belong to a different Kimi account.
+    /// The web session's 5-hour reading wins over Kimi Code's: `/usages` has
+    /// been seen to report 0% for a window Kimi had already closed.
+    static func assemble(
+        code: Result<QuotaSnapshot, Error>,
+        web: KimiWebSessionOutcome,
+        webSessionStored: Bool,
+        now: Date = Date()
+    ) throws -> (snapshot: QuotaSnapshot, warning: String?) {
+        let reading = web.reading
+        switch code {
+        case .success(let apiSnapshot):
+            let hasCodeMonthly = apiSnapshot.windows.contains { $0.windowKind == .monthly }
+            var snapshot = hasCodeMonthly
+                ? apiSnapshot
+                : mergeMonthlyUsage(reading?.monthly, into: apiSnapshot)
+            snapshot = mergeFiveHourUsage(reading?.fiveHour, into: snapshot)
+
+            var warning: String?
+            if webSessionStored, reading?.fiveHour == nil || (!hasCodeMonthly && reading?.monthly == nil) {
+                let reason = web.failure ?? "no reading"
+                warning = reading?.fiveHour == nil
+                    ? "kimi.ai web session: \(reason). The 5H meter shows Kimi Code's reading."
+                    : "kimi.ai web session: \(reason)."
+            }
+            KimiLog.info(
+                "snapshot: 5H from \(reading?.fiveHour != nil ? "kimi.ai web session" : "Kimi Code"), "
+                + "monthly from \(hasCodeMonthly ? "Kimi Code" : (reading?.monthly != nil ? "kimi.ai web session" : "nowhere"))"
+            )
+            if let warning { KimiLog.error(warning) }
+            return (snapshot, warning)
+
+        case .failure(let codeError):
+            let codeReason = KimiLog.describe(codeError)
+            guard let reading, reading.fiveHour != nil || reading.monthly != nil else {
+                KimiLog.error(
+                    "no snapshot: Kimi Code failed (\(codeReason)); "
+                    + (webSessionStored ? "kimi.ai web session: \(web.failure ?? "no reading")" : "no kimi.ai web session stored")
+                )
+                throw codeError
+            }
+            var snapshot = QuotaSnapshot(
+                providerID: .kimi,
+                displayName: "Kimi Code",
+                planName: nil,
+                windows: [],
+                fetchState: .success,
+                fetchedAt: now
+            )
+            snapshot = mergeMonthlyUsage(reading.monthly, into: snapshot)
+            snapshot = mergeFiveHourUsage(reading.fiveHour, into: snapshot)
+            var warning = "Kimi Code: \(codeReason) Showing the kimi.ai web session's readings."
+            if let webFailure = web.failure {
+                warning += " kimi.ai web session: \(webFailure)."
+            }
+            KimiLog.error("snapshot from kimi.ai web session only: \(warning)")
+            return (snapshot, warning)
+        }
+    }
+
+    /// Kimi Code's own reading: the CLI sign-in or Console key, `/usages`
+    /// and `/me`. Throws on any fault; `fetchSnapshot` decides what that
+    /// means for the card.
+    private func fetchCodeSnapshot(credentials: ProviderCredential) async throws -> QuotaSnapshot {
+        let authorization: KimiAuthorization
+        do {
+            authorization = try await resolvedAuthorization(from: credentials)
+        } catch {
+            KimiLog.error("Kimi Code sign-in: \(KimiLog.describe(error))")
+            throw error
+        }
         let accessToken = authorization.accessToken
         guard !accessToken.isEmpty else { throw ProviderFetchError.notConfigured }
 
@@ -4648,62 +5063,22 @@ public struct KimiProviderClient: ProviderClient {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            KimiLog.error("Kimi Code usages \(usageURL.host ?? "?"): \(KimiLog.describe(error))")
             throw ProviderFetchError.networkError(underlying: error)
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ProviderFetchError.unknown
         }
+        KimiLog.info("Kimi Code usages \(usageURL.host ?? "?")\(usageURL.path): HTTP \(httpResponse.statusCode)")
 
         switch httpResponse.statusCode {
         case 200..<300:
-            let apiSnapshot = try KimiUsageNormalizer.snapshot(
+            return try KimiUsageNormalizer.snapshot(
                 from: data,
                 fetchedAt: Date(),
                 planName: await planName
             )
-            // Kimi Code's own monthly window is the signed-in account's. The
-            // browser session only fills in for a payload without one: it
-            // can belong to a different Kimi account.
-            let needsMonthly = !apiSnapshot.windows.contains { $0.windowKind == .monthly }
-            // The 5-hour window is another matter: `/usages` has been seen to
-            // report 0% for a window Kimi had already closed, while the
-            // kimi.ai account page read 100%. When a web session is stored
-            // its 5-hour reading replaces Kimi Code's; without one, or when
-            // Kimi does not answer it, Kimi Code's stays.
-            let webReading: KimiWebUsageReading?
-            do {
-                webReading = try await webMembershipClient.fetchUsage(
-                    credentials: credentials,
-                    monthly: needsMonthly,
-                    fiveHour: true
-                )
-            } catch where !needsMonthly {
-                // Only the 5-hour reading was asked for, and Kimi Code has
-                // its own: a web-session fault must not blank the card.
-                webReading = nil
-            }
-            let snapshotWithMonthly = mergeFiveHourUsage(
-                webReading?.fiveHour,
-                into: needsMonthly ? mergeMonthlyUsage(webReading?.monthly, into: apiSnapshot) : apiSnapshot
-            )
-            // Best-effort augmentation: read local Kimi CLI session logs.
-            // so per-turn activity events surface on the heatmap. Returns [] if
-            // the sandbox denies the read (typical when the user only granted a
-            // bookmark to `kimi-code.json` itself).
-            let cliEvents = loadLocalKimiEvents(credentials: credentials)
-            // Additional source: AGBench's unified usage.json tracks every
-            // run the user invokes through TaskWraith, including Kimi runs.
-            // For users who drive activity through AGBench this is the
-            // richer signal (61 records vs whatever wire.jsonl has on its
-            // own). No-op when the user hasn't granted the bookmark.
-            let agbenchEvents = AGBenchUsageReader.loadEvents(forProviderKey: "kimi")
-            let combinedEvents = cliEvents + agbenchEvents
-            let merged = mergeEvents(into: snapshotWithMonthly, events: combinedEvents)
-            // Preserve historical events whose source `wire.jsonl` has aged
-            // past the 30-day modification-date window in
-            // `KimiLocalTranscriptReader`. Same fix as Claude.
-            return enrichEventsWithHistory(merged)
         case 401, 403:
             throw ProviderFetchError.invalidCredential
         case 429:
@@ -4715,7 +5090,7 @@ public struct KimiProviderClient: ProviderClient {
 
     /// Replaces Kimi Code's 5H window with the web session's, in the same
     /// place and shape, so snapshot readers see only the numbers change.
-    private func mergeFiveHourUsage(
+    private static func mergeFiveHourUsage(
         _ reading: KimiWebFiveHourUsageReading?,
         into snapshot: QuotaSnapshot
     ) -> QuotaSnapshot {
@@ -4752,7 +5127,7 @@ public struct KimiProviderClient: ProviderClient {
         )
     }
 
-    private func mergeMonthlyUsage(
+    private static func mergeMonthlyUsage(
         _ reading: KimiWebMonthlyUsageReading?,
         into snapshot: QuotaSnapshot
     ) -> QuotaSnapshot {
@@ -5081,6 +5456,10 @@ private actor KimiOAuthRefreshCoordinator {
         if !shouldRefresh(initial) {
             return initial.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        KimiLog.info(
+            "Kimi Code sign-in \(signIn.environment.slot): token expires in "
+            + "\(Int(initial.expiresAt - Date().timeIntervalSince1970)) s, renewing"
+        )
 
         if let refreshDisabledMessage {
             throw ProviderFetchError.credentialExpired(refreshDisabledMessage)
@@ -5100,6 +5479,7 @@ private actor KimiOAuthRefreshCoordinator {
             heartbeat.cancel()
             try? FileManager.default.removeItem(at: lockURL)
         }
+        KimiLog.info("Kimi Code sign-in: renewal lock taken")
         try verifyCredentialDirectoryIsWritable(fileURL: fileURL)
 
         // Another Kimi process may have refreshed while this app waited.
@@ -5137,6 +5517,7 @@ private actor KimiOAuthRefreshCoordinator {
             )
         }
         try persist(refreshed, preserving: afterLock, at: fileURL)
+        KimiLog.info("Kimi Code sign-in: renewed and saved the rotated token")
         return refreshed.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -5298,6 +5679,10 @@ private actor KimiOAuthRefreshCoordinator {
         }
 
         let oauthErrorCode = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+        KimiLog.info(
+            "Kimi Code OAuth renewal \(tokenURL.host ?? "?"): HTTP \(httpResponse.statusCode)"
+            + (oauthErrorCode.map { ", error \($0)" } ?? "")
+        )
         if httpResponse.statusCode == 401
             || httpResponse.statusCode == 403
             || oauthErrorCode == "invalid_grant" {

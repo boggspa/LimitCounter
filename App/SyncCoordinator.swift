@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import WidgetKit
 
 /// Orchestrates fetching from all configured providers.
@@ -16,6 +17,20 @@ final class SyncCoordinator {
     private let signalDetector = SnapshotSignalDetector()
     private var clients: [ProviderID: any ProviderClient]
     private let maximumConcurrentRefreshes = 3
+    /// Provider refresh failures, which `print` loses once the app is
+    /// launched from Finder.
+    private static let logger = Logger(subsystem: "com.chrisizatt.LLMUsageCounter", category: "sync")
+
+    /// Kimi's messages are written by `KimiProviderClient` and never carry
+    /// request or token material, so they are logged readable. Other
+    /// providers' messages can quote response bodies and stay redacted.
+    private static func logRefreshFailure(_ providerID: ProviderID, _ message: String) {
+        if providerID == .kimi {
+            logger.error("kimi refresh failed: \(message, privacy: .public)")
+        } else {
+            logger.error("\(providerID.rawValue, privacy: .public) refresh failed: \(message, privacy: .private)")
+        }
+    }
     private let refreshStartSpacingNanoseconds: UInt64 = 175_000_000
 
     init(
@@ -300,10 +315,14 @@ final class SyncCoordinator {
                 snapshot,
                 previousSnapshot: previousSnapshot
             )
+            // A snapshot written without one of the provider's sources still
+            // says why, beside the fresh card.
+            let partialWarning = await (client as? any ProviderPartialRefreshReporting)?
+                .takePartialRefreshWarning()
             return ProviderSyncOutcome(
                 account: account,
                 snapshot: signalDetector.enrichedSnapshot(from: historyPreservedSnapshot, previousSnapshot: previousSnapshot),
-                errorMessage: nil
+                errorMessage: partialWarning
             )
         } catch ProviderFetchError.notConfigured {
             print("[SyncCoordinator] Not configured error for \(providerID.rawValue)")
@@ -332,6 +351,7 @@ final class SyncCoordinator {
             )
         } catch ProviderFetchError.credentialExpired(let message) {
             print("[SyncCoordinator] Expired credential for \(providerID.rawValue): \(message)")
+            Self.logRefreshFailure(providerID, message)
             if let preservedSnapshot = preservedSnapshotAfterRefreshMiss(
                 providerID: providerID,
                 previousSnapshot: previousSnapshot,
@@ -359,6 +379,7 @@ final class SyncCoordinator {
             let message = (error as? ProviderFetchError)?.errorDescription
                 ?? error.localizedDescription
             print("[SyncCoordinator] Error for \(providerID.rawValue): \(message)")
+            Self.logRefreshFailure(providerID, message)
 
             // A Codex folder now signed in to another account: the previous
             // snapshot may already be that account's, so it is not kept.
@@ -428,6 +449,7 @@ final class SyncCoordinator {
         guard shouldPreserve else { return nil }
 
         print("[SyncCoordinator] Preserving previous \(providerID.rawValue) snapshot after refresh miss: \(reason)")
+        Self.logger.notice("keeping the previous \(providerID.rawValue, privacy: .public) snapshot after a refresh miss")
         return previousSnapshot
     }
 

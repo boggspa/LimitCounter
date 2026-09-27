@@ -71,6 +71,10 @@ enum KimiUsageTestRunner {
         try await testWebFiveHourReplacesCodeFiveHour()
         try await testWebFiveHourFaultKeepsCodeFiveHour()
         try await testWebSessionRenewsOnceForBothReadings()
+        try await testWebFaultStillWritesCodeSnapshot()
+        try await testCodeFailureStillWritesWebSnapshot()
+        try await testStalledSourceDoesNotHoldTheSnapshot()
+        try await testWebRenewalIsReusedForTheMonthlyReading()
         print("Kimi usage tests passed")
     }
 
@@ -1370,6 +1374,247 @@ enum KimiUsageTestRunner {
         try expectEqual(reading?.fiveHour?.usedPercent, 25, "renewed web 5h")
     }
 
+    /// The kimi.ai account page read "5-hour usage · Code 6.65%, resets
+    /// 09-27 20:08" and "Total usage 13.28%" while this was written.
+    private static func webAnswer(for request: URLRequest) -> (HTTPURLResponse, Data)? {
+        let path = request.url?.path ?? ""
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        if path.hasSuffix("BillingService/GetUsages") {
+            return (response, webFiveHourJSON(used: 133, limit: 2000, reset: "2099-09-27T19:08:23.717479433Z"))
+        }
+        if path.contains("GetSubscriptionStats") {
+            return (
+                response,
+                #"{"subscription_balance":{"amount_used_ratio":0.1328,"expire_time":"2099-10-25T00:00:00Z"}}"#
+                    .data(using: .utf8)!
+            )
+        }
+        return nil
+    }
+
+    /// A failing kimi.ai read, in any form, still yields a fresh snapshot
+    /// with Kimi Code's values, and says why beside it.
+    private static func testWebFaultStillWritesCodeSnapshot() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let credentials = ProviderCredential(
+            accessToken: "code-access-token",
+            extraFields: ["kimiWebAccessToken": "web-access-token", "kimiWebRefreshToken": "web-refresh"]
+        )
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let faults: [(name: String, answer: (URLRequest) throws -> (HTTPURLResponse, Data), reason: String)] = [
+            ("HTTP 500", { request in
+                (HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data())
+            }, "GetUsages returned HTTP 500"),
+            ("transport error", { _ in
+                throw URLError(.cannotFindHost)
+            }, "GetUsages did not answer"),
+            ("unparseable reply", { request in
+                (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                 #"{"usages":[{"scope":"FEATURE_CODING"}]}"#.data(using: .utf8)!)
+            }, "without a FEATURE_CODING 5-hour window"),
+            ("expired session that will not renew", { request in
+                let renewing = request.url?.path.contains("RefreshToken") == true
+                return (HTTPURLResponse(url: request.url!, statusCode: renewing ? 403 : 401, httpVersion: nil, headerFields: nil)!, Data())
+            }, "refused to renew"),
+        ]
+        for fault in faults {
+            KimiMockURLProtocol.requestHandler = { request in
+                let path = request.url?.path ?? ""
+                if path.contains("GetUsages") || path.contains("RefreshToken") {
+                    return try fault.answer(request)
+                }
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, proUsagesJSON)
+            }
+            let client = KimiProviderClient(
+                session: URLSession(configuration: configuration),
+                persistWebSessionTokens: { _ in true }
+            )
+            let started = Date()
+            let snapshot = try await client.fetchSnapshot(credentials: credentials)
+            try expectEqual(snapshot.fetchState, .success, "\(fault.name): snapshot state")
+            try expect(snapshot.fetchedAt >= started.addingTimeInterval(-1), "\(fault.name): fetched_at is fresh")
+            try expectEqual(try requiredWindow("5H", in: snapshot).percentageUsed, 5, "\(fault.name): Kimi Code 5h")
+            try expectEqual(try requiredWindow("Monthly", in: snapshot).percentageUsed, 40, "\(fault.name): Kimi Code monthly")
+            let warning = await client.takePartialRefreshWarning()
+            try expect(warning?.contains("kimi.ai web session") == true, "\(fault.name): warning names the web session, got \(warning ?? "nil")")
+            try expect(warning?.contains(fault.reason) == true, "\(fault.name): warning gives the reason, got \(warning ?? "nil")")
+        }
+    }
+
+    /// The fault behind the 27 September stall: Kimi Code's sign-in failed
+    /// before any request, which used to abort the whole refresh. The web
+    /// session's readings now make the snapshot on their own.
+    private static func testCodeFailureStillWritesWebSnapshot() async throws {
+        let root = try temporaryDirectory().appendingPathComponent(".kimi-code", isDirectory: true)
+        let credentialsDirectory = root.appendingPathComponent("credentials", isDirectory: true)
+        try FileManager.default.createDirectory(at: credentialsDirectory, withIntermediateDirectories: true)
+        let tokenFile = credentialsDirectory.appendingPathComponent("kimi-code.json")
+        // Inside the renewal window, as the CLI token was from 12:59:43Z.
+        try oauthJSON(
+            accessToken: "code-access-token",
+            refreshToken: "code-refresh-token",
+            expiresAt: Date().timeIntervalSince1970 + 440,
+            expiresIn: 900
+        ).write(to: tokenFile)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        var codeRequests = 0
+        KimiMockURLProtocol.requestHandler = { request in
+            if let answer = webAnswer(for: request) { return answer }
+            codeRequests += 1
+            // Kimi Code's OAuth host rejects the renewal.
+            return (HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        let client = KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in true }
+        )
+        let credential = ProviderCredential(
+            customEndpoint: tokenFile.path,
+            extraFields: ["kimiAuthMode": "oauthFile", "kimiWebAccessToken": "web-access-token"]
+        )
+        let started = Date()
+        let snapshot = try await client.fetchSnapshot(credentials: credential)
+        try expectEqual(codeRequests, 1, "Kimi Code's renewal was attempted")
+        try expectEqual(snapshot.fetchState, .success, "web-only snapshot state")
+        try expect(snapshot.fetchedAt >= started.addingTimeInterval(-1), "web-only snapshot fetched_at is fresh")
+        try expectEqual(snapshot.windows.map(\.label), ["5H", "Monthly"], "web-only windows")
+        try expectClose(try requiredWindow("5H", in: snapshot).used, 6.65, "web 5h without Kimi Code")
+        try expectEqual(
+            try requiredWindow("5H", in: snapshot).resetDate,
+            ISO8601DateFormatter.fractional.date(from: "2099-09-27T19:08:23.717479Z"),
+            "web 5h reset without Kimi Code"
+        )
+        try expectClose(try requiredWindow("Monthly", in: snapshot).used, 13.28, "web monthly without Kimi Code")
+        let warning = await client.takePartialRefreshWarning()
+        try expect(warning?.contains("Kimi Code: Kimi rejected the saved refresh token") == true, "warning names Kimi Code's fault, got \(warning ?? "nil")")
+        try expectNil(await client.takePartialRefreshWarning(), "a warning is collected once")
+
+        // The same when the renewal fails before any request: the token
+        // folder cannot be written, so the lock or the write probe throws.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: credentialsDirectory.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: root.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: credentialsDirectory.path)
+        }
+        codeRequests = 0
+        let beforeRequest = try await client.fetchSnapshot(credentials: credential)
+        try expectEqual(codeRequests, 0, "the renewal failed before its request")
+        try expectClose(try requiredWindow("5H", in: beforeRequest).used, 6.65, "web 5h after a pre-request renewal fault")
+        let preRequestWarning = await client.takePartialRefreshWarning()
+        try expect(preRequestWarning?.contains("~/.kimi-code") == true, "warning gives the renewal fault, got \(preRequestWarning ?? "nil")")
+
+        // Without a web session the fault still reaches the coordinator,
+        // which keeps the last snapshot and shows the message.
+        do {
+            _ = try await client.fetchSnapshot(
+                credentials: ProviderCredential(customEndpoint: tokenFile.path, extraFields: ["kimiAuthMode": "oauthFile"])
+            )
+            throw TestFailure.failed("a Kimi Code fault without a web session should throw")
+        } catch ProviderFetchError.credentialExpired {}
+    }
+
+    /// A source that never answers is waited for a bounded time, and the
+    /// other one's reading is written without it.
+    private static func testStalledSourceDoesNotHoldTheSnapshot() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let credentials = ProviderCredential(
+            accessToken: "code-access-token",
+            extraFields: ["kimiWebAccessToken": "web-access-token"]
+        )
+        defer {
+            KimiMockURLProtocol.requestHandler = nil
+            KimiMockURLProtocol.delayHandler = nil
+        }
+        KimiMockURLProtocol.requestHandler = { request in
+            if let answer = webAnswer(for: request) { return answer }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, proUsagesJSON)
+        }
+        func client() -> KimiProviderClient {
+            KimiProviderClient(
+                session: URLSession(configuration: configuration),
+                persistWebSessionTokens: { _ in true },
+                codeWaitSeconds: 0.5,
+                refreshBudgetSeconds: 1
+            )
+        }
+
+        // kimi.ai stalls: Kimi Code's reading is written on time.
+        KimiMockURLProtocol.delayHandler = { $0.url?.host == "www.kimi.ai" ? 5 : 0 }
+        var started = Date()
+        let webStalled = client()
+        let codeOnly = try await webStalled.fetchSnapshot(credentials: credentials)
+        try expect(Date().timeIntervalSince(started) < 3, "a stalled web session is not waited for")
+        try expectEqual(try requiredWindow("5H", in: codeOnly).percentageUsed, 5, "Kimi Code 5h while kimi.ai stalls")
+        let webWarning = await webStalled.takePartialRefreshWarning()
+        try expect(webWarning?.contains("did not answer in time") == true, "stalled web warning, got \(webWarning ?? "nil")")
+
+        // Kimi Code stalls: the web session's reading is written on time.
+        KimiMockURLProtocol.delayHandler = { $0.url?.host == "www.kimi.ai" ? 0 : 5 }
+        started = Date()
+        let codeStalled = client()
+        let webOnly = try await codeStalled.fetchSnapshot(credentials: credentials)
+        try expect(Date().timeIntervalSince(started) < 3, "a stalled Kimi Code is not waited for")
+        try expectClose(try requiredWindow("5H", in: webOnly).used, 6.65, "web 5h while Kimi Code stalls")
+        try expectClose(try requiredWindow("Monthly", in: webOnly).used, 13.28, "web monthly while Kimi Code stalls")
+        let codeWarning = await codeStalled.takePartialRefreshWarning()
+        try expect(codeWarning?.contains("Kimi Code did not answer") == true, "stalled Kimi Code warning, got \(codeWarning ?? "nil")")
+    }
+
+    /// The monthly read comes after the 5-hour one; when the 5-hour read had
+    /// to renew the session, the monthly read uses the renewed pair rather
+    /// than presenting the spent one again.
+    private static func testWebRenewalIsReusedForTheMonthlyReading() async throws {
+        var refreshRequests = 0
+        var staleMonthlyRequests = 0
+        KimiMockURLProtocol.requestHandler = { request in
+            let path = request.url?.path ?? ""
+            let response = { (status: Int) in
+                HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            }
+            if path.contains("RefreshToken") {
+                refreshRequests += 1
+                return (response(200), #"{"access_token":"rotated-web-access","refresh_token":"rotated-web-refresh"}"#.data(using: .utf8)!)
+            }
+            let fresh = request.value(forHTTPHeaderField: "Authorization") == "Bearer rotated-web-access"
+            if path.contains("GetUsages") || path.contains("GetSubscriptionStats") {
+                if !fresh {
+                    if path.contains("GetSubscriptionStats") { staleMonthlyRequests += 1 }
+                    return (response(401), Data())
+                }
+                return webAnswer(for: request)!
+            }
+            // Kimi Code is signed out.
+            return (response(401), Data())
+        }
+        defer { KimiMockURLProtocol.requestHandler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [KimiMockURLProtocol.self]
+        let snapshot = try await KimiProviderClient(
+            session: URLSession(configuration: configuration),
+            persistWebSessionTokens: { _ in true }
+        ).fetchSnapshot(
+            credentials: ProviderCredential(
+                accessToken: "code-access-token",
+                extraFields: ["kimiWebAccessToken": "web-access-token", "kimiWebRefreshToken": "web-refresh"]
+            )
+        )
+        try expectEqual(refreshRequests, 1, "one renewal serves both web reads")
+        try expectEqual(staleMonthlyRequests, 0, "the monthly read presents the renewed token")
+        try expectClose(try requiredWindow("Monthly", in: snapshot).used, 13.28, "web monthly after a renewal")
+        try expectClose(try requiredWindow("5H", in: snapshot).used, 6.65, "web 5h after a renewal")
+    }
+
     private static func webFiveHourJSON(used: Int, limit: Int, reset: String) -> Data {
         """
         {"usages":[{"scope":"FEATURE_CODING","detail":{"limit":"2048","used":"1"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"\(limit)","used":"\(used)","remaining":"\(limit - used)","resetTime":"\(reset)"}}]}]}
@@ -1499,6 +1744,9 @@ private func requestBodyString(_ request: URLRequest) -> String {
 
 private final class KimiMockURLProtocol: URLProtocol {
     static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    /// Seconds to hold a request's answer back, to stand in for a stalled
+    /// endpoint without blocking the loading thread.
+    static var delayHandler: ((URLRequest) -> TimeInterval)?
     /// Answers the `/me` request each usage fetch makes beside `/usages`;
     /// `nil` answers 404, like an endpoint without one.
     static var userInfoHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
@@ -1518,14 +1766,22 @@ private final class KimiMockURLProtocol: URLProtocol {
             return
         }
 
-        do {
-            let (response, data) = try requestHandler(request)
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        } catch {
-            print("Kimi mock request failed: \(error)")
-            client?.urlProtocol(self, didFailWithError: error)
+        let delay = Self.delayHandler?(request) ?? 0
+        let answer = { [self] in
+            do {
+                let (response, data) = try requestHandler(request)
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                print("Kimi mock request failed: \(error)")
+                client?.urlProtocol(self, didFailWithError: error)
+            }
+        }
+        if delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: answer)
+        } else {
+            answer()
         }
     }
 
