@@ -75,6 +75,7 @@ enum KimiUsageTestRunner {
         try await testCodeFailureStillWritesWebSnapshot()
         try await testStalledSourceDoesNotHoldTheSnapshot()
         try await testWebRenewalIsReusedForTheMonthlyReading()
+        try testParsesRecordedWebReplyShapes()
         print("Kimi usage tests passed")
     }
 
@@ -1613,6 +1614,59 @@ enum KimiUsageTestRunner {
         try expectEqual(staleMonthlyRequests, 0, "the monthly read presents the renewed token")
         try expectClose(try requiredWindow("Monthly", in: snapshot).used, 13.28, "web monthly after a renewal")
         try expectClose(try requiredWindow("5H", in: snapshot).used, 6.65, "web 5h after a renewal")
+    }
+
+    /// The reply shapes the installed app logged from kimi.ai on 27 September
+    /// 2026 (values replaced; the logger keeps key names and types only):
+    ///
+    ///     GetUsages: {totalQuota:{limit:string,remaining:string,used:string},
+    ///       usages:[1x{detail:{limit:string,remaining:string,resetTime:string,used:string},
+    ///       limits:[1x{detail:{limit,remaining,resetTime,used},window:{duration,timeUnit}}],
+    ///       scope:string}]}
+    ///     GetSubscriptionStats: {ratelimitCode5h:{enabled:bool,ratio:number,resetTime:string},
+    ///       subscriptionBalance:{amountUsedRatio:number,domain:string,expireTime:string,
+    ///       feature:string,id:string,kimiCodeUsedRatio:number,type:string,unit:string}}
+    ///
+    /// The logged depth stopped above `window`'s field types; they follow
+    /// Kimi's web client (a number of minutes and a `TIME_UNIT_*` name).
+    private static func testParsesRecordedWebReplyShapes() throws {
+        let usages = """
+        {
+          "totalQuota": { "limit": "2048", "remaining": "1778", "used": "270" },
+          "usages": [{
+            "detail": { "limit": "2048", "remaining": "1778", "resetTime": "2026-10-25T08:12:44.000000000Z", "used": "270" },
+            "limits": [{
+              "detail": { "limit": "200", "remaining": "186.7", "resetTime": "2026-09-27T19:08:23.717479433Z", "used": "13.3" },
+              "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" }
+            }],
+            "scope": "FEATURE_CODING"
+          }]
+        }
+        """.data(using: .utf8)!
+        let fiveHour = KimiWebMembershipParser.fiveHourUsage(from: usages)
+        try expectClose(fiveHour?.usedPercent, 6.65, "recorded GetUsages shape: 5h percentage")
+        try expectEqual(
+            fiveHour?.resetDate,
+            ISO8601DateFormatter.fractional.date(from: "2026-09-27T19:08:23.717479Z"),
+            "recorded GetUsages shape: 5h reset (20:08 BST)"
+        )
+
+        let stats = """
+        {
+          "ratelimitCode5h": { "enabled": true, "ratio": 0.0665, "resetTime": "2026-09-27T19:08:23Z" },
+          "subscriptionBalance": {
+            "amountUsedRatio": 0.1328, "domain": "DOMAIN_KIMI", "expireTime": "2026-10-26T00:00:00Z",
+            "feature": "FEATURE_CODING", "id": "balance-id", "kimiCodeUsedRatio": 0.1, "type": "TYPE_SUBSCRIPTION", "unit": "UNIT_CREDIT"
+          }
+        }
+        """.data(using: .utf8)!
+        let monthly = KimiWebMembershipParser.monthlyUsage(from: stats)
+        try expectClose(monthly?.usedPercent, 13.28, "recorded GetSubscriptionStats shape: monthly percentage")
+        try expectEqual(
+            monthly?.resetDate,
+            ISO8601DateFormatter().date(from: "2026-10-26T00:00:00Z"),
+            "recorded GetSubscriptionStats shape: monthly reset"
+        )
     }
 
     private static func webFiveHourJSON(used: Int, limit: Int, reset: String) -> Data {
