@@ -408,6 +408,20 @@ final class ProviderSetupModel: ObservableObject {
         refreshHealth(for: providerID)
     }
 
+    /// Takes the provider out of Limit Counter entirely: every extra account,
+    /// the primary credential and browser session, then its place on the
+    /// dashboard and in the rail. Deleting the credential alone left the
+    /// provider enabled — and a provider with a readable local source (or a
+    /// sync error) looked exactly as it did before, so "Remove" appeared to do
+    /// nothing. It can be added back from "Add provider".
+    func removeProvider(_ providerID: ProviderID) {
+        for record in accounts.accounts(for: providerID) {
+            removeAccount(record.key)
+        }
+        delete(providerID)
+        disable(providerID)
+    }
+
     /// Only these three clear their browser session on delete today. The
     /// asymmetry with kimi/ollama/mistral/meta/cerebras predates this refactor
     /// and is preserved deliberately rather than widened here.

@@ -177,6 +177,7 @@ struct ProviderSetupProviderPage: View {
 
     @State private var showAddAccount = false
     @State private var accountPendingRemoval: ProviderAccountKey?
+    @State private var showRemoveProvider = false
 
     private var accent: Color { Color(hex: providerID.accentColorHex) }
 
@@ -234,15 +235,25 @@ struct ProviderSetupProviderPage: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                if model.health(for: providerID).isConnected {
-                    Button("Remove…") { model.delete(providerID) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
+                // Offered in every state: a provider that needs attention is
+                // the one most likely to be unwanted.
+                Button("Remove…") { showRemoveProvider = true }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
+        }
+        .confirmationDialog(
+            "Remove \(providerID.displayName)?",
+            isPresented: $showRemoveProvider,
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) { model.removeProvider(providerID) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Its stored credentials, extra accounts and browser sign-in on this Mac are deleted, and it leaves the dashboard. Add it back any time from Add provider.")
         }
     }
 
