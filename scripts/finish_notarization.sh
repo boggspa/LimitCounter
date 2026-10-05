@@ -25,7 +25,9 @@ xcrun stapler staple "$APP" 2>&1 | tee "$NOTARY_DIR/staple.log"
 xcrun stapler validate "$APP"
 spctl --assess --type execute --verbose=4 "$APP"
 
-FINAL_ZIP="$ROOT_DIR/dist/LimitCounter-1.0-1-macOS26-notarized-$STAMP.zip"
+APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+APP_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")
+FINAL_ZIP="$ROOT_DIR/dist/LimitCounter-$APP_VERSION-$APP_BUILD-macOS26-notarized-$STAMP.zip"
 mkdir -p "$ROOT_DIR/dist"
 # --norsrc/--noextattr/--noacl matter. Without them ditto stores every extended
 # attribute as an AppleDouble "._" entry *inside* the signed bundle — 27 of them
