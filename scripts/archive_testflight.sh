@@ -133,7 +133,9 @@ redact_auth_values() {
 run_logged() {
     local log_path=$1
     shift
-    if ! "$@" >"$log_path" 2>&1; then
+    # Keep credentials/logs private, but Xcode's bundle resources must remain
+    # readable to ordinary users when the Mac installer installs as root.
+    if ! (umask 022; "$@") >"$log_path" 2>&1; then
         printf 'Xcode failed. Preserved log and artifacts: %s\n' "$log_path" >&2
         tail -n 40 "$log_path" | redact_auth_values >&2
         exit 1
