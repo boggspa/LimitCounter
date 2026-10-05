@@ -2584,6 +2584,266 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+// MARK: - Cloud snapshot transport
+
+/// One atomic provider roster in the existing CloudKit `payloadData` field.
+/// The primary snapshot stays at the JSON root so older viewers can read it.
+/// A present, empty additionalAccounts list explicitly removes secondaries;
+/// legacy primary-only payloads cannot make that assertion.
+public struct CloudSnapshotPayload: Codable {
+    public static let currentVersion = 3
+    public let primary: QuotaSnapshot
+    public let additionalAccounts: [QuotaSnapshot]?
+    public var snapshots: [QuotaSnapshot] { [primary] + (additionalAccounts ?? []) }
+
+    public enum PayloadError: Error {
+        case invalidRoster, unsupportedVersion, tooLarge
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountPayloadVersion, additionalAccounts
+    }
+
+    private struct IdentityCheckedSnapshot: Decodable {
+        let snapshot: QuotaSnapshot
+        private enum CodingKeys: String, CodingKey { case accountSlot }
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if container.contains(.accountSlot) {
+                let slot = try container.decode(String.self, forKey: .accountSlot)
+                guard slot == ProviderAccountKey.normalizedSlot(slot) else { throw PayloadError.invalidRoster }
+            }
+            snapshot = try QuotaSnapshot(from: decoder)
+        }
+    }
+
+    public init(snapshots: [QuotaSnapshot]) throws {
+        guard let first = snapshots.first else { throw PayloadError.invalidRoster }
+        let primaries = snapshots.filter(\.isPrimaryAccount)
+        guard primaries.count <= 1 else { throw PayloadError.invalidRoster }
+        primary = primaries.first ?? QuotaSnapshot(
+            providerID: first.providerID, displayName: first.providerID.snapshotDisplayName,
+            fetchState: .notConfigured, fetchedAt: first.fetchedAt
+        )
+        additionalAccounts = snapshots.filter { !$0.isPrimaryAccount }
+        try validate(providerID: first.providerID)
+    }
+
+    public init(from decoder: Decoder) throws {
+        primary = try IdentityCheckedSnapshot(from: decoder).snapshot
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.accountPayloadVersion) {
+            guard try container.decode(Int.self, forKey: .accountPayloadVersion) == Self.currentVersion else {
+                throw PayloadError.unsupportedVersion
+            }
+            additionalAccounts = try container.decode([IdentityCheckedSnapshot].self, forKey: .additionalAccounts).map(\.snapshot)
+        } else {
+            guard !container.contains(.additionalAccounts) else { throw PayloadError.invalidRoster }
+            additionalAccounts = nil
+        }
+        try validate(providerID: primary.providerID)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try primary.encode(to: encoder)
+        if let additionalAccounts {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(Self.currentVersion, forKey: .accountPayloadVersion)
+            try container.encode(additionalAccounts, forKey: .additionalAccounts)
+        }
+    }
+
+    public func validate(providerID: ProviderID) throws {
+        guard primary.providerID == providerID, primary.isPrimaryAccount,
+              snapshots.allSatisfy({ $0.providerID == providerID }),
+              additionalAccounts?.allSatisfy({ !$0.isPrimaryAccount }) != false,
+              Set(snapshots.map(\.accountKey)).count == snapshots.count else {
+            throw PayloadError.invalidRoster
+        }
+    }
+
+    /// Limit the entire provider bundle, retaining every account and all live
+    /// status, balances and banked resets when activity history is trimmed.
+    public func encoded(maxBytes: Int) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(self)
+        if data.count <= maxBytes { return data }
+        let compact = try Self(snapshots: snapshots.map {
+            Self.replacingActivity(in: $0, events: [], analyticsBuckets: [])
+        })
+        let compactData = try encoder.encode(compact)
+        guard compactData.count <= maxBytes else { throw PayloadError.tooLarge }
+        return compactData
+    }
+
+    public static func replacingActivity(
+        in snapshot: QuotaSnapshot, events: [UsageEvent], analyticsBuckets: [UsageAnalyticsBucket]
+    ) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: snapshot.id, providerID: snapshot.providerID, displayName: snapshot.displayName,
+            planName: snapshot.planName, windows: snapshot.windows, stats: snapshot.stats,
+            balances: snapshot.balances, signals: snapshot.signals, events: events,
+            analyticsBuckets: analyticsBuckets, fetchState: snapshot.fetchState,
+            fetchedAt: snapshot.fetchedAt, resetCredits: snapshot.resetCredits,
+            accountSlot: snapshot.accountSlot, accountLabel: snapshot.accountLabel,
+            accountFingerprint: snapshot.accountFingerprint
+        )
+    }
+
+    public var statusHash: String { Self.statusHash(for: snapshots) }
+
+    public static func statusHash(for snapshots: [QuotaSnapshot]) -> String {
+        let input = "accounts-v\(currentVersion)\n" + snapshots.map { statusHash(for: $0) }.joined(separator: "\n")
+        return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func statusHash(for snapshot: QuotaSnapshot) -> String {
+        var parts: [String] = [
+            snapshot.accountKey.rawValue,
+            snapshot.accountLabel ?? "",
+            snapshot.accountFingerprint ?? "",
+            snapshot.displayName,
+            snapshot.planName ?? "",
+            fetchStateSignature(snapshot.fetchState)
+        ]
+
+        let sortedWindows = snapshot.windows.sorted {
+            ($0.label, $0.windowKind.rawValue, $0.unit) < ($1.label, $1.windowKind.rawValue, $1.unit)
+        }
+        for window in sortedWindows {
+            parts.append(
+                [
+                    "window",
+                    window.label,
+                    window.windowKind.rawValue,
+                    formatMetric(window.used),
+                    formatMetric(window.total ?? -1),
+                    window.resetDate.map { String(Int($0.timeIntervalSince1970)) } ?? "",
+                    window.unit,
+                    window.subtitle ?? ""
+                ].joined(separator: "|")
+            )
+        }
+
+        let sortedStats = snapshot.stats.sorted { ($0.label, $0.unit) < ($1.label, $1.unit) }
+        for stat in sortedStats {
+            parts.append(
+                [
+                    "stat",
+                    stat.label,
+                    formatMetric(stat.value),
+                    stat.unit,
+                    stat.subtitle ?? ""
+                ].joined(separator: "|")
+            )
+        }
+
+        let sortedBalances = snapshot.balances.sorted { ($0.label, $0.unit) < ($1.label, $1.unit) }
+        for balance in sortedBalances {
+            parts.append(
+                [
+                    "balance",
+                    balance.label,
+                    formatMetric(balance.amount),
+                    balance.unit,
+                    balance.subtitle ?? "",
+                    balance.resetDate.map { String(Int($0.timeIntervalSince1970)) } ?? ""
+                ].joined(separator: "|")
+            )
+        }
+
+        let sortedSignals = snapshot.signals.sorted {
+            ($0.kind.rawValue, $0.windowLabel ?? "", $0.title) < ($1.kind.rawValue, $1.windowLabel ?? "", $1.title)
+        }
+        for signal in sortedSignals {
+            // `detectedAt` is deliberately absent. It records when a signal was
+            // observed, not what it says, and a provider that re-derives its
+            // signals on every fetch would otherwise change this hash every
+            // cycle — republishing the status record and waking every other
+            // device over APNs for a reading that had not changed. Two signals
+            // matching on everything below are the same signal by every
+            // user-visible measure. Notifications are unaffected: the alert
+            // record has its own signature, and that one does carry the
+            // timestamp.
+            parts.append(
+                [
+                    "signal",
+                    signal.kind.rawValue,
+                    signal.windowLabel ?? "",
+                    signal.title,
+                    signal.message,
+                    signal.severity.rawValue,
+                    signal.confidence.map { formatMetric($0) } ?? "",
+                    signal.resetKind?.rawValue ?? ""
+                ].joined(separator: "|")
+            )
+        }
+
+        if let credits = snapshot.resetCredits {
+            let stableCredits = QuotaResetCreditSummary(
+                availableCount: credits.availableCount, earnedCount: credits.earnedCount,
+                credits: credits.credits.sorted { $0.id < $1.id },
+                history: credits.history.sorted { $0.id < $1.id },
+                redeemHint: credits.redeemHint, observedAt: .distantPast
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = .sortedKeys
+            if let data = try? encoder.encode(stableCredits) {
+                parts.append("resetCredits:" + data.base64EncodedString())
+            }
+        }
+
+        // Include events in hash to detect new activity
+        parts.append("events:\(snapshot.events.count)")
+        if let latest = snapshot.events.map(\.timestamp).max() {
+            parts.append("latestEvent:\(Int(latest.timeIntervalSince1970))")
+        }
+        let eventTokenTotal = snapshot.events.compactMap(\.tokens).reduce(0, +)
+        if eventTokenTotal > 0 {
+            parts.append("eventTokens:\(formatMetric(eventTokenTotal))")
+        }
+        parts.append("analytics:\(snapshot.analyticsBuckets.count)")
+        if let latestAnalytics = snapshot.analyticsBuckets.map(\.endDate).max() {
+            parts.append("latestAnalytics:\(Int(latestAnalytics.timeIntervalSince1970))")
+        }
+
+        let digest = SHA256.hash(data: Data(parts.joined(separator: "\n").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func fetchStateSignature(_ fetchState: ProviderFetchState) -> String {
+        switch fetchState {
+        case .success:
+            return "success"
+        case .error:
+            return "error"
+        case .notConfigured:
+            return "notConfigured"
+        }
+    }
+
+    private static func formatMetric(_ value: Double) -> String {
+        String(format: "%.6f", value)
+    }
+
+    /// Call with successfully decoded providers only. A failed fetch therefore
+    /// keeps that provider's cached accounts; a v3 roster replaces it atomically.
+    public static func merging(_ payloads: [Self], into cached: [QuotaSnapshot]) -> [QuotaSnapshot] {
+        var grouped = Dictionary(grouping: cached, by: \.providerID)
+        for payload in payloads {
+            let providerID = payload.primary.providerID
+            if payload.additionalAccounts != nil {
+                grouped[providerID] = payload.snapshots
+            } else {
+                grouped[providerID] = [payload.primary] + (grouped[providerID] ?? []).filter { !$0.isPrimaryAccount }
+            }
+        }
+        return ProviderID.allCases.flatMap { grouped[$0] ?? [] }
+    }
+}
+
 // MARK: - Date Helpers
 
 public extension Date {

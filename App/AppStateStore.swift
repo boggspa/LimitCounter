@@ -7,7 +7,17 @@ import AppKit
 
 @MainActor
 enum CloudSnapshotBackgroundRefresher {
+    private static var refreshTask: Task<Bool, Never>?
+
     static func refreshFromCloudKit() async -> Bool {
+        if let refreshTask { return await refreshTask.value }
+        let task = Task { await performRefresh() }
+        refreshTask = task
+        defer { refreshTask = nil }
+        return await task.value
+    }
+
+    private static func performRefresh() async -> Bool {
         var analyticsChanged = false
         if let remote = try? await CloudKitSyncService.shared.fetchModelUsage() {
             let cached = ModelUsageArchiveStore.load()
@@ -17,18 +27,21 @@ enum CloudSnapshotBackgroundRefresher {
             }
         }
         do {
-            let remoteSnapshots = try await CloudKitSyncService.shared.fetchRemoteSnapshots()
+            let store = QuotaSnapshotStore.shared
+            let cachedSnapshots = store.loadSnapshots()
+            let remoteSnapshots = try await CloudKitSyncService.shared.fetchRemoteSnapshots(retaining: cachedSnapshots)
             guard !remoteSnapshots.isEmpty else {
                 return analyticsChanged
             }
 
-            let store = QuotaSnapshotStore.shared
-            let cachedSnapshots = store.loadSnapshots()
             let didChange = cachedSnapshots != remoteSnapshots
 
             if didChange {
                 store.replaceAll(remoteSnapshots)
             }
+            #if os(iOS)
+            ProviderAccountRegistry.shared.reconcileSyncedAccounts(from: remoteSnapshots)
+            #endif
 
             WidgetCenter.shared.reloadAllTimelines()
             return didChange || analyticsChanged
@@ -66,6 +79,7 @@ final class AppStateStore: ObservableObject {
     @Published var pendingModelUsageNavigation = false
     @Published private var usageResetHistory: [UsageResetHistoryEntry] = []
     @Published var pendingDeepLinkProviderID: ProviderID?
+    @Published var pendingDeepLinkAccountKey: ProviderAccountKey?
     #if os(iOS)
     @Published var lastSeenAlertDate: Date?
     #endif
@@ -340,7 +354,7 @@ final class AppStateStore: ObservableObject {
     }
 
     func openUsageAlert(_ alert: CloudAlertPayload) {
-        pendingDeepLinkProviderID = alert.providerID
+        pendingDeepLinkAccountKey = alert.accountKey
         dismissUsageAlert(alert)
     }
 

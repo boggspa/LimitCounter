@@ -8,12 +8,13 @@ import UserNotifications
 enum CloudKitSyncError: LocalizedError {
     case accountUnavailable
     case statusPublishFailed(String)
+    case statusFetchFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .accountUnavailable:
             return "iCloud is unavailable for CloudKit sync."
-        case .statusPublishFailed(let message):
+        case .statusPublishFailed(let message), .statusFetchFailed(let message):
             return message
         }
     }
@@ -227,7 +228,7 @@ final class CloudKitSyncService {
         }
     }
 
-    func fetchRemoteSnapshots() async throws -> [QuotaSnapshot] {
+    func fetchRemoteSnapshots(retaining cachedSnapshots: [QuotaSnapshot] = []) async throws -> [QuotaSnapshot] {
         recordOperationAttempt(.fetch)
 
         do {
@@ -235,7 +236,8 @@ final class CloudKitSyncService {
                 throw CloudKitSyncError.accountUnavailable
             }
 
-            var snapshotsByProvider: [ProviderID: QuotaSnapshot] = [:]
+            var payloads: [CloudSnapshotPayload] = []
+            var failures: [String] = []
 
             for providerID in ProviderID.allCases {
                 // Skip the heatmap virtual provider
@@ -245,19 +247,29 @@ final class CloudKitSyncService {
 
                 do {
                     let record = try await database.record(for: recordID)
-                    guard let payloadData = record["payloadData"] as? Data else { continue }
-                    let snapshot = try decoder.decode(QuotaSnapshot.self, from: payloadData)
-                    snapshotsByProvider[providerID] = snapshot
+                    guard let payloadData = record["payloadData"] as? Data else {
+                        throw CloudSnapshotPayload.PayloadError.invalidRoster
+                    }
+                    let payload = try decoder.decode(CloudSnapshotPayload.self, from: payloadData)
+                    try payload.validate(providerID: providerID)
+                    payloads.append(payload)
                 } catch let error as CKError where error.code == .unknownItem {
                     continue
                 } catch {
+                    failures.append(providerID.displayName)
                     print("[CloudKitSync] Failed to decode record for \(providerID.rawValue): \(error.localizedDescription)")
                     continue
                 }
             }
 
-            recordOperationSuccess(.fetch)
-            return ProviderID.allCases.compactMap { snapshotsByProvider[$0] }
+            if failures.isEmpty {
+                recordOperationSuccess(.fetch)
+            } else {
+                recordOperationFailure(.fetch, error: CloudKitSyncError.statusFetchFailed(
+                    "Kept cached accounts for providers that could not be refreshed: \(failures.joined(separator: ", "))."
+                ))
+            }
+            return CloudSnapshotPayload.merging(payloads, into: cachedSnapshots)
         } catch {
             recordOperationFailure(.fetch, error: error)
             throw error
@@ -284,24 +296,33 @@ final class CloudKitSyncService {
             var statusFailures: [String] = []
             var alertFailures: [String] = []
 
-            for snapshot in snapshots {
-                let statusSnapshot = cloudStatusSnapshot(for: snapshot)
-                let providerKey = snapshot.providerID.rawValue
-                let currentHash = statusHash(for: statusSnapshot)
+            let snapshotsByProvider = Dictionary(grouping: snapshots.filter { $0.providerID != .heatmap }, by: \.providerID)
+            var failedProviders = Set<ProviderID>()
+            for providerID in ProviderID.allCases {
+                guard let accounts = snapshotsByProvider[providerID] else { continue }
+                let providerKey = providerID.rawValue
+                let statusSnapshots = accounts.map { cloudStatusSnapshot(for: $0) }
+                // Version forces an upgrade publication even when readings have
+                // not changed. Account order, labels and membership also matter.
+                let currentHash = CloudSnapshotPayload.statusHash(for: statusSnapshots)
                 let previousHash = publishedHashes[providerKey]
 
                 if previousHash != currentHash {
                     do {
-                        try await saveStatusRecord(statusSnapshot, statusHash: currentHash)
+                        try await saveStatusRecord(CloudSnapshotPayload(snapshots: statusSnapshots), statusHash: currentHash)
                         publishedHashes[providerKey] = currentHash
                     } catch {
                         let detail = cloudKitErrorDescription(error)
                         statusFailures.append("\(providerKey): \(detail)")
+                        failedProviders.insert(providerID)
                         print("[CloudKitSync] Status publish failed for \(providerKey): \(detail)")
                         continue
                     }
                 }
+            }
 
+            for snapshot in snapshots where !failedProviders.contains(snapshot.providerID) {
+                let providerKey = snapshot.accountKey.rawValue
                 let alertDescriptor = alertDescriptor(for: snapshot)
 
                 if let alertDescriptor {
@@ -319,7 +340,9 @@ final class CloudKitSyncService {
                                     createdAt: createdAt,
                                     windowLabel: alertDescriptor.windowLabel,
                                     kind: alertDescriptor.kind,
-                                    resetKind: alertDescriptor.resetKind
+                                    resetKind: alertDescriptor.resetKind,
+                                    accountSlot: snapshot.accountSlot,
+                                    accountLabel: snapshot.accountLabel
                                 )
                             )
                         } catch {
@@ -385,6 +408,13 @@ final class CloudKitSyncService {
         }
 
         return extractAlertPayloads(from: userInfo).first?.providerID
+    }
+
+    func accountKey(fromNotificationUserInfo userInfo: [AnyHashable: Any]) -> ProviderAccountKey? {
+        if let payload = extractAlertPayloads(from: userInfo).first { return payload.accountKey }
+        guard let raw = userInfo["providerID"] as? String, let providerID = ProviderID(rawValue: raw) else { return nil }
+        let metadata = CloudAlertPayload.cloudAccount(from: userInfo["signature"] as? String ?? "", providerID: providerID)
+        return ProviderAccountKey(providerID: providerID, slot: userInfo["accountSlot"] as? String ?? metadata.slot)
     }
 
     func extractAlertPayloads(from userInfo: [AnyHashable: Any]) -> [CloudAlertPayload] {
@@ -454,6 +484,7 @@ final class CloudKitSyncService {
             return nil
         }
         let parsed = CloudAlertPayload.parse(signature: signature)
+        let account = CloudAlertPayload.cloudAccount(from: signature, providerID: providerID)
         let createdAt = (fields["createdAt"] as? Date) ?? Date()
         let fieldLabel = (fields["windowLabel"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -467,7 +498,11 @@ final class CloudKitSyncService {
             createdAt: createdAt,
             windowLabel: fieldLabel?.isEmpty == false ? fieldLabel : parsed.windowLabel,
             kind: fieldKind ?? parsed.kind,
-            resetKind: fieldResetKind ?? parsed.resetKind
+            resetKind: fieldResetKind ?? parsed.resetKind,
+            accountSlot: account.slot,
+            accountLabel: account.label ?? QuotaSnapshotStore.shared.snapshot(
+                for: ProviderAccountKey(providerID: providerID, slot: account.slot)
+            )?.accountLabel
         )
     }
 
@@ -507,7 +542,8 @@ final class CloudKitSyncService {
         )
     }
 
-    private func saveStatusRecord(_ snapshot: QuotaSnapshot, statusHash: String) async throws {
+    private func saveStatusRecord(_ payload: CloudSnapshotPayload, statusHash: String) async throws {
+        let snapshot = payload.primary
         let recordID = CKRecord.ID(recordName: statusRecordName(for: snapshot.providerID))
         let record = CKRecord(recordType: statusRecordType, recordID: recordID)
 
@@ -516,17 +552,11 @@ final class CloudKitSyncService {
         if let planName = snapshot.planName, !planName.isEmpty {
             record["planName"] = planName as NSString
         }
-        record["fetchedAt"] = snapshot.fetchedAt as NSDate
+        record["fetchedAt"] = (payload.snapshots.map(\.fetchedAt).max() ?? snapshot.fetchedAt) as NSDate
         record["summary"] = snapshotSummary(for: snapshot) as NSString
         record["statusHash"] = statusHash as NSString
-        var payloadSnapshot = snapshot
-        var payloadData = try encoder.encode(payloadSnapshot)
-        if payloadData.count > maxCloudStatusPayloadBytes {
-            payloadSnapshot = statusOnlySnapshot(from: payloadSnapshot)
-            payloadData = try encoder.encode(payloadSnapshot)
-            print("[CloudKitSync] Reduced \(snapshot.providerID.rawValue) status payload to status-only (\(payloadData.count) bytes)")
-        }
-        record["payloadVersion"] = 2 as NSNumber
+        let payloadData = try payload.encoded(maxBytes: maxCloudStatusPayloadBytes)
+        record["payloadVersion"] = CloudSnapshotPayload.currentVersion as NSNumber
         record["payloadData"] = payloadData as NSData
 
         let operation = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: [])
@@ -609,30 +639,12 @@ final class CloudKitSyncService {
         )
     }
 
-    private func statusOnlySnapshot(from snapshot: QuotaSnapshot) -> QuotaSnapshot {
-        copySnapshot(snapshot, events: [], analyticsBuckets: [])
-    }
-
     private func copySnapshot(
         _ snapshot: QuotaSnapshot,
         events: [UsageEvent],
         analyticsBuckets: [UsageAnalyticsBucket]
     ) -> QuotaSnapshot {
-        QuotaSnapshot(
-            id: snapshot.id,
-            providerID: snapshot.providerID,
-            displayName: snapshot.displayName,
-            planName: snapshot.planName,
-            windows: snapshot.windows,
-            stats: snapshot.stats,
-            balances: snapshot.balances,
-            signals: snapshot.signals,
-            events: events,
-            analyticsBuckets: analyticsBuckets,
-            fetchState: snapshot.fetchState,
-            fetchedAt: snapshot.fetchedAt,
-            resetCredits: snapshot.resetCredits
-        )
+        CloudSnapshotPayload.replacingActivity(in: snapshot, events: events, analyticsBuckets: analyticsBuckets)
     }
 
     private func compactCloudStatusEvents(
@@ -700,127 +712,16 @@ final class CloudKitSyncService {
         }
     }
 
-    private func statusHash(for snapshot: QuotaSnapshot) -> String {
-        var parts: [String] = [
-            snapshot.providerID.rawValue,
-            snapshot.displayName,
-            snapshot.planName ?? "",
-            fetchStateSignature(snapshot.fetchState)
-        ]
-
-        let sortedWindows = snapshot.windows.sorted {
-            ($0.label, $0.windowKind.rawValue, $0.unit) < ($1.label, $1.windowKind.rawValue, $1.unit)
-        }
-        for window in sortedWindows {
-            parts.append(
-                [
-                    "window",
-                    window.label,
-                    window.windowKind.rawValue,
-                    formatMetric(window.used),
-                    formatMetric(window.total ?? -1),
-                    window.resetDate.map { String(Int($0.timeIntervalSince1970)) } ?? "",
-                    window.unit,
-                    window.subtitle ?? ""
-                ].joined(separator: "|")
-            )
-        }
-
-        let sortedStats = snapshot.stats.sorted { ($0.label, $0.unit) < ($1.label, $1.unit) }
-        for stat in sortedStats {
-            parts.append(
-                [
-                    "stat",
-                    stat.label,
-                    formatMetric(stat.value),
-                    stat.unit,
-                    stat.subtitle ?? ""
-                ].joined(separator: "|")
-            )
-        }
-
-        let sortedBalances = snapshot.balances.sorted { ($0.label, $0.unit) < ($1.label, $1.unit) }
-        for balance in sortedBalances {
-            parts.append(
-                [
-                    "balance",
-                    balance.label,
-                    formatMetric(balance.amount),
-                    balance.unit,
-                    balance.subtitle ?? "",
-                    balance.resetDate.map { String(Int($0.timeIntervalSince1970)) } ?? ""
-                ].joined(separator: "|")
-            )
-        }
-
-        let sortedSignals = snapshot.signals.sorted {
-            ($0.kind.rawValue, $0.windowLabel ?? "", $0.title) < ($1.kind.rawValue, $1.windowLabel ?? "", $1.title)
-        }
-        for signal in sortedSignals {
-            // `detectedAt` is deliberately absent. It records when a signal was
-            // observed, not what it says, and a provider that re-derives its
-            // signals on every fetch would otherwise change this hash every
-            // cycle — republishing the status record and waking every other
-            // device over APNs for a reading that had not changed. Two signals
-            // matching on everything below are the same signal by every
-            // user-visible measure. Notifications are unaffected: the alert
-            // record has its own signature, and that one does carry the
-            // timestamp.
-            parts.append(
-                [
-                    "signal",
-                    signal.kind.rawValue,
-                    signal.windowLabel ?? "",
-                    signal.title,
-                    signal.message,
-                    signal.severity.rawValue,
-                    signal.confidence.map { formatMetric($0) } ?? ""
-                ].joined(separator: "|")
-            )
-        }
-
-        if let credits = snapshot.resetCredits {
-            parts.append(
-                [
-                    "resetCredits",
-                    String(credits.availableCount),
-                    credits.earnedCount.map(String.init) ?? "",
-                    credits.nearestExpiry.map { String(Int($0.timeIntervalSince1970)) } ?? "",
-                    String(credits.history.count)
-                ].joined(separator: "|")
-            )
-        }
-
-        // Include events in hash to detect new activity
-        parts.append("events:\(snapshot.events.count)")
-        if let latest = snapshot.events.map(\.timestamp).max() {
-            parts.append("latestEvent:\(Int(latest.timeIntervalSince1970))")
-        }
-        let eventTokenTotal = snapshot.events.compactMap(\.tokens).reduce(0, +)
-        if eventTokenTotal > 0 {
-            parts.append("eventTokens:\(formatMetric(eventTokenTotal))")
-        }
-        parts.append("analytics:\(snapshot.analyticsBuckets.count)")
-        if let latestAnalytics = snapshot.analyticsBuckets.map(\.endDate).max() {
-            parts.append("latestAnalytics:\(Int(latestAnalytics.timeIntervalSince1970))")
-        }
-
-        let digest = SHA256.hash(data: Data(parts.joined(separator: "\n").utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func fetchStateSignature(_ fetchState: ProviderFetchState) -> String {
-        switch fetchState {
-        case .success:
-            return "success"
-        case .error:
-            return "error"
-        case .notConfigured:
-            return "notConfigured"
-        }
-    }
-
     private func alertDescriptor(for snapshot: QuotaSnapshot) -> CloudAlertDescriptor? {
+        guard let descriptor = baseAlertDescriptor(for: snapshot) else { return nil }
+        return CloudAlertDescriptor(
+            title: descriptor.title, body: descriptor.body,
+            signature: CloudAlertPayload.cloudSignature(descriptor.signature, account: snapshot.accountKey, label: snapshot.accountLabel),
+            windowLabel: descriptor.windowLabel, kind: descriptor.kind, resetKind: descriptor.resetKind
+        )
+    }
+
+    private func baseAlertDescriptor(for snapshot: QuotaSnapshot) -> CloudAlertDescriptor? {
         guard snapshot.providerID != .heatmap,
               snapshot.providerID != .codexTelemetry else {
             return nil
@@ -844,7 +745,7 @@ final class CloudKitSyncService {
         switch snapshot.fetchState {
         case .error:
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) sync issue",
+                title: "\(snapshot.accountDisplayName) sync issue",
                 body: "Check your local credentials and logs.",
                 signature: "error",
                 windowLabel: nil,
@@ -856,7 +757,7 @@ final class CloudKitSyncService {
 
         if let exhausted = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 1.0 }) {
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) — 100% used",
+                title: "\(snapshot.accountDisplayName) — 100% used",
                 body: "\(exhausted.label): \(exhausted.measurementSummary). Resets in \(resetCountdown(for: exhausted.resetDate)).",
                 signature: "exhausted|\(exhausted.label)",
                 windowLabel: exhausted.label,
@@ -866,7 +767,7 @@ final class CloudKitSyncService {
 
         if let critical = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.95 }) {
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) — 95% used",
+                title: "\(snapshot.accountDisplayName) — 95% used",
                 body: "\(critical.label): \(critical.measurementSummary). Resets in \(resetCountdown(for: critical.resetDate)).",
                 signature: "critical|\(critical.label)",
                 windowLabel: critical.label,
@@ -876,7 +777,7 @@ final class CloudKitSyncService {
 
         if let warning = snapshot.windows.first(where: { $0.hasExplicitLimit && $0.fractionUsed >= 0.90 }) {
             return CloudAlertDescriptor(
-                title: "\(snapshot.displayName) — 90% used",
+                title: "\(snapshot.accountDisplayName) — 90% used",
                 body: "\(warning.label): \(warning.measurementSummary). Resets in \(resetCountdown(for: warning.resetDate)).",
                 signature: "warning|\(warning.label)",
                 windowLabel: warning.label,
@@ -897,10 +798,6 @@ final class CloudKitSyncService {
         if h > 0 && m > 0 { return "\(h)h \(m)m" }
         if h > 0 { return "\(h)h" }
         return "\(m)m"
-    }
-
-    private func formatMetric(_ value: Double) -> String {
-        String(format: "%.6f", value)
     }
 
     private func loadAccountStatus() async -> CKAccountStatus {

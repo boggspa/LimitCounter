@@ -374,6 +374,110 @@ private func testResetAlertSignatureCarriesTheAccount() throws {
     try expectEqual(decoded.accountKey, .primary(.claude), "an alert published before accounts belongs to the primary")
 }
 
+private func testCloudAlertSignaturesKeepAccountsDistinct() throws {
+    let signature = "critical|Weekly"
+    let primary = CloudAlertPayload.cloudSignature(signature, account: .primary(.claude), label: "Personal")
+    try expectEqual(primary, signature, "primary cloud signatures remain byte-for-byte compatible")
+    let work = ProviderAccountKey(providerID: .claude, slot: "work01")
+    let home = ProviderAccountKey(providerID: .claude, slot: "home02")
+    let label = "Work | account-v1: · 日本語 🦊\nResearch"
+    let workSignature = CloudAlertPayload.cloudSignature(signature, account: work, label: label)
+    let homeSignature = CloudAlertPayload.cloudSignature(signature, account: home, label: nil)
+    try expect(workSignature != primary && homeSignature != primary && workSignature != homeSignature,
+               "simultaneous thresholds from three accounts have distinct cloud signatures")
+    try expectEqual(Array(workSignature.split(separator: "|").prefix(2)).map(String.init), ["critical", "Weekly"],
+                    "legacy clients still see the original threshold components first")
+    let metadata = CloudAlertPayload.cloudAccount(from: workSignature, providerID: .claude)
+    try expectEqual(metadata.slot, work.slot, "cloud metadata restores the secondary account")
+    try expect(metadata.label == nil, "mutable account labels are excluded from the deduplication signature")
+    try expectEqual(CloudAlertPayload.cloudSignature(signature, account: work, label: "Client | 新しい名前"), workSignature,
+                    "renaming an account leaves the threshold alert identity unchanged")
+    try expectEqual(CloudAlertPayload.cloudSignature(signature, account: work, label: nil), workSignature,
+                    "an unavailable cached label leaves the threshold alert identity unchanged")
+    try expectEqual(CloudAlertPayload.cloudAccount(from: homeSignature, providerID: .claude).label, nil,
+                    "an unlabelled account remains unlabelled")
+    try expectEqual(CloudAlertPayload.cloudSignature(workSignature, account: work, label: label), workSignature,
+                    "re-encoding metadata is stable and does not append it twice")
+    try expectEqual(CloudAlertPayload.parse(signature: workSignature).windowLabel, "Weekly",
+                    "account metadata does not become part of the window label")
+
+    let legacyMetadata = try JSONEncoder().encode(["accountKey": work.rawValue, "label": label])
+    let legacySignature = signature + "|account-v1:" + legacyMetadata.base64EncodedString()
+    try expectEqual(CloudAlertPayload.cloudAccount(from: legacySignature, providerID: .claude).label, label,
+                    "older suffix labels with pipes and unicode can still be read")
+    try expectEqual(CloudAlertPayload.cloudSignature(legacySignature, account: work, label: label), workSignature,
+                    "re-encoding an older suffix strips mutable presentation metadata")
+
+    let wrongProvider = CloudAlertPayload.cloudAccount(from: workSignature, providerID: .openai)
+    try expectEqual(wrongProvider.slot, "", "a suffix for another provider cannot assign an account")
+    try expect(wrongProvider.label == nil, "a rejected suffix does not leak its account label")
+}
+
+private func testCloudAlertMetadataPreservesResetKindsAndLegacyAccounts() throws {
+    let account = ProviderAccountKey(providerID: .claude, slot: "work01")
+    for (kind, resetKind) in [("unexpectedRecovery", QuotaResetKind.gifted),
+                              ("resetAvailable", .bankedAvailable),
+                              ("unexpectedRecovery", .bankedRedeemed)] {
+        let legacy = "reset|claude#work01|\(kind)|1760000000|Weekly|\(resetKind.rawValue)"
+        let signature = CloudAlertPayload.cloudSignature(legacy, account: account, label: "Work")
+        let parsed = CloudAlertPayload.parse(signature: signature)
+        try expectEqual(parsed.kind.rawValue, kind, "account metadata preserves reset classification")
+        try expectEqual(parsed.resetKind, resetKind, "account metadata preserves the finer reset kind")
+        try expectEqual(parsed.windowLabel, "Weekly", "the reset window still parses")
+        try expectEqual(CloudAlertPayload.cloudAccount(from: legacy, providerID: .claude).slot, "work01",
+                        "legacy reset signatures recover their account without a suffix")
+        try expectEqual(CloudAlertPayload.cloudAccount(from: legacy, providerID: .openai).slot, "",
+                        "legacy reset account recovery also checks the provider")
+    }
+    let oldReset = "reset|claude#work01|scheduledReset|1760000000|Weekly"
+    let parsedOldReset = CloudAlertPayload.parse(signature: CloudAlertPayload.cloudSignature(oldReset, account: account, label: nil))
+    try expectEqual(parsedOldReset.resetKind, .scheduled, "a suffix does not occupy an absent optional reset kind")
+
+    for malformed in ["critical|Weekly", "error|account-v1:not-base64", "reset|claude#Bad Slot!|unexpectedRecovery|1|Weekly"] {
+        let metadata = CloudAlertPayload.cloudAccount(from: malformed, providerID: .claude)
+        try expectEqual(metadata.slot, "", "absent or malformed account metadata falls back to primary")
+        try expect(metadata.label == nil, "absent or malformed account metadata has no label")
+    }
+    let malformedJSON = "{\"accountKey\":\"claude#Bad Slot!\",\"label\":\"Work\"}"
+    let invalidSlot = "critical|Weekly|account-v1:" + Data(malformedJSON.utf8).base64EncodedString()
+    try expectEqual(CloudAlertPayload.cloudAccount(from: invalidSlot, providerID: .claude).slot, "",
+                    "a malformed suffix slot is rejected rather than silently normalized")
+}
+
+private func testLocalAndCloudResetAlertsShareTheirSignature() throws {
+    let noticedAt = Date(timeIntervalSince1970: 1_760_000_000)
+    for resetKind in [QuotaResetKind.gifted, .bankedAvailable] {
+        let signal = QuotaSignal(
+            kind: .unexpectedRecovery,
+            title: "Weekly reset",
+            message: "Weekly reset or banked reset available",
+            severity: .info,
+            windowLabel: "Weekly",
+            detectedAt: noticedAt,
+            resetKind: resetKind
+        )
+        let current = snapshot(.claude, slot: "work01", label: "Work | 日本語", signals: [signal])
+        guard let alert = UsageResetAlertBuilder.resetAlert(for: current, noticedAt: noticedAt) else {
+            throw AccountTestError.failure("a secondary account produces its local reset alert")
+        }
+        let metadata = CloudAlertPayload.cloudAccount(from: alert.signature, providerID: .claude)
+        try expect(metadata.label == nil, "local reset signatures exclude mutable labels")
+        try expectEqual(metadata.slot, current.accountSlot, "the canonical local signature names its account")
+        let cloudSignature = CloudAlertPayload.cloudSignature(alert.signature, account: current.accountKey, label: current.accountBadgeText)
+        try expectEqual(alert.signature, cloudSignature, "publishing either reset kind preserves the local deduplication identity")
+        try expectEqual(CloudAlertPayload.parse(signature: cloudSignature).resetKind, resetKind,
+                        "canonical reset signatures retain their classification")
+        let renamed = snapshot(.claude, slot: "work01", label: "Client | 新しい名前", signals: [signal])
+        guard let renamedAlert = UsageResetAlertBuilder.resetAlert(for: renamed, noticedAt: noticedAt) else {
+            throw AccountTestError.failure("renaming an account preserves its reset alert")
+        }
+        try expectEqual(renamedAlert.signature, alert.signature, "renaming does not duplicate a local reset or available-reset alert")
+        try expectEqual(CloudAlertPayload.cloudSignature(renamedAlert.signature, account: renamed.accountKey, label: renamed.accountBadgeText),
+                        cloudSignature, "renaming preserves the same cloud reset deduplication identity")
+        try expectEqual(renamedAlert.accountLabel, renamed.accountBadgeText, "the payload still carries the current presentation label")
+    }
+}
+
 @main
 private enum ProviderAccountTestRunner {
     static func main() async throws {
@@ -391,6 +495,9 @@ private enum ProviderAccountTestRunner {
         try testDetectorStateIsPerAccount()
         try testResetEventsCarryTheAccount()
         try testResetAlertSignatureCarriesTheAccount()
+        try testCloudAlertSignaturesKeepAccountsDistinct()
+        try testCloudAlertMetadataPreservesResetKindsAndLegacyAccounts()
+        try testLocalAndCloudResetAlertsShareTheirSignature()
         print("Provider account tests passed")
     }
 }

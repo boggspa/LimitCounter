@@ -104,12 +104,25 @@ Stated plainly, including the parts that are limitations rather than features.
 no `CKShare`). There is no maintainer-operated server anywhere in the app, and
 the maintainer cannot read what you sync.
 
-**What is uploaded.** One record per provider, holding the normalized snapshot:
-provider, display name, plan name, meter values and totals, reset dates, fetch
-timestamps, a status hash, a payload version, and any alert title/body text. No
-credentials of any kind — no API keys, OAuth tokens, cookies or session headers,
-and no raw provider API responses. Those stay in the macOS Keychain, which the
-widget extension has no entitlement to reach.
+**What is uploaded.** One record per provider holds its primary snapshot and
+complete secondary-account list. Each account retains its label, opaque slot,
+hashed identity, meter values, credit balances, banked resets, and fetch time.
+Payload version 3 keeps the primary at the JSON root so older viewers can still
+read it. New viewers replace an account list only after that provider's payload
+has downloaded and validated; a failed fetch preserves its cached accounts. A
+legacy primary-only payload cannot remove cached secondary accounts. Credentials
+and raw provider responses stay on the Mac: no API keys, OAuth tokens, cookies,
+session headers or folder grants are included. Account-aware alerts use the
+existing signature field, so this upgrade needs no new CloudKit schema fields.
+
+**Code updates and data updates are separate.** New sections and widget layouts
+require a new iOS app/extension build as well as the Mac publisher build. The
+shared dashboard already provides Usage Credits and Resets Available on both
+platforms; iCloud supplies their values and account labels. Compact-layout
+selection, visibility and drag ordering remain local to each device. iOS refreshes
+on foreground entry, pull-to-refresh, its foreground timer, and system-granted
+background opportunities. The app and Mac must use the same iCloud account and
+CloudKit environment; a Mac notarisation does not install new code on iPhone.
 
 **Push notifications.** Alert text can reach the iOS viewer through Apple Push
 Notification service. The macOS app carries no `aps-environment` entitlement, so

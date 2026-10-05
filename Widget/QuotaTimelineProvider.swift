@@ -65,7 +65,7 @@ public struct QuotaTimelineProvider: TimelineProvider {
         let visible = filteredSnapshots(snapshots)
 
         // Find special cases like Codex (usage + telemetry are shown together in one card)
-        let usageSnapshot = visible.first(where: { $0.providerID == .openai })
+        let usageSnapshot = visible.first(where: { $0.providerID == .openai && $0.isPrimaryAccount })
         let telemetrySnapshot = visible.first(where: { $0.providerID == .codexTelemetry })
 
         var items: [QuotaSnapshot] = []
@@ -103,6 +103,13 @@ public struct QuotaTimelineProvider: TimelineProvider {
         let refreshBucket = max(Int(date.timeIntervalSinceReferenceDate / 900), 0)
         let offset = refreshBucket % ordered.count
         return Array(ordered[offset...]) + Array(ordered[..<offset])
+    }
+
+    /// Local Codex telemetry belongs to the primary account's folder. A
+    /// rotating widget must not attach it to a secondary Codex account.
+    static func telemetrySnapshot(for snapshot: QuotaSnapshot, from snapshots: [QuotaSnapshot]) -> QuotaSnapshot? {
+        guard snapshot.providerID == .openai, snapshot.isPrimaryAccount else { return nil }
+        return snapshots.first { $0.providerID == .codexTelemetry && $0.isPrimaryAccount }
     }
 
     private func filteredSnapshots(_ snapshots: [QuotaSnapshot]) -> [QuotaSnapshot] {
@@ -209,7 +216,7 @@ public struct QuotaWidgetEntryView: View {
         entry.snapshots.flatMap { snapshot in
             snapshot.summaryWindows.map { window in
                 LockScreenMetric(
-                    id: "\(snapshot.providerID.rawValue)-\(window.id.uuidString)",
+                    id: "\(snapshot.accountKey.rawValue)-\(window.id.uuidString)",
                     snapshot: snapshot,
                     window: window
                 )
@@ -254,8 +261,8 @@ public struct QuotaWidgetEntryView: View {
     }
 
     private func lockScreenTitle(for metrics: [LockScreenMetric]) -> String {
-        let providers = Set(metrics.map(\.snapshot.providerID))
-        guard providers.count == 1, let first = metrics.first else {
+        let accounts = Set(metrics.map(\.snapshot.accountKey))
+        guard accounts.count == 1, let first = metrics.first else {
             return "Limit Counter"
         }
         return first.snapshot.accountDisplayName
@@ -267,6 +274,9 @@ public struct QuotaWidgetEntryView: View {
             label = label.replacingOccurrences(of: "GPT-5.3-Codex-Spark", with: "5.3 Spark")
             label = label.replacingOccurrences(of: "Codex Spark", with: "Spark")
             label = label.replacingOccurrences(of: " Weekly", with: " Wk")
+        }
+        if let badge = metric.snapshot.accountBadgeText {
+            return "\(badge) · \(label)"
         }
         return label
     }
@@ -472,10 +482,6 @@ public struct SingleProviderWidgetEntryView: View {
         self.entry = entry
     }
 
-    private var telemetrySnapshot: QuotaSnapshot? {
-        entry.allSnapshots.first(where: { $0.providerID == .codexTelemetry })
-    }
-
     public var body: some View {
         Group {
             if let first = entry.snapshots.first(where: { $0.providerID != .codexTelemetry }) {
@@ -486,7 +492,7 @@ public struct SingleProviderWidgetEntryView: View {
                 case .systemLarge:
                     LargeSingleProviderView(
                         snapshot: first,
-                        telemetrySnapshot: first.providerID == .openai ? telemetrySnapshot : nil,
+                        telemetrySnapshot: QuotaTimelineProvider.telemetrySnapshot(for: first, from: entry.allSnapshots),
                         style: .bare
                     )
                     .padding(10)
@@ -1406,7 +1412,7 @@ private enum LockScreenMeterStackSelector {
     ) -> LockScreenMeterStackRow {
         let title = compactTitle(for: snapshot, window: window, mode: mode, isSupplementalCodex: isSupplementalCodex)
         return LockScreenMeterStackRow(
-            id: "\(snapshot.providerID.rawValue)-\(window.id.uuidString)",
+            id: "\(snapshot.accountKey.rawValue)-\(window.id.uuidString)",
             providerID: snapshot.providerID,
             title: title,
             valueText: window.leadingValueText,
@@ -1435,7 +1441,8 @@ private enum LockScreenMeterStackSelector {
         label = label.replacingOccurrences(of: "Codex", with: "")
         label = label.replacingOccurrences(of: "Weekly", with: "")
         label = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        return label.isEmpty ? "Codex Extra" : "Codex \(label)"
+        let accountTitle = snapshot.accountBadgeText.map { "Codex · \($0)" } ?? "Codex"
+        return label.isEmpty ? "\(accountTitle) Extra" : "\(accountTitle) \(label)"
     }
 
     private static func isFiveHourWindow(_ window: QuotaWindow) -> Bool {
@@ -1762,6 +1769,8 @@ public struct SelectQuotaTrioIntent: WidgetConfigurationIntent {
     }
 }
 
+#endif
+
 /// One row in the trio. Carries everything the row view needs to render
 /// without poking back at the original snapshot — including the raw
 /// `resetDate` so the row view can show an inline countdown like
@@ -1770,11 +1779,9 @@ public struct SelectQuotaTrioIntent: WidgetConfigurationIntent {
 public struct SelectQuotaTrioMeterRow: Identifiable, Hashable {
     public let id: String
     public let providerID: ProviderID
-    /// Window label — "Session", "Weekly", "Fable", "Pro 3.1 (preview)" etc.
-    /// We deliberately use the window label (not the provider's display
-    /// name) so a user picking three Claude meters sees "Session / Weekly
-    /// / Fable" rather than "Claude Code" three times. The provider icon
-    /// disambiguates when rows span multiple providers.
+    /// Window label, prefixed with the account badge for secondary accounts.
+    /// The provider icon identifies the provider; the badge distinguishes two
+    /// accounts' "Weekly" meters without repeating the provider name.
     public let title: String
     public let valueText: String
     public let fraction: Double
@@ -1784,6 +1791,8 @@ public struct SelectQuotaTrioMeterRow: Identifiable, Hashable {
     public let pace: QuotaPace?
     public let segmentCount: Int?
 }
+
+#if os(iOS)
 
 /// Entry payload for the trio widget — a pre-built array of stack rows.
 public struct SelectQuotaTrioEntry: TimelineEntry {
@@ -1839,11 +1848,13 @@ public struct SelectQuotaTrioTimelineProvider: AppIntentTimelineProvider {
     }
 }
 
+#endif
+
 /// Builds `SelectQuotaTrioMeterRow` items from the user's selected metric
 /// IDs. The ID format mirrors `SelectQuotaTimelineProvider.filteredSnapshots`
-/// (`"<providerID>:<windowLabel>"`) so the existing `QuotaWindowEntity`
+/// (`"<accountKey>:<windowLabel>"`) so the existing `QuotaWindowEntity`
 /// picker continues to work unchanged.
-private enum SelectQuotaTrioRowBuilder {
+enum SelectQuotaTrioRowBuilder {
     /// Hard cap: this widget renders exactly 3 rows. Anything the user
     /// picks beyond that is silently dropped (matches how the 2-meter
     /// variant truncates with `prefix(2)`).
@@ -1889,9 +1900,9 @@ private enum SelectQuotaTrioRowBuilder {
 
     private static func row(snapshot: QuotaSnapshot, window: QuotaWindow, at date: Date) -> SelectQuotaTrioMeterRow {
         SelectQuotaTrioMeterRow(
-            id: "\(snapshot.providerID.rawValue):\(window.label)",
+            id: "\(snapshot.accountKey.rawValue):\(window.label)",
             providerID: snapshot.providerID,
-            title: window.label,
+            title: snapshot.accountBadgeText.map { "\($0) · \(window.label)" } ?? window.label,
             valueText: window.leadingValueText,
             fraction: window.fractionUsed,
             accentHex: snapshot.providerID.accentColorHex,
@@ -1902,6 +1913,8 @@ private enum SelectQuotaTrioRowBuilder {
         )
     }
 }
+
+#if os(iOS)
 
 public struct SelectQuotaTrioEntryView: View {
     let entry: SelectQuotaTrioEntry
@@ -2024,7 +2037,9 @@ public struct AIUsageLockScreenTrioWidget: Widget {
 
 // MARK: - Widget Bundle
 
+#if !WIDGET_ACCOUNT_PARITY_TESTS
 @main
+#endif
 public struct AIUsageTrackerWidgetBundle: WidgetBundle {
     public init() {}
 

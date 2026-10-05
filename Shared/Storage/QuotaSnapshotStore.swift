@@ -1196,6 +1196,28 @@ public final class ProviderAccountRegistry: ObservableObject {
 
     // MARK: Writing
 
+    /// iOS mirrors only the account roster and labels, never Mac credentials.
+    /// The caller supplies the merged cache so failed providers keep their rows.
+    public func reconcileSyncedAccounts(from snapshots: [QuotaSnapshot]) {
+        let existing = Dictionary(records.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        var positions: [ProviderID: Int] = [:]
+        var seen = Set<ProviderAccountKey>()
+        let synced: [ProviderAccountRecord] = snapshots.compactMap { snapshot in
+            guard !snapshot.isPrimaryAccount, snapshot.providerID.supportsAdditionalAccounts,
+                  seen.insert(snapshot.accountKey).inserted else { return nil }
+            positions[snapshot.providerID, default: 0] += 1
+            return ProviderAccountRecord(
+                providerID: snapshot.providerID, slot: snapshot.accountSlot,
+                label: snapshot.accountLabel ?? existing[snapshot.accountKey]?.label ?? "Account \(positions[snapshot.providerID]! + 1)",
+                createdAt: existing[snapshot.accountKey]?.createdAt ?? snapshot.fetchedAt,
+                position: positions[snapshot.providerID]!
+            )
+        }
+        guard synced != records else { return }
+        records = synced
+        save()
+    }
+
     /// Adds a secondary account and returns it. A blank label gets a numbered
     /// default so the card never shows an empty chip.
     @discardableResult

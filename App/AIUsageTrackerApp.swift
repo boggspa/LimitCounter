@@ -8,6 +8,8 @@ import UIKit
 @main
 struct AIUsageTrackerApp: App {
 
+    @Environment(\.scenePhase) private var scenePhase
+
     #if os(iOS)
     @UIApplicationDelegateAdaptor private var appDelegate: IOSAppDelegate
     #endif
@@ -49,6 +51,13 @@ struct AIUsageTrackerApp: App {
                     menuBarController?.updateMenu()
                     #endif
                 }
+                .onChange(of: scenePhase) { phase in
+                    #if os(iOS)
+                    if phase == .active {
+                        Task { await appState.refresh() }
+                    }
+                    #endif
+                }
         }
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
@@ -60,7 +69,15 @@ struct AIUsageTrackerApp: App {
 #if os(iOS)
 final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     private let backgroundTaskIdentifier = "com.chrisizatt.LLMUsageCounter.refresh"
-    weak var appState: AppStateStore?
+    private var pendingNotificationAccount: ProviderAccountKey?
+    weak var appState: AppStateStore? {
+        didSet {
+            if let appState, let account = pendingNotificationAccount {
+                appState.pendingDeepLinkAccountKey = account
+                pendingNotificationAccount = nil
+            }
+        }
+    }
 
     func application(
         _ application: UIApplication,
@@ -149,11 +166,17 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
         didReceive response: UNNotificationResponse
     ) async {
         let info = response.notification.request.content.userInfo
-        guard let providerID = CloudKitSyncService.shared.providerID(fromNotificationUserInfo: info) else { return }
+        guard let account = CloudKitSyncService.shared.accountKey(fromNotificationUserInfo: info) else { return }
 
         switch response.actionIdentifier {
         case AlertNotificationContent.openActionIdentifier, UNNotificationDefaultActionIdentifier:
-            await MainActor.run { self.appState?.pendingDeepLinkProviderID = providerID }
+            await MainActor.run {
+                if let appState = self.appState {
+                    appState.pendingDeepLinkAccountKey = account
+                } else {
+                    self.pendingNotificationAccount = account
+                }
+            }
         default:
             break
         }
@@ -242,7 +265,9 @@ final class MacNotificationCoordinator: NSObject, UNUserNotificationCenterDelega
         switch actionIdentifier {
         case AlertNotificationContent.openActionIdentifier, UNNotificationDefaultActionIdentifier:
             Task { @MainActor in
-                self.appState?.pendingDeepLinkProviderID = providerID
+                self.appState?.pendingDeepLinkAccountKey = ProviderAccountKey(
+                    providerID: providerID, slot: info["accountSlot"] as? String ?? ""
+                )
                 NSApp.activate(ignoringOtherApps: true)
             }
         default:

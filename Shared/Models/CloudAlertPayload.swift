@@ -128,6 +128,60 @@ public struct CloudAlertPayload: Codable, Hashable {
 }
 
 public extension CloudAlertPayload {
+    /// Carry account identity through the existing CloudKit signature field.
+    /// Keeping the original components first lets older clients continue to
+    /// classify alerts without adding fields to the deployed record schema.
+    /// Labels are presentation only: renaming an account must not create a
+    /// second alert or reset-history entry for the same event.
+    nonisolated static func cloudSignature(
+        _ signature: String,
+        account: ProviderAccountKey,
+        label _: String?
+    ) -> String {
+        guard !account.isPrimary else { return signature }
+        let metadata = ["accountKey": account.rawValue]
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(metadata) else { return signature }
+        return baseCloudSignature(signature) + "|account-v1:" + data.base64EncodedString()
+    }
+
+    /// Read the account suffix, or recover the slot from a reset signature
+    /// written by the first account-aware builds. Invalid metadata never
+    /// redirects an alert to another provider or an invented account slot.
+    nonisolated static func cloudAccount(
+        from signature: String,
+        providerID: ProviderID
+    ) -> (slot: String, label: String?) {
+        let primary: (slot: String, label: String?) = (ProviderAccountKey.primarySlot, nil)
+        if let suffix = signature.range(of: "|account-v1:", options: .backwards) {
+            guard let data = Data(base64Encoded: String(signature[suffix.upperBound...])),
+                  let metadata = try? JSONDecoder().decode([String: String].self, from: data),
+                  let rawKey = metadata["accountKey"],
+                  let account = ProviderAccountKey(rawValue: rawKey),
+                  account.providerID == providerID,
+                  !account.isPrimary else {
+                return primary
+            }
+            return (account.slot, metadata["label"])
+        }
+
+        let parts = signature.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count >= 4, parts[0] == "reset",
+              let account = ProviderAccountKey(rawValue: String(parts[1])),
+              account.providerID == providerID else {
+            return primary
+        }
+        return (account.slot, nil)
+    }
+
+    private nonisolated static func baseCloudSignature(_ signature: String) -> String {
+        guard let suffix = signature.range(of: "|account-v1:", options: .backwards) else {
+            return signature
+        }
+        return String(signature[..<suffix.lowerBound])
+    }
+
     /// Derive `kind` and `windowLabel` from the signature string produced by
     /// `CloudKitSyncService.alertDescriptor(for:)`.
     ///
@@ -143,7 +197,7 @@ public extension CloudAlertPayload {
     nonisolated static func parse(
         signature: String
     ) -> (kind: CloudAlertKind, windowLabel: String?, resetKind: QuotaResetKind?) {
-        let parts = signature.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        let parts = baseCloudSignature(signature).split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard let first = parts.first else { return (.threshold, nil, nil) }
         switch first {
         case "reset":
@@ -230,6 +284,8 @@ public enum UsageResetAlertBuilder {
             // The account key sits where the provider raw value used to: the
             // primary account's signatures are unchanged, and a secondary
             // account's reset can never be deduplicated away as the primary's.
+            // Add cloud metadata locally too, so publishing the same reset
+            // never gives it a second deduplication identity.
             let signature = [
                 "reset",
                 snapshot.accountKey.rawValue,
@@ -243,7 +299,11 @@ public enum UsageResetAlertBuilder {
                 providerID: snapshot.providerID,
                 title: title,
                 body: body,
-                signature: signature,
+                signature: CloudAlertPayload.cloudSignature(
+                    signature,
+                    account: snapshot.accountKey,
+                    label: snapshot.accountBadgeText
+                ),
                 createdAt: noticedAt,
                 windowLabel: labelSummary,
                 kind: kind,
@@ -274,7 +334,11 @@ public enum UsageResetAlertBuilder {
             providerID: snapshot.providerID,
             title: "\(snapshot.accountDisplayName) reset available",
             body: "\(available.message) Noticed at \(clockString(for: noticedAt)).",
-            signature: signature,
+            signature: CloudAlertPayload.cloudSignature(
+                signature,
+                account: snapshot.accountKey,
+                label: snapshot.accountBadgeText
+            ),
             createdAt: noticedAt,
             windowLabel: labelSummary,
             kind: .resetAvailable,

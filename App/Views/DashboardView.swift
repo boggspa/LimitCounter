@@ -119,10 +119,13 @@ struct DashboardView: View {
             }
             appState.pendingDeepLinkProviderID = nil
         }
+        .onChange(of: appState.pendingDeepLinkAccountKey) { _ in openPendingAccountRoute() }
+        .onChange(of: appState.snapshots) { _ in openPendingAccountRoute() }
         .onChange(of: appState.pendingModelUsageNavigation) { pending in
             if pending { openModelUsage() }
         }
         .onAppear {
+            openPendingAccountRoute()
             if appState.pendingModelUsageNavigation { openModelUsage() }
         }
     }
@@ -928,14 +931,26 @@ struct DashboardView: View {
     }
 
     private func routeForProvider(_ providerID: ProviderID) -> DashboardRoute? {
-        guard let snapshot = snapshotFor(providerID) else { return nil }
+        routeForAccount(.primary(providerID))
+    }
 
-        if providerID == .openai,
+    private func routeForAccount(_ account: ProviderAccountKey) -> DashboardRoute? {
+        guard let snapshot = appState.snapshots.first(where: { $0.accountKey == account }) else { return nil }
+
+        if account == .primary(.openai),
            let telemetrySnapshot = appState.snapshots.first(where: { $0.providerID == .codexTelemetry && $0.fetchState == .success && $0.hasContent }) {
             return .codexCombined(usageSnapshot: snapshot, telemetrySnapshot: telemetrySnapshot)
         }
 
         return .provider(snapshot)
+    }
+
+    private func openPendingAccountRoute() {
+        guard let account = appState.pendingDeepLinkAccountKey,
+              let route = routeForAccount(account) else { return }
+        navigationPath = NavigationPath()
+        navigationPath.append(route)
+        appState.pendingDeepLinkAccountKey = nil
     }
 
     private var lastSyncText: String {
