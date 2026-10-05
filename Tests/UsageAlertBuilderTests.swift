@@ -166,6 +166,9 @@ private enum UsageAlertBuilderTestRunner {
         try testRepeatedWindowResetGetsNewSignature()
         try testClassifiedSignalsDriveTheAlert()
         try testLegacySignalsStillReadAsEarlyResets()
+        try testBankedAvailabilityRequiresCurrentCredits()
+        try testAvailabilityReplayIsRetiredAfterRedemption()
+        try testResetPublicationSurvivesUnrelatedAlerts()
         print("Usage alert builder tests passed")
     }
 }
@@ -190,7 +193,7 @@ private func testClassifiedSignalsDriveTheAlert() throws {
     // never counted as a reset that happened.
     let available = snapshot(signals: [
         classifiedSignal(.bankedAvailable, label: "Banked reset", message: "1 usage-limit reset is banked and expires in 2h.", detectedAt: noticedAt)
-    ])
+    ]).withResetCredits(QuotaResetCreditSummary(availableCount: 1, observedAt: noticedAt))
     let availableAlert = try UsageResetAlertBuilder.resetAlert(for: available, noticedAt: noticedAt).orThrow("available alert")
     try alertExpectEqual(availableAlert.kind, .resetAvailable, "available kind")
     try alertExpectEqual(availableAlert.resetKind, .bankedAvailable, "available reset kind")
@@ -229,6 +232,48 @@ private func testClassifiedSignalsDriveTheAlert() throws {
         classifiedSignal(.scheduled, label: "Weekly", message: "Quota refreshed from 80% to 0%.", detectedAt: noticedAt)
     ])
     try alertExpect(UsageResetAlertBuilder.resetAlert(for: scheduled, noticedAt: noticedAt) == nil, "scheduled stays quiet")
+}
+
+private func testBankedAvailabilityRequiresCurrentCredits() throws {
+    let date = Date(timeIntervalSince1970: 10_000)
+    let stale = snapshot(signals: [classifiedSignal(.bankedAvailable, label: "Banked reset", message: "old availability", detectedAt: date)])
+    try alertExpect(UsageResetAlertBuilder.resetAlert(for: stale, noticedAt: date) == nil, "missing current credits cannot re-announce a standing notice")
+    try alertExpect(UsageResetAlertBuilder.resetAlert(for: stale.withResetCredits(.init(availableCount: 0)), noticedAt: date) == nil, "authoritative zero suppresses old availability")
+    let history = [QuotaResetCreditEvent(id: "used", kind: .used, occurredAt: date.addingTimeInterval(10))]
+    try alertExpect(UsageResetAlertBuilder.resetAlert(for: stale.withResetCredits(.init(availableCount: 1, history: history)), noticedAt: date.addingTimeInterval(20)) == nil, "remaining credits cannot make a pre-redemption announcement current again")
+}
+
+private func testAvailabilityReplayIsRetiredAfterRedemption() throws {
+    let date = Date(timeIntervalSince1970: 20_000)
+    let granted = snapshot(signals: [classifiedSignal(.bankedAvailable, label: "Banked reset", message: "available", detectedAt: date)])
+        .withResetCredits(.init(availableCount: 1, observedAt: date))
+    let alert = try UsageResetAlertBuilder.resetAlert(for: granted, noticedAt: date).orThrow("current banked alert")
+    try alertExpect(alert.isRelevant(to: [granted]), "current availability remains relevant")
+    try alertExpect(!alert.isRelevant(to: [granted.withResetCredits(.init(availableCount: 0))]), "replay is retired after count reaches zero")
+    try alertExpect(!alert.isRelevant(to: []), "no account reading means no actionable old availability")
+    let other = granted.withAccount(slot: "work", label: "Work", fingerprint: nil)
+    try alertExpect(!alert.isRelevant(to: [other]), "another account's credits cannot keep an old alert alive")
+    let consumed = granted.withResetCredits(.init(availableCount: 1, history: [.init(id: "used", kind: .used, occurredAt: date.addingTimeInterval(10))]))
+    try alertExpect(!alert.isRelevant(to: [consumed]), "replay is retired after partial redemption too")
+    let newGrant = consumed.withSignals([classifiedSignal(.bankedAvailable, label: "Banked reset", message: "new grant", detectedAt: date.addingTimeInterval(30))])
+    let newAlert = try UsageResetAlertBuilder.resetAlert(for: newGrant, noticedAt: date.addingTimeInterval(30)).orThrow("new grant after use")
+    try alertExpect(newAlert.isRelevant(to: [newGrant]), "a genuine later grant can still notify")
+}
+
+private func testResetPublicationSurvivesUnrelatedAlerts() throws {
+    let first = "reset|openai|resetAvailable|1000|Banked reset|bankedAvailable"
+    let reminder = "reset|openai|resetAvailable|2000|Banked reset|bankedAvailable"
+    var history = ResetAlertPublication.remember(first, in: [])
+    history = ResetAlertPublication.remember(reminder, in: history)
+    try alertExpect(history.contains(first), "publishing a different notice cannot forget the grant")
+    for latest in [nil, "error", "warning|Weekly", reminder] {
+        try alertExpect(!ResetAlertPublication.shouldPublish(signature: first, kind: .resetAvailable, lastSignature: latest, resetHistory: history), "no alert, error, threshold or expiry notice cannot re-arm an already-published grant")
+    }
+    try alertExpect(ResetAlertPublication.shouldPublish(signature: "reset|openai|resetAvailable|3000|Banked reset|bankedAvailable", kind: .resetAvailable, lastSignature: reminder, resetHistory: history), "a genuine later grant publishes")
+    try alertExpect(ResetAlertPublication.shouldPublish(signature: "warning|Weekly", kind: .threshold, lastSignature: nil, resetHistory: history), "reset dedup preserves recurring threshold transitions")
+    try alertExpectEqual(ResetAlertPublication.remember(first, in: history).count, 2, "retry does not duplicate the saved signature")
+    try alertExpectEqual(ResetAlertPublication.recordName(signature: first), ResetAlertPublication.recordName(signature: first), "retry/second publisher addresses the same cloud event")
+    try alertExpect(ResetAlertPublication.recordName(signature: first) != ResetAlertPublication.recordName(signature: reminder), "the intentional expiry reminder remains a distinct event")
 }
 
 private func testLegacySignalsStillReadAsEarlyResets() throws {

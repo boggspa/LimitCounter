@@ -122,11 +122,13 @@ final class IOSAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationC
                 if alerts.isEmpty {
                     alerts = (try? await CloudKitSyncService.shared.fetchRecentAlerts(since: nil, limit: 5)) ?? []
                 }
-                if !CloudKitSyncService.shared.hasVisibleAlertPayload(userInfo) {
+                let visible = CloudKitSyncService.shared.hasVisibleAlertPayload(userInfo)
+                if visible { LocalNotificationPublisher.shared.markDelivered(alerts) }
+                let didUpdate = await CloudSnapshotBackgroundRefresher.refreshFromCloudKit()
+                if !visible {
                     await LocalNotificationPublisher.shared.processIncomingAlerts(alerts)
                 }
 
-                let didUpdate = await CloudSnapshotBackgroundRefresher.refreshFromCloudKit()
                 self.scheduleBackgroundRefresh()
                 completionHandler(didUpdate ? .newData : .noData)
             }

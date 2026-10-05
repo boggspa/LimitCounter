@@ -94,6 +94,7 @@ final class CloudKitSyncService {
     private let subscriptionVersionKey = "cloudkit.viewerSubscriptionVersion"
     private let publishedHashKey = "cloudkit.publishedStatusHashes"
     private let lastAlertSignatureKey = "cloudkit.lastAlertSignatures"
+    private let publishedResetSignaturesKey = "cloudkit.publishedResetSignatures.v1"
     private let publishDebugStateKey = "cloudkit.debug.publish"
     private let fetchDebugStateKey = "cloudkit.debug.fetch"
     private let subscriptionDebugStateKey = "cloudkit.debug.subscriptions"
@@ -292,6 +293,10 @@ final class CloudKitSyncService {
                 print("[CloudKitSync] Previous publish failed — forcing full status republish")
             }
             var lastAlertSignatures = defaults.dictionary(forKey: lastAlertSignatureKey) as? [String: String] ?? [:]
+            var publishedResetSignatures = defaults.stringArray(forKey: publishedResetSignaturesKey) ?? []
+            for signature in lastAlertSignatures.values where signature.hasPrefix("reset|") {
+                publishedResetSignatures = ResetAlertPublication.remember(signature, in: publishedResetSignatures)
+            }
             var emittedAlerts: [CloudAlertPayload] = []
             var statusFailures: [String] = []
             var alertFailures: [String] = []
@@ -326,11 +331,20 @@ final class CloudKitSyncService {
                 let alertDescriptor = alertDescriptor(for: snapshot)
 
                 if let alertDescriptor {
-                    if lastAlertSignatures[providerKey] != alertDescriptor.signature {
+                    let isReset = alertDescriptor.kind.isUsageReset || alertDescriptor.kind == .resetAvailable
+                    if ResetAlertPublication.shouldPublish(
+                        signature: alertDescriptor.signature, kind: alertDescriptor.kind,
+                        lastSignature: lastAlertSignatures[providerKey], resetHistory: publishedResetSignatures
+                    ) {
                         let createdAt = Date()
                         do {
-                            try await saveAlertRecord(snapshot, descriptor: alertDescriptor, createdAt: createdAt)
+                            let created = try await saveAlertRecord(snapshot, descriptor: alertDescriptor, createdAt: createdAt)
                             lastAlertSignatures[providerKey] = alertDescriptor.signature
+                            if isReset {
+                                publishedResetSignatures = ResetAlertPublication.remember(alertDescriptor.signature, in: publishedResetSignatures)
+                                defaults.set(publishedResetSignatures, forKey: publishedResetSignaturesKey)
+                            }
+                            guard created else { continue }
                             emittedAlerts.append(
                                 CloudAlertPayload(
                                     providerID: snapshot.providerID,
@@ -358,6 +372,7 @@ final class CloudKitSyncService {
 
             defaults.set(publishedHashes, forKey: publishedHashKey)
             defaults.set(lastAlertSignatures, forKey: lastAlertSignatureKey)
+            defaults.set(publishedResetSignatures, forKey: publishedResetSignaturesKey)
 
             if !statusFailures.isEmpty {
                 let message = "Failed to publish CloudKit status records: \(statusFailures.joined(separator: "; "))"
@@ -575,8 +590,11 @@ final class CloudKitSyncService {
         }
     }
 
-    private func saveAlertRecord(_ snapshot: QuotaSnapshot, descriptor: CloudAlertDescriptor, createdAt: Date) async throws {
-        let recordID = CKRecord.ID(recordName: "alert.\(UUID().uuidString)")
+    private func saveAlertRecord(_ snapshot: QuotaSnapshot, descriptor: CloudAlertDescriptor, createdAt: Date) async throws -> Bool {
+        let isReset = descriptor.kind.isUsageReset || descriptor.kind == .resetAvailable
+        let recordID = CKRecord.ID(recordName: isReset
+            ? ResetAlertPublication.recordName(signature: descriptor.signature)
+            : "alert.\(UUID().uuidString)")
         let record = CKRecord(recordType: alertRecordType, recordID: recordID)
 
         record["providerID"] = snapshot.providerID.rawValue as NSString
@@ -593,19 +611,15 @@ final class CloudKitSyncService {
         record["createdAt"] = createdAt as NSDate
         record["statusRecordName"] = statusRecordName(for: snapshot.providerID) as NSString
 
-        let operation = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: [])
-        operation.savePolicy = .changedKeys
-        operation.qualityOfService = .userInitiated
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            operation.modifyRecordsCompletionBlock = { _, _, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-            database.add(operation)
+        do {
+            _ = try await database.save(record)
+            return true
+        } catch let error as CKError where isReset && error.code == .serverRecordChanged {
+            // Creation raced, or a prior successful response was lost. Never
+            // rewrite its createdAt or emit another notification locally.
+            guard let existing = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord,
+                  existing["signature"] as? String == descriptor.signature else { throw error }
+            return false
         }
     }
 
@@ -732,6 +746,7 @@ final class CloudKitSyncService {
             noticedAt: Date(),
             freshnessWindow: 30 * 60
         ) {
+            guard resetAlert.isAnnounceable else { return nil }
             return CloudAlertDescriptor(
                 title: resetAlert.title,
                 body: resetAlert.body,

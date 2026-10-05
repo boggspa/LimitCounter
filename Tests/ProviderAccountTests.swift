@@ -457,6 +457,7 @@ private func testLocalAndCloudResetAlertsShareTheirSignature() throws {
             resetKind: resetKind
         )
         let current = snapshot(.claude, slot: "work01", label: "Work | 日本語", signals: [signal])
+            .withResetCredits(.init(availableCount: 1, observedAt: noticedAt))
         guard let alert = UsageResetAlertBuilder.resetAlert(for: current, noticedAt: noticedAt) else {
             throw AccountTestError.failure("a secondary account produces its local reset alert")
         }
@@ -468,6 +469,7 @@ private func testLocalAndCloudResetAlertsShareTheirSignature() throws {
         try expectEqual(CloudAlertPayload.parse(signature: cloudSignature).resetKind, resetKind,
                         "canonical reset signatures retain their classification")
         let renamed = snapshot(.claude, slot: "work01", label: "Client | 新しい名前", signals: [signal])
+            .withResetCredits(.init(availableCount: 1, observedAt: noticedAt))
         guard let renamedAlert = UsageResetAlertBuilder.resetAlert(for: renamed, noticedAt: noticedAt) else {
             throw AccountTestError.failure("renaming an account preserves its reset alert")
         }

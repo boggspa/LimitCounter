@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum CloudAlertKind: String, Codable, Hashable {
     case scheduledReset
@@ -107,6 +108,34 @@ public struct CloudAlertPayload: Codable, Hashable {
         return resetKind != .bankedRedeemed
     }
 
+    /// Availability is current state, not permanent history. Do not revive an
+    /// old CloudKit notice after the matching account has used its banked reset.
+    public nonisolated func isRelevant(to snapshots: [QuotaSnapshot]) -> Bool {
+        guard kind == .resetAvailable || resetKind == .bankedAvailable else { return true }
+        guard let snapshot = snapshots.first(where: { $0.accountKey == accountKey }) else { return false }
+        let parts = Self.baseCloudSignature(signature).split(separator: "|", omittingEmptySubsequences: false)
+        let observedAt = parts.count > 3 ? Double(parts[3]).map(Date.init(timeIntervalSince1970:)) ?? createdAt : createdAt
+        // Signatures intentionally use seconds so JSON cache round trips do
+        // not mint new identities. Retain subsecond ordering while the live
+        // signal is present, including use+grant in one refresh.
+        let exactObservation = snapshot.signals.first {
+            $0.resetKind == .bankedAvailable && Int($0.detectedAt.timeIntervalSince1970) == Int(observedAt.timeIntervalSince1970)
+        }?.detectedAt ?? observedAt
+        return Self.bankedAvailabilityIsCurrent(in: snapshot, announcedAt: exactObservation)
+    }
+
+    public nonisolated static func bankedAvailabilityIsCurrent(in snapshot: QuotaSnapshot, announcedAt: Date) -> Bool {
+        guard snapshot.fetchState.isHealthy,
+              let summary = snapshot.resetCredits, summary.availableCount > 0 else { return false }
+        let usedAt = summary.history.filter { $0.kind == .used }.map(\.occurredAt).max()
+        let redemptionAt = snapshot.signals.filter { $0.resetKind == .bankedRedeemed }.map(\.detectedAt).max()
+        guard let latestUse = [usedAt, redemptionAt].compactMap({ $0 }).max(), latestUse >= announcedAt else { return true }
+        // A use and replacement can arrive in one observation. Its redemption
+        // signals share the fetch time, but provider history proves the order.
+        guard let usedAt, let grantedAt = summary.history.filter({ $0.kind == .granted }).map(\.occurredAt).max() else { return false }
+        return grantedAt > usedAt && grantedAt <= announcedAt && latestUse <= announcedAt
+    }
+
     /// Short badge text for the toast and the notification subtitle.
     public nonisolated var badgeTitle: String {
         if let resetKind {
@@ -124,6 +153,27 @@ public struct CloudAlertPayload: Codable, Hashable {
         case .error:
             return "Sync"
         }
+    }
+}
+
+/// Reset events must stay deduplicated when an error or threshold temporarily
+/// becomes the account's latest alert. Deterministic CloudKit IDs also make a
+/// retry (or a second publisher) unable to create another push for that event.
+public enum ResetAlertPublication {
+    public nonisolated static func shouldPublish(
+        signature: String, kind: CloudAlertKind, lastSignature: String?, resetHistory: [String]
+    ) -> Bool {
+        guard signature != lastSignature else { return false }
+        return !(kind.isUsageReset || kind == .resetAvailable) || !resetHistory.contains(signature)
+    }
+
+    public nonisolated static func recordName(signature: String) -> String {
+        let digest = SHA256.hash(data: Data(signature.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "alert.reset.\(digest)"
+    }
+
+    public nonisolated static func remember(_ signature: String, in history: [String]) -> [String] {
+        Array((history.filter { $0 != signature } + [signature]).suffix(1_024))
     }
 }
 
@@ -267,7 +317,14 @@ public enum UsageResetAlertBuilder {
                 return lhs.detectedAt > rhs.detectedAt
             }
 
-        if !resetSignals.isEmpty {
+        let available = freshSignals
+            .filter { $0.resetKind == .bankedAvailable && CloudAlertPayload.bankedAvailabilityIsCurrent(in: snapshot, announcedAt: $0.detectedAt) }
+            .max { $0.detectedAt < $1.detectedAt }
+        let newCreditAfterRedemption = available.map { notice in
+            resetSignals.allSatisfy { $0.resetKind == .bankedRedeemed && $0.detectedAt <= notice.detectedAt }
+        } ?? false
+
+        if !resetSignals.isEmpty && !newCreditAfterRedemption {
             let labels = uniqueWindowLabels(from: resetSignals)
             let labelSummary = listSummary(labels)
             let kind: CloudAlertKind = resetSignals.contains { $0.kind == .unexpectedRecovery }
@@ -314,10 +371,7 @@ public enum UsageResetAlertBuilder {
         }
 
         // No reset happened, but a banked one may be waiting to be redeemed.
-        let availableSignals = freshSignals
-            .filter { $0.resetKind == .bankedAvailable }
-            .sorted { $0.detectedAt > $1.detectedAt }
-        guard let available = availableSignals.first else { return nil }
+        guard let available else { return nil }
 
         let label = available.windowLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let labelSummary = (label?.isEmpty == false ? label : nil) ?? "Banked reset"

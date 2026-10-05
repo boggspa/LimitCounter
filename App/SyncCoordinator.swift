@@ -834,27 +834,17 @@ private struct SnapshotSignalDetector {
         }
     }
 
-    /// One live signal per (kind, window, reset kind): a newer reading of the
-    /// same thing replaces the older one rather than stacking beneath it.
+    /// Keep historical events, but require current evidence for banked reset
+    /// availability. An empty detector result must retire a spent reset too.
     private func merge(
         _ newSignals: [QuotaSignal],
         into signals: inout [String: [QuotaSignal]],
         account: ProviderAccountKey
     ) {
-        guard !newSignals.isEmpty else { return }
-
         let providerKey = account.rawValue
-        var merged = signals[providerKey] ?? []
-
-        for signal in newSignals {
-            merged.removeAll { existing in
-                existing.kind == signal.kind
-                    && existing.windowLabel == signal.windowLabel
-                    && existing.resetKind == signal.resetKind
-            }
-            merged.append(signal)
-        }
-
-        signals[providerKey] = merged.sorted { $0.detectedAt > $1.detectedAt }
+        signals[providerKey] = QuotaResetSignalRetention.merging(
+            newSignals,
+            with: signals[providerKey] ?? []
+        )
     }
 }

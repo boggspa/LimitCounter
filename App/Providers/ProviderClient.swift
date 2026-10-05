@@ -7514,11 +7514,13 @@ struct CodexResetCreditsFetcher {
     private static let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
 
     private let session: URLSession
+    private let defaults: UserDefaults
     private let detailsURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
     private let historyURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/history")!
 
-    init(session: URLSession) {
+    init(session: URLSession, defaults: UserDefaults? = nil) {
         self.session = session
+        self.defaults = defaults ?? UserDefaults(suiteName: Self.appGroupID) ?? .standard
     }
 
     /// Banked credits belong to one ChatGPT account, and every Codex account
@@ -7536,7 +7538,7 @@ struct CodexResetCreditsFetcher {
         now: Date = Date()
     ) async -> QuotaResetCreditSummary? {
         let cacheKey = Self.cacheKey(forAccountID: accountID)
-        let cached = Self.loadCache(forKey: cacheKey)
+        let cached = loadCache(forKey: cacheKey)
         let needsRefresh: Bool
         if let cached {
             needsRefresh = (usageCount != nil && usageCount != cached.availableCount)
@@ -7558,15 +7560,21 @@ struct CodexResetCreditsFetcher {
 
         let fetchedSomething = details != nil || history != nil
         let summary = QuotaResetCreditSummary(
-            availableCount: details?.availableCount ?? usageCount ?? cached?.availableCount ?? 0,
+            // The just-read quota surface carries the current total count,
+            // not applicable_available_count. Supplemental details can lag a
+            // redemption, so they must not resurrect a reset usage says is gone.
+            availableCount: usageCount ?? details?.availableCount ?? cached?.availableCount ?? 0,
             earnedCount: details?.earnedCount ?? cached?.earnedCount,
             credits: details?.credits ?? cached?.credits ?? [],
             history: history ?? cached?.history ?? [],
             redeemHint: Self.redeemHint,
             observedAt: fetchedSomething ? now : (cached?.observedAt ?? now)
         )
-        if fetchedSomething {
-            Self.saveCache(summary, forKey: cacheKey)
+        if fetchedSomething || usageCount != nil {
+            // Keep an authoritative count even if the detail requests fail.
+            // Retain the old detail timestamp above so their retry cadence is
+            // unchanged; a later missing usage count now falls back to zero.
+            saveCache(summary, forKey: cacheKey)
         }
         print("[CodexSessionProvider] Reset credits: \(summary.availableCount) available, \(summary.history.count) history events (details: \(details != nil), history: \(history != nil))")
         return summary
@@ -7589,18 +7597,14 @@ struct CodexResetCreditsFetcher {
         return data
     }
 
-    private static var defaults: UserDefaults {
-        UserDefaults(suiteName: appGroupID) ?? .standard
-    }
-
-    private static func loadCache(forKey cacheKey: String) -> QuotaResetCreditSummary? {
+    private func loadCache(forKey cacheKey: String) -> QuotaResetCreditSummary? {
         guard let data = defaults.data(forKey: cacheKey) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(QuotaResetCreditSummary.self, from: data)
     }
 
-    private static func saveCache(_ summary: QuotaResetCreditSummary, forKey cacheKey: String) {
+    private func saveCache(_ summary: QuotaResetCreditSummary, forKey cacheKey: String) {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(summary) else { return }

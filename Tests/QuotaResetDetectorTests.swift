@@ -246,7 +246,7 @@ private func testBankedCreditLifecycle() throws {
     try expect(available.message.contains("Redeem it in the Codex app."), "message carries the redeem hint")
 
     let availableAlert = try UsageResetAlertBuilder
-        .resetAlert(for: snapshot(.openai, "Codex", at: at(5), windows: []).withSignals(granted.signals), noticedAt: at(5))
+        .resetAlert(for: snapshot(.openai, "Codex", at: at(5), windows: [], credits: banked).withSignals(granted.signals), noticedAt: at(5))
         .orThrow("available alert")
     try expectEqual(availableAlert.kind, .resetAvailable, "available alert kind")
     try expect(availableAlert.isAnnounceable, "an expiring banked reset is worth a notification")
@@ -284,6 +284,110 @@ private func testBankedCreditLifecycle() throws {
 }
 
 // MARK: - Guards
+
+private func testBankedAvailabilityStopsAfterRedemptionAndUnknownReadings() throws {
+    let harness = Harness()
+    var retained: [QuotaSignal] = []
+    func sweep(_ minutes: Double, count: Int?) -> [QuotaSignal] {
+        let credits = count.map { QuotaResetCreditSummary(availableCount: $0, observedAt: at(minutes)) }
+        let result = harness.sweep(snapshot(.openai, "Codex", at: at(minutes), windows: [], credits: credits))
+        retained = QuotaResetSignalRetention.merging(result.signals, with: retained)
+        return retained
+    }
+
+    let grant = try sweep(0, count: 1).first.orThrow("grant")
+    let polled = try sweep(5, count: 1).first.orThrow("standing notice")
+    try expectEqual(polled.detectedAt, grant.detectedAt, "polling keeps the original availability identity")
+    let redeemed = sweep(10, count: 0)
+    try expect(!redeemed.contains { $0.resetKind == .bankedAvailable }, "redemption retires the persisted availability notice")
+    try expect(redeemed.contains { $0.resetKind == .bankedRedeemed }, "redemption history stays visible")
+    try expect(!sweep(15, count: 0).contains { $0.resetKind == .bankedAvailable }, "following polls cannot replay the spent reset")
+
+    let newGrant = try sweep(20, count: 1).first { $0.resetKind == .bankedAvailable }.orThrow("new grant")
+    try expectEqual(newGrant.detectedAt, at(20), "a genuinely new reset gets a new announcement")
+    try expect(!sweep(25, count: nil).contains { $0.resetKind == .bankedAvailable }, "a missing credit reading must not replay cached availability")
+    let restored = try sweep(30, count: 1).first { $0.resetKind == .bankedAvailable }.orThrow("restored reading")
+    try expectEqual(restored.detectedAt, newGrant.detectedAt, "availability returning after an outage is the same grant")
+
+    // Older builds persisted a standing availability for twelve hours. The
+    // first empty detector result must clean it up even without a new event.
+    let upgraded = QuotaResetSignalRetention.merging([], with: [grant])
+    try expect(upgraded.isEmpty, "legacy persisted availability is retired on the next healthy observation")
+}
+
+private func testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart() throws {
+    let harness = Harness()
+    func sweep(_ minutes: Double) -> QuotaSignal {
+        harness.sweep(snapshot(.openai, "Codex", at: at(minutes), windows: [], credits:
+            QuotaResetCreditSummary(
+                availableCount: 1,
+                credits: [QuotaResetCredit(id: "expiry-credit", status: "available", expiresAt: at(360))],
+                observedAt: at(minutes)
+            )
+        )).signals.first!
+    }
+    let granted = sweep(0)
+    try expectEqual(granted.detectedAt, at(0), "initial grant is announced")
+    try expectEqual(sweep(5).detectedAt, at(0), "ordinary polling does not announce it again")
+    let reminder = sweep(180)
+    try expectEqual(reminder.detectedAt, at(180), "crossing into the expiry window earns one reminder")
+    try expectEqual(reminder.severity, .warning, "expiry reminder remains visible as a warning")
+    try expectEqual(sweep(185).detectedAt, reminder.detectedAt, "countdown changes do not create another reminder")
+
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    harness.state = try decoder.decode(QuotaResetDetector.ProviderState.self, from: encoder.encode(harness.state!))
+    try expectEqual(sweep(190).detectedAt, reminder.detectedAt, "relaunch preserves the reminder identity")
+}
+
+private func testBankedFirstSightingNearExpiryDoesNotRemindTwice() throws {
+    for initiallyEmpty in [false, true] {
+        let harness = Harness()
+        if initiallyEmpty {
+            harness.sweep(snapshot(.openai, "Codex", at: at(-5), windows: [], credits:
+                QuotaResetCreditSummary(availableCount: 0, observedAt: at(-5))))
+        }
+        func sweep(_ minutes: Double) -> QuotaSignal {
+            harness.sweep(snapshot(.openai, "Codex", at: at(minutes), windows: [], credits:
+                QuotaResetCreditSummary(
+                    availableCount: 1,
+                    credits: [QuotaResetCredit(id: "late-credit", status: "available", expiresAt: at(90))],
+                    observedAt: at(minutes)
+                )
+            )).signals.first!
+        }
+        let first = sweep(0)
+        try expectEqual(first.severity, .warning, "an already urgent grant includes the expiry warning")
+        try expectEqual(sweep(5).detectedAt, first.detectedAt, "first sight and later grants inside the expiry window do not remind twice")
+    }
+}
+
+private func testDelayedGrantHistoryDoesNotReannounceExistingCredit() throws {
+    let harness = Harness()
+    let first = harness.sweep(snapshot(.openai, "Codex", at: at(0), windows: [], credits:
+        QuotaResetCreditSummary(availableCount: 1, observedAt: at(0))))
+    let firstSignal = try first.signals.first.orThrow("grant without history")
+    let delayed = harness.sweep(snapshot(.openai, "Codex", at: at(5), windows: [], credits:
+        QuotaResetCreditSummary(
+            availableCount: 1,
+            history: [QuotaResetCreditEvent(id: "grant-one", kind: .granted, occurredAt: at(-1))],
+            observedAt: at(5)
+        )))
+    try expectEqual(delayed.signals.first?.detectedAt, firstSignal.detectedAt, "history arriving later describes the credit already announced")
+    let genuinelyNew = harness.sweep(snapshot(.openai, "Codex", at: at(10), windows: [], credits:
+        QuotaResetCreditSummary(
+            availableCount: 1,
+            history: [
+                QuotaResetCreditEvent(id: "grant-two", kind: .granted, occurredAt: at(9)),
+                QuotaResetCreditEvent(id: "used-one", kind: .used, occurredAt: at(8)),
+                QuotaResetCreditEvent(id: "grant-one", kind: .granted, occurredAt: at(-1))
+            ],
+            observedAt: at(10)
+        )))
+    try expectEqual(genuinelyNew.signals.first { $0.resetKind == .bankedAvailable }?.detectedAt, at(10), "a used-then-granted credit with unchanged count is still a new grant")
+}
 
 private func testWindowCooldownAllowsOneGiftPerDay() throws {
     let harness = Harness()
@@ -401,6 +505,11 @@ private enum QuotaResetDetectorTestRunner {
         try testProviderWideResetAcrossWindows()
         try testSoloFiveHourDropIsIgnored()
         try testBankedCreditLifecycle()
+        try testBankedAvailabilityStopsAfterRedemptionAndUnknownReadings()
+        try testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart()
+        try testBankedFirstSightingNearExpiryDoesNotRemindTwice()
+        try testDelayedGrantHistoryDoesNotReannounceExistingCredit()
+        try testUseThenNewGrantBetweenPollsStillAnnouncesOnce()
         try testWindowCooldownAllowsOneGiftPerDay()
         try testKimiSoloWeeklyDropWaitsForUsageToResume()
         try testCurrencyMetersAreLeftAlone()
@@ -408,6 +517,35 @@ private enum QuotaResetDetectorTestRunner {
         try await testLedgerStoreDedupesAndCounts()
         print("Quota reset detector tests passed")
     }
+}
+
+private func testUseThenNewGrantBetweenPollsStillAnnouncesOnce() throws {
+    let detector = QuotaResetDetector()
+    let initial = snapshot(.openai, "Codex", at: at(0), windows: [], credits: .init(availableCount: 1, observedAt: at(0)))
+    let first = detector.observe(initial, state: nil)
+    let replacement = snapshot(.openai, "Codex", at: at(30), windows: [], credits: .init(
+        availableCount: 1,
+        history: [.init(id: "use-first", kind: .used, occurredAt: at(10)), .init(id: "grant-next", kind: .granted, occurredAt: at(20))],
+        observedAt: at(30)
+    ))
+    let next = detector.observe(replacement, state: first.state)
+    let retained = QuotaResetSignalRetention.merging(next.signals, with: first.signals)
+    let sameSweep = QuotaSignal(kind: .unexpectedRecovery, title: "Banked reset redeemed", message: "used", severity: .info, detectedAt: at(30).addingTimeInterval(0.25), resetKind: .bankedRedeemed)
+    let availability = try retained.first { $0.resetKind == .bankedAvailable }.orThrow("replacement signal")
+    let fractional = QuotaSignal(kind: availability.kind, title: availability.title, message: availability.message, severity: availability.severity, windowLabel: availability.windowLabel, detectedAt: at(30).addingTimeInterval(0.25), resetKind: .bankedAvailable)
+    let fractionalReading = replacement.withSignals([sameSweep, fractional])
+    let fractionalAlert = try UsageResetAlertBuilder.resetAlert(for: fractionalReading, noticedAt: at(30).addingTimeInterval(0.25)).orThrow("same-sweep replacement")
+    try expect(fractionalAlert.isRelevant(to: [fractionalReading]), "integer signature dates preserve live subsecond use/grant ordering")
+    let current = replacement.withSignals(retained)
+    let alert = try UsageResetAlertBuilder.resetAlert(for: current, noticedAt: at(30)).orThrow("replacement credit announcement")
+    try expectEqual(alert.kind, .resetAvailable, "quiet redemption must not mask a later genuine grant")
+    try expect(alert.isRelevant(to: [current]), "the replacement grant remains actionable")
+
+    let poll = snapshot(.openai, "Codex", at: at(35), windows: [], credits: replacement.resetCredits)
+    let repeated = detector.observe(poll, state: next.state)
+    let polled = poll.withSignals(QuotaResetSignalRetention.merging(repeated.signals, with: retained))
+    let repeatedAlert = try UsageResetAlertBuilder.resetAlert(for: polled, noticedAt: at(35)).orThrow("standing replacement credit")
+    try expectEqual(repeatedAlert.signature, alert.signature, "polling must not turn the replacement grant into another notification")
 }
 
 private extension Optional {

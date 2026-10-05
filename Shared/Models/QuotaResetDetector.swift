@@ -91,6 +91,23 @@ public struct QuotaResetEvent: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+/// Historical reset signals can stay on a card for a while, but availability
+/// is current state: replaying it after redemption would offer a spent reset.
+enum QuotaResetSignalRetention {
+    static func merging(_ detected: [QuotaSignal], with previous: [QuotaSignal]) -> [QuotaSignal] {
+        var merged = previous.filter { $0.resetKind != .bankedAvailable }
+        for signal in detected {
+            merged.removeAll {
+                $0.kind == signal.kind
+                    && $0.windowLabel == signal.windowLabel
+                    && $0.resetKind == signal.resetKind
+            }
+            merged.append(signal)
+        }
+        return merged.sorted { $0.detectedAt > $1.detectedAt }
+    }
+}
+
 // MARK: - Detector
 
 /// Turns successive quota readings into classified reset events.
@@ -504,6 +521,7 @@ public struct QuotaResetDetector {
             )
             if summary.availableCount > 0 {
                 fresh.announcedAvailableAt = now
+                fresh.announcedExpiringAt = isExpiringSoon(summary, now: now) ? now : nil
                 signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: now, now: now))
             }
             state.credits = fresh
@@ -514,7 +532,10 @@ public struct QuotaResetDetector {
         let newEvents = summary.history.filter { !seen.contains($0.id) }
         let recentCutoff = now.addingTimeInterval(-24 * 60 * 60)
         let usedEventNow = newEvents.contains { $0.kind == .used && $0.occurredAt >= recentCutoff }
-        let grantedEventNow = newEvents.contains { $0.kind == .granted && $0.occurredAt >= recentCutoff }
+        let grantedEventNow = newEvents.contains {
+            $0.kind == .granted && $0.occurredAt >= recentCutoff
+                && $0.occurredAt > (track.announcedAvailableAt ?? .distantPast)
+        }
 
         if summary.availableCount < track.lastAvailableCount || usedEventNow {
             redeemedNow = true
@@ -532,7 +553,7 @@ public struct QuotaResetDetector {
                     severity: .info,
                     confidence: 0.98,
                     windowLabel: Self.bankedResetWindowLabel,
-                    detectedAt: now,
+                    detectedAt: usedAt,
                     resetKind: .bankedRedeemed
                 )
             )
@@ -557,7 +578,9 @@ public struct QuotaResetDetector {
                 || track.announcedAvailableAt == nil
             if newlyAvailable {
                 track.announcedAvailableAt = now
-                track.announcedExpiringAt = nil
+                // A grant first seen inside the reminder window has already
+                // announced its expiry. Do not announce it again next sweep.
+                track.announcedExpiringAt = isExpiringSoon(summary, now: now) ? now : nil
                 signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: now, now: now))
             } else if let expiry = summary.nearestExpiry,
                       expiry.timeIntervalSince(now) <= configuration.expiringSoonLead,
@@ -581,6 +604,11 @@ public struct QuotaResetDetector {
         state.credits = track
 
         return CreditOutcome(signals: signals, events: events, redeemedNow: redeemedNow)
+    }
+
+    private func isExpiringSoon(_ summary: QuotaResetCreditSummary, now: Date) -> Bool {
+        guard let expiry = summary.nearestExpiry else { return false }
+        return expiry > now && expiry.timeIntervalSince(now) <= configuration.expiringSoonLead
     }
 
     private func availableSignal(

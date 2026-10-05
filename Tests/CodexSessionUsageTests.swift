@@ -272,6 +272,70 @@ private func testResetCreditCacheIsFiledPerAccount() throws {
     )
 }
 
+private final class CodexResetCreditURLProtocol: URLProtocol {
+    static var statusCode = 500
+    static var details = Data(#"{"credits":[],"available_count":1}"#.utf8)
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let body = request.url?.path.hasSuffix("/history") == true
+            ? Data(#"{"events":[]}"#.utf8) : Self.details
+        let response = HTTPURLResponse(url: request.url!, statusCode: Self.statusCode, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private func testUsageResetCountSurvivesSupplementalOutageAndRelaunch() async throws {
+    let suite = "codex-reset-outage-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let previous = QuotaResetCreditSummary(availableCount: 1, observedAt: now.addingTimeInterval(-60))
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    defaults.set(try encoder.encode(previous), forKey: CodexResetCreditsFetcher.cacheKey(forAccountID: "test-account"))
+
+    CodexResetCreditURLProtocol.statusCode = 500
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CodexResetCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let fetcher = CodexResetCreditsFetcher(session: session, defaults: defaults)
+    let redeemed = await fetcher.summary(usageCount: 0, accessToken: "fixture", accountID: "test-account", now: now)
+    try expectEqual(redeemed?.availableCount, 0, "usage count reports redemption while supplemental endpoints fail")
+    try expectEqual(redeemed?.observedAt, previous.observedAt, "failed supplemental reads do not postpone their refresh")
+
+    let relaunched = CodexResetCreditsFetcher(session: session, defaults: defaults)
+    let missingUsageCount = await relaunched.summary(usageCount: nil, accessToken: "fixture", accountID: "test-account", now: now.addingTimeInterval(5))
+    try expectEqual(missingUsageCount?.availableCount, 0, "cached pre-redemption credit cannot reappear when the next count is omitted")
+}
+
+private func testCurrentUsageResetCountOverridesLaggingDetails() async throws {
+    let suite = "codex-reset-count-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    CodexResetCreditURLProtocol.statusCode = 200
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CodexResetCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let fetcher = CodexResetCreditsFetcher(session: session, defaults: defaults)
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    let redeemed = await fetcher.summary(usageCount: 0, accessToken: "fixture", accountID: "redeemed", now: now)
+    try expectEqual(redeemed?.availableCount, 0, "lagging available details cannot override a current zero quota count")
+    let granted = await fetcher.summary(usageCount: 2, accessToken: "fixture", accountID: "granted", now: now)
+    try expectEqual(granted?.availableCount, 2, "current nonzero quota count takes precedence too")
+    let detailsOnly = await fetcher.summary(usageCount: nil, accessToken: "fixture", accountID: "details-only", now: now)
+    try expectEqual(detailsOnly?.availableCount, 1, "details remain a fallback when the quota surface omits counts")
+}
+
 // MARK: - Account identity
 
 /// An unsigned token carrying the ChatGPT claims the client reads.
@@ -494,6 +558,8 @@ private enum CodexSessionUsageTestRunner {
         try await testSparkRendersFriendlyWindowLabels()
         try testResetCreditParsersReadDetailsAndHistory()
         try testResetCreditCacheIsFiledPerAccount()
+        try await testUsageResetCountSurvivesSupplementalOutageAndRelaunch()
+        try await testCurrentUsageResetCountOverridesLaggingDetails()
         try await testRotationOfTheSameAccountIsFollowedAndSaved()
         try await testSwitchedFolderFallsBackToTheSavedSession()
         try await testTeamWorkspaceMembersAreDifferentAccounts()

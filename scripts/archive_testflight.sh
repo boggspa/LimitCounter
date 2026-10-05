@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare native iOS/macOS App Store Connect artifacts using Xcode's signed-in
-# account. This is separate from the Developer ID notarization/install workflow.
+# account or an optional ASC API key. Separate from Developer ID notarization.
 set -euo pipefail
 umask 077
 
@@ -11,6 +11,9 @@ Usage: scripts/archive_testflight.sh [all|ios|macos] --output-dir PATH [options]
 Archives and locally exports Release builds for App Store Connect/TestFlight.
 The output directory must not already exist; previous artifacts are preserved.
 Uses the developer account already configured in Xcode for automatic signing.
+Optionally set all three ASC_API_KEY_ID, ASC_API_ISSUER_ID, and ASC_API_KEY_PATH
+environment variables to use an App Store Connect API key instead. The key path
+must name a readable private-key file. Authentication values are never printed.
 
 Options:
   --output-dir PATH    New local directory for archives, exports, and build logs.
@@ -68,6 +71,23 @@ if [[ -n "$build_number" && ! "$build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; the
     fail '--build-number must contain one to three dot-separated integers.'
 fi
 
+use_api_key=false
+asc_api_key_id=${ASC_API_KEY_ID-}
+asc_api_issuer_id=${ASC_API_ISSUER_ID-}
+asc_api_key_path=${ASC_API_KEY_PATH-}
+if [[ -n "${ASC_API_KEY_ID+x}${ASC_API_ISSUER_ID+x}${ASC_API_KEY_PATH+x}" ]]; then
+    [[ -n "$asc_api_key_id" && -n "$asc_api_issuer_id" && -n "$asc_api_key_path" ]] ||
+        fail 'API authentication requires nonempty ASC_API_KEY_ID, ASC_API_ISSUER_ID, and ASC_API_KEY_PATH.'
+    [[ -f "$asc_api_key_path" && -r "$asc_api_key_path" ]] ||
+        fail 'ASC_API_KEY_PATH must name an existing readable file.'
+    use_api_key=true
+    authentication_args=(
+        -authenticationKeyPath "$asc_api_key_path"
+        -authenticationKeyID "$asc_api_key_id"
+        -authenticationKeyIssuerID "$asc_api_issuer_id"
+    )
+fi
+
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 project_path="$repo_dir/LLMUsageCounter.xcodeproj"
 [[ -d "$project_path" ]] || fail "Project not found: $project_path"
@@ -82,9 +102,32 @@ case "$platform" in
 esac
 
 print_command() {
+    local argument redact_next=false
     printf '  '
-    printf '%q ' "$@"
+    for argument in "$@"; do
+        if [[ "$redact_next" == true ]]; then
+            printf '%q ' '<redacted>'
+            redact_next=false
+        else
+            printf '%q ' "$argument"
+            case "$argument" in
+                -authenticationKeyPath|-authenticationKeyID|-authenticationKeyIssuerID)
+                    redact_next=true
+                    ;;
+            esac
+        fi
+    done
     printf '\n'
+}
+
+redact_auth_values() {
+    local line value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        for value in "$asc_api_key_path" "$asc_api_key_id" "$asc_api_issuer_id"; do
+            [[ -z "$value" ]] || line=${line//"$value"/<redacted>}
+        done
+        printf '%s\n' "$line"
+    done
 }
 
 run_logged() {
@@ -92,7 +135,7 @@ run_logged() {
     shift
     if ! "$@" >"$log_path" 2>&1; then
         printf 'Xcode failed. Preserved log and artifacts: %s\n' "$log_path" >&2
-        tail -n 40 "$log_path" >&2
+        tail -n 40 "$log_path" | redact_auth_values >&2
         exit 1
     fi
 }
@@ -134,6 +177,10 @@ for selected_platform in "${platforms[@]}"; do
         -exportPath "$platform_dir/export"
         -allowProvisioningUpdates
     )
+    if [[ "$use_api_key" == true ]]; then
+        archive_command+=("${authentication_args[@]}")
+        export_command+=("${authentication_args[@]}")
+    fi
 
     printf '%s: archive and local App Store Connect export\n' "$selected_platform"
     if [[ "$dry_run" == true ]]; then

@@ -351,6 +351,7 @@ final class AppStateStore: ObservableObject {
             )
         }
         #endif
+        pruneStoredUsageAlerts()
     }
 
     func openUsageAlert(_ alert: CloudAlertPayload) {
@@ -485,6 +486,7 @@ final class AppStateStore: ObservableObject {
         let now = Date()
         var merged = usageAlerts.filter {
             $0.isAnnounceable
+                && $0.isRelevant(to: snapshots)
                 && !dismissed.contains($0.signature)
                 && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
         }
@@ -493,6 +495,7 @@ final class AppStateStore: ObservableObject {
         let freshAlerts = alerts
             .filter {
                 $0.isAnnounceable
+                    && $0.isRelevant(to: snapshots)
                     && !dismissed.contains($0.signature)
                     && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
             }
@@ -516,7 +519,8 @@ final class AppStateStore: ObservableObject {
         let dismissed = Set(loadDismissedUsageAlertSignatures())
         let now = Date()
         let pruned = usageAlerts.filter {
-            !dismissed.contains($0.signature)
+            $0.isAnnounceable && $0.isRelevant(to: snapshots)
+                && !dismissed.contains($0.signature)
                 && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
         }
         guard pruned != usageAlerts else { return }
@@ -535,6 +539,7 @@ final class AppStateStore: ObservableObject {
         return decoded
             .filter {
                 $0.isAnnounceable
+                    && $0.isRelevant(to: snapshots)
                     && !dismissed.contains($0.signature)
                     && now.timeIntervalSince($0.createdAt) <= usageAlertRetention
             }
@@ -619,12 +624,16 @@ final class AppStateStore: ObservableObject {
         if let newest = alerts.map(\.createdAt).max() {
             lastSeenAlertDate = newest
         }
+        let visible = cloudSync.hasVisibleAlertPayload(userInfo)
+        if visible { LocalNotificationPublisher.shared.markDelivered(alerts) }
+        // Read the latest account state before deciding whether an old cloud
+        // availability event is still actionable.
+        await refresh()
         ingestUsageAlerts(alerts)
-        if !cloudSync.hasVisibleAlertPayload(userInfo) {
+        if !visible {
             await LocalNotificationPublisher.shared.processIncomingAlerts(alerts)
         }
 
-        await refresh()
         return true
     }
     #endif
