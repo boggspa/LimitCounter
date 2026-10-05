@@ -10603,6 +10603,10 @@ private final class ClaudeTimeoutRaceState<Value>: @unchecked Sendable {
         self.continuation = continuation
     }
 
+    // Releasing this lock-protected state requires no actor hop. Explicit
+    // isolation also avoids Swift 6.2's iOS Release optimizer crash in deinit.
+    nonisolated deinit {}
+
     func resume(with value: Value) -> Bool {
         lock.lock()
         guard let continuation else {

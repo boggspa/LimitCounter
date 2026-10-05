@@ -28,6 +28,7 @@
 		760136B5B967579A483B141C /* GeminiProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 005C22E36D2EC6FB0CB38B1E /* GeminiProviderClient.swift */; };
 		823855AA90207DEE5462F15A /* QuotaTimelineProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */; };
 		EA5E7C000000000000000002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EA5E7C000000000000000001 /* Assets.xcassets */; };
+		B72E54A961CE4815A203FD02 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B72E54A961CE4815A203FD01 /* PrivacyInfo.xcprivacy */; };
 		8415611E15321D8D3003EFFB /* QuotaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEF7A76AE81DE224C4627CF /* QuotaModels.swift */; };
 		A090A16CD728E819CEAB1C12 /* MockData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7D74721EA3E8C99B51CF09D /* MockData.swift */; };
 		A2276EF2147C77FC2081EE2A /* ProviderSetupCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = 939F535484B8F04B64834EC0 /* ProviderSetupCanvas.swift */; };
@@ -103,6 +104,7 @@
 		30658FE372ABF14A79F05A4E /* TelemetryParseCache.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = TelemetryParseCache.swift; path = Shared/Storage/TelemetryParseCache.swift; sourceTree = SOURCE_ROOT; };
 		318D0D0ED844E72B91AFEAF0 /* ProviderSetupPresenter.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupPresenter.swift; path = App/Views/ProviderSetup/ProviderSetupPresenter.swift; sourceTree = SOURCE_ROOT; };
 		EA5E7C000000000000000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Widget/Assets.xcassets; sourceTree = SOURCE_ROOT; };
+		B72E54A961CE4815A203FD01 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = Widget/PrivacyInfo.xcprivacy; sourceTree = SOURCE_ROOT; };
 		388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaTimelineProvider.swift; path = Widget/QuotaTimelineProvider.swift; sourceTree = SOURCE_ROOT; };
 		3B8B670098FA9E8DE0AFC40E /* QuotaCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = QuotaCardView.swift; path = Shared/Views/QuotaCardView.swift; sourceTree = SOURCE_ROOT; };
 		426990F3B946E045978B05CF /* ProviderSetupPolicy.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ProviderSetupPolicy.swift; path = App/Providers/ProviderSetupPolicy.swift; sourceTree = SOURCE_ROOT; };
@@ -283,6 +285,7 @@
 			children = (
 				388C5D6216DD6ABC374B9364 /* QuotaTimelineProvider.swift */,
 				EA5E7C000000000000000001 /* Assets.xcassets */,
+				B72E54A961CE4815A203FD01 /* PrivacyInfo.xcprivacy */,
 				47B21C6EE756C027946DD210 /* AIUsageWidgetExtension-Info.plist */,
 				6497EE5E8894C69C0C3FED10 /* AIUsageWidgetExtension.iOS.entitlements */,
 				14AB7C74EDD1E238694A97CC /* AIUsageWidgetExtension.macOS.entitlements */,
@@ -435,6 +438,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				EA5E7C000000000000000002 /* Assets.xcassets in Resources */,
+				B72E54A961CE4815A203FD02 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -531,7 +535,7 @@
 				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -565,7 +569,7 @@
 				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -714,7 +718,7 @@
 				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -767,7 +771,7 @@
 				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
