@@ -33,19 +33,31 @@ private func snapshot(_ rows: [[String: Any]]) throws -> QuotaSnapshot {
     try MiniMaxQuotaParser.snapshot(data: payload(rows), fetchedAt: now)
 }
 
+private func balancePayload(_ available: Any = "98.25", code: Int = 0) throws -> Data {
+    try JSONSerialization.data(withJSONObject: [
+        "base_resp": ["status_code": code, "status_msg": "fixture"],
+        "available_amount": available,
+        "cash_balance": "50.00", "voucher_balance": "48.25",
+        "credit_balance": "0.00", "owed_amount": "0.00"
+    ])
+}
+
 private final class QuotaURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var status = 200
     nonisolated(unsafe) static var body = Data()
     nonisolated(unsafe) static var requests: [URLRequest] = []
+    nonisolated(unsafe) static var balanceStatus = 200
+    nonisolated(unsafe) static var balanceBody: Data?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.append(request)
-        let response = HTTPURLResponse(url: request.url!, statusCode: Self.status,
+        let isBalance = request.url == MiniMaxProviderClient.balanceURL && Self.balanceBody != nil
+        let response = HTTPURLResponse(url: request.url!, statusCode: isBalance ? Self.balanceStatus : Self.status,
                                        httpVersion: "HTTP/1.1", headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocol(self, didLoad: isBalance ? Self.balanceBody! : Self.body)
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
@@ -142,6 +154,33 @@ private enum MiniMaxUsageTests {
                     catch ProviderFetchError.parsingError { }
                 }
             }),
+            ("Token Plan allowance is not a paid credit balance", {
+                let reading = try snapshot([row()])
+                try expect(reading.balances.isEmpty, "allowance units became paid credits")
+            }),
+            ("paid credits use the reported available total without guessing currency", {
+                let balance = try MiniMaxQuotaParser.balance(data: balancePayload())
+                try expect(balance.label == "Usage Credits" && balance.amount == 98.25, "incorrect available balance")
+                try expect(balance.unit.isEmpty, "invented currency")
+                try expect(balance.valueText == "98.25", "fractional balance lost")
+                for amount in ["0", "0.03", "-0.25"] {
+                    let balance = try MiniMaxQuotaParser.balance(data: balancePayload(amount))
+                    try expect(balance.amount == Double(amount), "changed reported balance")
+                    try expect(balance.valueText == amount, "rounded balance to another value")
+                }
+            }),
+            ("missing and malformed paid balances cannot become zero", {
+                for invalid: Any in ["", "NaN", "inf", "$12.00", true, 12, NSNull()] {
+                    do { _ = try MiniMaxQuotaParser.balance(data: balancePayload(invalid)); throw Failure("bad balance accepted") }
+                    catch ProviderFetchError.parsingError { }
+                }
+                for data in [try payload([row()]), Data("{\"available_amount\":\"12.00\"}".utf8)] {
+                    do { _ = try MiniMaxQuotaParser.balance(data: data); throw Failure("unverified balance accepted") }
+                    catch ProviderFetchError.parsingError { }
+                }
+                do { _ = try MiniMaxQuotaParser.balance(data: balancePayload("12", code: 1004)); throw Failure("rejected balance auth accepted") }
+                catch ProviderFetchError.invalidCredential { }
+            }),
             ("MiniMax identity, storage and setup preserve the dedicated key", {
                 try expect(ProviderID.userFacingCases.contains(.minimax), "missing provider")
                 try expect(ProviderID.minimax.accentColorHex == "#C044A4", "accent drift")
@@ -154,6 +193,16 @@ private enum MiniMaxUsageTests {
                 let decoded = try JSONDecoder().decode(QuotaSnapshot.self, from: JSONEncoder().encode(reading))
                 try expect(decoded.providerID == .minimax && decoded.windows == reading.windows, "snapshot cannot sync")
                 try expect(ProviderAccountKey(providerID: .minimax, slot: "work") != ProviderAccountKey(providerID: .minimax), "account slots collapsed")
+            }),
+            ("optional balance key survives setup load and save independently", {
+                let draft = ProviderSetupPolicy.Draft(accessToken: "sk-cp-fixture", extraFields: [
+                    MiniMaxProviderClient.balanceAPIKeyField: "sk-api-balance-fixture"
+                ])
+                let input = ProviderSetupPolicy.saveInput(for: draft, providerID: .minimax, now: now)
+                let credential = ProviderSetupPolicy.credential(from: draft, providerID: .minimax, extraFields: input.extraFields)
+                let restored = ProviderSetupPolicy.draft(from: credential, providerID: .minimax)
+                try expect(restored.accessToken == "sk-cp-fixture", "balance key replaced subscription key")
+                try expect(restored.extraFields[MiniMaxProviderClient.balanceAPIKeyField] == "sk-api-balance-fixture", "balance key was not retained")
             })
         ]
         for (name, test) in cases {
@@ -176,6 +225,7 @@ private enum MiniMaxUsageTests {
         try expect(request.httpMethod == "GET" && request.httpBody == nil, "quota fetch sent inference")
         try expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer sk-cp-fixture", "wrong auth")
         try expect(!request.httpShouldHandleCookies, "unexpected browser session use")
+        try expect(QuotaURLProtocol.requests.count == 1, "unrequested balance call")
         print("PASS dedicated quota request and subscription auth")
         for status in [401, 403, 429, 503] {
             QuotaURLProtocol.status = status
@@ -185,11 +235,48 @@ private enum MiniMaxUsageTests {
             catch ProviderFetchError.parsingError where status == 503 { }
         }
         print("PASS HTTP failure classification")
+        QuotaURLProtocol.status = 200
+        QuotaURLProtocol.balanceBody = try balancePayload()
+        let combinedCredential = ProviderCredential(accessToken: "sk-cp-fixture", extraFields: [
+            MiniMaxProviderClient.balanceAPIKeyField: " sk-api-balance-fixture "
+        ])
+        let beforeCombined = QuotaURLProtocol.requests.count
+        let combined = try await client.fetchSnapshot(credentials: combinedCredential)
+        try expect(combined.windows.count == 2 && combined.balances.first?.amount == 98.25, "combined quota and balance missing")
+        try expect(QuotaURLProtocol.requests.count == beforeCombined + 2, "wrong combined request count")
+        let balanceRequest = QuotaURLProtocol.requests.last!
+        try expect(balanceRequest.url == MiniMaxProviderClient.balanceURL && balanceRequest.url?.query == nil, "wrong balance endpoint")
+        try expect(balanceRequest.httpMethod == "GET" && balanceRequest.httpBody == nil && !balanceRequest.httpShouldHandleCookies, "unsafe balance request")
+        try expect(balanceRequest.value(forHTTPHeaderField: "Authorization") == "Bearer sk-api-balance-fixture", "wrong balance key")
+        print("PASS optional balance key adds credits without changing subscription meters")
+
+        for status in [401, 403, 429, 503] {
+            QuotaURLProtocol.balanceStatus = status
+            let partial = try await client.fetchSnapshot(credentials: combinedCredential)
+            try expect(partial.windows.count == 2 && partial.balances.isEmpty && partial.fetchState == .success, "balance failure discarded valid quota")
+        }
+        QuotaURLProtocol.balanceStatus = 200
+        QuotaURLProtocol.balanceBody = Data("{}".utf8)
+        let malformedBalance = try await client.fetchSnapshot(credentials: combinedCredential)
+        try expect(malformedBalance.windows.count == 2 && malformedBalance.balances.isEmpty, "malformed balance discarded quota")
+        print("PASS supplemental balance failures preserve Token Plan quota")
+
+        QuotaURLProtocol.balanceBody = try balancePayload("0.03")
+        for balanceOnlyCredential in [
+            ProviderCredential(accessToken: "sk-api-primary-fixture"),
+            ProviderCredential(extraFields: [MiniMaxProviderClient.balanceAPIKeyField: "sk-api-balance-fixture"])
+        ] {
+            let before = QuotaURLProtocol.requests.count
+            let balanceOnly = try await client.fetchSnapshot(credentials: balanceOnlyCredential)
+            try expect(balanceOnly.windows.isEmpty && balanceOnly.balances.first?.amount == 0.03, "balance-only account invented plan quota")
+            try expect(QuotaURLProtocol.requests.count == before + 1 && QuotaURLProtocol.requests.last?.url == MiniMaxProviderClient.balanceURL, "balance-only account fetched quota")
+        }
+        print("PASS API-only accounts read available credits without quota requests")
         let requestsBefore = QuotaURLProtocol.requests.count
         do { _ = try await client.fetchSnapshot(credentials: nil); throw Failure("missing key accepted") }
         catch ProviderFetchError.notConfigured { }
         try expect(QuotaURLProtocol.requests.count == requestsBefore, "request made without a key")
         print("PASS no network request before setup")
-        print("MiniMax: \(cases.count + 3) tests passed")
+        print("MiniMax: \(cases.count + 6) tests passed")
     }
 }

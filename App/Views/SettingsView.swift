@@ -904,6 +904,20 @@ struct ProviderCredentialView: View {
         )
     }
 
+    private var minimaxBalanceAPIKey: Binding<String> {
+        Binding(
+            get: { storedExtraFields[MiniMaxProviderClient.balanceAPIKeyField] ?? "" },
+            set: { value in
+                let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if key.isEmpty {
+                    storedExtraFields.removeValue(forKey: MiniMaxProviderClient.balanceAPIKeyField)
+                } else {
+                    storedExtraFields[MiniMaxProviderClient.balanceAPIKeyField] = key
+                }
+            }
+        )
+    }
+
     private func webSessionImportButton(
         _ title: String,
         systemImage: String,
@@ -1347,6 +1361,15 @@ struct ProviderCredentialView: View {
                     #endif
                     Link("Open MiniMax Plan Details", destination: URL(string: "https://platform.minimax.io/console/plan")!)
                     Text("Copy the Subscription Key (sk-cp) from Plan Details. The 5-hour and weekly meters share your Token Plan quota across tools and models. A pay-as-you-go API key does not report subscription usage.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    SecureField("API key for Usage Credits (optional)", text: minimaxBalanceAPIKey)
+                        .autocorrectionDisabled()
+                    #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                    #endif
+                    Text("Add a pay-as-you-go API key (sk-api) to show your available account balance alongside the Token Plan meters. It is stored in Keychain and used only to read MiniMax's account balance. Leave the Subscription Key empty to monitor only the balance.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

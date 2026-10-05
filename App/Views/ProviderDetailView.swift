@@ -44,9 +44,10 @@ struct ProviderDetailView: View {
                             statsSection
                         }
 
-                        if snapshot.balancesSectionTitle != nil {
-                            balancesSection
-                        }
+                    }
+
+                    if snapshot.balancesSectionTitle != nil {
+                        balancesSection
                     }
 
                     GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
@@ -98,17 +99,6 @@ struct ProviderDetailView: View {
                 title: $0.label,
                 value: $0.valueText,
                 subtitle: $0.subtitle
-            )
-        }
-    }
-
-    private var balanceItems: [SnapshotMetricItem] {
-        snapshot.balances.map {
-            SnapshotMetricItem(
-                id: $0.id,
-                title: $0.label,
-                value: $0.valueText,
-                subtitle: $0.subtitle ?? $0.resetDate.map { "Resets \($0.countdownString)" }
             )
         }
     }
@@ -301,7 +291,7 @@ struct ProviderDetailView: View {
                 .padding(.bottom, 4)
 
             GlassCardContainer(style: .panel, accent: accent, cornerRadius: 14) {
-                SnapshotMetricListView(items: balanceItems, accentColor: accent)
+                SnapshotBalanceListView(snapshot: snapshot, accentColor: accent)
             }
         }
     }

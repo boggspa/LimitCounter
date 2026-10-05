@@ -875,6 +875,9 @@ public final class ProviderCardOrderStore: ObservableObject {
 @MainActor
 public final class MeterOrderStore: ObservableObject {
     public static let shared = MeterOrderStore()
+    /// Credit rows have no reset period and keep an independent Period order.
+    public nonisolated static let scopeForUsageCredits = "usage-credits"
+    public nonisolated static let scopeForAvailableResets = "resets-available"
 
     private let appGroupID = "group.com.chrisizatt.LLMUsageCounter"
     private let orderedMetersKey = "dashboardMeterOrder"

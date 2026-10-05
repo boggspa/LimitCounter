@@ -295,6 +295,7 @@ struct GrokUsageSnapshot: Decodable {
     let weeklyLeftDisplay: String?
     let creditsUsedPercent: Double?
     let creditsUsedDisplay: String?
+    var prepaidBalanceUSD: Double?
     let resetAtText: String?
     let weeklyResetAtText: String?
     let nextResetText: String?
@@ -325,6 +326,7 @@ struct GrokUsageSnapshot: Decodable {
         weeklyLeftDisplay: String? = nil,
         creditsUsedPercent: Double? = nil,
         creditsUsedDisplay: String? = nil,
+        prepaidBalanceUSD: Double? = nil,
         resetAtText: String? = nil,
         weeklyResetAtText: String? = nil,
         nextResetText: String? = nil,
@@ -354,6 +356,7 @@ struct GrokUsageSnapshot: Decodable {
         self.weeklyLeftDisplay = weeklyLeftDisplay
         self.creditsUsedPercent = creditsUsedPercent
         self.creditsUsedDisplay = creditsUsedDisplay
+        self.prepaidBalanceUSD = prepaidBalanceUSD
         self.resetAtText = resetAtText
         self.weeklyResetAtText = weeklyResetAtText
         self.nextResetText = nextResetText
@@ -385,6 +388,7 @@ struct GrokUsageSnapshot: Decodable {
         case weeklyLeftDisplay
         case creditsUsedPercent
         case creditsUsedDisplay
+        case prepaidBalanceUSD
         case resetAtText
         case weeklyResetAtText
         case nextResetText
@@ -417,6 +421,7 @@ struct GrokUsageSnapshot: Decodable {
         weeklyLeftDisplay = try container.decodeIfPresent(String.self, forKey: .weeklyLeftDisplay)
         creditsUsedPercent = Self.decodeFlexibleDouble(container, .creditsUsedPercent)
         creditsUsedDisplay = try container.decodeIfPresent(String.self, forKey: .creditsUsedDisplay)
+        prepaidBalanceUSD = Self.decodeFlexibleDouble(container, .prepaidBalanceUSD)
         resetAtText = try container.decodeIfPresent(String.self, forKey: .resetAtText)
         weeklyResetAtText = try container.decodeIfPresent(String.self, forKey: .weeklyResetAtText)
         nextResetText = try container.decodeIfPresent(String.self, forKey: .nextResetText)
@@ -483,6 +488,13 @@ struct GrokUsageSnapshot: Decodable {
 }
 
 nonisolated enum GrokUsageWindowMapper {
+    static func usageCreditBalances(from snapshot: GrokUsageSnapshot) -> [QuotaBalance] {
+        guard snapshot.isObserved, let amount = snapshot.prepaidBalanceUSD,
+              amount.isFinite, amount >= 0 else { return [] }
+        return [QuotaBalance(label: "Usage Credits", amount: amount, unit: "USD",
+                             subtitle: "Remaining purchased credits reported by Grok")]
+    }
+
     static func quotaWindow(from snapshot: GrokUsageSnapshot, now: Date = Date()) -> QuotaWindow? {
         guard snapshot.isObserved else { return nil }
         let usageKind = snapshot.usageKind?.lowercased() ?? ""
@@ -897,6 +909,7 @@ nonisolated enum GrokCLIUsageParser {
                 ?? used.map(usedDisplayFromInvertedLeft),
             weeklyLimitLeftPercent: left.map(clampedPercent),
             weeklyLimitLeftDisplay: leftMatch.map { percentDisplay(lessThanPrefix: $0[1], rawValue: $0[2]) },
+            prepaidBalanceUSD: prepaidBalanceUSD(in: text),
             resetAtText: resetText,
             weeklyResetAtText: resetText,
             nextResetText: resetText,
@@ -944,12 +957,22 @@ nonisolated enum GrokCLIUsageParser {
             creditsUsedPercent: clampedPercent(creditsUsed),
             creditsUsedDisplay: creditsMatch.map { percentDisplay(lessThanPrefix: $0[1], rawValue: $0[2]) }
                 ?? "\(compactPercent(creditsUsed))%",
+            prepaidBalanceUSD: prepaidBalanceUSD(in: text),
             resetAtText: resetText,
             resetAt: resetAt.map(isoString),
             limitWindowSeconds: 30 * 24 * 60 * 60,
             refreshedAt: refreshedAtText,
             confidence: "observed"
         )
+    }
+
+    /// The official CLI prints purchased USD credits separately from the quota percentage.
+    /// Cursor-painted output can join labels after ANSI removal, so no line boundary is required.
+    private static func prepaidBalanceUSD(in text: String) -> Double? {
+        guard let raw = firstMatch(#"Credits\s*:\s*\$([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)(?![0-9.,])"#, in: text)?[1],
+              let amount = Double(raw.replacingOccurrences(of: ",", with: "")),
+              amount.isFinite else { return nil }
+        return amount
     }
 
     private static func resetText(from text: String) -> String? {
@@ -1041,8 +1064,10 @@ enum GrokCLIUsageProbe {
         defer { access.stop() }
         let cliSnapshot = runGrokUsageProbe(binaryURL: access.binaryURL, grokHomeURL: access.rootURL)
         let billingSnapshot = GrokLocalBillingLogReader.latestSnapshot(rootURL: access.rootURL)
-        if let billingSnapshot,
+        if var billingSnapshot,
            GrokUsageWindowMapper.quotaWindow(from: billingSnapshot) != nil {
+            // Older log schemas can omit a balance that the same CLI probe displayed.
+            billingSnapshot.prepaidBalanceUSD = billingSnapshot.prepaidBalanceUSD ?? cliSnapshot?.prepaidBalanceUSD
             return billingSnapshot
         }
         return cliSnapshot
@@ -1489,6 +1514,7 @@ nonisolated enum GrokLocalBillingLogReader {
                 usageKind: "weekly_limit",
                 weeklyLimitUsedPercent: clampedPercent(used),
                 weeklyLimitUsedDisplay: "\(compactPercent(used))%",
+                prepaidBalanceUSD: config.prepaidBalance.map { abs($0.val) / 100 },
                 resetAt: resetAt,
                 weeklyResetAt: resetAt,
                 nextResetAt: resetAt,
@@ -1505,6 +1531,7 @@ nonisolated enum GrokLocalBillingLogReader {
             usageKind: "subscription_credits",
             creditsUsedPercent: clampedPercent(used),
             creditsUsedDisplay: "\(compactPercent(used))%",
+            prepaidBalanceUSD: config.prepaidBalance.map { abs($0.val) / 100 },
             resetAt: resetAt,
             periodStartAt: periodStartDate.map(isoString) ?? periodStart,
             periodEndAt: resetAt,
@@ -1608,14 +1635,36 @@ nonisolated enum GrokLocalBillingLogReader {
         let subscriptionTier: String?
     }
 
+    // Grok's proto stores USD cents and omits `val` for an explicit zero.
+    private struct BillingCent: Decodable {
+        let val: Double
+        private enum CodingKeys: String, CodingKey { case val }
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if !container.contains(.val) {
+                val = 0
+            } else if let number = try? container.decode(Double.self, forKey: .val), number.isFinite {
+                val = number
+            } else if let text = try? container.decode(String.self, forKey: .val),
+                      let number = Double(text), number.isFinite {
+                val = number
+            } else {
+                throw DecodingError.dataCorruptedError(forKey: .val, in: container,
+                                                       debugDescription: "Invalid Grok credit cents")
+            }
+        }
+    }
+
     private struct BillingConfig: Decodable {
         let creditUsagePercent: Double?
+        let prepaidBalance: BillingCent?
         let currentPeriod: BillingPeriod?
         let billingPeriodStart: String?
         let billingPeriodEnd: String?
 
         private enum CodingKeys: String, CodingKey {
             case creditUsagePercent
+            case prepaidBalance
             case currentPeriod
             case billingPeriodStart
             case billingPeriodEnd
@@ -1624,6 +1673,7 @@ nonisolated enum GrokLocalBillingLogReader {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             creditUsagePercent = Self.decodeFlexibleDouble(container, .creditUsagePercent)
+            prepaidBalance = try? container.decode(BillingCent.self, forKey: .prepaidBalance)
             currentPeriod = try container.decodeIfPresent(BillingPeriod.self, forKey: .currentPeriod)
             billingPeriodStart = try container.decodeIfPresent(String.self, forKey: .billingPeriodStart)
             billingPeriodEnd = try container.decodeIfPresent(String.self, forKey: .billingPeriodEnd)
@@ -1662,16 +1712,19 @@ public struct GrokProviderClient: ProviderClient {
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         let agbenchData = readTaskWraithGrokData()
         var windows: [QuotaWindow] = []
+        var balances: [QuotaBalance] = []
         var planName = "Grok"
 
         if let cliSnapshot = await GrokCLIUsageProbe.fetchSnapshot(credentials: credentials),
            let cliWindow = GrokUsageWindowMapper.quotaWindow(from: cliSnapshot) {
             planName = cliSnapshot.resolvedPlanName
             windows.append(cliWindow)
+            balances = GrokUsageWindowMapper.usageCreditBalances(from: cliSnapshot)
         } else if let bridgeSnapshot = agbenchData.snapshot,
                   let bridgeWindow = GrokUsageWindowMapper.quotaWindow(from: bridgeSnapshot) {
             planName = bridgeSnapshot.resolvedPlanName
             windows.append(bridgeWindow)
+            balances = GrokUsageWindowMapper.usageCreditBalances(from: bridgeSnapshot)
         }
 
         if windows.isEmpty && agbenchData.events.isEmpty {
@@ -1698,7 +1751,7 @@ public struct GrokProviderClient: ProviderClient {
             planName: planName,
             windows: windows,
             stats: [],
-            balances: [],
+            balances: balances,
             signals: [],
             events: agbenchData.events.sorted { $0.timestamp > $1.timestamp },
             fetchState: .success,
@@ -10148,6 +10201,87 @@ struct ClaudeOAuthExtraUsage: Decodable {
     }
 }
 
+struct ClaudePrepaidCreditsResponse: Decodable {
+    let amount: Double
+    let currency: String
+}
+
+nonisolated enum ClaudeUsageCreditMapper {
+    /// Claude Code's OAuth schema reports money in currency minor units.
+    private static func currencyAmount(_ minorUnits: Double, currency: String) -> (Double, String)? {
+        let code = currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard minorUnits.isFinite, minorUnits >= 0,
+              Locale.commonISOCurrencyCodes.contains(code) else { return nil }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .currency
+        formatter.currencyCode = code
+        return (minorUnits / pow(10, Double(formatter.maximumFractionDigits)), code)
+    }
+
+    static func prepaidBalance(from response: ClaudePrepaidCreditsResponse) -> QuotaBalance? {
+        guard let (amount, currency) = currencyAmount(response.amount, currency: response.currency) else { return nil }
+        return QuotaBalance(label: "Usage Credits", amount: amount, unit: currency,
+                            subtitle: "Remaining purchased credits reported by Claude")
+    }
+
+    static func extraUsageBalances(from extra: ClaudeOAuthExtraUsage?) -> [QuotaBalance] {
+        guard let extra, extra.isEnabled, let used = extra.usedCredits,
+              let (usedAmount, currency) = currencyAmount(used, currency: extra.currency ?? "USD") else { return [] }
+        if let limit = extra.monthlyLimit,
+           let (limitAmount, _) = currencyAmount(limit, currency: currency) {
+            return [QuotaBalance(label: "Extra usage limit remaining", amount: max(0, limitAmount - usedAmount),
+                                 unit: currency,
+                                 subtitle: "\(usedAmount.compactString) of \(limitAmount.compactString) \(currency) used this month; purchased balance is separate")]
+        }
+        return [QuotaBalance(label: "Extra usage used", amount: usedAmount, unit: currency,
+                             subtitle: "Additional usage this month; purchased balance is separate")]
+    }
+}
+
+/// Mirrors Claude Code's read-only prepaid balance request, using the same OAuth account.
+/// Failure is supplemental: it must never erase successfully fetched quota windows.
+struct ClaudePrepaidCreditsClient {
+    let session: URLSession
+
+    init(session: URLSession = .shared) { self.session = session }
+
+    static func request(token: String, organizationID: String?) -> URLRequest? {
+        guard let organizationID, UUID(uuidString: organizationID) != nil,
+              let url = URL(string: "https://api.anthropic.com/api/oauth/organizations/\(organizationID)/prepaid/credits") else { return nil }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue(organizationID, forHTTPHeaderField: "x-organization-uuid")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
+    func fetchBalance(token: String, organizationID: String?) async -> QuotaBalance? {
+        guard let request = Self.request(token: token, organizationID: organizationID) else { return nil }
+        do {
+            let (data, response) = try await session.data(for: request, delegate: ClaudePrepaidRedirectPolicy())
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  data.count <= 1_048_576,
+                  let balance = try? JSONDecoder().decode(ClaudePrepaidCreditsResponse.self, from: data) else { return nil }
+            return ClaudeUsageCreditMapper.prepaidBalance(from: balance)
+        } catch {
+            return nil
+        }
+    }
+}
+
+private final class ClaudePrepaidRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 struct ClaudeOAuthUsageResponse: Decodable {
     let fiveHour: ClaudeOAuthWindow?
     let sevenDay: ClaudeOAuthWindow?
@@ -10229,6 +10363,7 @@ struct ClaudeOAuthProfileResponse: Decodable {
 nonisolated struct ClaudeOAuthProfileInfo {
     let plan: ClaudePlanInfo?
     let accountFingerprint: String?
+    let organizationID: String?
 }
 
 // MARK: - Claude Provider Client
@@ -10293,6 +10428,8 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
     /// token. Process-lifetime only: the fingerprint that matters across
     /// launches is the one on the stored snapshot.
     private var identity: (tokenHash: String, fingerprint: String)?
+    /// The endpoint routing UUID stays in memory and is never written to shared snapshots.
+    private var organization: (tokenHash: String, id: String)?
 
     init(
         freshTTL: TimeInterval = 120,                  // 2 min
@@ -10353,6 +10490,20 @@ final class ClaudeOAuthResponseCache: @unchecked Sendable {
         let hash = Self.tokenHash(token)
         lock.lock(); defer { lock.unlock() }
         identity = (hash, fingerprint)
+    }
+
+    func cachedOrganizationID(forToken token: String) -> String? {
+        let hash = Self.tokenHash(token)
+        lock.lock(); defer { lock.unlock() }
+        guard let organization, organization.tokenHash == hash else { return nil }
+        return organization.id
+    }
+
+    func storeOrganizationID(_ organizationID: String, forToken token: String) {
+        guard UUID(uuidString: organizationID) != nil else { return }
+        let hash = Self.tokenHash(token)
+        lock.lock(); defer { lock.unlock() }
+        organization = (hash, organizationID)
     }
 
     private static func tokenHash(_ token: String) -> String {
@@ -11990,14 +12141,21 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
             store: context.keychainStore
         )
         var accountFingerprint = context.cache.cachedFingerprint(forToken: token)
-        if plan == nil || accountFingerprint == nil,
+        var organizationID = context.cache.cachedOrganizationID(forToken: token)
+        if plan == nil || accountFingerprint == nil || organizationID == nil,
            let profile = await fetchOAuthProfile(token: token) {
             if plan == nil { plan = profile.plan }
             if let fingerprint = profile.accountFingerprint {
                 accountFingerprint = fingerprint
                 context.cache.storeFingerprint(fingerprint, forToken: token)
             }
+            if let id = profile.organizationID, UUID(uuidString: id) != nil {
+                organizationID = id
+                context.cache.storeOrganizationID(id, forToken: token)
+            }
         }
+        let creditOrganizationID = organizationID
+        async let prepaidBalance = ClaudePrepaidCreditsClient().fetchBalance(token: token, organizationID: creditOrganizationID)
 
         let fableWeeklyWindow = usage.fableWeeklyWindow
 
@@ -12067,26 +12225,9 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
             }
         }
 
-        var balances: [QuotaBalance] = []
-        if let extra = usage.extraUsage, extra.isEnabled {
-            let unit = extra.currency ?? "credits"
-            if let used = extra.usedCredits, let limit = extra.monthlyLimit {
-                balances.append(QuotaBalance(
-                    label: "Extra Usage",
-                    amount: max(0, limit - used),
-                    unit: unit,
-                    subtitle: "\(used.compactString) of \(limit.compactString) \(unit) used this month",
-                    resetDate: nil
-                ))
-            } else if let used = extra.usedCredits {
-                balances.append(QuotaBalance(
-                    label: "Extra Usage",
-                    amount: used,
-                    unit: unit,
-                    subtitle: "Additional usage this month",
-                    resetDate: nil
-                ))
-            }
+        var balances = ClaudeUsageCreditMapper.extraUsageBalances(from: usage.extraUsage)
+        if let prepaid = await prepaidBalance {
+            balances.insert(prepaid, at: 0)
         }
 
         return QuotaSnapshot(
@@ -12120,7 +12261,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
             }
 
             let profile = try JSONDecoder().decode(ClaudeOAuthProfileResponse.self, from: data)
-            return ClaudeOAuthProfileInfo(plan: profile.planInfo, accountFingerprint: profile.accountFingerprint)
+            return ClaudeOAuthProfileInfo(plan: profile.planInfo, accountFingerprint: profile.accountFingerprint,
+                                          organizationID: profile.organization?.uuid)
         } catch {
             print("[ClaudeProvider] OAuth profile lookup failed; retaining credential plan metadata")
             return nil

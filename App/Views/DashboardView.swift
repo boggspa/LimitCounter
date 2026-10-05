@@ -1844,9 +1844,72 @@ private enum DashboardRoute: Hashable {
 /// carried beside the window instead of being derived inside the loop. Keying
 /// on the per-fetch UUID would rebuild every row on every refresh, which is
 /// invisible right up until it tears down a drag mid-gesture.
-private struct OrderedMeter: Identifiable {
-    let id: String
-    let window: QuotaWindow
+private enum OrderedMeter: Identifiable {
+    case window(id: String, window: QuotaWindow)
+    case readout(CompactReadout)
+
+    var id: String {
+        switch self {
+        case .window(let id, _): return id
+        case .readout(let readout): return readout.id
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .window(_, let window): return window.label
+        case .readout(let readout): return readout.title
+        }
+    }
+}
+
+/// Shared presentation for the two supplemental compact lines.
+private enum CompactReadout: Identifiable {
+    case credits(QuotaUsageCredits)
+    case resets(QuotaAvailableResets)
+
+    var id: String {
+        switch self {
+        case .credits(let row): return row.id
+        case .resets(let row): return row.id
+        }
+    }
+    var providerID: ProviderID {
+        switch self {
+        case .credits(let row): return row.providerID
+        case .resets(let row): return row.providerID
+        }
+    }
+    var label: String {
+        switch self {
+        case .credits(let row): return row.label
+        case .resets(let row): return row.label
+        }
+    }
+    var title: String {
+        switch self {
+        case .credits: return "Usage Credits"
+        case .resets: return "Resets Available"
+        }
+    }
+    var valueText: String {
+        switch self {
+        case .credits(let row): return row.valueText
+        case .resets(let row): return row.valueText
+        }
+    }
+    var detail: String {
+        switch self {
+        case .credits(let row): return row.detail
+        case .resets(let row): return row.detail
+        }
+    }
+    var hasValue: Bool {
+        switch self {
+        case .credits(let row): return row.balance != nil
+        case .resets(let row): return row.summary != nil
+        }
+    }
 }
 
 // MARK: - Compact Layout
@@ -1904,11 +1967,12 @@ struct CompactDashboardCardView: View {
         // are different meters, with orders of their own.
         let scope = MeterOrderStore.scopeForProvider(snapshot.accountKey)
         let naturalMeters = snapshot.summaryWindows.map {
-            OrderedMeter(
+            OrderedMeter.window(
                 id: MeterOrderStore.key(account: snapshot.accountKey, window: $0),
                 window: $0
             )
-        }
+        } + (snapshot.usageCredits.map { [OrderedMeter.readout(.credits($0))] } ?? [])
+            + (snapshot.availableResets.map { [OrderedMeter.readout(.resets($0))] } ?? [])
         let meterKeys = naturalMeters.map(\.id)
         let meters = meterOrderStore.ordered(naturalMeters, scope: scope, key: \.id)
 
@@ -1937,9 +2001,6 @@ struct CompactDashboardCardView: View {
 
                 Spacer(minLength: 4)
 
-                if let banked = snapshot.resetCredits, banked.hasAvailableReset {
-                    BankedResetPill(text: banked.statusLine() ?? "Reset banked", accent: accent, compact: true)
-                }
             }
             .padding(.bottom, 1)
 
@@ -1957,19 +2018,34 @@ struct CompactDashboardCardView: View {
                         meterOrderStore.move(key, toGap: gap, scope: scope, natural: meterKeys)
                     },
                     row: { meter, meterReorder in
-                        compactMeterRow(window: meter.window, accent: accent, providerID: snapshot.providerID) {
-                            ReorderGrip(key: meter.id, label: meter.window.label, style: .lines, controller: meterReorder)
+                        compactRow(meter, accent: accent, providerID: snapshot.providerID) {
+                            ReorderGrip(key: meter.id, label: meter.label, style: .lines, controller: meterReorder)
                         }
                     },
                     phantom: { meter in
                         ReorderPhantomRow {
-                            compactMeterRow(window: meter.window, accent: accent, providerID: snapshot.providerID) {
+                            compactRow(meter, accent: accent, providerID: snapshot.providerID) {
                                 ReorderGripGlyph()
                             }
                         }
                     }
                 )
             }
+        }
+    }
+
+    @ViewBuilder
+    private func compactRow<Leading: View>(
+        _ meter: OrderedMeter,
+        accent: Color,
+        providerID: ProviderID,
+        @ViewBuilder leading: @escaping () -> Leading
+    ) -> some View {
+        switch meter {
+        case .window(_, let window):
+            compactMeterRow(window: window, accent: accent, providerID: providerID, leading: leading)
+        case .readout(let readout):
+            CompactReadoutRow(readout: readout, showsProvider: false, leading: leading)
         }
     }
 
@@ -2052,12 +2128,56 @@ struct PeriodCompactDashboardCardView: View {
     var body: some View {
         let orderedSections = sections
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(orderedSections) { section in
-                sectionBlock(section)
-                if section.id != orderedSections.last?.id {
-                    Divider().overlay(Color.white.opacity(0.08))
+            if !orderedSections.isEmpty {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(orderedSections) { section in
+                        sectionBlock(section)
+                        if section.id != orderedSections.last?.id {
+                            Divider().overlay(Color.white.opacity(0.08))
+                        }
+                    }
                 }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
             }
+            if !snapshots.compactMap(\.usageCredits).isEmpty {
+                readoutBlock(title: "Usage Credits", naturalRows: snapshots.compactMap(\.usageCredits).map(CompactReadout.credits),
+                             scope: MeterOrderStore.scopeForUsageCredits)
+            }
+            if !snapshots.compactMap(\.availableResets).isEmpty {
+                readoutBlock(title: "Resets Available", naturalRows: snapshots.compactMap(\.availableResets).map(CompactReadout.resets),
+                             scope: MeterOrderStore.scopeForAvailableResets)
+            }
+        }
+    }
+
+    private func readoutBlock(title: String, naturalRows: [CompactReadout], scope: String) -> some View {
+        let rows = meterOrderStore.ordered(naturalRows, scope: scope, key: \.id)
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 13, weight: .bold))
+                .padding(.bottom, 1)
+
+            ReorderableStack(
+                items: rows,
+                key: \.id,
+                spacing: 6,
+                accent: { Color(hex: $0.providerID.accentColorHex) },
+                onMove: { key, gap in
+                    meterOrderStore.move(key, toGap: gap, scope: scope, natural: naturalRows.map(\.id))
+                },
+                row: { readout, reorder in
+                    CompactReadoutRow(readout: readout, showsProvider: true) {
+                        ReorderGrip(key: readout.id, label: readout.label + " " + title, style: .lines, controller: reorder)
+                    }
+                },
+                phantom: { readout in
+                    ReorderPhantomRow {
+                        CompactReadoutRow(readout: readout, showsProvider: true) { ReorderGripGlyph() }
+                    }
+                }
+            )
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2181,6 +2301,39 @@ struct PeriodCompactDashboardCardView: View {
                 )
             }
         }
+    }
+}
+
+/// A single line with no progress bar for credits and banked reset counts.
+private struct CompactReadoutRow<Leading: View>: View {
+    let readout: CompactReadout
+    let showsProvider: Bool
+    @ViewBuilder let leading: () -> Leading
+
+    var body: some View {
+        HStack(spacing: 8) {
+            leading()
+            if showsProvider {
+                ProviderBrandIconView(providerID: readout.providerID, size: 13)
+                    .frame(width: 16, height: 16)
+            }
+            Text(showsProvider ? readout.label : readout.title)
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 6)
+            Text(readout.valueText)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(!readout.hasValue ? Color.secondary : Color(hex: readout.providerID.accentColorHex))
+                .lineLimit(1)
+                .monospacedDigit()
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .frame(minHeight: 16)
+        .help(readout.detail)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(readout.label) \(readout.title)")
+        .accessibilityValue(!readout.hasValue ? readout.detail : "\(readout.valueText). \(readout.detail)")
     }
 }
 

@@ -829,9 +829,95 @@ private func testClaudeMirrorNeverStoresTheRefreshToken() throws {
     try expect(mirrored["expiresAt"] is NSNumber, "expiry is stored in Claude Code's integer-millisecond format")
 }
 
+private func testClaudeCreditsUseMinorCurrencyUnits() throws {
+    for (currency, raw, expected) in [("USD", 1250.0, 12.5), ("JPY", 1250.0, 1250.0), ("BHD", 1250.0, 1.25)] {
+        let balance = ClaudeUsageCreditMapper.prepaidBalance(from: ClaudePrepaidCreditsResponse(amount: raw, currency: currency))
+        try expectEqual(balance?.amount, expected, "prepaid currency minor units")
+        try expectEqual(balance?.unit, currency, "prepaid currency")
+        try expectEqual(balance?.label, "Usage Credits", "purchased credit label")
+    }
+    try expectEqual(ClaudeUsageCreditMapper.prepaidBalance(from: ClaudePrepaidCreditsResponse(amount: 0, currency: "USD"))?.amount,
+                    0, "known zero balance is retained")
+    for amount in [-1.0, Double.infinity, Double.nan] {
+        try expect(ClaudeUsageCreditMapper.prepaidBalance(from: ClaudePrepaidCreditsResponse(amount: amount, currency: "USD")) == nil,
+                   "invalid prepaid values stay unavailable")
+    }
+    try expect(ClaudeUsageCreditMapper.prepaidBalance(from: ClaudePrepaidCreditsResponse(amount: 100, currency: "unknown")) == nil,
+               "unknown currency is not guessed")
+    let response = try claudeOAuthDecoder().decode(ClaudeOAuthUsageResponse.self, from: Data(#"{"extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":1250,"utilization":25,"currency":"USD"}}"#.utf8))
+    let cap = ClaudeUsageCreditMapper.extraUsageBalances(from: response.extraUsage).first
+    try expectEqual(cap?.amount, 37.5, "spending limit remaining converts cents")
+    try expectEqual(cap?.label, "Extra usage limit remaining", "cap is identified separately from purchased credits")
+    let usedOnly = ClaudeOAuthExtraUsage(isEnabled: true, monthlyLimit: nil, usedCredits: 1250, utilization: nil, currency: "USD")
+    try expectEqual(ClaudeUsageCreditMapper.extraUsageBalances(from: usedOnly).first?.label, "Extra usage used", "spend is not called remaining")
+    let disabled = ClaudeOAuthExtraUsage(isEnabled: false, monthlyLimit: 5000, usedCredits: 1250, utilization: 25, currency: "USD")
+    try expect(ClaudeUsageCreditMapper.extraUsageBalances(from: disabled).isEmpty, "disabled usage does not invent spend availability")
+}
+
+private func testClaudeCreditOrganizationCacheIsTokenScoped() throws {
+    let (defaults, suite) = isolatedDefaults()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let cache = ClaudeOAuthResponseCache(defaults: defaults, persistenceKey: "credit-test", legacySnapshotLoader: { nil })
+    let org = "11111111-1111-4111-8111-111111111111"
+    cache.storeOrganizationID(org, forToken: "first-token")
+    try expectEqual(cache.cachedOrganizationID(forToken: "first-token"), org, "same token reuses its org")
+    try expect(cache.cachedOrganizationID(forToken: "other-token") == nil, "rotated or different token cannot inherit old org")
+    let relaunched = ClaudeOAuthResponseCache(defaults: defaults, persistenceKey: "credit-test", legacySnapshotLoader: { nil })
+    try expect(relaunched.cachedOrganizationID(forToken: "first-token") == nil, "raw organization stays in process memory")
+}
+
+private final class ClaudeCreditURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var status = 200
+    nonisolated(unsafe) static var body = Data()
+    nonisolated(unsafe) static var requests: [URLRequest] = []
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.requests.append(request)
+        let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+private func testClaudePrepaidCreditFetchIsOptionalAndReadOnly() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let client = ClaudePrepaidCreditsClient(session: session)
+    let org = "11111111-1111-4111-8111-111111111111"
+    ClaudeCreditURLProtocol.body = Data(#"{"amount":1250,"currency":"USD"}"#.utf8)
+    let balance = await client.fetchBalance(token: "fixture-token", organizationID: org)
+    try expectEqual(balance?.amount, 12.5, "prepaid fetched dollars")
+    let request = ClaudeCreditURLProtocol.requests.last!
+    try expectEqual(request.url?.absoluteString, "https://api.anthropic.com/api/oauth/organizations/\(org)/prepaid/credits", "known official endpoint")
+    try expectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-token", "same OAuth account")
+    try expectEqual(request.value(forHTTPHeaderField: "x-organization-uuid"), org, "organization routing header")
+    try expect(request.httpMethod == "GET" && request.httpBody == nil && !request.httpShouldHandleCookies, "read-only credit request")
+    for status in [401, 403, 404, 429, 503] {
+        ClaudeCreditURLProtocol.status = status
+        let failed = await client.fetchBalance(token: "fixture-token", organizationID: org)
+        try expect(failed == nil, "supplemental failure remains unavailable")
+    }
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"amount":true,"currency":"USD"}"#.utf8)
+    let invalid = await client.fetchBalance(token: "fixture-token", organizationID: org)
+    try expect(invalid == nil, "malformed credit response stays unavailable")
+    let before = ClaudeCreditURLProtocol.requests.count
+    let missing = await client.fetchBalance(token: "fixture-token", organizationID: nil)
+    try expect(missing == nil && ClaudeCreditURLProtocol.requests.count == before, "no request without verified organization")
+    try expect(ClaudePrepaidCreditsClient.request(token: "fixture", organizationID: "../another") == nil, "invalid organization rejected")
+}
+
 @main
 private enum ClaudeUsageTestRunner {
-    static func main() throws {
+    static func main() async throws {
+        try testClaudeCreditsUseMinorCurrencyUnits()
+        try testClaudeCreditOrganizationCacheIsTokenScoped()
+        try await testClaudePrepaidCreditFetchIsOptionalAndReadOnly()
         try testClaudeHeatmapBucketingRetainsFullWindow()
         try testClaudeFableWindowWithoutResetStillDisplays()
         try testClaudeMissingFableWindowDoesNotDisplay()

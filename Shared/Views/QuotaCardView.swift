@@ -387,10 +387,17 @@ public struct QuotaCardView: View {
         switch snapshot.fetchState {
         case .success:
             if !snapshot.hasContent {
-                Text("No usage data available")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(8)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("No usage data available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if showsTelemetryDetails, let title = snapshot.balancesSectionTitle {
+                        supplementalSection(title: title) {
+                            SnapshotBalanceListView(snapshot: snapshot, accentColor: accentColor)
+                        }
+                    }
+                }
+                .padding(8)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     if showsTelemetryDetails, !snapshot.signals.isEmpty {
@@ -452,17 +459,7 @@ public struct QuotaCardView: View {
                     if showsTelemetryDetails, snapshot.providerID != .kimi,
                        let balancesTitle = snapshot.balancesSectionTitle {
                         supplementalSection(title: balancesTitle) {
-                            SnapshotMetricListView(
-                                items: snapshot.balances.map {
-                                    SnapshotMetricItem(
-                                        id: $0.id,
-                                        title: $0.label,
-                                        value: $0.valueText,
-                                        subtitle: $0.subtitle ?? $0.resetDate.map { "Resets \($0.countdownString)" }
-                                    )
-                                },
-                                accentColor: accentColor
-                            )
+                            SnapshotBalanceListView(snapshot: snapshot, accentColor: accentColor)
                         }
                     }
                 }
@@ -496,7 +493,7 @@ public struct QuotaCardView: View {
     private var hasTelemetryContent: Bool {
         if !snapshot.signals.isEmpty { return true }
         if snapshot.providerID == .kimi { return false }
-        return !snapshot.stats.isEmpty || !snapshot.balances.isEmpty
+        return !snapshot.stats.isEmpty || snapshot.balancesSectionTitle != nil
     }
 
     private var telemetryToggleButton: some View {
@@ -797,6 +794,30 @@ private struct RefreshHaloOverlay: View {
                 }
             }
             .allowsHitTesting(false)
+    }
+}
+
+/// The detailed balance section includes a clear unavailable state for
+/// providers whose quota source does not always carry purchased credits.
+struct SnapshotBalanceListView: View {
+    let snapshot: QuotaSnapshot
+    let accentColor: Color
+
+    var body: some View {
+        SnapshotMetricListView(items: items, accentColor: accentColor)
+    }
+
+    private var items: [SnapshotMetricItem] {
+        let balances = snapshot.balances.map {
+            SnapshotMetricItem(
+                id: $0.id,
+                title: $0.label,
+                value: $0.valueText,
+                subtitle: $0.subtitle ?? $0.resetDate.map { "Resets \($0.countdownString)" }
+            )
+        }
+        guard let credits = snapshot.usageCredits, credits.balance == nil else { return balances }
+        return [SnapshotMetricItem(title: "Usage Credits", value: credits.valueText, subtitle: credits.detail)] + balances
     }
 }
 

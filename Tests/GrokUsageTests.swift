@@ -371,6 +371,46 @@ private func expectSnapshot(_ snapshot: GrokUsageSnapshot?) throws -> GrokUsageS
     return snapshot
 }
 
+private func testPurchasedCreditsAreSeparateFromWeeklyPercentage() throws {
+    let snapshot = GrokCLIUsageParser.parse("Weekly limit: 100%\nNext reset: October 8, 18:04\n\nCredits: $12.50\nAuto topup: $20",
+                                            refreshedAt: makeDate("2026-10-05T13:00:00Z"))
+    let balances = GrokUsageWindowMapper.usageCreditBalances(from: snapshot)
+    try expectEqual(snapshot.weeklyLimitUsedPercent, 100, "weekly percentage retained")
+    try expectEqual(balances.first?.amount, 12.5, "CLI purchased credit dollars")
+    try expectEqual(balances.first?.unit, "USD", "CLI purchased credit currency")
+    try expectEqual(balances.first?.label, "Usage Credits", "purchased balance label")
+    let painted = GrokCLIUsageParser.parse("Weeklylimit:100%Nextreset:October8,11:04PTCredits:$12.50Autotopup:$20")
+    try expectEqual(GrokUsageWindowMapper.usageCreditBalances(from: painted).first?.amount, 12.5,
+                    "cursor-painted credits survive joined labels")
+    for text in ["Weekly limit: 100%", "Credits used: 40%", "Weekly limit: 25%\nAuto topup: $20"] {
+        try expect(GrokUsageWindowMapper.usageCreditBalances(from: GrokCLIUsageParser.parse(text)).isEmpty,
+                   "quota percentage and top-up settings cannot become a purchased balance")
+    }
+}
+
+private func testBillingCreditsPreserveZeroSignedCentsAndMissing() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("grok-credit-test-\(UUID().uuidString)")
+    let logs = root.appendingPathComponent("logs")
+    try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = makeDate("2026-10-05T13:00:00Z")
+    let cases: [(String?, Double?)] = [(#"{"val":-1250}"#, 12.5), (#"{"val":"350"}"#, 3.5),
+                                     ("{}", 0), (nil, nil), (#"{"val":"invalid"}"#, nil),
+                                     (#"{"val":true}"#, nil), (#"{"val":null}"#, nil)]
+    for (rawBalance, expected) in cases {
+        let balanceField = rawBalance.map { ",\"prepaidBalance\":\($0)" } ?? ""
+        let line = """
+        {"ts":"2026-10-05T13:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":100,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-01T00:00:00Z","end":"2026-10-08T00:00:00Z"}\(balanceField)}}}
+        """
+        try Data(line.utf8).write(to: logs.appendingPathComponent("unified.jsonl"))
+        let snapshot = try expectSnapshot(GrokLocalBillingLogReader.latestSnapshot(rootURL: root, now: now))
+        try expectEqual(snapshot.prepaidBalanceUSD, expected, "billing balance semantics")
+        try expectEqual(snapshot.weeklyLimitUsedPercent, 100, "invalid optional credits preserve quota")
+        try expectEqual(GrokUsageWindowMapper.usageCreditBalances(from: snapshot).first?.amount, expected,
+                        "only known credit balances render")
+    }
+}
+
 @main
 private enum GrokUsageTestRunner {
     static func main() async throws {
@@ -380,6 +420,8 @@ private enum GrokUsageTestRunner {
         try testCLIParserReadsWeeklyStatusLineFallback()
         try testCLIParserReadsCursorPaintedUsageScreen()
         try testCLIParserReadsLegacyCreditScreen()
+        try testPurchasedCreditsAreSeparateFromWeeklyPercentage()
+        try testBillingCreditsPreserveZeroSignedCentsAndMissing()
         try testBillingLogReaderUsesLatestWeeklyConfig()
         try testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset()
         try testBillingLogReaderPreservesUsageAcrossSamePeriodOmission()

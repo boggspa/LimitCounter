@@ -256,7 +256,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mimo:
             return "Xiaomi MiMo Token Plan"
         case .minimax:
-            return "MiniMax Token Plan usage"
+            return "MiniMax Token Plan usage and credits"
         case .heatmap:
             return "Activity Heatmap"
         }
@@ -303,7 +303,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mimo:
             return "Uses an imported Xiaomi MiMo console web session to read the plan quota meter and renewal metadata from platform.xiaomimimo.com."
         case .minimax:
-            return "Uses your MiniMax Subscription Key to read the shared 5-hour and weekly Token Plan quota and reset times from MiniMax's usage API."
+            return "Uses your MiniMax Subscription Key to read the shared 5-hour and weekly Token Plan quota and reset times. An optional API key reads your available account credits alongside those meters."
         case .heatmap:
             return "Aggregated usage activity across all enabled services."
         }
@@ -419,7 +419,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .mimo:
             return "Stores your imported Xiaomi MiMo console web session securely in macOS Keychain. Used only to read your plan quota meter from platform.xiaomimimo.com."
         case .minimax:
-            return "Stores the Subscription Key you enter in Keychain and sends it only to MiniMax's official quota API. Refreshing reads usage without sending model prompts."
+            return "Stores your Subscription Key and optional balance API key in Keychain. Sends each only to MiniMax's official quota or account-balance API. Refreshing reads usage without sending model prompts."
         case .heatmap:
             return "Aggregates only locally available data."
           }
@@ -996,6 +996,8 @@ public struct QuotaPeriodSection: Identifiable, Equatable, Hashable {
             // collapse into one row; the primary account's ids are unchanged.
             let accountPrefix = snapshot.isPrimaryAccount ? "" : "\(snapshot.accountKey.rawValue)|"
             guard !windows.isEmpty else {
+                // A balance-only account is represented in Usage Credits.
+                guard snapshot.usageCredits == nil, snapshot.availableResets == nil else { continue }
                 idleRows.append(
                     QuotaPeriodRow(
                         id: "idle|\(snapshot.accountKey.rawValue)",
@@ -1103,7 +1105,16 @@ public struct QuotaBalance: Codable, Identifiable, Equatable, Hashable {
     public let resetDate: Date?
 
     public var valueText: String {
-        formattedMetricValue(amount, unit: unit)
+        // Some providers report a balance without a currency code. Retain
+        // fractional credits instead of rounding small positive balances to 0.
+        if unit.isEmpty {
+            return amount.formatted(.number.precision(.fractionLength(0...6)))
+        }
+        let currency = unit.uppercased()
+        if !["USD", "GBP", "EUR"].contains(currency), Locale.commonISOCurrencyCodes.contains(currency) {
+            return amount.formatted(.currency(code: currency))
+        }
+        return formattedMetricValue(amount, unit: unit)
     }
 
     public init(
@@ -1120,6 +1131,97 @@ public struct QuotaBalance: Codable, Identifiable, Equatable, Hashable {
         self.unit = unit
         self.subtitle = subtitle
         self.resetDate = resetDate
+    }
+}
+
+/// One remaining-credit readout per account, separate from resettable quota
+/// windows. Its identity survives both balance refreshes and missing readings.
+public struct QuotaUsageCredits: Identifiable, Equatable, Hashable {
+    public let providerID: ProviderID
+    public let accountSlot: String
+    public let label: String
+    public let balance: QuotaBalance?
+    public let unavailableReason: String?
+
+    public var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
+    }
+
+    public var id: String { "usage-credits|\(accountKey.rawValue)" }
+    public var valueText: String { balance?.valueText ?? "—" }
+    public var detail: String {
+        balance.map { balance in
+            [balance.label, balance.subtitle].compactMap { $0 }.joined(separator: " · ")
+        } ?? unavailableReason ?? "Credit balance not reported"
+    }
+}
+
+/// Banked resets use the provider's existing summary, never a count of resets
+/// inferred from quota drops. A missing summary is distinct from a known zero.
+public struct QuotaAvailableResets: Identifiable, Equatable, Hashable {
+    public let providerID: ProviderID
+    public let accountSlot: String
+    public let label: String
+    public let summary: QuotaResetCreditSummary?
+
+    public var accountKey: ProviderAccountKey {
+        ProviderAccountKey(providerID: providerID, slot: accountSlot)
+    }
+
+    public var id: String { "resets-available|\(accountKey.rawValue)" }
+    public var valueText: String { summary.map { String($0.availableCount) } ?? "—" }
+    public var detail: String {
+        guard let summary else { return "The provider has not reported a banked reset count." }
+        return summary.statusLine() ?? "No banked resets available"
+    }
+}
+
+public extension QuotaSnapshot {
+    var availableResets: QuotaAvailableResets? {
+        guard resetCredits != nil || fetchState != .notConfigured || hasContent else { return nil }
+        guard resetCredits != nil || [.claude, .openai, .grok, .qwen].contains(providerID) else { return nil }
+        return QuotaAvailableResets(providerID: providerID, accountSlot: accountSlot,
+                                    label: accountDisplayName, summary: resetCredits)
+    }
+
+    /// Prefer the total remaining balance over its prepaid/granted components.
+    /// Billing totals, local estimates, membership quota and banked resets are
+    /// deliberately not interchangeable with spendable usage credits.
+    var usageCredits: QuotaUsageCredits? {
+        guard fetchState != .notConfigured || hasContent else { return nil }
+        guard providerID != .openaiAPI, providerID != .kimi else { return nil }
+
+        let preferredLabels = [
+            "usage credits", "credits remaining", "credit remaining",
+            "total available", "remaining balance", "current balance",
+            "prepaid remaining", "extra usage balance"
+        ]
+        let balance = preferredLabels.lazy.compactMap { label in
+            balances.first {
+                $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == label
+                    && $0.amount.isFinite
+            }
+        }.first
+
+        let reason: String?
+        switch providerID {
+        case .grok:
+            reason = "The connected Grok usage source has not reported a prepaid credit balance."
+        case .minimax:
+            reason = "Add or check the optional API key in Setup to read available MiniMax account credits."
+        case .claude:
+            reason = "Claude has not reported a prepaid credit balance. Check the account’s Extra usage settings."
+        default:
+            reason = nil
+        }
+        guard balance != nil || reason != nil else { return nil }
+        return QuotaUsageCredits(
+            providerID: providerID,
+            accountSlot: accountSlot,
+            label: accountDisplayName,
+            balance: balance,
+            unavailableReason: balance == nil ? reason : nil
+        )
     }
 }
 
@@ -2224,6 +2326,9 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     }
 
     public var balancesSectionTitle: String? {
+        if [.grok, .minimax, .claude].contains(providerID), usageCredits != nil {
+            return "Usage Credits"
+        }
         guard !balances.isEmpty else { return nil }
         if providerID == .openai { return "Credits / Balance" }
         if providerID == .openaiAPI { return "API Costs" }
