@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 
 // The widget renders the same QuotaCardView as the app and looks each
 // provider's logo up by name in its own bundle, so it needs its own copy of
@@ -78,12 +79,54 @@ private func testTheWidgetTargetBundlesItsCatalog() throws {
     )
 }
 
+private func testDefaultIOSAppStoreIconHasNoAlphaChannel() throws {
+    let iconFolder = appCatalog.appendingPathComponent("AppIcon.appiconset", isDirectory: true)
+    let contents = try Data(contentsOf: iconFolder.appendingPathComponent("Contents.json"))
+    guard let catalog = try JSONSerialization.jsonObject(with: contents) as? [String: Any],
+          let images = catalog["images"] as? [[String: Any]] else {
+        throw WidgetAssetTestError.failure("the app icon catalog has no images")
+    }
+    let defaultIcons = images.filter { image in
+        let isiOS = image["platform"] as? String == "ios" || image["idiom"] as? String == "ios-marketing"
+        let appearances = image["appearances"] as? [[String: String]] ?? []
+        return isiOS && image["size"] as? String == "1024x1024" && appearances.isEmpty
+    }
+    try expect(!defaultIcons.isEmpty, "the default 1024x1024 iOS App Store icon is missing")
+    // Apple rejects an alpha channel in the default App Store icon, even when
+    // every pixel is opaque. Dark appearance icons intentionally support alpha.
+    for entry in defaultIcons {
+        guard let filename = entry["filename"] as? String else {
+            throw WidgetAssetTestError.failure("the default iOS App Store icon has no filename")
+        }
+        let url = iconFolder.appendingPathComponent(filename)
+        let png = try Data(contentsOf: url)
+        try expect(
+            png.count >= 33 && Array(png.prefix(8)) == [137, 80, 78, 71, 13, 10, 26, 10],
+            "\(filename): the App Store icon must be a readable PNG"
+        )
+        try expect(
+            png[25] != 4 && png[25] != 6,
+            "\(filename): PNG color type \(png[25]) encodes an alpha channel; App Store upload will reject it"
+        )
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw WidgetAssetTestError.failure("\(filename): ImageIO cannot decode the App Store icon")
+        }
+        try expect(image.width == 1024 && image.height == 1024, "\(filename): App Store icon must be 1024x1024")
+        try expect(
+            [.none, .noneSkipFirst, .noneSkipLast].contains(image.alphaInfo),
+            "\(filename): the decoded default App Store icon has alpha or palette transparency"
+        )
+    }
+}
+
 @main
 private enum WidgetAssetCatalogTestRunner {
     static func main() throws {
         try testEveryProviderLogoIsInBothCatalogs()
         try testEveryAppLogoSetIsInTheWidget()
         try testTheWidgetTargetBundlesItsCatalog()
+        try testDefaultIOSAppStoreIconHasNoAlphaChannel()
         print("Widget asset catalog tests passed")
     }
 }
