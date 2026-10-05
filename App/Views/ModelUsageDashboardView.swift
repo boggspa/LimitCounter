@@ -22,10 +22,11 @@ struct ModelUsageDashboardView: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { timeline in
             let data = ModelUsageInsightData(archive: appState.modelUsage, snapshots: appState.snapshots)
-            // Until one is picked, open on the source with the most tokens in the window.
-            let source = data.sources.first { $0.id == selectedSource } ?? data.busiest(1, window: window, now: timeline.date).first?.source
+            let aggregate = selectedSource.isEmpty
+            let source: ModelUsageInsightSource? = aggregate ? nil : data.sources.first { $0.id == selectedSource }
+            let aggregateHasLocal = data.sources.contains { $0.local }
             let sourceID = source?.id ?? ""
-            let accent = UsageColor.provider(source.flatMap { data.brand(of: $0, window: window, now: timeline.date) })
+            let accent = aggregate ? UsageColor.neutral : (source.flatMap { UsageColor.provider(data.brand(of: $0, window: window, now: timeline.date)) } ?? UsageColor.neutral)
             let entries = data.selected(source: sourceID, model: selectedModel, window: window, now: timeline.date)
             let totals = ModelUsageInsightTotals(entries)
             let chartRows = data.chartRows(source: sourceID, model: selectedModel)
@@ -36,30 +37,10 @@ struct ModelUsageDashboardView: View {
                         emptyState
                     } else {
                         controls(data: data, source: sourceID)
-                        if let source {
-                            StackCard(accent: accent) {
-                                summary(source, totals: totals, models: Set(entries.filter { $0.tokens.total > 0 }.map(\.model)).count, accent: accent)
-                                StackDivider()
-                                tokenMix(totals, accent: accent)
-                                StackDivider()
-                                models(data, source: sourceID, now: timeline.date)
-                                if let snapshot = appState.snapshots.first(where: { $0.providerID == source.provider }) {
-                                    StackDivider()
-                                    quota(snapshot)
-                                }
-                            }
-                            StackCard(accent: accent) { windows(data, source: sourceID, now: timeline.date) }
-                            StackCard(accent: accent) {
-                                ModelUsageTokenChart(rows: chartRows, window: window, now: timeline.date)
-                                StackDivider()
-                                if source.local {
-                                    ModelUsageActivityGrid(rows: chartRows, now: timeline.date)
-                                } else {
-                                    Text("Provider buckets · two-hour activity needs local logs").font(.system(size: 9)).foregroundStyle(.secondary)
-                                }
-                                StackDivider()
-                                ModelUsageYearGrid(rows: chartRows, now: timeline.date)
-                            }
+                        if aggregate || source == nil {
+                            aggregateBody(data: data, totals: totals, chartRows: chartRows, now: timeline.date, hasLocal: aggregateHasLocal, accent: accent)
+                        } else if let source {
+                            perSourceBody(data: data, source: source, totals: totals, entries: entries, chartRows: chartRows, now: timeline.date, accent: accent)
                         }
                     }
                     StackCard(accent: .white) { rates }
@@ -112,29 +93,86 @@ struct ModelUsageDashboardView: View {
         }
     }
 
+    private func perSourceBody(data: ModelUsageInsightData, source: ModelUsageInsightSource, totals: ModelUsageInsightTotals,
+                               entries: [ModelUsageInsightEntry], chartRows: [ModelUsageRollup], now: Date, accent: Color) -> some View {
+        Group {
+            StackCard(accent: accent) {
+                summary(source, totals: totals, models: Set(entries.filter { $0.tokens.total > 0 }.map(\.model)).count, accent: accent)
+                StackDivider()
+                tokenMix(totals, accent: accent)
+                StackDivider()
+                models(data, source: source.id, now: now)
+                if let snapshot = appState.snapshots.first(where: { $0.providerID == source.provider }) {
+                    StackDivider()
+                    quota(snapshot)
+                }
+            }
+            StackCard(accent: accent) { windows(data, source: source.id, now: now) }
+            StackCard(accent: accent) {
+                ModelUsageTokenChart(rows: chartRows, window: window, now: now, aggregate: false)
+                StackDivider()
+                if source.local {
+                    ModelUsageActivityGrid(rows: chartRows, now: now)
+                } else {
+                    Text("Provider buckets · two-hour activity needs local logs").font(.system(size: 9)).foregroundStyle(.secondary)
+                }
+                StackDivider()
+                ModelUsageYearGrid(rows: chartRows, now: now)
+            }
+        }
+    }
+
+    private func aggregateBody(data: ModelUsageInsightData, totals: ModelUsageInsightTotals, chartRows: [ModelUsageRollup],
+                               now: Date, hasLocal: Bool, accent: Color) -> some View {
+        Group {
+            StackCard(accent: accent) {
+                summaryAll(totals, accent: accent)
+                StackDivider()
+                tokenMix(totals, accent: accent)
+                StackDivider()
+                models(data, source: "", now: now)
+            }
+            // The windows card totals one source per cell; the aggregate mixes exact and ranged records, so the cell totals cannot be priced uniformly.
+            StackCard(accent: accent) {
+                ModelUsageTokenChart(rows: chartRows, window: window, now: now, aggregate: true)
+                StackDivider()
+                if hasLocal {
+                    let activityRows = chartRows.filter { row in
+                        (data.sources.first { $0.id == row.source }?.local == true) || row.seconds <= 7200
+                    }
+                    ModelUsageActivityGrid(rows: activityRows, now: now)
+                } else {
+                    Text("Provider buckets · two-hour activity needs local logs").font(.system(size: 9)).foregroundStyle(.secondary)
+                }
+                StackDivider()
+                ModelUsageYearGrid(rows: chartRows, now: now)
+            }
+        }
+    }
+
     private func controls(data: ModelUsageInsightData, source: String) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
-                sourceMenu(data: data, source: source)
+                sourceMenu(data: data)
                 modelMenu(data: data, source: source)
                 Spacer(minLength: 4)
                 windowPicker
             }
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    sourceMenu(data: data, source: source)
+                    sourceMenu(data: data)
                     modelMenu(data: data, source: source)
                 }
                 windowPicker
             }
             VStack(alignment: .leading, spacing: 5) {
-                sourceMenu(data: data, source: source)
+                sourceMenu(data: data)
                 modelMenu(data: data, source: source)
                 windowPicker
             }
         }
         .controlSize(.small)
-        .help("One source at a time: local logs and API reports can describe the same requests, so sources are never added together.")
+        .help("All sources adds every retained record; overlapping sources may count the same requests more than once. Pick a source for its own accounting.")
     }
 
     private var windowPicker: some View {
@@ -143,8 +181,9 @@ struct ModelUsageDashboardView: View {
         }.pickerStyle(.segmented).labelsHidden().fixedSize()
     }
 
-    private func sourceMenu(data: ModelUsageInsightData, source: String) -> some View {
-        Picker("Source", selection: Binding(get: { source }, set: { selectedSource = $0 })) {
+    private func sourceMenu(data: ModelUsageInsightData) -> some View {
+        Picker("Source", selection: $selectedSource) {
+            Text("All sources").tag("")
             ForEach(data.sources) { Text($0.title).tag($0.id) }
         }.pickerStyle(.menu).labelsHidden().fixedSize()
     }
@@ -152,7 +191,7 @@ struct ModelUsageDashboardView: View {
     private func modelMenu(data: ModelUsageInsightData, source: String) -> some View {
         Picker("Model", selection: $selectedModel) {
             Text("All models").tag("")
-            ForEach(Array(Set(data.entries.filter { $0.source == source && $0.tokens.total > 0 }.map(\.model))).sorted(), id: \.self) {
+            ForEach(Array(Set(data.entries.filter { (source.isEmpty || $0.source == source) && $0.tokens.total > 0 }.map(\.model))).sorted(), id: \.self) {
                 Text($0).tag($0)
             }
         }.pickerStyle(.menu).labelsHidden().fixedSize()
@@ -186,6 +225,35 @@ struct ModelUsageDashboardView: View {
             if let cost = totals.reportedEstimateUSD {
                 StackRow(label: "Card estimate", detail: "card's method · not billed", value: ModelUsageFormat.money(cost))
             }
+        }
+        .help("Blank cells mean no recorded usage, not proof of no activity.")
+    }
+
+    private func summaryAll(_ totals: ModelUsageInsightTotals, accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text("All sources").font(.system(size: 13, weight: .bold))
+                Spacer(minLength: 4)
+            }
+            StackRow(label: "Total tokens", value: ModelUsageFormat.tokens(totals.tokens.total))
+            StackRow(label: "Prompt incl. cache", value: ModelUsageFormat.tokens(totals.tokens.prompt))
+            StackRow(label: "Output", value: ModelUsageFormat.tokens(totals.tokens.output))
+            StackRow(label: "Fresh input", value: ModelUsageFormat.tokens(totals.tokens.input))
+            StackRow(label: "Cache read", value: ModelUsageFormat.tokens(totals.tokens.cacheRead))
+            StackRow(label: "Cache write", value: ModelUsageFormat.tokens(totals.tokens.cacheWrite))
+            if totals.inferredTokens > 0 {
+                StackRow(label: "Inferred", detail: "estimated, not reported", value: ModelUsageFormat.tokens(totals.inferredTokens))
+            }
+            StackRow(label: "Requests", detail: totals.runs <= 0 || totals.runs >= totals.requests ? nil : "incl. \(ModelUsageFormat.tokens(totals.runs)) whole runs",
+                     value: ModelUsageFormat.requests(totals.requests, runs: totals.runs))
+            StackRow(label: "Runs", value: ModelUsageFormat.tokens(totals.runs))
+            StackRow(label: "API equivalent", detail: estimateFootnote(totals), value: ModelUsageFormat.estimate(totals), valueColor: accent)
+            StackRow(label: "Reported spend", detail: "billed by providers", value: ModelUsageFormat.money(totals.actualUSD))
+            StackRow(label: "Cache share", value: totals.cacheShare.formatted(.percent.precision(.fractionLength(1))))
+            StackRow(label: "Coverage", value: totals.coverage.formatted(.percent.precision(.fractionLength(1))))
+            StackRow(label: "Range coverage", value: totals.rangeCoverage.formatted(.percent.precision(.fractionLength(1))))
+            StackRow(label: "Measured tokens", value: ModelUsageFormat.tokens(totals.measuredTokens))
+            Text("All sources · \(window.rawValue) · sources may overlap").font(.system(size: 9)).foregroundStyle(.secondary)
         }
         .help("Blank cells mean no recorded usage, not proof of no activity.")
     }
@@ -234,12 +302,20 @@ struct ModelUsageDashboardView: View {
     private func models(_ data: ModelUsageInsightData, source: String, now: Date) -> some View {
         let rows = data.selected(source: source, window: window, now: now)
         let groups = Dictionary(grouping: rows.filter { $0.tokens.total > 0 }, by: \.model)
-            .map { (model: $0.key, total: ModelUsageInsightTotals($0.value)) }
+            .map { (model: $0.key, rows: $0.value, total: ModelUsageInsightTotals($0.value)) }
             .sorted { $0.total.tokens.total > $1.total.tokens.total }
         let total = rows.reduce(0) { $0 + $1.tokens.total }
-        return StackSection(title: "Models", caption: "\(window.rawValue) · share of source") {
+        return StackSection(title: "Models", caption: "\(window.rawValue) · share of selection") {
             ForEach(groups, id: \.model) { item in
-                let color = UsageColor.provider(ModelUsageDisplayIdentity.provider(model: item.model, source: source))
+                // Aggregate: pick the source behind most of this model's tokens so each row wears a meaningful hue.
+                let dominant = Dictionary(grouping: item.rows, by: \.source)
+                    .mapValues { group in group.reduce(0) { $0 + $1.tokens.total } }
+                    .sorted { lhs, rhs in
+                        if lhs.value != rhs.value { return lhs.value > rhs.value }
+                        return lhs.key < rhs.key
+                    }
+                    .first?.key ?? source
+                let color = UsageColor.provider(ModelUsageDisplayIdentity.provider(model: item.model, source: dominant))
                 let share = item.total.tokens.total / max(1, total)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
@@ -252,7 +328,7 @@ struct ModelUsageDashboardView: View {
                     }
                     StackBar(fraction: share, color: color)
                 }
-                .help("\(share.formatted(.percent.precision(.fractionLength(1)))) of source · \(ModelUsageFormat.tokens(item.total.tokens.prompt)) in incl. cache · \(ModelUsageFormat.tokens(item.total.tokens.output)) out · \(ModelUsageFormat.requests(item.total.requests, runs: item.total.runs))")
+                .help("\(share.formatted(.percent.precision(.fractionLength(1)))) of selection · \(ModelUsageFormat.tokens(item.total.tokens.prompt)) in incl. cache · \(ModelUsageFormat.tokens(item.total.tokens.output)) out · \(ModelUsageFormat.requests(item.total.requests, runs: item.total.runs))")
             }
             if groups.isEmpty { Text("No model tokens in this window").font(.system(size: 9)).foregroundStyle(.secondary) }
             DisclosureGroup("Compare sources") {
@@ -266,7 +342,7 @@ struct ModelUsageDashboardView: View {
                         Text(ModelUsageFormat.tokens(totals.tokens.total)).font(.system(size: 10, weight: .bold)).monospacedDigit()
                     }
                 }
-                Text("Sources can overlap and are never added together").font(.system(size: 9)).foregroundStyle(.secondary)
+                Text("Sources can overlap; the totals above add them as-is.").font(.system(size: 9)).foregroundStyle(.secondary)
             }.font(.system(size: 10, weight: .semibold))
         }
     }
@@ -443,6 +519,7 @@ private struct ModelUsageTokenChart: View {
     let rows: [ModelUsageRollup]
     let window: ModelUsageWindow
     let now: Date
+    let aggregate: Bool
     @State private var selectedDate: Date?
 
     private var samples: [ModelUsageDay] {
@@ -474,7 +551,7 @@ private struct ModelUsageTokenChart: View {
             return Calendar.current.startOfDay(for: row.start)
         }).compactMapValues { ModelUsageDisplayIdentity.dominant(in: $0) }
         let selected = selectedDate.flatMap { date in points.min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) } }
-        StackSection(title: "Volume", caption: "\(window.rawValue) · drag to inspect") {
+        StackSection(title: "Volume", caption: "\(window.rawValue) · drag to inspect\(aggregate ? " · sources may overlap" : "")") {
             Chart(points) { point in
                 BarMark(x: .value("Date", point.date), y: .value("Tokens", point.tokens))
                     .foregroundStyle(UsageColor.provider(vendors[point.date]).gradient)

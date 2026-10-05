@@ -1,7 +1,7 @@
 import Foundation
 
-/// View data preserves source boundaries: local request ledgers never get added to
-/// their own quota-card copies, and provider cost reports retain their own meaning.
+/// Per-source views preserve source boundaries; the aggregate adds every retained
+/// record and may double-count requests reported by overlapping sources.
 struct ModelUsageInsightEntry: Identifiable {
     let id: String
     let source: String
@@ -212,7 +212,7 @@ struct ModelUsageInsightData {
     }
 
     func chartRows(source: String, model: String = "") -> [ModelUsageRollup] {
-        entries.filter { $0.source == source && (model.isEmpty || $0.model == model) && $0.tokens.total > 0 }.map {
+        entries.filter { (source.isEmpty || $0.source == source) && (model.isEmpty || $0.model == model) && $0.tokens.total > 0 }.map {
             ModelUsageRollup(source: $0.source, model: $0.model, start: $0.start,
                 seconds: max(1, Int($0.end.timeIntervalSince($0.start))), tokens: $0.tokens, requests: Int($0.requests), runs: Int($0.runs))
         }

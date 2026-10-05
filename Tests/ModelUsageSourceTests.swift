@@ -16,6 +16,7 @@ struct ModelUsageSourceTests {
         try aggregationPricesEachRecord()
         try schemaCompatibility()
         try snapshotInsights()
+        aggregateInsights()
         sourceAttribution()
         try await unchangedRefreshSkipsRollups()
         try await changedDayRollups()
@@ -721,5 +722,82 @@ struct ModelUsageSourceTests {
         let unnamed = QuotaSnapshot(providerID: .antigravity, displayName: "Antigravity", events: [UsageEvent(timestamp: hour, tokens: 5000, model: "gemini-api:x")])
         let unpriced = ModelUsageInsightTotals(ModelUsageInsightData(archive: .empty, snapshots: [unnamed]).selected(source: "antigravity:events", window: .day, now: now))
         expect(unpriced.tokens.unsplit == 5000 && unpriced.estimateBounds == nil, "An unknown model stays unpriced rather than borrowing a rate")
+    }
+
+    static func aggregateInsights() {
+        let now = date("2026-09-24T12:00:00Z")
+        let hour = now.addingTimeInterval(-3600)
+        let archive = ModelUsageArchive(generatedAt: now, buckets: [
+            ModelUsageRollup(source: "codex", model: "gpt-6-sol", start: hour, seconds: 300, tokens: .init(input: 1000), requests: 2),
+            ModelUsageRollup(source: "claude", model: "gpt-6-sol", start: hour, seconds: 300, tokens: .init(input: 2000), requests: 3),
+            ModelUsageRollup(source: "grok", model: "codex/gpt-6-sol", start: hour, seconds: 300, tokens: .init(input: 400), requests: 1)
+        ])
+        let data = ModelUsageInsightData(archive: archive, snapshots: [])
+        let all = data.selected(source: "", window: .day, now: now)
+        let aggregate = ModelUsageInsightTotals(all)
+        let sourceSum = data.sources.reduce(0) { partial, source in
+            partial + ModelUsageInsightTotals(data.selected(source: source.id, window: .day, now: now)).tokens.total
+        }
+        expect(Set(all.map(\.source)) == Set(["codex", "claude", "grok"]) && aggregate.tokens.total == sourceSum,
+               "All-source selection adds rows from each retained source")
+        let models = Dictionary(grouping: all, by: \.model)
+        expect(models["gpt-6-sol"]?.reduce(0) { $0 + $1.tokens.total } == 3000
+               && models["codex/gpt-6-sol"]?.reduce(0) { $0 + $1.tokens.total } == 400,
+               "Same model strings group across sources while namespaced model strings remain distinct")
+
+        let overlapAPI = UsageAnalyticsBucket(startDate: hour, endDate: now, model: "unknown-model", inputTokens: 1000,
+            outputTokens: 0, requests: 1, costUSD: 0.42, source: .officialAPI)
+        let overlapData = ModelUsageInsightData(archive: ModelUsageArchive(generatedAt: now, buckets: [
+            ModelUsageRollup(source: "codex", model: "unknown-model", start: hour, seconds: 300, tokens: .init(input: 1000), requests: 1,
+                estimatedUSD: 0.007, pricedTokens: 1000, pricedRequests: 1)
+        ]), snapshots: [QuotaSnapshot(providerID: .openaiAPI, displayName: "API", windows: [], analyticsBuckets: [overlapAPI])])
+        let overlapEntries = overlapData.selected(source: "", window: .day, now: now)
+        let overlap = ModelUsageInsightTotals(overlapEntries)
+        expect(overlapEntries.count == 2 && overlapEntries.allSatisfy { $0.tokens.input == 1000 && $0.tokens.output == 0 },
+               "Both sources describe the same 1,000-input, zero-output request")
+        expect(overlap.tokens.total == 2000 && overlap.requests == 2,
+               "Aggregate preserves source overlap by design — the same request is counted once per source")
+        close(overlap.actualUSD, 0.42, "Aggregate retains provider-reported spend")
+        close(overlap.estimatedUSD, 0.007, "Aggregate retains the ledger estimate")
+        expect(overlapEntries.filter { $0.actualUSD != nil }.count == 1,
+               "Only the provider bucket carries reported spend")
+
+        let rangedAPI = UsageAnalyticsBucket(id: "range", startDate: hour, endDate: now, model: "gpt-6-sol", inputTokens: 300_000,
+            outputTokens: 100, requests: 5, source: .officialAPI)
+        let mixed = ModelUsageInsightData(archive: ModelUsageArchive(generatedAt: now, buckets: [
+            ModelUsageRollup(source: "codex", model: "gpt-6-sol", start: hour, seconds: 300, tokens: .init(input: 1000), requests: 1,
+                estimatedUSD: 0.007, pricedTokens: 1000, pricedRequests: 1)
+        ]), snapshots: [QuotaSnapshot(providerID: .openaiAPI, displayName: "API", windows: [], analyticsBuckets: [rangedAPI])])
+        let mixedEntries = mixed.selected(source: "", window: .day, now: now)
+        let mixedTotals = ModelUsageInsightTotals(mixedEntries)
+        let expectedRange = ModelRateCatalog.costRange(source: "openaiAPI", model: "gpt-6-sol",
+            tokens: .init(input: 300_000, output: 100), calls: 0)!
+        let expectedLower = 0.007 + expectedRange.low
+        let expectedUpper = 0.007 + expectedRange.high
+        expect(mixedTotals.estimatedUSD != nil, "Aggregate retains exact pricing beside bounded records")
+        expect(mixedTotals.rangedTokens > 0, "Aggregate retains the range-priced record")
+        close(mixedTotals.coverage, 1000.0 / 301_100, "Aggregate exact coverage uses priced tokens over total tokens")
+        close(mixedTotals.rangeCoverage, 300_100.0 / 301_100, "Aggregate range coverage uses ranged tokens over total tokens")
+        expect(mixedTotals.coverage + mixedTotals.rangeCoverage <= 1.0 + 1e-6,
+               "coverage and rangeCoverage do not exceed 100%")
+        close(mixedTotals.estimateBounds?.lowerBound, expectedLower, "Aggregate estimate lower bound adds exact estimates and range lows")
+        close(mixedTotals.estimateBounds?.upperBound, expectedUpper, "Aggregate estimate upper bound adds exact estimates and range highs")
+
+        let secondRangedAPI = UsageAnalyticsBucket(id: "range-second", startDate: hour, endDate: now, model: "gpt-6-sol",
+            inputTokens: 250_000, outputTokens: 200, requests: 4, source: .officialAPI)
+        let rangedPair = ModelUsageInsightData(archive: ModelUsageArchive(generatedAt: now, buckets: []),
+            snapshots: [QuotaSnapshot(providerID: .openaiAPI, displayName: "API", windows: [], analyticsBuckets: [rangedAPI, secondRangedAPI])])
+        let rangedPairEntries = rangedPair.selected(source: "", window: .day, now: now)
+        let rangedPairTotals = ModelUsageInsightTotals(rangedPairEntries)
+        let expectedSecondRange = ModelRateCatalog.costRange(source: "openaiAPI", model: "gpt-6-sol",
+            tokens: .init(input: 250_000, output: 200), calls: 0)!
+        close(rangedPairTotals.estimateBounds?.lowerBound, expectedRange.low + expectedSecondRange.low,
+              "Aggregate range lower bound sums both ranged entries")
+        close(rangedPairTotals.estimateBounds?.upperBound, expectedRange.high + expectedSecondRange.high,
+              "Aggregate range upper bound sums both ranged entries")
+        expect((rangedPairTotals.estimateBounds?.upperBound ?? 0) > (rangedPairTotals.estimateBounds?.lowerBound ?? 0),
+               "Aggregate ranged bounds have a nonzero spread")
+        expect(data.chartRows(source: "").count == 3 && Set(data.chartRows(source: "").map(\.source)) == Set(["codex", "claude", "grok"]),
+               "Aggregate chart rows include rollups from every source")
     }
 }
