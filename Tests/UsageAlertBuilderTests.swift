@@ -125,7 +125,7 @@ private func testStaleCacheWarningDoesNotNotifyAsAReset() throws {
         QuotaSignal(
             kind: .scheduledReset,
             title: "Devin quota reading is stale",
-            message: "Daily quota (boggspa) and Weekly quota (boggspa) covered a period that has already reset, so they are hidden rather than shown as current.",
+            message: "Daily quota and Weekly quota covered a period that has already reset, so they are hidden rather than shown as current.",
             severity: .warning,
             detectedAt: noticedAt
         )
