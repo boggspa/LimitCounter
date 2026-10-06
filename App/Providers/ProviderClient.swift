@@ -1888,8 +1888,8 @@ private nonisolated struct UsageEventContentKey: Hashable {
 /// grows.
 ///
 /// Everything else on the snapshot (windows, stats, fetchState,
-/// fetchedAt, planName) passes through unchanged so the card keeps
-/// reflecting the latest live data.
+/// fetchedAt, planName, account identity) passes through unchanged so
+/// the card keeps reflecting the latest live data.
 private func enrichEventsWithHistory(
     _ snapshot: QuotaSnapshot,
     lookbackDays: Int = 60
@@ -1922,9 +1922,13 @@ private func enrichEventsWithHistory(
         balances: snapshot.balances,
         signals: snapshot.signals,
         events: combined,
+        analyticsBuckets: snapshot.analyticsBuckets,
         fetchState: snapshot.fetchState,
         fetchedAt: snapshot.fetchedAt,
-        resetCredits: snapshot.resetCredits
+        resetCredits: snapshot.resetCredits,
+        accountSlot: snapshot.accountSlot,
+        accountLabel: snapshot.accountLabel,
+        accountFingerprint: snapshot.accountFingerprint
     )
 }
 
@@ -7731,18 +7735,30 @@ public struct DevinProviderClient: ProviderClient {
             )
         }
         if states.count == 1 {
-            return makeSnapshot(from: first, userLabel: nil)
+            return makeSnapshot(from: first, accountQualifier: nil)
         }
-        // Multiple accounts: merge all windows/balances/stats/signals/events
+        // Multiple accounts: merge all windows/balances/stats/signals/events.
+        //
+        // Each account's meters need a label of their own: the period layout
+        // and the reset detector both key a window on provider, label, kind
+        // and unit, so two "Daily quota" windows would collapse into one row
+        // and one reset trail. The qualifier is an ordinal and never anything
+        // from `accountIdentityText`. Window labels are stored in the App
+        // Group cache the widget reads and in the CloudKit payload, and
+        // `QuotaSnapshot` promises those never carry an email or a display
+        // name. The ordinal follows the hashed identity rather than the row
+        // order, which the reader sorts by payload length, a value that moves
+        // as usage digits do; a label that swapped accounts between fetches
+        // would read as a reset.
+        let ordered = Self.orderedForLabelling(states)
         var allWindows: [QuotaWindow] = []
         var allBalances: [QuotaBalance] = []
         var allStats: [QuotaStat] = []
         var allSignals: [QuotaSignal] = []
         var allEvents: [UsageEvent] = []
         var planNames: [String] = []
-        for state in states {
-            let label = Self.shortUserLabel(from: state.planInfo.accountIdentityText)
-            let snap = makeSnapshot(from: state, userLabel: label)
+        for (index, state) in ordered.enumerated() {
+            let snap = makeSnapshot(from: state, accountQualifier: "account \(index + 1)")
             allWindows.append(contentsOf: snap.windows)
             allBalances.append(contentsOf: snap.balances)
             allStats.append(contentsOf: snap.stats)
@@ -7768,33 +7784,75 @@ public struct DevinProviderClient: ProviderClient {
             // already reports the editor's last write, and a snapshot that
             // carries a "reading is stale" signal must not also claim it was
             // just fetched.
-            fetchedAt: states.compactMap(\.cachedAt).min() ?? Date()
+            fetchedAt: states.compactMap(\.cachedAt).min() ?? Date(),
+            // One reading covers every account in the cache, so its identity
+            // is the set of them: an account signing in or out changes it,
+            // which is what the reset detector needs to restart its trail.
+            accountFingerprint: Self.accountFingerprint(for: states)
         )
     }
 
-    private static func shortUserLabel(from accountIdentityText: String?) -> String {
-        guard let text = accountIdentityText, !text.isEmpty else { return "Unknown" }
-        // Format is "email - Display Name" or "email - email"
-        let parts = text.components(separatedBy: " - ")
-        if parts.count >= 2 {
-            let name = parts[1].trimmingCharacters(in: .whitespaces)
-            // If the name is the same as the email, use the local part
-            if name.contains("@") {
-                return String(name.prefix(while: { $0 != "@" }))
-            }
-            return name
+    /// The stable part of Devin's `"email - Display Name"` identity text,
+    /// lowercased, as material for `ProviderAccountFingerprint`. The display
+    /// name is left out so a renamed profile does not read as a different
+    /// account. This is only ever hashed: the text itself goes into no label,
+    /// signal, log line or stored field.
+    private static func identityComponent(from accountIdentityText: String?) -> String? {
+        guard let text = accountIdentityText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            return nil
         }
-        // Fallback: use local part of email
-        if text.contains("@") {
-            return String(text.prefix(while: { $0 != "@" }))
-        }
-        return text
+        let address = text.components(separatedBy: " - ").first ?? text
+        let normalized = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
     }
 
-    private func makeSnapshot(from state: DevinStateSnapshot, userLabel: String?) -> QuotaSnapshot {
+    /// The hashed identity of every account in `states`, in a fixed order so
+    /// the same set of accounts always hashes the same way. Nil when none of
+    /// them reports an identity.
+    private static func accountFingerprint(for states: [DevinStateSnapshot]) -> String? {
+        ProviderAccountFingerprint.make(
+            providerID: .devin,
+            components: states.compactMap { identityComponent(from: $0.planInfo.accountIdentityText) }.sorted()
+        )
+    }
+
+    /// Accounts in the order their merged meters are numbered: by hashed
+    /// identity, with accounts that report none last in the order they were
+    /// read. Stable across fetches of the same account set, unlike the
+    /// reader's payload-length ordering.
+    private static func orderedForLabelling(_ states: [DevinStateSnapshot]) -> [DevinStateSnapshot] {
+        states.enumerated()
+            .map { (offset: $0.offset, state: $0.element, fingerprint: accountFingerprint(for: [$0.element])) }
+            .sorted { lhs, rhs in
+                switch (lhs.fingerprint, rhs.fingerprint) {
+                case let (left?, right?) where left != right:
+                    return left < right
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                default:
+                    return lhs.offset < rhs.offset
+                }
+            }
+            .map { $0.state }
+    }
+
+    /// - Parameter accountQualifier: Set when several accounts share one
+    ///   reading, to keep their meters apart ("account 2"); nil for a single
+    ///   account, whose labels stay plain. Never derived from the account's
+    ///   identity, see `mergeSnapshots`.
+    private func makeSnapshot(from state: DevinStateSnapshot, accountQualifier: String?) -> QuotaSnapshot {
         let planInfo = state.planInfo
         let localMetadata = state.localMetadata
         let now = Date()
+
+        func qualified(_ label: String) -> String {
+            guard let accountQualifier else { return label }
+            return "\(label) (\(accountQualifier))"
+        }
+
         var windows: [QuotaWindow] = []
         var balances: [QuotaBalance] = []
         var stats: [QuotaStat] = []
@@ -7818,7 +7876,7 @@ public struct DevinProviderClient: ProviderClient {
 
         if !planInfo.hideDailyQuota, let used = dailyUsedPercent {
             let resetDate = dailyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
-            let label = userLabel.map { "Daily quota (\($0))" } ?? "Daily quota usage"
+            let label = qualified("Daily quota")
             if resetDate > now {
                 windows.append(
                     QuotaWindow(
@@ -7848,7 +7906,7 @@ public struct DevinProviderClient: ProviderClient {
 
         if !planInfo.hideWeeklyQuota, let used = weeklyUsedPercent {
             let resetDate = weeklyResetDate ?? Date(timeIntervalSince1970: TimeInterval(planInfo.endTimestamp / 1000))
-            let label = userLabel.map { "Weekly quota (\($0))" } ?? "Weekly quota usage"
+            let label = qualified("Weekly quota")
             if resetDate > now {
                 windows.append(
                     QuotaWindow(
@@ -7872,7 +7930,7 @@ public struct DevinProviderClient: ProviderClient {
             let balance = max(0, Double(overageBalanceMicros) / 1_000_000.0)
             balances.append(
                 QuotaBalance(
-                    label: userLabel.map { "Extra usage (\($0))" } ?? "Extra usage balance",
+                    label: qualified("Extra usage balance"),
                     amount: balance,
                     unit: "$",
                     subtitle: "Extra usage balance",
@@ -8078,7 +8136,8 @@ public struct DevinProviderClient: ProviderClient {
             fetchState: .success,
             // The data is only as fresh as the editor's last write, so report
             // that rather than the moment this snapshot was assembled.
-            fetchedAt: state.cachedAt ?? now
+            fetchedAt: state.cachedAt ?? now,
+            accountFingerprint: Self.accountFingerprint(for: [state])
         )
     }
 }
@@ -8238,7 +8297,9 @@ private enum DevinLocalStateReader {
                 continue
             }
             let jsonString = String(cString: textPointer)
-            print("[DevinLocalStateReader] Got JSON (first 200 chars): \(jsonString.prefix(200))")
+            // The row carries the account's email and display name, so only
+            // its size is logged, never its contents.
+            print("[DevinLocalStateReader] Got JSON row (\(jsonString.utf8.count) bytes)")
 
             guard let data = jsonString.data(using: .utf8) else {
                 print("[DevinLocalStateReader] Failed to convert to data, skipping row")
@@ -8246,7 +8307,7 @@ private enum DevinLocalStateReader {
             }
             do {
                 let planInfo = try JSONDecoder().decode(DevinCachedPlanInfo.self, from: data)
-                print("[DevinLocalStateReader] Successfully decoded plan: \(planInfo.planName) (\(planInfo.accountIdentityText ?? "no identity"))")
+                print("[DevinLocalStateReader] Successfully decoded plan: \(planInfo.planName) (account identity \(planInfo.accountIdentityText == nil ? "absent" : "present"))")
                 results.append(planInfo)
             } catch {
                 print("[DevinLocalStateReader] JSON decode error for row: \(error)")

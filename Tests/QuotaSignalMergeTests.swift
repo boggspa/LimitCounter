@@ -190,7 +190,7 @@ private func makeDevinState(cacheAge: TimeInterval) throws -> (url: URL, root: U
                 // and the cache reports a tiny negative overage balance.
                 key: "reactSettings.cachedPlanInfoData:user-stale",
                 value: devinPlanJSON(
-                    identity: "stale@example.com",
+                    identity: "stale@example.com - Former Teammate",
                     dailyRemainingPercent: 0,
                     weeklyRemainingPercent: 0,
                     dailyResetAtUnix: past,
@@ -203,7 +203,7 @@ private func makeDevinState(cacheAge: TimeInterval) throws -> (url: URL, root: U
             (
                 key: "reactSettings.cachedPlanInfoData:user-live",
                 value: devinPlanJSON(
-                    identity: "live@example.com",
+                    identity: "live@example.com - Jane Doe",
                     dailyRemainingPercent: 65,
                     weeklyRemainingPercent: 80,
                     dailyResetAtUnix: future,
@@ -227,6 +227,35 @@ private func fetchDevinSnapshot(databaseURL: URL) async throws -> QuotaSnapshot 
     )
 }
 
+/// A one-account `state.vscdb` with both meters live.
+private func makeSingleAccountDevinState(identity: String) throws -> (url: URL, root: URL) {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-devin-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let url = root.appendingPathComponent("state.vscdb")
+
+    let now = Date()
+    try seedDevinDatabase(
+        at: url,
+        rows: [
+            (
+                key: "reactSettings.cachedPlanInfoData:user-solo",
+                value: devinPlanJSON(
+                    identity: identity,
+                    dailyRemainingPercent: 65,
+                    weeklyRemainingPercent: 80,
+                    dailyResetAtUnix: Int(now.addingTimeInterval(6 * 3_600).timeIntervalSince1970),
+                    weeklyResetAtUnix: Int(now.addingTimeInterval(4 * 86_400).timeIntervalSince1970),
+                    overageBalanceMicros: 4_500_000,
+                    hasBillingWritePermissions: false,
+                    endTimestampMilliseconds: Int(now.addingTimeInterval(20 * 86_400).timeIntervalSince1970) * 1_000
+                )
+            )
+        ]
+    )
+    return (url, root)
+}
+
 // MARK: - Devin behaviour
 
 private func testDevinDropsExpiredWindowsAndKeepsFutureDatedOnes() async throws {
@@ -235,17 +264,19 @@ private func testDevinDropsExpiredWindowsAndKeepsFutureDatedOnes() async throws 
 
     let snapshot = try await fetchDevinSnapshot(databaseURL: state.url)
 
-    try expect(
-        !snapshot.windows.contains { $0.label.contains("(stale)") },
-        "windows whose reset already passed must not render as live meters, got \(snapshot.windows.map(\.label))"
-    )
+    // The stale account's meters are dropped (and reported through the
+    // signal tested below), so only the live account's two survive.
     try expectEqual(
-        snapshot.windows.filter { $0.label.contains("(live)") }.count,
+        snapshot.windows.count,
         2,
-        "future-dated windows must be kept"
+        "expired windows must be dropped and future-dated ones kept, got \(snapshot.windows.map(\.label))"
+    )
+    try expect(
+        snapshot.windows.contains { $0.label.hasPrefix("Weekly quota") },
+        "missing live weekly window in \(snapshot.windows.map(\.label))"
     )
 
-    guard let daily = snapshot.windows.first(where: { $0.label == "Daily quota (live)" }) else {
+    guard let daily = snapshot.windows.first(where: { $0.label.hasPrefix("Daily quota") }) else {
         throw SignalMergeTestError.failure("missing live daily window in \(snapshot.windows.map(\.label))")
     }
     try expectClose(daily.used, 35, 0.000_001, "daily used percent")
@@ -272,8 +303,16 @@ private func testDevinReportsStaleCacheSignalAndCacheTimestamp() async throws {
         )
     }
     try expectEqual(stale.severity, .warning, "stale-cache signal severity")
-    try expect(stale.message.contains("Daily quota (stale)"), "stale signal names the dropped daily window")
-    try expect(stale.message.contains("Weekly quota (stale)"), "stale signal names the dropped weekly window")
+    try expect(stale.message.contains("Daily quota (account "), "stale signal names the dropped daily window, got: \(stale.message)")
+    try expect(stale.message.contains("Weekly quota (account "), "stale signal names the dropped weekly window, got: \(stale.message)")
+    // The dropped meters belong to the other account; the warning must not
+    // read as though the live meters on the card were the stale ones.
+    for window in snapshot.windows {
+        try expect(
+            !stale.message.contains(window.label),
+            "stale signal must not name the live meter \"\(window.label)\", got: \(stale.message)"
+        )
+    }
     try expect(stale.message.contains("11 days ago"), "stale signal reports cache age, got: \(stale.message)")
 
     // Both accounts are merged, so a signal raised for the *other* account
@@ -342,6 +381,16 @@ private func testDevinSignalsAreStableAcrossRepeatedFetches() async throws {
         1,
         "an unchanged cache must report the same fetchedAt"
     )
+    try expectEqual(
+        first.windows.map(\.label),
+        second.windows.map(\.label),
+        "an unchanged cache must number its accounts the same way on every fetch"
+    )
+    try expectEqual(
+        first.accountFingerprint,
+        second.accountFingerprint,
+        "an unchanged cache must hash to the same account fingerprint, or every fetch reads as an account switch"
+    )
 }
 
 /// The end of the pipeline: provider signals must still be present after the
@@ -354,9 +403,13 @@ private func testDevinStaleSignalSurvivesDetectionAndPersistence() async throws 
     let providerTitles = Set(fetched.signals.map(\.title))
     try expect(providerTitles.contains("Devin quota reading is stale"), "precondition: provider emitted the signal")
 
+    guard let liveDaily = fetched.windows.first(where: { $0.label.hasPrefix("Daily quota") }) else {
+        throw SignalMergeTestError.failure("precondition: a live daily window, got \(fetched.windows.map(\.label))")
+    }
+
     // Stands in for `SnapshotSignalDetector.enrichedSnapshot`, which merges the
     // signals it derived from the previous snapshot into the fetched one.
-    let detected = [signal("Daily quota (live) reset", windowLabel: "Daily quota (live)")]
+    let detected = [signal("\(liveDaily.label) reset", windowLabel: liveDaily.label)]
     let enriched = fetched.mergingSignals(detected)
 
     let encoder = JSONEncoder()
@@ -370,7 +423,7 @@ private func testDevinStaleSignalSurvivesDetectionAndPersistence() async throws 
         "the stale warning must reach the persisted snapshot, got \(persisted.signals.map(\.title))"
     )
     try expect(
-        persisted.signals.contains { $0.title == "Daily quota (live) reset" },
+        persisted.signals.contains { $0.title == "\(liveDaily.label) reset" },
         "the detected signal must reach the persisted snapshot too"
     )
     try expectEqual(
@@ -378,6 +431,78 @@ private func testDevinStaleSignalSurvivesDetectionAndPersistence() async throws 
         fetched.signals.count + 1,
         "merging must add the detected signal without dropping or duplicating provider ones"
     )
+}
+
+/// Window labels, balances and signals ride in the App Group cache the widget
+/// reads and in the CloudKit payload, and `QuotaSnapshot` promises that neither
+/// ever carries an email or a display name. Devin's identity text has exactly
+/// one destination: the hashed `accountFingerprint`.
+private func testDevinKeepsAccountIdentityOutOfTheSnapshot() async throws {
+    let state = try makeDevinState(cacheAge: 11 * 86_400)
+    defer { try? FileManager.default.removeItem(at: state.root) }
+
+    let snapshot = try await fetchDevinSnapshot(databaseURL: state.url)
+
+    var stored = snapshot.windows.map(\.label)
+    stored += snapshot.balances.map(\.label)
+    stored += snapshot.stats.map(\.label)
+    stored += snapshot.signals.flatMap { [$0.title, $0.message, $0.windowLabel ?? ""] }
+    stored += [snapshot.planName ?? "", snapshot.accountFingerprint ?? ""]
+    for fragment in ["example.com", "live@", "stale@", "Jane", "Teammate"] {
+        try expect(
+            !stored.contains { $0.localizedCaseInsensitiveContains(fragment) },
+            "\"\(fragment)\" must not appear anywhere in the stored snapshot, got \(stored)"
+        )
+    }
+
+    // The accounts' meters still have to be told apart, because the period
+    // layout and the reset detector key a window on its label, so the merged
+    // reading numbers them instead.
+    try expectEqual(
+        Set(snapshot.windows.map(\.label)).count,
+        snapshot.windows.count,
+        "merged window labels must stay distinct, got \(snapshot.windows.map(\.label))"
+    )
+    for window in snapshot.windows {
+        try expect(
+            window.label.hasSuffix(" (account 1)") || window.label.hasSuffix(" (account 2)"),
+            "a merged meter is qualified by an ordinal and nothing else, got \"\(window.label)\""
+        )
+    }
+
+    guard let fingerprint = snapshot.accountFingerprint, !fingerprint.isEmpty else {
+        throw SignalMergeTestError.failure("the reading must carry a hashed account fingerprint")
+    }
+    try expectEqual(
+        snapshot.accountFingerprint,
+        ProviderAccountFingerprint.make(providerID: .devin, components: ["live@example.com", "stale@example.com"]),
+        "the fingerprint hashes every account's address, lowercased and in a fixed order, and nothing else"
+    )
+}
+
+/// One account in the cache gets plain labels, and its fingerprint follows the
+/// address alone: a renamed profile is the same account, a different address
+/// is not.
+private func testDevinSingleAccountUsesPlainLabelsAndHashesTheAddress() async throws {
+    func reading(identity: String) async throws -> QuotaSnapshot {
+        let state = try makeSingleAccountDevinState(identity: identity)
+        defer { try? FileManager.default.removeItem(at: state.root) }
+        return try await fetchDevinSnapshot(databaseURL: state.url)
+    }
+
+    let original = try await reading(identity: "Solo@Example.com - Solo Person")
+    try expectEqual(original.windows.map(\.label), ["Daily quota", "Weekly quota"], "single-account window labels")
+    try expectEqual(original.balances.map(\.label), ["Extra usage balance"], "single-account balance label")
+    try expect(original.accountFingerprint != nil, "a single account still reports a fingerprint")
+
+    let renamed = try await reading(identity: "solo@example.com - Renamed Person")
+    try expectEqual(original.accountFingerprint, renamed.accountFingerprint, "a renamed profile is the same account")
+
+    let other = try await reading(identity: "other@example.com - Solo Person")
+    try expect(original.accountFingerprint != other.accountFingerprint, "a different address is a different account")
+
+    let anonymous = try await reading(identity: "")
+    try expect(anonymous.accountFingerprint == nil, "no identity yields no fingerprint rather than a hash of nothing")
 }
 
 @main
@@ -391,6 +516,8 @@ private enum QuotaSignalMergeTestRunner {
         try await testDevinReportsStaleCacheSignalAndCacheTimestamp()
         try await testDevinSignalsAreStableAcrossRepeatedFetches()
         try await testDevinStaleSignalSurvivesDetectionAndPersistence()
+        try await testDevinKeepsAccountIdentityOutOfTheSnapshot()
+        try await testDevinSingleAccountUsesPlainLabelsAndHashesTheAddress()
         print("Quota signal merge tests passed")
     }
 }
