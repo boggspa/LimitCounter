@@ -182,7 +182,7 @@ public struct GeminiProviderClient: ProviderClient {
     }
 }
 
-private struct GeminiLocalStateReader {
+struct GeminiLocalStateReader {
     private let fileManager: FileManager
     private let decoder: JSONDecoder
     private let cliQuota: GeminiCLIQuota?
@@ -194,7 +194,12 @@ private struct GeminiLocalStateReader {
     init(fileManager: FileManager, cliQuota: GeminiCLIQuota? = nil) {
         self.fileManager = fileManager
         self.decoder = JSONDecoder()
-        self.decoder.dateDecodingStrategy = .iso8601
+        // Gemini CLI stamps every session line with JavaScript's
+        // `toISOString()`, which always carries milliseconds. `.iso8601`
+        // rejected those before Foundation's ISO 8601 parsing became lenient
+        // in Swift 6.2, skipping every message line; parse them explicitly
+        // so the reader never depends on that behaviour.
+        self.decoder.dateDecodingStrategy = ISO8601Timestamp.decodingStrategy
         self.cliQuota = cliQuota
     }
 
@@ -251,7 +256,7 @@ private struct GeminiLocalStateReader {
     /// the legacy `.json` (one-object-per-file) and modern `.jsonl`
     /// (one-line-per-record) formats. Returns nil if the file is neither
     /// parseable nor recoverable.
-    private func parseGeminiSessionFile(at fileURL: URL) -> GeminiSessionFile? {
+    func parseGeminiSessionFile(at fileURL: URL) -> GeminiSessionFile? {
         guard let data = try? Data(contentsOf: fileURL) else {
             return nil
         }
@@ -333,7 +338,7 @@ private struct GeminiLocalStateReader {
         return encoder
     }
 
-    private func loadSnapshotUncached(rootURL: URL, credentials: ProviderCredential?, latestFileDate: Date) throws -> QuotaSnapshot {
+    func loadSnapshotUncached(rootURL: URL, credentials: ProviderCredential?, latestFileDate: Date) throws -> QuotaSnapshot {
         guard fileManager.fileExists(atPath: rootURL.path) else {
             throw ProviderFetchError.notConfigured
         }
@@ -924,7 +929,7 @@ private struct GeminiLocalStateReader {
 
 // MARK: - CLI Quota Fetching
 
-private struct GeminiCLIQuota {
+struct GeminiCLIQuota {
     let dailyLimit: Double
     let remainingRequests: Double
     let resetDate: Date?
@@ -1016,7 +1021,7 @@ private struct GeminiMetadata {
     var defaultModel: String?
 }
 
-private struct GeminiSessionFile: Decodable {
+struct GeminiSessionFile: Decodable {
     let sessionId: String
     let messages: [GeminiMessage]
 }
@@ -1028,7 +1033,7 @@ private struct GeminiSessionMetadata: Decodable {
     let sessionId: String
 }
 
-private struct GeminiMessage: Decodable {
+struct GeminiMessage: Decodable {
     let id: String?
     let timestamp: Date?
     let type: String
@@ -1065,7 +1070,7 @@ private struct GeminiContentItem: Decodable {
     let text: String?
 }
 
-private struct GeminiTokens: Decodable {
+struct GeminiTokens: Decodable {
     let input: Double
     let output: Double
     let cached: Double?
@@ -1481,17 +1486,7 @@ enum GeminiLiveQuotaFetcher {
                 return GeminiQuotaCache.shared.staleFallback()
             }
             let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .custom { decoder in
-                let raw = try decoder.singleValueContainer().decode(String.self)
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime]
-                if let d = formatter.date(from: raw) { return d }
-                let fractional = ISO8601DateFormatter()
-                fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                if let d = fractional.date(from: raw) { return d }
-                throw DecodingError.dataCorruptedError(in: try decoder.singleValueContainer(),
-                                                       debugDescription: "Unparseable date: \(raw)")
-            }
+            decoder.dateDecodingStrategy = ISO8601Timestamp.decodingStrategy
             let parsed = try decoder.decode(GeminiQuotaResponse.self, from: data)
 
             let windows = buildWindows(from: parsed.buckets)
