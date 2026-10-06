@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Watch the mac release pipeline until it installs and relaunches, or fails.
+# Watch the mac release pipeline started through scripts/run-release.command or
+# the launchd job (both log to scratch/release-run.log) until it finishes with a
+# verified zip in dist/, has also installed and relaunched when --install was
+# requested, or fails. Its own trace stays in scratch/ too.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIR=~/.grok/long-running-background-tasks
-mkdir -p "$DIR"
-TRACE="$DIR/watch_release_$$.log"
+mkdir -p "$ROOT/scratch"
+TRACE="$ROOT/scratch/watch_release_$$.log"
 RUNLOG="$ROOT/scratch/release-run.log"
 APP="/Applications/Limit Counter.app"
 START_MTIME=$(stat -f %m "$APP" 2>/dev/null || echo 0)
@@ -43,15 +45,27 @@ while :; do
     echo "FAILED: export failed: $(why)"
     exit 1
   fi
-  if grep -q 'Installed and relaunched the stapled build.' "$RUNLOG" 2>/dev/null; then
-    echo 'DONE: installed and relaunched'
+  if grep -q '^Release complete: ' "$RUNLOG" 2>/dev/null; then
+    if grep -q 'Installed and relaunched the stapled build.' "$RUNLOG"; then
+      echo 'DONE: installed and relaunched'
+    else
+      echo 'DONE: notarized zip verified (not installed; --install does that)'
+    fi
     exit 0
   fi
+  # Without a live run log (the pipeline was started directly rather than through
+  # run-release.command or the launchd job) fall back to the artifacts: the
+  # final-zip pointer is only written once the zip has verified.
+  RUNLOG_MTIME=$(stat -f %m "$RUNLOG" 2>/dev/null || echo 0)
   FINAL=$(cat "$ROOT/build/.current-final-zip" 2>/dev/null || true)
-  APP_MTIME=$(stat -f %m "$APP" 2>/dev/null || echo 0)
   FINAL_MTIME=$(stat -f %m "$FINAL" 2>/dev/null || echo 0)
-  if [ -n "${FINAL:-}" ] && [ -f "$FINAL" ] && [ "$FINAL_MTIME" -ge "$WATCH_START" ] && [ "$APP_MTIME" -gt "$START_MTIME" ]; then
-    echo 'DONE: final zip and Applications bundle updated'
+  if [ "$RUNLOG_MTIME" -lt "$WATCH_START" ] && [ -n "${FINAL:-}" ] && [ -f "$FINAL" ] && [ "$FINAL_MTIME" -ge "$WATCH_START" ]; then
+    APP_MTIME=$(stat -f %m "$APP" 2>/dev/null || echo 0)
+    if [ "$APP_MTIME" -gt "$START_MTIME" ]; then
+      echo "DONE: final zip verified and Applications bundle updated: $FINAL"
+    else
+      echo "DONE: final zip verified: $FINAL"
+    fi
     exit 0
   fi
   if [ "$SECONDS" -ge 90 ] && [ "$WARNED_START" -eq 0 ] && ! fresh_dir "$NDIR"; then
