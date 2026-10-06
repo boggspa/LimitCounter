@@ -1,11 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd job that runs the notarised release build once when loaded.
-  Fill in the checkout path, then load the result, for example from the repo root:
-    sed "s#__REPO_DIR__#$PWD#g" scripts/com.chrisizatt.limitcounter.release.plist.template \
+  launchd job that runs the notarised release build once when loaded. launchd
+  does not inherit your shell's environment, so the team ID and notary keychain
+  profile are filled in alongside the checkout path. From the repo root, with
+  LIMITCOUNTER_TEAM_ID and LIMITCOUNTER_NOTARY_PROFILE exported:
+    mkdir -p scratch
+    sed -e "s#__REPO_DIR__#$PWD#g" \
+        -e "s#__TEAM_ID__#$LIMITCOUNTER_TEAM_ID#g" \
+        -e "s#__NOTARY_PROFILE__#$LIMITCOUNTER_NOTARY_PROFILE#g" \
+        scripts/com.chrisizatt.limitcounter.release.plist.template \
       > ~/Library/LaunchAgents/com.chrisizatt.limitcounter.release.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisizatt.limitcounter.release.plist
+  The job builds, notarises and verifies into build/ and dist/; it does not
+  install. To also replace /Applications/Limit Counter.app, add a
+  LIMITCOUNTER_INSTALL key with the string 1 to EnvironmentVariables before
+  loading it.
 -->
 <plist version="1.0">
 <dict>
@@ -16,6 +26,13 @@
 		<string>/bin/bash</string>
 		<string>__REPO_DIR__/scripts/build_and_notarise.sh</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>LIMITCOUNTER_TEAM_ID</key>
+		<string>__TEAM_ID__</string>
+		<key>LIMITCOUNTER_NOTARY_PROFILE</key>
+		<string>__NOTARY_PROFILE__</string>
+	</dict>
 	<key>WorkingDirectory</key>
 	<string>__REPO_DIR__</string>
 	<key>StandardOutPath</key>

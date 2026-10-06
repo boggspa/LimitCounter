@@ -145,6 +145,59 @@ Both limitations are documented rather than fixed here on purpose: closing them
 means adding a deletion path and an opt-out toggle, which is product work, not a
 wording change.
 
+## Releasing
+
+The release scripts under `scripts/` run from a fresh clone on macOS and write
+only inside the repository: `build/` for archives and exports, `dist/` for the
+finished zip, `scratch/` for logs, all gitignored. Nothing is installed, tagged
+or published unless you ask for it.
+
+### Notarised macOS build
+
+```sh
+export LIMITCOUNTER_TEAM_ID=XXXXXXXXXX          # your Apple Developer team ID
+export LIMITCOUNTER_NOTARY_PROFILE="My Notary"  # your notarytool keychain profile
+scripts/build_and_notarise.sh
+```
+
+`build_and_notarise.sh` archives the `LLMUsageCounter` scheme for macOS,
+exports it with Developer ID signing, submits the zip to Apple's notary
+service, staples the ticket, zips the stapled bundle into `dist/` and proves
+that the zip still verifies after a plain `unzip`. Its last line is the path
+of the finished zip. Both variables are required; the script stops with a
+message naming the missing one before anything is built. The team ID must
+match the `DEVELOPMENT_TEAM` the project signs with. Store the notary
+credentials once, with an app-specific password for your Apple ID:
+
+```sh
+xcrun notarytool store-credentials "$LIMITCOUNTER_NOTARY_PROFILE" --team-id "$LIMITCOUNTER_TEAM_ID"
+```
+
+- **Installing is opt-in.** `--install` (or `LIMITCOUNTER_INSTALL=1`) on either
+  script quits Limit Counter after verification, keeps the existing
+  `/Applications/Limit Counter.app` as a stamped backup, copies the verified
+  build in and relaunches it. Without it the installed app is never touched.
+- `scripts/finish_notarization.sh` resumes from the build recorded in
+  `build/.current-notary-dir` (notarise, staple, zip, verify) without archiving
+  again, for example after fixing the keychain profile.
+- `scripts/run-release.command` and `scripts/run-notary.command` are
+  double-clickable wrappers for the two scripts above; they log to
+  `scratch/release-run.log` and `scratch/notary-run.log`. Set the two variables
+  in your shell profile so Terminal passes them on.
+- `scripts/watch_release.sh` follows `scratch/release-run.log` and prints one
+  `DONE`, `FAILED` or `ACTION_REQUIRED` line when the run ends; its own trace
+  goes to `scratch/`.
+- `scripts/com.chrisizatt.limitcounter.release.plist.template` is a launchd
+  job that runs one release build when loaded. The comment at its top shows how
+  to fill in the checkout path and both variables.
+
+### TestFlight archives
+
+`scripts/archive_testflight.sh` prepares App Store Connect archives for iOS
+and macOS into a new directory of your choice (`--help` lists the options). It
+uploads nothing; upload through Xcode Organizer or Transporter after inspecting
+the artifacts.
+
 ## Next Steps
 
 1. Add local Codex session analytics as explicitly labeled local estimates, with model and cost breakdowns derived only from user-granted `~/.codex` data.
