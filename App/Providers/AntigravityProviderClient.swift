@@ -181,7 +181,9 @@ nonisolated enum AntigravityQuotaSummaryParser {
 
         let remaining = min(max(bucket.remainingFraction, 0), 1)
         let usedPercent = (1 - remaining) * 100
-        let resetDate = bucket.resetTime.flatMap { ISO8601DateFormatter().date(from: $0) }
+        // protobuf `Timestamp` JSON carries fractional digits whenever its
+        // nanos are non-zero, which a bare formatter rejects.
+        let resetDate = bucket.resetTime.flatMap { ISO8601Timestamp.date(from: $0) }
 
         return QuotaWindow(
             label: label,

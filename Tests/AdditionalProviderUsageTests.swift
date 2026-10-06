@@ -30,6 +30,12 @@ private func date(_ value: String) -> Date {
     ISO8601DateFormatter().date(from: value)!
 }
 
+private func fractionalDate(_ value: String) -> Date {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.date(from: value)!
+}
+
 /// The other direction, for fixtures that have to stay relative to the clock.
 /// A hard-coded "far future" date drifts into range as time passes and quietly
 /// turns a passing test into a failing one.
@@ -286,6 +292,30 @@ private func testAntigravityFailsClosedWithoutBothGeminiBuckets() throws {
         parsed == nil,
         "A third-party five-hour bucket must not satisfy Gemini quota"
     )
+}
+
+private func testAntigravityParsesFractionalSecondResetTimes() throws {
+    // protobuf `Timestamp` JSON carries fractional digits whenever its nanos
+    // are non-zero, so live reset times are not always whole seconds.
+    let payload = """
+    {"groups":[{"buckets":[
+      {"bucketId":"gemini-weekly","remainingFraction":0.42,"resetTime":"2026-08-05T07:44:00.123Z"},
+      {"bucketId":"gemini-5h","remainingFraction":1.0,"resetTime":"2026-08-01T16:00:00.500Z"}
+    ]}]}
+    """
+    let observed = try AntigravityQuotaSummaryParser.parse(Data(payload.utf8), planName: nil)
+    let parsed = try observed
+        ?? { throw AdditionalProviderTestError.failure("Antigravity summary with fractional reset times did not parse") }()
+    let weekly = try parsed.windows.first(where: { $0.label == "Gemini Weekly" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Gemini weekly window") }()
+    let fiveHour = try parsed.windows.first(where: { $0.label == "Gemini 5H" })
+        ?? { throw AdditionalProviderTestError.failure("Missing Gemini five-hour window") }()
+    let weeklyReset = try weekly.resetDate
+        ?? { throw AdditionalProviderTestError.failure("Fractional weekly reset time was dropped") }()
+    let fiveHourReset = try fiveHour.resetDate
+        ?? { throw AdditionalProviderTestError.failure("Fractional five-hour reset time was dropped") }()
+    try expectEqual(weeklyReset, fractionalDate("2026-08-05T07:44:00.123Z"), "Antigravity fractional weekly reset")
+    try expectEqual(fiveHourReset, fractionalDate("2026-08-01T16:00:00.500Z"), "Antigravity fractional five-hour reset")
 }
 
 private func testAntigravityParsesOfficialOAuthEnvelope() throws {
@@ -4004,6 +4034,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
         try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
+        try testAntigravityParsesFractionalSecondResetTimes()
         try testAntigravityParsesOfficialOAuthEnvelope()
         try testAntigravityImportAcceptsOfficialCLIDataFolder()
         try testAntigravityRefreshCadenceLoopsFourSevenSixteenThreeTwentyOne()

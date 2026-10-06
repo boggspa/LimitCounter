@@ -8,6 +8,55 @@ import SQLite3
 import Darwin
 #endif
 
+// MARK: - ISO 8601 Timestamps
+
+/// Internet-format ISO 8601 timestamps, with or without fractional seconds.
+///
+/// A bare `ISO8601DateFormatter()` rejects fractional seconds, and so did
+/// `JSONDecoder`'s `.iso8601` strategy before Foundation's ISO 8601 parsing
+/// became lenient in Swift 6.2. Most sources this app reads write them:
+/// Gemini CLI stamps every session line with JavaScript's `toISOString()`
+/// (`2026-05-01T10:00:00.000Z`), and protobuf `Timestamp` JSON carries
+/// fractional digits whenever its nanos are non-zero. Whole seconds are
+/// tried first, then fractional, so both forms parse on every Foundation.
+nonisolated enum ISO8601Timestamp {
+    // Both formatters are configured once and never mutated afterwards, the
+    // same way `ClaudeCodeLocalStateReader` and `CodexTelemetryReader` share
+    // theirs, so per-line decoding of large session histories stays cheap.
+    nonisolated(unsafe) private static let wholeSeconds: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    nonisolated(unsafe) private static let fractionalSeconds: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    /// `2026-05-01T10:00:00Z` or `2026-05-01T10:00:00.000Z`; nil otherwise.
+    static func date(from text: String) -> Date? {
+        wholeSeconds.date(from: text) ?? fractionalSeconds.date(from: text)
+    }
+
+    /// Drop-in replacement for `JSONDecoder.DateDecodingStrategy.iso8601`
+    /// that also accepts fractional seconds.
+    static var decodingStrategy: JSONDecoder.DateDecodingStrategy {
+        .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let text = try container.decode(String.self)
+            guard let date = Self.date(from: text) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Unparseable date: \(text)"
+                )
+            }
+            return date
+        }
+    }
+}
+
 // MARK: - TaskWraith Unified Telemetry Source
 
 /// Reads TaskWraith's unified usage telemetry (`usage.json`) and emits
@@ -9590,8 +9639,7 @@ public struct CursorProviderClient: ProviderClient {
 
     private func parseResetDate(from string: String?) -> Date? {
         guard let string = string else { return nil }
-        let formatter = ISO8601DateFormatter()
-        return formatter.date(from: string)
+        return ISO8601Timestamp.date(from: string)
     }
 
     private func firstUsageBlock(in json: [String: Any]) -> [String: Any]? {
