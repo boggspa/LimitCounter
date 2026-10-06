@@ -3,6 +3,7 @@
 # Xcode build products and local state
 DerivedData/
 .derivedData/
+xcuserdata/
 build/
 dist/
 *.xcresult

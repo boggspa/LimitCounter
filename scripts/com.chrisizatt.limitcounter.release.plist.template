@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job that runs the notarised release build once when loaded.
+  Fill in the checkout path, then load the result, for example from the repo root:
+    sed "s#__REPO_DIR__#$PWD#g" scripts/com.chrisizatt.limitcounter.release.plist.template \
+      > ~/Library/LaunchAgents/com.chrisizatt.limitcounter.release.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisizatt.limitcounter.release.plist
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.chrisizatt.limitcounter.release</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__REPO_DIR__/scripts/build_and_notarise.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__REPO_DIR__</string>
+	<key>StandardOutPath</key>
+	<string>__REPO_DIR__/scratch/release-run.log</string>
+	<key>StandardErrorPath</key>
+	<string>__REPO_DIR__/scratch/release-run.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
+	<true/>
+</dict>
+</plist>

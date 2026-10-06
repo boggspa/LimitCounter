@@ -201,24 +201,24 @@ private func testProviderOnlyStoresHoldNoSecondaryAccounts() throws {
 // MARK: - Claude keychain naming
 
 private func testClaudeServiceNameMatchesTheCLI() throws {
-    // sha256("/Users/chris/.claude-work") starts d756c37f; with a trailing slash a001afe6.
+    // sha256("/Users/tester/.claude-work") starts c4394a73; with a trailing slash ba2961b5.
     try expectEqual(
-        ClaudeConfigDirKeychain.serviceName(forConfigDir: "/Users/chris/.claude-work"),
-        "Claude Code-credentials-d756c37f",
+        ClaudeConfigDirKeychain.serviceName(forConfigDir: "/Users/tester/.claude-work"),
+        "Claude Code-credentials-c4394a73",
         "a custom config dir hashes to the CLI's suffixed service name"
     )
     let custom = ClaudeConfigDirKeychain.serviceNameCandidates(
-        forConfigDir: "/Users/chris/.claude-work/",
-        defaultConfigDir: "/Users/chris/.claude"
+        forConfigDir: "/Users/tester/.claude-work/",
+        defaultConfigDir: "/Users/tester/.claude"
     )
-    try expectEqual(custom.first, "Claude Code-credentials-d756c37f", "the trailing slash is stripped for the first guess")
-    try expect(custom.contains("Claude Code-credentials-a001afe6"), "the slashed spelling is still tried")
+    try expectEqual(custom.first, "Claude Code-credentials-c4394a73", "the trailing slash is stripped for the first guess")
+    try expect(custom.contains("Claude Code-credentials-ba2961b5"), "the slashed spelling is still tried")
     try expect(!custom.contains("Claude Code-credentials"), "a secondary folder never falls back to the primary's item")
 
-    let primary = ClaudeConfigDirKeychain.serviceNameCandidates(forConfigDir: nil, defaultConfigDir: "/Users/chris/.claude")
+    let primary = ClaudeConfigDirKeychain.serviceNameCandidates(forConfigDir: nil, defaultConfigDir: "/Users/tester/.claude")
     try expectEqual(primary.first, "Claude Code-credentials", "the default folder reads the bare item first")
     try expect(primary.count > 1, "and then the hashed spelling for shells that export the default explicitly")
-    let explicitDefault = ClaudeConfigDirKeychain.serviceNameCandidates(forConfigDir: "/Users/chris/.claude", defaultConfigDir: "/Users/chris/.claude")
+    let explicitDefault = ClaudeConfigDirKeychain.serviceNameCandidates(forConfigDir: "/Users/tester/.claude", defaultConfigDir: "/Users/tester/.claude")
     try expectEqual(explicitDefault.first, "Claude Code-credentials", "naming the default folder explicitly is still the default")
 }
 
