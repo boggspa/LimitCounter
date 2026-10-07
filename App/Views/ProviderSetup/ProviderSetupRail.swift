@@ -10,6 +10,10 @@ import SwiftUI
 /// gutter gives the whole picture before any colour is processed.
 struct ProviderSetupRail: View {
     @ObservedObject var model: ProviderSetupModel
+    /// Extra space above the first row, for the window's traffic lights. A
+    /// padding rather than a safe-area inset: an inset spacer is flexible in
+    /// width and makes the rail stretch in its `HStack`.
+    var topInset: CGFloat = 0
     @State private var showAddProvider = false
 
     var body: some View {
@@ -23,7 +27,8 @@ struct ProviderSetupRail: View {
                     section("Not set up", model.notSetUpProviderIDs)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 12)
+                .padding(.top, 12 + topInset)
+                .padding(.bottom, 12)
             }
             .scrollContentBackground(.hidden)
 
