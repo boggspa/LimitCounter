@@ -535,7 +535,7 @@
 				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -569,7 +569,7 @@
 				CODE_SIGN_ENTITLEMENTS = Widget/AIUsageWidgetExtension.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Widget/AIUsageWidgetExtension.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -718,7 +718,7 @@
 				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -771,7 +771,7 @@
 				CODE_SIGN_ENTITLEMENTS = LLMUsageCounter/LLMUsageCounter.iOS.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = LLMUsageCounter/LLMUsageCounter.macOS.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 8CZML8FK2D;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
