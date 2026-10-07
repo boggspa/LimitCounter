@@ -730,46 +730,4 @@ public struct TransparentWindowConfigurator: NSViewRepresentable {
         }
     }
 }
-
-/// Clears the sheet's backing window so the glass shows through.
-///
-/// A SwiftUI sheet's window is opaque and paints the system sheet background,
-/// which would flatten `LiquidGlassBackdrop` into a grey slab. This is
-/// deliberately *not* `TransparentWindowConfigurator`: that one also makes the
-/// window movable by its background and hides a titlebar, both wrong for a
-/// sheet, which is positioned by its parent and has no titlebar to hide.
-public struct SheetWindowConfigurator: NSViewRepresentable {
-    public var cornerRadius: CGFloat = 20
-
-    public init(cornerRadius: CGFloat = 20) {
-        self.cornerRadius = cornerRadius
-    }
-
-    public func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async { configure(view.window) }
-        return view
-    }
-
-    public func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async { configure(nsView.window) }
-    }
-
-    private func configure(_ window: NSWindow?) {
-        guard let window else { return }
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-
-        if let contentView = window.contentView {
-            contentView.wantsLayer = true
-            if contentView.layer == nil {
-                contentView.makeBackingLayer()
-            }
-            contentView.layer?.cornerRadius = cornerRadius
-            contentView.layer?.cornerCurve = .continuous
-            contentView.layer?.masksToBounds = true
-        }
-    }
-}
 #endif

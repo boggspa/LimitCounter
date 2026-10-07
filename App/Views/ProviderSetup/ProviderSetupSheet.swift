@@ -4,25 +4,28 @@ import SwiftUI
 
 /// The single setup surface, replacing the per-provider `NSWindow` swarm.
 ///
-/// It is a sheet on the dashboard rather than a window of its own: a sheet
-/// cannot end up behind another app, does not appear in Mission Control or the
-/// window cycle, inherits the app's environment and colour scheme, and cannot
-/// be left floating above everything the way `window.level = .floating` did.
+/// `ProviderSetupPresenter` hosts it in one free-standing Liquid Glass window
+/// (an `NSGlassEffectView` on a transparent `NSWindow`), so this paints no
+/// backdrop of its own: the glass is the chrome, and only a thin ink wash sits
+/// between it and the content for contrast over bright desktops.
 struct ProviderSetupSheet: View {
     @ObservedObject var model: ProviderSetupModel
     var onRefresh: () -> Void
     var lastSyncDate: Date?
     var onClose: () -> Void
 
+    @ObservedObject private var presenter = ProviderSetupPresenter.shared
     @State private var showDiscardConfirmation = false
 
     var body: some View {
         ZStack {
-            LiquidGlassBackdrop(intensity: .settings)
+            ProGlassTheme.ink.opacity(0.22)
                 .ignoresSafeArea()
 
             HStack(spacing: 0) {
-                ProviderSetupRail(model: model)
+                // The window's traffic lights sit in this corner; the rail
+                // keeps its first row clear of them.
+                ProviderSetupRail(model: model, topInset: 30)
                 Divider().opacity(0.18)
                 VStack(spacing: 0) {
                     titleBar
@@ -35,12 +38,18 @@ struct ProviderSetupSheet: View {
                 }
             }
         }
-        // Sized for the largest page rather than resized per page: a sheet that
-        // animates its window frame on every rail click is the jank being
-        // removed. The embedded browsers need 760x720, plus the 240pt rail and
-        // the 44pt title bar.
-        .frame(width: 1020, height: 780)
-        .background(SheetWindowConfigurator())
+        // Sized for the largest page rather than resized per page: a window
+        // that animates its frame on every rail click is the jank being
+        // removed. The presenter sizes the window to match.
+        .frame(
+            width: ProviderSetupPresenter.windowSize.width,
+            height: ProviderSetupPresenter.windowSize.height
+        )
+        // Full-size content: the layout above accounts for the title bar, so
+        // the host must not inset it a second time.
+        .ignoresSafeArea()
+        // The window's close button lands here when there are unsaved edits.
+        .onChange(of: presenter.closeRequestCount) { _ in attemptClose() }
         .confirmationDialog(
             "Discard unsaved changes?",
             isPresented: $showDiscardConfirmation
@@ -54,6 +63,8 @@ struct ProviderSetupSheet: View {
 
     private var titleBar: some View {
         HStack(spacing: 8) {
+            // The traffic lights sit over the rail, not here, so this strip
+            // starts flush. It doubles as the window's main drag handle.
             // Steps advance inside the canvas rather than pushing a stack, so
             // "back" is one level and only exists on the form page.
             if case .credential(let account) = model.page {

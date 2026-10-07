@@ -16,7 +16,6 @@ struct DashboardView: View {
     @StateObject private var reorderAutoscroller = ReorderAutoscroller()
     @State private var showSettings = false
     #if os(macOS)
-    @StateObject private var setupModel = ProviderSetupModel()
     @ObservedObject private var setupPresenter = ProviderSetupPresenter.shared
     #endif
     @State private var navigationPath = NavigationPath()
@@ -70,23 +69,6 @@ struct DashboardView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
-        #if os(macOS)
-        .sheet(isPresented: $setupPresenter.isPresented) {
-            ProviderSetupSheet(
-                model: setupModel,
-                onRefresh: { Task { await appState.refresh(userInitiated: true) } },
-                lastSyncDate: appState.lastSyncDate,
-                onClose: { setupPresenter.isPresented = false }
-            )
-            .environmentObject(appState)
-            .preferredColorScheme(.dark)
-        }
-        .onChange(of: setupPresenter.isPresented) { isPresented in
-            // The menu-bar popover reaches the presenter directly, so it never
-            // passes through `openSettings()`.
-            if isPresented { setupModel.load(syncErrors: appState.syncErrors) }
-        }
-        #endif
         #if os(iOS)
         .alert(
             screenshotSaveAlert?.title ?? "Screenshot",
@@ -125,6 +107,9 @@ struct DashboardView: View {
             if pending { openModelUsage() }
         }
         .onAppear {
+            #if os(macOS)
+            setupPresenter.configure(appState: appState)
+            #endif
             openPendingAccountRoute()
             if appState.pendingModelUsageNavigation { openModelUsage() }
         }
@@ -160,13 +145,9 @@ struct DashboardView: View {
 
     private func openSettings() {
         #if os(macOS)
-        // Load before presenting, not in the sheet's `onAppear`: otherwise the
-        // rail's first render sees an empty health map, every row builds itself
-        // as "Not set up", and the accessibility labels stay that way even
-        // after the visuals correct themselves a frame later.
-        setupModel.load(syncErrors: appState.syncErrors)
         // One surface on macOS: providers and preferences are both pages in the
-        // setup sheet, so there is no settings window to raise any more.
+        // setup window, which the presenter owns and sizes.
+        setupPresenter.configure(appState: appState)
         setupPresenter.present()
         #else
         showSettings = true

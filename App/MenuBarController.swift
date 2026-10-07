@@ -14,6 +14,7 @@ final class MenuBarController: NSObject {
         setupStatusItem()
         setupPopover()
         FloatingPanelManager.shared.configure(appState: appState)
+        ProviderSetupPresenter.shared.configure(appState: appState)
     }
 
     private func setupStatusItem() {
