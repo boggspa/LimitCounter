@@ -912,12 +912,151 @@ private func testClaudePrepaidCreditFetchIsOptionalAndReadOnly() async throws {
     try expect(ClaudePrepaidCreditsClient.request(token: "fixture", organizationID: "../another") == nil, "invalid organization rejected")
 }
 
+private func testAnthropicCostReportParsesCentsAndFailsClosed() throws {
+    let page = Data(#"{"data":[{"starting_at":"2026-10-01T00:00:00Z","ending_at":"2026-10-02T00:00:00Z","results":[{"currency":"USD","amount":"1234.5","workspace_id":null,"description":"Claude Opus 5.5 Usage - Input Tokens","cost_type":"tokens"},{"currency":"USD","amount":"65.5"}]},{"starting_at":"2026-10-02T00:00:00Z","ending_at":"2026-10-03T00:00:00Z","results":[]}],"has_more":true,"next_page":"page_abc"}"#.utf8)
+    let parsed = APIUsageCostReportParser.anthropicPage(page)
+    try expect(parsed != nil, "documented page shape parses")
+    try expectEqual(parsed!.cents, 1300, "decimal-string cents are summed")
+    try expectEqual(parsed!.bucketCount, 2, "every daily bucket counts, even an empty one")
+    try expectEqual(parsed!.lineItemCount, 2, "line items counted")
+    try expectEqual(parsed!.nextPage, "page_abc", "pagination cursor read from has_more + next_page")
+
+    let last = Data(#"{"data":[{"results":[{"amount":"5"}]}],"has_more":false,"next_page":null}"#.utf8)
+    try expect(APIUsageCostReportParser.anthropicPage(last)?.nextPage == nil, "no cursor once has_more is false")
+    try expectEqual(APIUsageCostReportParser.anthropicPage(Data(#"{"data":[]}"#.utf8))?.cents, 0, "an empty month is a real zero")
+
+    for body in [
+        #"{"data":[{"results":[{"amount":"abc"}]}]}"#,
+        #"{"data":[{"results":[{"amount":true}]}]}"#,
+        #"{"data":[{"results":[{"amount":"100","currency":"EUR"}]}]}"#,
+        #"{"data":[{"results":[{"amount":"100"},"oops"]}]}"#,
+        #"{"data":"nope"}"#,
+        "not json"
+    ] {
+        try expect(APIUsageCostReportParser.anthropicPage(Data(body.utf8)) == nil,
+                   "an unreadable amount withholds the whole page instead of reporting zero: \(body)")
+    }
+}
+
+private func testAPIUsagePeriodAndAnthropicRequestShape() throws {
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime]
+    let now = iso.date(from: "2026-10-08T01:48:41Z")!
+    let period = APIUsagePeriod.utcMonthToDate(now: now)
+    try expectEqual(iso.string(from: period.start), "2026-10-01T00:00:00Z", "period starts at the UTC month")
+    try expectEqual(iso.string(from: period.end), "2026-10-08T01:48:00Z", "period end is truncated to the minute")
+    try expectEqual(iso.string(from: period.nextReset), "2026-11-01T00:00:00Z", "the figure resets at the next UTC month")
+
+    let request = APIUsageReportClient.anthropicRequest(adminKey: "sk-ant-admin01-test", period: period)
+    let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+    try expectEqual(components.scheme, "https", "TLS only")
+    try expectEqual(components.host, "api.anthropic.com", "documented host")
+    try expectEqual(components.path, "/v1/organizations/cost_report", "documented cost report endpoint")
+    let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+    try expectEqual(query["starting_at"], "2026-10-01T00:00:00Z", "RFC 3339 range start")
+    try expectEqual(query["ending_at"], "2026-10-08T01:48:00Z", "RFC 3339 range end")
+    try expectEqual(request.value(forHTTPHeaderField: "x-api-key"), "sk-ant-admin01-test", "admin key goes in x-api-key")
+    try expectEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01", "versioned request")
+    try expect(request.value(forHTTPHeaderField: "Authorization") == nil, "no bearer header for an admin key")
+    try expect(request.httpMethod == "GET" && request.httpBody == nil && !request.httpShouldHandleCookies, "read-only, cookie-free request")
+    let paged = APIUsageReportClient.anthropicRequest(adminKey: "k", period: period, page: "page_abc")
+    try expect(paged.url!.query!.contains("page=page_abc"), "pagination cursor forwarded")
+
+    let credentials = ProviderCredential(extraFields: [
+        APIUsageCredentialField.anthropicAdminKey: "  sk-ant-admin01-test \n",
+        APIUsageCredentialField.openAIProjectID: "proj_ok-1"
+    ])
+    try expectEqual(APIUsageCredentialField.adminKey(for: .anthropic, in: credentials), "sk-ant-admin01-test", "stored key is trimmed")
+    try expect(APIUsageCredentialField.adminKey(for: .openai, in: credentials) == nil, "the other provider's slot is separate")
+    try expectEqual(APIUsageCredentialField.openAIProjectID(in: credentials), "proj_ok-1", "documented id alphabet accepted")
+    try expect(APIUsageCredentialField.openAIProjectID(in: ProviderCredential(extraFields: [APIUsageCredentialField.openAIProjectID: "proj_x&y=1"])) == nil,
+               "query metacharacters never reach the URL")
+}
+
+private func testAPIUsageLaneServesFreshThenBacksOffAndFilesUnderUsageCredits() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer {
+        session.invalidateAndCancel()
+        ClaudeCreditURLProtocol.status = 200
+        ClaudeCreditURLProtocol.body = Data()
+    }
+    nonisolated(unsafe) var clock = Date(timeIntervalSince1970: 1_791_000_000)
+    let lane = APIUsageReportLane(client: APIUsageReportClient(session: session), freshTTL: 900, failureBackoff: 300, now: { clock })
+    let credentials = ProviderCredential(extraFields: [APIUsageCredentialField.anthropicAdminKey: "sk-ant-admin01-test"])
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"1234","currency":"USD"}]}],"has_more":false}"#.utf8)
+    let before = ClaudeCreditURLProtocol.requests.count
+
+    let first = await lane.report(for: .anthropic, credentials: credentials)
+    try expectEqual(first?.amount, 12.34, "cents become dollars")
+    try expectEqual(first?.label, "Console API", "Anthropic lane label")
+    try expectEqual(first?.currency, "USD", "cost report is USD only")
+    try expectEqual(first?.detail, "Month to date (UTC) · Anthropic Console cost report", "subtitle names the source")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "one request for a cold read")
+    try expectEqual(ClaudeCreditURLProtocol.requests.last?.url?.host, "api.anthropic.com", "key sent only to its own host")
+
+    clock = clock.addingTimeInterval(60)
+    let second = await lane.report(for: .anthropic, credentials: credentials)
+    try expectEqual(second, first, "a fresh report is served as-is")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "no request inside the fresh window")
+
+    clock = clock.addingTimeInterval(900)
+    ClaudeCreditURLProtocol.status = 401
+    let stale = await lane.report(for: .anthropic, credentials: credentials)
+    try expect(stale?.isStale == true && stale?.amount == 12.34 && stale?.id == first?.id,
+               "a failure after a successful read serves the last figure flagged stale")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 2, "the stale read did try the network once")
+
+    clock = clock.addingTimeInterval(60)
+    _ = await lane.report(for: .anthropic, credentials: credentials)
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 2, "failures back off instead of hammering the endpoint")
+
+    let none = await lane.report(for: .anthropic, credentials: ProviderCredential(accessToken: "oauth-only"))
+    try expect(none == nil && ClaudeCreditURLProtocol.requests.count == before + 2, "no admin key means no lane and no request")
+
+    let cold = APIUsageReportLane(client: APIUsageReportClient(session: session), now: { clock })
+    ClaudeCreditURLProtocol.status = 403
+    let failed = await cold.report(for: .anthropic, credentials: credentials)
+    try expect(failed?.amount == nil, "a failed cold read never reports a number")
+    try expect(failed?.failureMessage?.contains("organisation admin key") == true, "the row explains that a workspace or seat key cannot read the report")
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"oops"}]}]}"#.utf8)
+    let unreadable = APIUsageReportLane(client: APIUsageReportClient(session: session), now: { clock })
+    let withheld = await unreadable.report(for: .anthropic, credentials: credentials)
+    try expect(withheld?.amount == nil && withheld?.failureMessage?.contains("withheld") == true, "unreadable amounts are withheld, not zeroed")
+
+    let snapshot = QuotaSnapshot(providerID: .claude, displayName: "Claude Code").withAPIUsage(first)
+    let row = snapshot.apiUsageCredits
+    try expectEqual(row?.label, "Claude · Console API", "row is named for the API organisation, not the seat")
+    try expectEqual(row?.id, "usage-credits|claude|api-usage", "its own meter identity")
+    try expect(row?.id != snapshot.usageCredits?.id, "distinct from the account's own credit row")
+    try expectEqual(row?.balance?.label, "API usage", "balance label")
+    try expectEqual(row?.valueText, QuotaBalance(label: "x", amount: 12.34, unit: "USD").valueText, "formatted like every other USD balance")
+    try expectEqual(snapshot.usageCreditRows.count, 2, "the account row and the API row both file under Usage Credits")
+    let labelled = snapshot.withAccount(slot: "k7f2q1", label: "Work", fingerprint: nil)
+    try expectEqual(labelled.apiUsageCredits?.label, "Claude · Console API · Work", "account badge carries over")
+    try expectEqual(labelled.apiUsage, first, "stamping the account keeps the report")
+    let failedRow = snapshot.withAPIUsage(failed).apiUsageCredits
+    try expect(failedRow?.balance == nil && failedRow?.unavailableReason == failed?.failureMessage, "a failed report shows its reason in the row")
+    try expect(snapshot.withAPIUsage(nil).apiUsageCredits == nil, "clearing the key clears the row")
+
+    let decoded = try JSONDecoder().decode(QuotaSnapshot.self, from: JSONEncoder().encode(snapshot))
+    try expectEqual(decoded.apiUsage, first, "the report persists with the snapshot")
+    let legacy = Data(#"{"providerID":"claude","displayName":"Claude Code","fetchState":"success"}"#.utf8)
+    try expect(try JSONDecoder().decode(QuotaSnapshot.self, from: legacy).apiUsage == nil, "snapshots written before the field decode unchanged")
+}
+
 @main
 private enum ClaudeUsageTestRunner {
     static func main() async throws {
         try testClaudeCreditsUseMinorCurrencyUnits()
         try testClaudeCreditOrganizationCacheIsTokenScoped()
         try await testClaudePrepaidCreditFetchIsOptionalAndReadOnly()
+        try testAnthropicCostReportParsesCentsAndFailsClosed()
+        try testAPIUsagePeriodAndAnthropicRequestShape()
+        try await testAPIUsageLaneServesFreshThenBacksOffAndFilesUnderUsageCredits()
         try testClaudeHeatmapBucketingRetainsFullWindow()
         try testClaudeFableWindowWithoutResetStillDisplays()
         try testClaudeMissingFableWindowDoesNotDisplay()

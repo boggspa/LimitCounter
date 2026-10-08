@@ -654,7 +654,8 @@ final class SyncCoordinator {
             resetCredits: usage.resetCredits,
             accountSlot: usage.accountSlot,
             accountLabel: usage.accountLabel,
-            accountFingerprint: usage.accountFingerprint
+            accountFingerprint: usage.accountFingerprint,
+            apiUsage: usage.apiUsage
         )
     }
 }
