@@ -265,9 +265,9 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     public var configurationDescription: String {
         switch self {
         case .claude:
-            return "Reads local Claude Code transcripts under `~/.claude` for token stats. Uses a pasted OAuth token or Limit Counter's mirrored OAuth token for live 5-hour and 7-day quota meters."
+            return "Reads local Claude Code transcripts under `~/.claude` for token stats. Uses a pasted OAuth token or Limit Counter's mirrored OAuth token for live 5-hour and 7-day quota meters. An optional Anthropic Admin API key adds the Console organisation's month-to-date API spend under Usage Credits."
         case .openai:
-            return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface. An optional `~/.codex` folder grant follows CLI token rotation without repeated prompts."
+            return "Uses a ChatGPT-authorized Codex session to read the private 5-hour and 7-day usage surface. An optional `~/.codex` folder grant follows CLI token rotation without repeated prompts. An optional OpenAI admin API key adds the organisation's month-to-date API costs under Usage Credits."
         case .openaiAPI:
             return "Uses an OpenAI admin API key and project ID to read official 30-day usage, request, and cost history from OpenAI organization APIs."
         case .chatgpt:
@@ -381,7 +381,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     public var securityNote: String {
         switch self {
         case .openai:
-            return "Use only a Codex session or `~/.codex` folder you intentionally grant from an account you control. Folder access is limited to following `auth.json` session rotation."
+            return "Use only a Codex session or `~/.codex` folder you intentionally grant from an account you control. Folder access is limited to following `auth.json` session rotation. An optional admin API key is stored in Keychain and sent only to `https://api.openai.com/v1/organization/costs`."
         case .openaiAPI:
             return "Use only an OpenAI admin key you intentionally create for usage reporting, and scope it to the organization/project you control."
         case .chatgpt:
@@ -389,7 +389,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .codexTelemetry:
             return "Use only local Codex log folders or exports you intentionally point the app at."
         case .claude:
-            return "Use only Claude Code logs, OAuth tokens, or keychain access you intentionally provide."
+            return "Use only Claude Code logs, OAuth tokens, or keychain access you intentionally provide. An optional Admin API key is stored in Keychain and sent only to `https://api.anthropic.com/v1/organizations/cost_report`."
         case .cursor:
             return "Use only a Cursor web credential you intentionally import. Local Cursor state is read only for cached metadata."
         case .devin:
@@ -1142,17 +1142,97 @@ public struct QuotaUsageCredits: Identifiable, Equatable, Hashable {
     public let label: String
     public let balance: QuotaBalance?
     public let unavailableReason: String?
+    /// Nil for the account's own credit balance. A named lane ("api-usage")
+    /// is a second row for the same account that must keep its own identity
+    /// and meter order.
+    public var lane: String? = nil
 
     public var accountKey: ProviderAccountKey {
         ProviderAccountKey(providerID: providerID, slot: accountSlot)
     }
 
-    public var id: String { "usage-credits|\(accountKey.rawValue)" }
+    public var id: String {
+        let base = "usage-credits|\(accountKey.rawValue)"
+        return lane.map { "\(base)|\($0)" } ?? base
+    }
     public var valueText: String { balance?.valueText ?? "—" }
     public var detail: String {
         balance.map { balance in
             [balance.label, balance.subtitle].compactMap { $0 }.joined(separator: " · ")
         } ?? unavailableReason ?? "Credit balance not reported"
+    }
+}
+
+/// The Console / organisation API bill for the current UTC calendar month,
+/// read with an admin key the user stores beside the account's own
+/// credential. It meters an API organisation, not the subscription the
+/// account's windows meter, so it files as its own Usage Credits row
+/// ("Claude · Console API") instead of folding into the account's balances.
+/// Mirrors TaskWraith's API usage report lane so both apps describe the same
+/// figure the same way.
+public struct QuotaAPIUsageReport: Codable, Equatable, Hashable {
+    /// Stable across refreshes so the derived balance keeps its identity.
+    public let id: UUID
+    /// "Console API" for Anthropic, "OpenAI API" for OpenAI.
+    public let label: String
+    /// Month-to-date spend, or nil when the report could not be read. A
+    /// failed read is never shown as a zero.
+    public let amount: Double?
+    public let currency: String
+    /// Where the figure came from and what it covers, for the row subtitle.
+    public let detail: String
+    public let periodStart: Date
+    /// The next UTC month boundary, when the figure returns to zero.
+    public let periodEnd: Date
+    public let fetchedAt: Date
+    /// True when this is the last successful read, served because a newer
+    /// read failed.
+    public let isStale: Bool
+    public let failureMessage: String?
+
+    public init(
+        id: UUID = UUID(),
+        label: String,
+        amount: Double?,
+        currency: String,
+        detail: String,
+        periodStart: Date,
+        periodEnd: Date,
+        fetchedAt: Date,
+        isStale: Bool = false,
+        failureMessage: String? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.amount = amount
+        self.currency = currency
+        self.detail = detail
+        self.periodStart = periodStart
+        self.periodEnd = periodEnd
+        self.fetchedAt = fetchedAt
+        self.isStale = isStale
+        self.failureMessage = failureMessage
+    }
+
+    /// The spend as a balance row: "API usage  $12.34".
+    public var balance: QuotaBalance? {
+        guard let amount, amount.isFinite else { return nil }
+        return QuotaBalance(
+            id: id,
+            label: "API usage",
+            amount: amount,
+            unit: currency,
+            subtitle: isStale ? "\(detail) · last successful read" : detail,
+            resetDate: periodEnd
+        )
+    }
+
+    public func markedStale() -> QuotaAPIUsageReport {
+        QuotaAPIUsageReport(
+            id: id, label: label, amount: amount, currency: currency, detail: detail,
+            periodStart: periodStart, periodEnd: periodEnd, fetchedAt: fetchedAt,
+            isStale: true, failureMessage: failureMessage
+        )
     }
 }
 
@@ -1222,6 +1302,30 @@ public extension QuotaSnapshot {
             balance: balance,
             unavailableReason: balance == nil ? reason : nil
         )
+    }
+
+    /// The admin-key cost report as its own Usage Credits row, beside the
+    /// account's balance row: "Claude · Console API  $12.34".
+    var apiUsageCredits: QuotaUsageCredits? {
+        guard let report = apiUsage else { return nil }
+        var label = "\(providerID.displayName) · \(report.label)"
+        if let badge = accountBadgeText { label += " · \(badge)" }
+        let balance = report.balance
+        return QuotaUsageCredits(
+            providerID: providerID,
+            accountSlot: accountSlot,
+            label: label,
+            balance: balance,
+            unavailableReason: balance == nil
+                ? (report.failureMessage ?? "\(report.label) usage report unavailable.")
+                : nil,
+            lane: "api-usage"
+        )
+    }
+
+    /// Every Usage Credits row this snapshot contributes, in display order.
+    var usageCreditRows: [QuotaUsageCredits] {
+        [usageCredits, apiUsageCredits].compactMap { $0 }
     }
 }
 
@@ -2211,6 +2315,10 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
     public let accountLabel: String?
     /// See `ProviderAccountFingerprint`. Nil when the provider exposes no identity.
     public let accountFingerprint: String?
+    /// The admin-key API cost report, when the account stores such a key.
+    /// Optional so snapshots written before it existed, and older decoders,
+    /// are unaffected.
+    public let apiUsage: QuotaAPIUsageReport?
 
     public var accountKey: ProviderAccountKey {
         ProviderAccountKey(providerID: providerID, slot: accountSlot)
@@ -2256,7 +2364,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             resetCredits: resetCredits,
             accountSlot: slot,
             accountLabel: label,
-            accountFingerprint: fingerprint
+            accountFingerprint: fingerprint,
+            apiUsage: apiUsage
         )
     }
 
@@ -2329,6 +2438,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         if [.grok, .minimax, .claude].contains(providerID), usageCredits != nil {
             return "Usage Credits"
         }
+        if balances.isEmpty, apiUsage != nil { return "Usage Credits" }
         guard !balances.isEmpty else { return nil }
         if providerID == .openai { return "Credits / Balance" }
         if providerID == .openaiAPI { return "API Costs" }
@@ -2401,7 +2511,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             resetCredits: resetCredits,
             accountSlot: accountSlot,
             accountLabel: accountLabel,
-            accountFingerprint: accountFingerprint
+            accountFingerprint: accountFingerprint,
+            apiUsage: apiUsage
         )
     }
 
@@ -2450,7 +2561,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             resetCredits: resetCredits,
             accountSlot: accountSlot,
             accountLabel: accountLabel,
-            accountFingerprint: accountFingerprint
+            accountFingerprint: accountFingerprint,
+            apiUsage: apiUsage
         )
     }
 
@@ -2471,7 +2583,32 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             resetCredits: resetCredits,
             accountSlot: accountSlot,
             accountLabel: accountLabel,
-            accountFingerprint: accountFingerprint
+            accountFingerprint: accountFingerprint,
+            apiUsage: apiUsage
+        )
+    }
+
+    /// The same reading with the admin-key API cost report attached (or
+    /// cleared). Everything the provider reported is untouched.
+    public func withAPIUsage(_ report: QuotaAPIUsageReport?) -> QuotaSnapshot {
+        QuotaSnapshot(
+            id: id,
+            providerID: providerID,
+            displayName: displayName,
+            planName: planName,
+            windows: windows,
+            stats: stats,
+            balances: balances,
+            signals: signals,
+            events: events,
+            analyticsBuckets: analyticsBuckets,
+            fetchState: fetchState,
+            fetchedAt: fetchedAt,
+            resetCredits: resetCredits,
+            accountSlot: accountSlot,
+            accountLabel: accountLabel,
+            accountFingerprint: accountFingerprint,
+            apiUsage: report
         )
     }
 
@@ -2492,7 +2629,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
             resetCredits: credits,
             accountSlot: accountSlot,
             accountLabel: accountLabel,
-            accountFingerprint: accountFingerprint
+            accountFingerprint: accountFingerprint,
+            apiUsage: apiUsage
         )
     }
 
@@ -2513,6 +2651,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         case accountSlot
         case accountLabel
         case accountFingerprint
+        case apiUsage
     }
 
     public init(
@@ -2531,7 +2670,8 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         resetCredits: QuotaResetCreditSummary? = nil,
         accountSlot: String = ProviderAccountKey.primarySlot,
         accountLabel: String? = nil,
-        accountFingerprint: String? = nil
+        accountFingerprint: String? = nil,
+        apiUsage: QuotaAPIUsageReport? = nil
     ) {
         self.id = id
         self.providerID = providerID
@@ -2549,6 +2689,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         self.accountSlot = ProviderAccountKey.normalizedSlot(accountSlot)
         self.accountLabel = accountLabel
         self.accountFingerprint = accountFingerprint
+        self.apiUsage = apiUsage
     }
 
     public init(from decoder: Decoder) throws {
@@ -2581,6 +2722,7 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         )
         accountLabel = try? container.decodeIfPresent(String.self, forKey: .accountLabel)
         accountFingerprint = try? container.decodeIfPresent(String.self, forKey: .accountFingerprint)
+        apiUsage = (try? container.decodeIfPresent(QuotaAPIUsageReport.self, forKey: .apiUsage)) ?? nil
     }
 }
 
@@ -2687,7 +2829,7 @@ public struct CloudSnapshotPayload: Codable {
             analyticsBuckets: analyticsBuckets, fetchState: snapshot.fetchState,
             fetchedAt: snapshot.fetchedAt, resetCredits: snapshot.resetCredits,
             accountSlot: snapshot.accountSlot, accountLabel: snapshot.accountLabel,
-            accountFingerprint: snapshot.accountFingerprint
+            accountFingerprint: snapshot.accountFingerprint, apiUsage: snapshot.apiUsage
         )
     }
 

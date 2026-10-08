@@ -1967,7 +1967,7 @@ struct CompactDashboardCardView: View {
                 id: MeterOrderStore.key(account: snapshot.accountKey, window: $0),
                 window: $0
             )
-        } + (snapshot.usageCredits.map { [OrderedMeter.readout(.credits($0))] } ?? [])
+        } + snapshot.usageCreditRows.map { OrderedMeter.readout(.credits($0)) }
             + (snapshot.availableResets.map { [OrderedMeter.readout(.resets($0))] } ?? [])
         let meterKeys = naturalMeters.map(\.id)
         let meters = meterOrderStore.ordered(naturalMeters, scope: scope, key: \.id)
@@ -2137,8 +2137,8 @@ struct PeriodCompactDashboardCardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .glassCardBackground(accent: ProGlassTheme.accent, cornerRadius: 16)
             }
-            if !snapshots.compactMap(\.usageCredits).isEmpty {
-                readoutBlock(title: "Usage Credits", naturalRows: snapshots.compactMap(\.usageCredits).map(CompactReadout.credits),
+            if !snapshots.flatMap(\.usageCreditRows).isEmpty {
+                readoutBlock(title: "Usage Credits", naturalRows: snapshots.flatMap(\.usageCreditRows).map(CompactReadout.credits),
                              scope: MeterOrderStore.scopeForUsageCredits)
             }
             if !snapshots.compactMap(\.availableResets).isEmpty {

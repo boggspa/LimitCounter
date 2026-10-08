@@ -6969,6 +6969,7 @@ public struct CodexSessionProviderClient: AccountScopedProviderClient {
     private let endpointURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     private let readingDefaults: UserDefaults?
     private let credentialSaver: any CodexCredentialSaving
+    private let apiUsageLane: APIUsageReportLane
 
     public init(session: URLSession = .shared) {
         self.init(session: session, readingDefaults: nil, credentialSaver: KeychainCodexCredentialSaver())
@@ -6976,10 +6977,16 @@ public struct CodexSessionProviderClient: AccountScopedProviderClient {
 
     /// `readingDefaults` holds the verified readings and the identity
     /// registry; `nil` is the app group.
-    init(session: URLSession, readingDefaults: UserDefaults?, credentialSaver: any CodexCredentialSaving) {
+    init(
+        session: URLSession,
+        readingDefaults: UserDefaults?,
+        credentialSaver: any CodexCredentialSaving,
+        apiUsageLane: APIUsageReportLane = .shared
+    ) {
         self.session = session
         self.readingDefaults = readingDefaults
         self.credentialSaver = credentialSaver
+        self.apiUsageLane = apiUsageLane
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
@@ -6987,6 +6994,17 @@ public struct CodexSessionProviderClient: AccountScopedProviderClient {
     }
 
     public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
+        let snapshot = try await fetchAccountSnapshot(credentials: credentials, account: account, userInitiated: userInitiated)
+        // The organisation's API bill rides beside the ChatGPT subscription
+        // meters as its own Usage Credits row; it never replaces them.
+        return await apiUsageLane.attaching(.openai, to: snapshot, credentials: credentials)
+    }
+
+    private func fetchAccountSnapshot(
         credentials: ProviderCredential?,
         account: ProviderAccountKey,
         userInitiated: Bool
@@ -10395,6 +10413,457 @@ private final class ClaudePrepaidRedirectPolicy: NSObject, URLSessionTaskDelegat
     }
 }
 
+// MARK: - API usage reporting (Console / organisation cost reports)
+
+/// Admin keys that read a Console / organisation bill. They live beside the
+/// account's own credential in Keychain (`ProviderCredential.extraFields`),
+/// are never injected anywhere, and only ever reach the vendor's documented
+/// cost endpoint. Mirrors TaskWraith's API usage key store so both apps
+/// describe the same figure the same way.
+enum APIUsageCredentialField {
+    /// Anthropic Admin API key (`sk-ant-admin01-…`), stored on the Claude card.
+    static let anthropicAdminKey = "anthropicAdminAPIKey"
+    /// OpenAI organisation admin key, stored on the Codex card.
+    static let openAIAdminKey = "openaiAdminAPIKey"
+    /// Optional `proj_…` id that narrows the OpenAI bill to one project.
+    static let openAIProjectID = "openaiCostProjectID"
+
+    static func adminKey(for provider: APIUsageReportProvider, in credentials: ProviderCredential?) -> String? {
+        let field = provider == .anthropic ? anthropicAdminKey : openAIAdminKey
+        let value = credentials?.extraFields?[field]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !value.isEmpty, value.utf8.count <= 4096 else { return nil }
+        return value
+    }
+
+    /// A `proj_…` identifier is not a credential, but it is query input, so
+    /// anything outside the documented id alphabet is dropped rather than sent.
+    static func openAIProjectID(in credentials: ProviderCredential?) -> String? {
+        let value = credentials?.extraFields?[openAIProjectID]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !value.isEmpty, value.count <= 128,
+              value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }) else {
+            return nil
+        }
+        return value
+    }
+}
+
+enum APIUsageReportProvider: String, CaseIterable, Hashable {
+    case anthropic
+    case openai
+
+    var vendorName: String { self == .anthropic ? "Anthropic" : "OpenAI" }
+    /// The Usage Credits row suffix: "Claude · Console API", "Codex · OpenAI API".
+    var reportLabel: String { self == .anthropic ? "Console API" : "OpenAI API" }
+    var keyName: String { self == .anthropic ? "Anthropic Admin API key" : "OpenAI admin API key" }
+}
+
+enum APIUsageReportFailure: Error, Equatable {
+    case unauthorized(Int)
+    case rateLimited
+    case http(Int)
+    case network
+    case parse
+
+    func message(for provider: APIUsageReportProvider) -> String {
+        switch self {
+        case .unauthorized(let status):
+            return "\(provider.vendorName) rejected the key (HTTP \(status)). API usage needs an organisation admin key, not a project or seat key."
+        case .rateLimited:
+            return "\(provider.vendorName) rate-limited the usage report. Limit Counter will retry later."
+        case .http(let status):
+            return "\(provider.vendorName) usage report returned HTTP \(status)."
+        case .network:
+            return "\(provider.vendorName) usage report could not be reached."
+        case .parse:
+            return "\(provider.vendorName) usage report could not be read; the figure is withheld rather than guessed."
+        }
+    }
+}
+
+struct APIUsageReading: Equatable {
+    let total: Double
+    let currency: String
+    let bucketCount: Int
+    let lineItemCount: Int
+}
+
+/// The UTC calendar month containing `now`: [first of the month, now) plus
+/// the next month boundary. `end` is truncated to the minute so repeated
+/// reads inside a minute ask the same question.
+struct APIUsagePeriod: Equatable {
+    let start: Date
+    let end: Date
+    let nextReset: Date
+
+    static func utcMonthToDate(now: Date) -> APIUsagePeriod {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        let start = calendar.date(from: calendar.dateComponents([.year, .month], from: now)) ?? now
+        let nextReset = calendar.date(byAdding: .month, value: 1, to: start) ?? start
+        let truncated = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970 / 60) * 60)
+        return APIUsagePeriod(start: start, end: max(truncated, start.addingTimeInterval(60)), nextReset: nextReset)
+    }
+}
+
+/// Pure page parsers for the two cost reports. Both fail closed: an amount
+/// that cannot be read makes the whole page `nil`, never a zero, because a
+/// fabricated $0.00 is the most dangerous wrong answer a spend readout can give.
+enum APIUsageCostReportParser {
+    /// `GET /v1/organizations/cost_report`: amounts are USD cents as decimal
+    /// strings ("1234.5"), daily buckets, `has_more` / `next_page`.
+    struct AnthropicPage: Equatable {
+        let cents: Double
+        let bucketCount: Int
+        let lineItemCount: Int
+        let nextPage: String?
+    }
+
+    /// `GET /v1/organization/costs`: each result carries
+    /// `amount: { value, currency }` in whole currency units (dollars).
+    struct OpenAIPage: Equatable {
+        let total: Double
+        let currency: String?
+        let bucketCount: Int
+        let lineItemCount: Int
+        let nextPage: String?
+    }
+
+    /// Decimal string or JSON number; nil for anything else (including booleans).
+    static func decimal(_ value: Any?) -> Double? {
+        guard let value else { return nil }
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let double = number.doubleValue
+            return double.isFinite ? double : nil
+        }
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: #"^-?\d+(?:\.\d+)?$"#, options: .regularExpression) != nil,
+                  let double = Double(trimmed), double.isFinite else { return nil }
+            return double
+        }
+        return nil
+    }
+
+    private static func nextPage(in object: [String: Any]) -> String? {
+        guard (object["has_more"] as? Bool) == true,
+              let page = object["next_page"] as? String, !page.isEmpty else { return nil }
+        return page
+    }
+
+    static func anthropicPage(_ data: Data) -> AnthropicPage? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let buckets = object["data"] as? [Any] else { return nil }
+        var cents = 0.0
+        var lineItems = 0
+        for bucket in buckets {
+            guard let bucket = bucket as? [String: Any] else { return nil }
+            guard let rawResults = bucket["results"], !(rawResults is NSNull) else { continue }
+            guard let results = rawResults as? [Any] else { return nil }
+            for result in results {
+                guard let result = result as? [String: Any], let amount = decimal(result["amount"]) else { return nil }
+                if let currency = result["currency"] as? String, currency.uppercased() != "USD" { return nil }
+                cents += amount
+                lineItems += 1
+            }
+        }
+        return AnthropicPage(cents: cents, bucketCount: buckets.count, lineItemCount: lineItems, nextPage: nextPage(in: object))
+    }
+
+    static func openAIPage(_ data: Data) -> OpenAIPage? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let buckets = object["data"] as? [Any] else { return nil }
+        var total = 0.0
+        var currency: String?
+        var lineItems = 0
+        for bucket in buckets {
+            guard let bucket = bucket as? [String: Any] else { return nil }
+            guard let rawResults = bucket["results"], !(rawResults is NSNull) else { continue }
+            guard let results = rawResults as? [Any] else { return nil }
+            for result in results {
+                guard let result = result as? [String: Any],
+                      let amount = result["amount"] as? [String: Any],
+                      let value = decimal(amount["value"]) else { return nil }
+                if let unit = (amount["currency"] as? String)?.trimmingCharacters(in: .whitespaces), !unit.isEmpty {
+                    let normalized = unit.uppercased()
+                    if let currency, currency != normalized { return nil }
+                    currency = normalized
+                }
+                total += value
+                lineItems += 1
+            }
+        }
+        return OpenAIPage(total: total, currency: currency, bucketCount: buckets.count,
+                          lineItemCount: lineItems, nextPage: nextPage(in: object))
+    }
+}
+
+/// Read-only fetches of the two documented cost endpoints. No cookies, no
+/// redirects, bounded pages and bodies; the key goes only to its own host.
+struct APIUsageReportClient {
+    static let anthropicCostReportURL = URL(string: "https://api.anthropic.com/v1/organizations/cost_report")!
+    static let openAICostsURL = URL(string: "https://api.openai.com/v1/organization/costs")!
+    static let anthropicVersion = "2023-06-01"
+    static let userAgent = "LimitCounter (https://github.com/boggspa/LimitCounter)"
+    static let maxPages = 8
+    static let maxResponseBytes = 4 * 1024 * 1024
+    static let requestTimeout: TimeInterval = 10
+
+    private static let rfc3339: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter
+    }()
+
+    let session: URLSession
+
+    init(session: URLSession = .shared) { self.session = session }
+
+    static func anthropicRequest(adminKey: String, period: APIUsagePeriod, page: String? = nil) -> URLRequest {
+        var components = URLComponents(url: anthropicCostReportURL, resolvingAgainstBaseURL: false)!
+        var items = [
+            URLQueryItem(name: "starting_at", value: rfc3339.string(from: period.start)),
+            URLQueryItem(name: "ending_at", value: rfc3339.string(from: period.end))
+        ]
+        if let page { items.append(URLQueryItem(name: "page", value: page)) }
+        components.queryItems = items
+        var request = baseRequest(url: components.url ?? anthropicCostReportURL)
+        request.setValue(adminKey, forHTTPHeaderField: "x-api-key")
+        request.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        return request
+    }
+
+    static func openAIRequest(adminKey: String, projectID: String?, period: APIUsagePeriod, page: String? = nil) -> URLRequest {
+        var components = URLComponents(url: openAICostsURL, resolvingAgainstBaseURL: false)!
+        var items = [
+            URLQueryItem(name: "start_time", value: String(Int(period.start.timeIntervalSince1970))),
+            URLQueryItem(name: "end_time", value: String(Int(period.end.timeIntervalSince1970))),
+            URLQueryItem(name: "bucket_width", value: "1d"),
+            URLQueryItem(name: "limit", value: "31")
+        ]
+        if let projectID { items.append(URLQueryItem(name: "project_ids", value: projectID)) }
+        if let page { items.append(URLQueryItem(name: "page", value: page)) }
+        components.queryItems = items
+        var request = baseRequest(url: components.url ?? openAICostsURL)
+        request.setValue("Bearer \(adminKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    private static func baseRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: requestTimeout)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    func fetch(
+        provider: APIUsageReportProvider,
+        adminKey: String,
+        projectID: String?,
+        period: APIUsagePeriod
+    ) async -> Result<APIUsageReading, APIUsageReportFailure> {
+        var total = 0.0
+        var currency: String?
+        var buckets = 0
+        var lineItems = 0
+        var page: String?
+        for _ in 0..<Self.maxPages {
+            let request = provider == .anthropic
+                ? Self.anthropicRequest(adminKey: adminKey, period: period, page: page)
+                : Self.openAIRequest(adminKey: adminKey, projectID: projectID, period: period, page: page)
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request, delegate: ClaudePrepaidRedirectPolicy())
+            } catch {
+                return .failure(.network)
+            }
+            guard let http = response as? HTTPURLResponse else { return .failure(.network) }
+            switch http.statusCode {
+            case 200..<300: break
+            case 401, 403: return .failure(.unauthorized(http.statusCode))
+            case 429: return .failure(.rateLimited)
+            default: return .failure(.http(http.statusCode))
+            }
+            guard data.count <= Self.maxResponseBytes else { return .failure(.parse) }
+            switch provider {
+            case .anthropic:
+                guard let parsed = APIUsageCostReportParser.anthropicPage(data) else { return .failure(.parse) }
+                total += parsed.cents
+                currency = "USD"
+                buckets += parsed.bucketCount
+                lineItems += parsed.lineItemCount
+                page = parsed.nextPage
+            case .openai:
+                guard let parsed = APIUsageCostReportParser.openAIPage(data) else { return .failure(.parse) }
+                if let unit = parsed.currency {
+                    if let currency, currency != unit { return .failure(.parse) }
+                    currency = unit
+                }
+                total += parsed.total
+                buckets += parsed.bucketCount
+                lineItems += parsed.lineItemCount
+                page = parsed.nextPage
+            }
+            if page == nil { break }
+        }
+        let amount = provider == .anthropic ? (total / 100).rounded(toPlaces: 2) : total.rounded(toPlaces: 2)
+        return .success(APIUsageReading(total: amount, currency: currency ?? "USD",
+                                        bucketCount: buckets, lineItemCount: lineItems))
+    }
+}
+
+private extension Double {
+    func rounded(toPlaces places: Int) -> Double {
+        let factor = pow(10.0, Double(places))
+        return (self * factor).rounded() / factor
+    }
+}
+
+/// Serves each account's admin-key cost report with a 15-minute fresh window
+/// and a 5-minute backoff after a failure, so the dashboard's refresh bursts
+/// stay well inside Anthropic's one-poll-a-minute allowance and the ~5-minute
+/// lag before cost data lands. A failure after a successful read serves the
+/// last report flagged stale; a failure with nothing cached yields a report
+/// that carries the reason, so the row can say why instead of showing zero.
+/// Keys are hashed into the cache key and never stored here.
+final class APIUsageReportLane: @unchecked Sendable {
+    static let shared = APIUsageReportLane()
+    static let defaultFreshTTL: TimeInterval = 15 * 60
+    static let defaultFailureBackoff: TimeInterval = 5 * 60
+    private static let entryRetention: TimeInterval = 24 * 60 * 60
+
+    private struct Entry {
+        var report: QuotaAPIUsageReport?
+        var fetchedAt: Date?
+        var lastFailureAt: Date?
+        var lastFailure: String?
+        var touchedAt: Date
+    }
+
+    private let client: APIUsageReportClient
+    private let freshTTL: TimeInterval
+    private let failureBackoff: TimeInterval
+    private let now: () -> Date
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    init(
+        client: APIUsageReportClient = APIUsageReportClient(),
+        freshTTL: TimeInterval = APIUsageReportLane.defaultFreshTTL,
+        failureBackoff: TimeInterval = APIUsageReportLane.defaultFailureBackoff,
+        now: @escaping () -> Date = { Date() }
+    ) {
+        self.client = client
+        self.freshTTL = freshTTL
+        self.failureBackoff = failureBackoff
+        self.now = now
+    }
+
+    /// The snapshot with this account's report attached, or unchanged when
+    /// the account stores no admin key for `provider`.
+    func attaching(
+        _ provider: APIUsageReportProvider,
+        to snapshot: QuotaSnapshot,
+        credentials: ProviderCredential?
+    ) async -> QuotaSnapshot {
+        guard let report = await report(for: provider, credentials: credentials) else { return snapshot }
+        return snapshot.withAPIUsage(report)
+    }
+
+    func report(for provider: APIUsageReportProvider, credentials: ProviderCredential?) async -> QuotaAPIUsageReport? {
+        guard let adminKey = APIUsageCredentialField.adminKey(for: provider, in: credentials) else { return nil }
+        let projectID = provider == .openai ? APIUsageCredentialField.openAIProjectID(in: credentials) : nil
+        let key = Self.cacheKey(provider: provider, adminKey: adminKey, projectID: projectID)
+        let at = now()
+
+        lock.lock()
+        entries = entries.filter { at.timeIntervalSince($0.value.touchedAt) < Self.entryRetention }
+        var entry = entries[key] ?? Entry(touchedAt: at)
+        entry.touchedAt = at
+        entries[key] = entry
+        lock.unlock()
+
+        if let report = entry.report, let fetchedAt = entry.fetchedAt, at.timeIntervalSince(fetchedAt) < freshTTL {
+            return report
+        }
+        let period = APIUsagePeriod.utcMonthToDate(now: at)
+        if let lastFailureAt = entry.lastFailureAt, at.timeIntervalSince(lastFailureAt) < failureBackoff {
+            return entry.report?.markedStale()
+                ?? Self.failureReport(provider: provider, message: entry.lastFailure ?? APIUsageReportFailure.network.message(for: provider),
+                                      period: period, at: at)
+        }
+
+        let outcome = await client.fetch(provider: provider, adminKey: adminKey, projectID: projectID, period: period)
+        let readAt = now()
+        lock.lock()
+        defer { lock.unlock() }
+        var updated = entries[key] ?? entry
+        switch outcome {
+        case .success(let reading):
+            let report = QuotaAPIUsageReport(
+                id: updated.report?.id ?? UUID(),
+                label: provider.reportLabel,
+                amount: reading.total,
+                currency: reading.currency,
+                detail: Self.detail(provider: provider, projectID: projectID),
+                periodStart: period.start,
+                periodEnd: period.nextReset,
+                fetchedAt: readAt
+            )
+            updated.report = report
+            updated.fetchedAt = readAt
+            updated.lastFailureAt = nil
+            updated.lastFailure = nil
+            entries[key] = updated
+            return report
+        case .failure(let failure):
+            let message = failure.message(for: provider)
+            updated.lastFailureAt = readAt
+            updated.lastFailure = message
+            entries[key] = updated
+            return updated.report?.markedStale()
+                ?? Self.failureReport(provider: provider, message: message, period: period, at: readAt)
+        }
+    }
+
+    static func detail(provider: APIUsageReportProvider, projectID: String?) -> String {
+        switch provider {
+        case .anthropic:
+            return "Month to date (UTC) · Anthropic Console cost report"
+        case .openai:
+            let scope = projectID.map { "project \($0)" } ?? "whole organisation"
+            return "Month to date (UTC) · OpenAI costs, \(scope)"
+        }
+    }
+
+    private static func failureReport(
+        provider: APIUsageReportProvider,
+        message: String,
+        period: APIUsagePeriod,
+        at: Date
+    ) -> QuotaAPIUsageReport {
+        QuotaAPIUsageReport(
+            label: provider.reportLabel,
+            amount: nil,
+            currency: "USD",
+            detail: detail(provider: provider, projectID: nil),
+            periodStart: period.start,
+            periodEnd: period.nextReset,
+            fetchedAt: at,
+            failureMessage: message
+        )
+    }
+
+    private static func cacheKey(provider: APIUsageReportProvider, adminKey: String, projectID: String?) -> String {
+        let digest = SHA256.hash(data: Data("\(adminKey)\u{0}\(projectID ?? "")".utf8))
+        return "\(provider.rawValue)|" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 struct ClaudeOAuthUsageResponse: Decodable {
     let fiveHour: ClaudeOAuthWindow?
     let sevenDay: ClaudeOAuthWindow?
@@ -11750,9 +12219,15 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
     public let providerID: ProviderID = .claude
 
     private let fileManager: FileManager
+    private let apiUsageLane: APIUsageReportLane
 
     public init(fileManager: FileManager = .default) {
+        self.init(fileManager: fileManager, apiUsageLane: .shared)
+    }
+
+    init(fileManager: FileManager = .default, apiUsageLane: APIUsageReportLane) {
         self.fileManager = fileManager
+        self.apiUsageLane = apiUsageLane
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
@@ -11767,6 +12242,17 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
     }
 
     public func fetchSnapshot(
+        credentials: ProviderCredential?,
+        account: ProviderAccountKey,
+        userInitiated: Bool
+    ) async throws -> QuotaSnapshot {
+        let snapshot = try await fetchAccountSnapshot(credentials: credentials, account: account, userInitiated: userInitiated)
+        // The Console organisation's API bill rides beside the subscription
+        // meters as its own Usage Credits row; it never replaces them.
+        return await apiUsageLane.attaching(.anthropic, to: snapshot, credentials: credentials)
+    }
+
+    private func fetchAccountSnapshot(
         credentials: ProviderCredential?,
         account: ProviderAccountKey,
         userInitiated: Bool

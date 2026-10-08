@@ -1408,6 +1408,10 @@ struct ProviderCredentialView: View {
                         #endif
                     }
                 }
+
+                if providerID == .claude || providerID == .openai {
+                    apiUsageReportingFields
+                }
             }
             .padding(.horizontal, 12)
             .listRowBackground(Color.white.opacity(0.04))
@@ -1702,6 +1706,48 @@ struct ProviderCredentialView: View {
         }
         .padding(.horizontal, 12)
         .listRowBackground(Color.white.opacity(0.04))
+    }
+
+    /// The admin key that reads a Console / organisation API bill. It is a
+    /// separate credential from the seat's own token: it reads spend, never
+    /// runs anything, and stays in Keychain beside the account's fields.
+    @ViewBuilder
+    private var apiUsageReportingFields: some View {
+        if providerID == .claude {
+            SecureField(
+                "Anthropic Admin API key (usage reporting, optional)",
+                text: extraFieldBinding(APIUsageCredentialField.anthropicAdminKey)
+            )
+                .autocorrectionDisabled()
+            #if os(iOS)
+                .textInputAutocapitalization(.never)
+            #endif
+            Text("Reads the Console organisation's month-to-date cost report so API spend shows under Usage Credits as \"Claude · Console API\". Use an Admin API key (`sk-ant-admin01-…`) from Console → Settings → Organization, not the OAuth token above. It is stored in Keychain and sent only to api.anthropic.com. Individual accounts and workspace-scoped keys cannot read the report.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            SecureField(
+                "OpenAI admin API key (usage reporting, optional)",
+                text: extraFieldBinding(APIUsageCredentialField.openAIAdminKey)
+            )
+                .autocorrectionDisabled()
+            #if os(iOS)
+                .textInputAutocapitalization(.never)
+            #endif
+            TextField(
+                "OpenAI project ID (optional, proj_…)",
+                text: extraFieldBinding(APIUsageCredentialField.openAIProjectID)
+            )
+                .autocorrectionDisabled()
+            #if os(iOS)
+                .textInputAutocapitalization(.never)
+            #endif
+            Text("Reads the organisation's month-to-date costs so API spend shows under Usage Credits as \"Codex · OpenAI API\". Use an admin key from platform.openai.com → Settings → Organization → Admin keys; a project key cannot read costs. Leave the project ID blank for the whole organisation. The key is stored in Keychain and sent only to api.openai.com.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func extraFieldBinding(_ key: String, defaultValue: String = "") -> Binding<String> {

@@ -816,8 +816,18 @@ struct SnapshotBalanceListView: View {
                 subtitle: $0.subtitle ?? $0.resetDate.map { "Resets \($0.countdownString)" }
             )
         }
-        guard let credits = snapshot.usageCredits, credits.balance == nil else { return balances }
-        return [SnapshotMetricItem(title: "Usage Credits", value: credits.valueText, subtitle: credits.detail)] + balances
+        // The admin-key API bill is a separate pool from the account's own
+        // balances, so it closes the list under its own name.
+        let apiUsage = snapshot.apiUsage.map { report in
+            [SnapshotMetricItem(
+                id: report.id,
+                title: report.label,
+                value: report.balance?.valueText ?? "—",
+                subtitle: report.balance?.subtitle ?? report.failureMessage
+            )]
+        } ?? []
+        guard let credits = snapshot.usageCredits, credits.balance == nil else { return balances + apiUsage }
+        return [SnapshotMetricItem(title: "Usage Credits", value: credits.valueText, subtitle: credits.detail)] + balances + apiUsage
     }
 }
 

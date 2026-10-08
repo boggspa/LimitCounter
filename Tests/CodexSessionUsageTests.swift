@@ -86,11 +86,24 @@ private final class CodexMockURLProtocol: URLProtocol {
     static var responseData: Data?
     /// Bearer tokens sent to the usage endpoint, in order.
     static var usageTokens: [String] = []
+    /// The organisation costs page, when a test stores an admin key; a
+    /// request without one is answered 401 like OpenAI would.
+    static var costsResponseData: Data?
+    static var costsRequests: [URLRequest] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        if request.url?.path.hasSuffix("/organization/costs") == true {
+            Self.costsRequests.append(request)
+            let status = Self.costsResponseData == nil ? 401 : 200
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Self.costsResponseData ?? Data())
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         if request.url?.path.hasSuffix("/wham/usage") == true,
            let authorization = request.value(forHTTPHeaderField: "Authorization") {
             Self.usageTokens.append(String(authorization.dropFirst("Bearer ".count)))
@@ -548,9 +561,118 @@ private func testFolderPathsAreShownFromHome() throws {
     try expectEqual(CodexSessionProviderClient.abbreviatedHomePath("/opt/codex"), "/opt/codex", "other folders unchanged")
 }
 
+private func testOpenAICostPageParsesDollarsAndFailsClosed() throws {
+    let page = Data(#"{"object":"page","data":[{"object":"bucket","start_time":1759276800,"end_time":1759363200,"results":[{"object":"organization.costs.result","amount":{"value":3.25,"currency":"usd"},"line_item":null,"project_id":"proj_test"},{"object":"organization.costs.result","amount":{"value":"2.42","currency":"USD"},"line_item":"gpt-5","project_id":"proj_test"}]},{"object":"bucket","start_time":1759363200,"end_time":1759449600,"results":[]}],"has_more":true,"next_page":"page_xyz"}"#.utf8)
+    let parsed = APIUsageCostReportParser.openAIPage(page)
+    try expect(parsed != nil, "documented costs page parses")
+    try expectEqual(parsed!.total, 5.67, "amount values are whole dollars and are summed")
+    try expectEqual(parsed!.currency, "USD", "currency normalised to upper case")
+    try expectEqual(parsed!.bucketCount, 2, "daily buckets counted")
+    try expectEqual(parsed!.lineItemCount, 2, "line items counted")
+    try expectEqual(parsed!.nextPage, "page_xyz", "pagination cursor read")
+    try expectEqual(APIUsageCostReportParser.openAIPage(Data(#"{"data":[]}"#.utf8))?.total, 0, "an empty month is a real zero")
+    for body in [
+        #"{"data":[{"results":[{"amount":{"value":"abc","currency":"USD"}}]}]}"#,
+        #"{"data":[{"results":[{"amount":{"value":1,"currency":"USD"}},{"amount":{"value":1,"currency":"EUR"}}]}]}"#,
+        #"{"data":[{"results":[{"amount":"1.00"}]}]}"#,
+        #"{"data":[{"results":[{"amount":{"value":true}}]}]}"#
+    ] {
+        try expect(APIUsageCostReportParser.openAIPage(Data(body.utf8)) == nil,
+                   "an unreadable or mixed-currency amount withholds the whole page: \(body)")
+    }
+
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime]
+    let period = APIUsagePeriod.utcMonthToDate(now: iso.date(from: "2026-10-08T01:48:41Z")!)
+    let request = APIUsageReportClient.openAIRequest(adminKey: "sk-admin-test", projectID: "proj_test", period: period)
+    let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+    try expectEqual(components.host, "api.openai.com", "documented host")
+    try expectEqual(components.path, "/v1/organization/costs", "documented costs endpoint")
+    let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+    try expectEqual(query["start_time"], String(Int(period.start.timeIntervalSince1970)), "unix start")
+    try expectEqual(query["end_time"], String(Int(period.end.timeIntervalSince1970)), "unix end")
+    try expectEqual(query["bucket_width"], "1d", "daily buckets")
+    try expectEqual(query["limit"], "31", "a whole month per page")
+    try expectEqual(query["project_ids"], "proj_test", "project scope forwarded")
+    try expectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sk-admin-test", "admin key as bearer")
+    try expect(request.httpMethod == "GET" && !request.httpShouldHandleCookies, "read-only, cookie-free request")
+    let wholeOrg = APIUsageReportClient.openAIRequest(adminKey: "k", projectID: nil, period: period)
+    try expect(wholeOrg.url!.query!.contains("project_ids") == false, "no project filter without a project id")
+}
+
+private func testCodexSnapshotCarriesTheOpenAIAPIBill() async throws {
+    CodexMockURLProtocol.responseData = fixture(planType: "plus")
+    CodexMockURLProtocol.costsResponseData = Data(#"{"object":"page","data":[{"object":"bucket","start_time":1759276800,"end_time":1759363200,"results":[{"object":"organization.costs.result","amount":{"value":3.25,"currency":"usd"},"line_item":null,"project_id":"proj_test"},{"object":"organization.costs.result","amount":{"value":2.42,"currency":"USD"},"line_item":"gpt-5","project_id":"proj_test"}]}],"has_more":false,"next_page":null}"#.utf8)
+    defer {
+        CodexMockURLProtocol.responseData = nil
+        CodexMockURLProtocol.costsResponseData = nil
+    }
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CodexMockURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let suite = "codex-api-usage-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let lane = APIUsageReportLane(client: APIUsageReportClient(session: session))
+    let client = CodexSessionProviderClient(
+        session: session,
+        readingDefaults: defaults,
+        credentialSaver: CodexSessionUsageNoopSaver(),
+        apiUsageLane: lane
+    )
+
+    let before = CodexMockURLProtocol.costsRequests.count
+    let plain = try await client.fetchSnapshot(credentials: ProviderCredential(accessToken: "test-token", accountIdentifier: "test-account"))
+    try expect(plain.apiUsage == nil && plain.apiUsageCredits == nil, "no admin key, no API row")
+    try expectEqual(CodexMockURLProtocol.costsRequests.count, before, "no admin key, no costs request")
+    try expectEqual(plain.windows.count, 2, "the subscription meters are untouched")
+
+    let keyed = ProviderCredential(
+        accessToken: "test-token",
+        accountIdentifier: "test-account",
+        extraFields: [
+            APIUsageCredentialField.openAIAdminKey: "sk-admin-test",
+            APIUsageCredentialField.openAIProjectID: "proj_test"
+        ]
+    )
+    let billed = try await client.fetchSnapshot(credentials: keyed)
+    try expectEqual(billed.windows.count, 2, "the subscription meters still lead the card")
+    try expectEqual(billed.apiUsage?.amount, 5.67, "month-to-date OpenAI costs attached")
+    try expectEqual(billed.apiUsage?.currency, "USD", "currency carried through")
+    try expectEqual(billed.apiUsage?.detail, "Month to date (UTC) · OpenAI costs, project proj_test", "subtitle names the scope")
+    try expectEqual(billed.apiUsageCredits?.label, "Codex · OpenAI API", "files under Usage Credits as the organisation's bill")
+    try expectEqual(billed.apiUsageCredits?.id, "usage-credits|openai|api-usage", "its own meter identity")
+    try expectEqual(
+        billed.usageCreditRows.map(\.id),
+        [billed.usageCredits?.id, billed.apiUsageCredits?.id].compactMap { $0 },
+        "the API row follows the account's own credits row (absent on a plan that reports no credits)"
+    )
+    try expect(billed.usageCreditRows.last?.id == billed.apiUsageCredits?.id, "the API row files under Usage Credits")
+    try expectEqual(CodexMockURLProtocol.costsRequests.count, before + 1, "one costs request")
+    let costsRequest = CodexMockURLProtocol.costsRequests.last!
+    try expectEqual(costsRequest.value(forHTTPHeaderField: "Authorization"), "Bearer sk-admin-test", "admin key only on the costs request")
+    try expect(costsRequest.url!.query!.contains("project_ids=proj_test"), "project scope applied")
+    try expect(CodexMockURLProtocol.usageTokens.last == "test-token", "the ChatGPT session token never changes")
+
+    CodexMockURLProtocol.costsResponseData = nil
+    let rejectedLane = APIUsageReportLane(client: APIUsageReportClient(session: session))
+    let rejected = try await CodexSessionProviderClient(
+        session: session, readingDefaults: defaults, credentialSaver: CodexSessionUsageNoopSaver(), apiUsageLane: rejectedLane
+    ).fetchSnapshot(credentials: keyed)
+    try expectEqual(rejected.windows.count, 2, "a rejected admin key never hides the subscription meters")
+    try expect(rejected.apiUsage?.amount == nil, "a rejected key reports no figure")
+    try expect(rejected.apiUsageCredits?.unavailableReason?.contains("organisation admin key") == true, "the row says a project key cannot read costs")
+}
+
+private struct CodexSessionUsageNoopSaver: CodexCredentialSaving {
+    @MainActor func save(_ credential: ProviderCredential, for account: ProviderAccountKey) {}
+}
+
 @main
 private enum CodexSessionUsageTestRunner {
     static func main() async throws {
+        try testOpenAICostPageParsesDollarsAndFailsClosed()
+        try await testCodexSnapshotCarriesTheOpenAIAPIBill()
         try await testPlusRendersFiveHourThenWeekly()
         try await testProOmitsFiveHourAndKeepsWeekly()
         try await testProLiteOmitsFiveHourAndNamesThePlan()
