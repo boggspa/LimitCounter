@@ -1,4 +1,6 @@
 import Foundation
+import LocalAuthentication
+import Security
 
 private enum TestError: Error, CustomStringConvertible {
     case failure(String)
@@ -407,7 +409,7 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
         ) else {
         throw TestError.failure("background recovery needs a silent read budget")
     }
-    try expect(backgroundBudget.authenticationContext.interactionNotAllowed, "background recovery cannot prompt")
+    try expect(!backgroundBudget.allowsInteraction, "background recovery cannot prompt")
     try expect(backgroundBudget.claimRead(), "silent recovery gets one read")
     try expect(!backgroundBudget.claimRead(), "silent recovery cannot loop")
     try expect(
@@ -420,7 +422,7 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     ) else {
         throw TestError.failure("opted-in manual refresh should receive a Claude Code keychain read budget")
     }
-    try expect(!manualRefreshBudget.authenticationContext.interactionNotAllowed, "manual recovery may authorize access")
+    try expect(manualRefreshBudget.allowsInteraction, "manual recovery may authorize access")
     try expect(
         manualRefreshBudget.claimRead(),
         "the first Claude Code keychain read in a manual refresh should be allowed"
@@ -1048,6 +1050,228 @@ private func testAPIUsageLaneServesFreshThenBacksOffAndFilesUnderUsageCredits() 
     try expect(try JSONDecoder().decode(QuotaSnapshot.self, from: legacy).apiUsage == nil, "snapshots written before the field decode unchanged")
 }
 
+private func testClaudeSecurityToolReadMirrorsClaudeCode() throws {
+    // Verified against Claude Code 2.1.295: it reads its own item with
+    // `security find-generic-password -a <user> -w -s <service>`. Sending the
+    // same request from the same tool is what makes the read prompt-free.
+    try expectEqual(
+        ClaudeCodeSecurityToolReader.arguments(service: "Claude Code-credentials-ba2961b5", account: "chris"),
+        ["find-generic-password", "-a", "chris", "-w", "-s", "Claude Code-credentials-ba2961b5"],
+        "the request is the one Claude Code itself makes"
+    )
+    try expectEqual(ClaudeCodeSecurityToolReader.executablePath, "/usr/bin/security", "only Apple's tool, by absolute path")
+
+    let environment = ClaudeCodeSecurityToolReader.environment(
+        inheriting: ["HOME": "/Users/chris/Library/Containers/com.chrisizatt.LLMUsageCounter/Data", "PATH": "/usr/bin"],
+        homeDirectory: "/Users/chris"
+    )
+    try expectEqual(environment["HOME"], "/Users/chris", "the tool looks for the login keychain under the real home, not the sandbox container")
+    try expectEqual(environment["PATH"], "/usr/bin", "everything else is inherited")
+
+    let json = Data(#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}"#.utf8)
+    try expectEqual(ClaudeCodeSecurityToolReader.payload(fromOutput: json + Data("\n".utf8)), json, "the trailing newline -w prints is dropped")
+    try expectEqual(ClaudeCodeSecurityToolReader.payload(fromOutput: json), json, "no newline is fine too")
+    try expect(ClaudeCodeSecurityToolReader.payload(fromOutput: Data("\n".utf8)) == nil, "an empty answer is no payload")
+    let hex = json.map { String(format: "%02x", $0) }.joined()
+    try expectEqual(
+        ClaudeCodeSecurityToolReader.payload(fromOutput: Data("0x\(hex)  \"{...}\"\n".utf8)),
+        json,
+        "the hex rendering the tool uses for non-printable secrets is decoded"
+    )
+    try expectEqual(
+        ClaudeCodeSecurityToolReader.payload(fromOutput: Data("0xZZ".utf8)),
+        Data("0xZZ".utf8),
+        "text that merely starts with 0x is kept verbatim"
+    )
+}
+
+private func testClaudeSecurityToolExitStatusesAreClassified() throws {
+    func result(
+        status: Int32,
+        stdout: String = "",
+        stderr: String = "",
+        timedOut: Bool = false,
+        launchError: String? = nil
+    ) -> ClaudeCodeSecurityToolReader.CommandResult {
+        ClaudeCodeSecurityToolReader.CommandResult(
+            launchError: launchError,
+            timedOut: timedOut,
+            status: status,
+            stdout: Data(stdout.utf8),
+            stderr: Data(stderr.utf8),
+            durationMilliseconds: 1
+        )
+    }
+    try expectEqual(
+        ClaudeCodeSecurityToolReader.outcome(from: result(status: 0, stdout: "{\"a\":1}\n")),
+        .payload(Data("{\"a\":1}".utf8)),
+        "exit 0 carries the secret"
+    )
+    try expectEqual(
+        ClaudeCodeSecurityToolReader.outcome(from: result(
+            status: 44,
+            stderr: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
+        )),
+        .itemNotFound,
+        "errSecItemNotFound's low byte is 44, the exit status Claude Code itself keys on"
+    )
+    guard case .failed(let interaction) = ClaudeCodeSecurityToolReader.outcome(from: result(status: 36)) else {
+        throw TestError.failure("exit 36 is a failure")
+    }
+    try expect(interaction.contains("user interaction is not allowed"), "errSecInteractionNotAllowed is named: \(interaction)")
+    guard case .failed(let stopped) = ClaudeCodeSecurityToolReader.outcome(from: result(status: -1, timedOut: true)) else {
+        throw TestError.failure("a timeout is a failure")
+    }
+    try expect(stopped.contains("stopped"), "a stopped tool says so: \(stopped)")
+    guard case .failed(let empty) = ClaudeCodeSecurityToolReader.outcome(from: result(status: 0)) else {
+        throw TestError.failure("exit 0 without output is a failure")
+    }
+    try expect(empty.contains("empty"), "an empty answer is reported: \(empty)")
+    guard case .failed(let launch) = ClaudeCodeSecurityToolReader.outcome(from: result(status: -1, launchError: "sandbox")) else {
+        throw TestError.failure("a launch failure is a failure")
+    }
+    try expect(launch.contains("sandbox"), "the launch error is carried: \(launch)")
+}
+
+private func testClaudeKeychainAccessListDecidesWhoReadsSilently() throws {
+    typealias Entry = ClaudeCodeKeychainAccessInspector.DecryptEntry
+    typealias Access = ClaudeCodeKeychainItemAccess
+    let app = ["/Applications/Limit Counter.app"]
+    let team = "8CZML8FK2D"
+    func access(
+        _ entries: [Entry],
+        partitions: String?,
+        incomplete: Bool = false
+    ) -> Access {
+        ClaudeCodeKeychainAccessInspector.access(
+            decryptEntries: entries,
+            partitionList: partitions,
+            inspectionIncomplete: incomplete,
+            thisAppPaths: app,
+            thisAppTeamIdentifier: team
+        )
+    }
+
+    // What Claude Code writes: `security add-generic-password -U`, no -T.
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security"])], partitions: "apple-tool:"),
+        Access(securityTool: .trusted, thisApp: .untrusted),
+        "a fresh Claude Code item trusts the security tool and nobody else"
+    )
+    // After the user clicked Always Allow for Limit Counter.
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", "/Applications/Limit Counter.app"])], partitions: "apple-tool:,teamid:8CZML8FK2D"),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "Always Allow adds the app to the ACL and its Team ID to the partition list"
+    )
+    // After Claude Code's next renewal: the ACL entry survives, the partition
+    // grant does not (CodexBar #3798 traced exactly this).
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", "/Applications/Limit Counter.app"])], partitions: "apple-tool:"),
+        Access(securityTool: .trusted, thisApp: .untrusted),
+        "the renewal drops the app's partition grant, so an in-process read would prompt again — the tool still reads"
+    )
+    let plist = "<?xml version=\"1.0\"?><plist><dict><key>Partitions</key><array><string>apple-tool:</string><string>teamid:8CZML8FK2D</string></array></dict></plist>"
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", "/Applications/Limit Counter.app"])], partitions: plist),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "the plist spelling of the partition list reads the same"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", "/Applications/Limit Counter.app"])], partitions: nil),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "an item without a partition list (pre-Sierra) has nothing to veto with"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", "/Applications/Limit Counter.app"])], partitions: "Claude Code-credentials"),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "a description that is not a partition list vetoes nothing"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: nil)], partitions: "apple-tool:"),
+        Access(securityTool: .trusted, thisApp: .untrusted),
+        "an ACL open to every application still answers to the partition list"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security"], promptSelector: 1)], partitions: "apple-tool:"),
+        Access(securityTool: .untrusted, thisApp: .untrusted),
+        "an entry that always wants the password counts for nobody"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/Applications/Other.app"])], partitions: nil, incomplete: true),
+        Access(securityTool: .unknown, thisApp: .unknown),
+        "a rejection drawn from an incomplete reading is not a rejection"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security"])], partitions: "apple-tool:", incomplete: true),
+        Access(securityTool: .trusted, thisApp: .unknown),
+        "but a trust that was read stands"
+    )
+    try expectEqual(access([], partitions: "apple-tool:"), .unknown, "no readable entries means no verdict")
+    try expectEqual(ClaudeCodeKeychainAccessInspector.partitionListAllows(nil, "apple-tool:"), nil, "no list, no answer")
+    try expectEqual(ClaudeCodeKeychainAccessInspector.partitionListAllows("teamid:ABC", "apple-tool:"), false, "a list without the partition says no")
+
+    // macOS hands the partition list over hex-encoded, as the plist
+    // `security dump-keychain -a` prints. This is a Claude Code item after
+    // "Always Allow" for Limit Counter, read on macOS 26.
+    func hexPlist(_ partitions: [String]) -> String {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>Partitions</key>\n\t<array>\n"
+            + partitions.map { "\t\t<string>\($0)</string>\n" }.joined()
+            + "\t</array>\n</dict>\n</plist>\n"
+        return xml.utf8.map { String(format: "%02x", $0) }.joined()
+    }
+    let granted = hexPlist(["apple-tool:", "teamid:\(team)"])
+    try expect(
+        ClaudeCodeKeychainAccessInspector.decodedPartitionList(granted).contains("<key>Partitions</key>"),
+        "a hex-encoded partition plist is decoded before it is read"
+    )
+    try expectEqual(ClaudeCodeKeychainAccessInspector.decodedPartitionList("apple-tool:"), "apple-tool:", "plain text passes through")
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", app[0]])], partitions: granted),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "a hex-encoded list that names both partitions lets both read"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", app[0]])], partitions: hexPlist(["apple-tool:"])),
+        Access(securityTool: .trusted, thisApp: .untrusted),
+        "a hex-encoded list without this app's team vetoes the in-process read"
+    )
+}
+
+private func testClaudeKeychainReadRoutesNeverPromptInTheBackground() throws {
+    typealias Access = ClaudeCodeKeychainItemAccess
+    func routes(_ access: Access, interactive: Bool) -> [ClaudeCodeKeychainReadRoute] {
+        ClaudeCodeKeychainReadPlanner.routes(for: access, allowsInteraction: interactive)
+    }
+    let fresh = Access(securityTool: .trusted, thisApp: .untrusted)
+    try expectEqual(routes(fresh, interactive: false), [.securityTool], "a background cycle reads a Claude Code item through the security tool and nothing else")
+    try expectEqual(routes(fresh, interactive: true), [.securityTool, .inProcessInteractive], "an explicit refresh keeps the prompting read as its last resort")
+    let granted = Access(securityTool: .trusted, thisApp: .trusted)
+    try expectEqual(routes(granted, interactive: false), [.securityTool, .inProcessSilent], "a silent in-process read backs the tool up while the grant lasts")
+    let foreign = Access(securityTool: .untrusted, thisApp: .untrusted)
+    try expectEqual(routes(foreign, interactive: false), [], "nothing silent works: the background leaves the item alone and says so")
+    try expectEqual(routes(foreign, interactive: true), [.inProcessInteractive], "only an explicit refresh may ask")
+    try expectEqual(routes(.unknown, interactive: false), [], "an unreadable access list is never a licence to risk a prompt")
+    try expectEqual(routes(.unknown, interactive: true), [.inProcessInteractive], "but the user may still be asked when they refresh")
+}
+
+private func testClaudeNoUIQueryMarksLegacyKeychainReadsNonInteractive() throws {
+    var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword]
+    ClaudeCodeKeychainNoUIQuery.apply(to: &query)
+    try expectEqual(
+        ClaudeCodeKeychainNoUIQuery.authenticationUIFailPolicy,
+        "u_AuthUIF",
+        "kSecUseAuthenticationUIFail resolves to the value it has always had"
+    )
+    try expectEqual(
+        query[kSecUseAuthenticationUI as String] as? String,
+        "u_AuthUIF",
+        "the UI-fail policy is what makes a login-keychain read fail instead of prompting"
+    )
+    let context = query[kSecUseAuthenticationContext as String] as? LAContext
+    try expect(context?.interactionNotAllowed == true, "the LocalAuthentication switch is set as well")
+}
+
 @main
 private enum ClaudeUsageTestRunner {
     static func main() async throws {
@@ -1086,6 +1310,11 @@ private enum ClaudeUsageTestRunner {
         try testClaudeRefreshRequestRequiresARefreshToken()
         try testClaudeCredentialExpiryDrivesCacheRefresh()
         try testClaudeMirrorNeverStoresTheRefreshToken()
+        try testClaudeSecurityToolReadMirrorsClaudeCode()
+        try testClaudeSecurityToolExitStatusesAreClassified()
+        try testClaudeKeychainAccessListDecidesWhoReadsSilently()
+        try testClaudeKeychainReadRoutesNeverPromptInTheBackground()
+        try testClaudeNoUIQueryMarksLegacyKeychainReadsNonInteractive()
         print("Claude usage tests passed")
     }
 }

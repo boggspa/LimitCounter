@@ -1425,7 +1425,7 @@ struct ProviderCredentialView: View {
             Section("Advanced") {
                 if providerID == .claude {
                     Toggle("Read Claude Code's sign-in from the Keychain", isOn: claudeCodeKeychainFallbackEnabled)
-                    Text("Reads the token Claude Code already holds so the dashboard can show live 5-hour and weekly meters. Limit Counter only ever reads that Keychain item — Claude Code stays the only thing that renews or writes it, because writing it makes the CLI ask for your login password on every read. If macOS asks for authorization, click Refresh and choose Always Allow. The meters go quiet when Claude Code has not run for over 8 hours; running it brings them back.")
+                    Text("Reads the token Claude Code already holds so the dashboard can show live 5-hour and weekly meters. Limit Counter reads that Keychain item the way Claude Code itself does, through macOS's `security` tool, so Claude Code's renewals (which reset the item's access grants every few hours) never trigger a Keychain password prompt. Limit Counter only ever reads the item — Claude Code stays the only thing that signs in, renews or writes it. Background refreshes never show the macOS dialog; if one ever appears after you click Refresh, choose Always Allow. The meters go quiet when Claude Code has not run for over 8 hours; running it brings them back.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

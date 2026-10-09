@@ -11533,20 +11533,16 @@ enum ClaudeOAuthCredentialPolicy {
 
 /// A refresh-cycle-scoped, one-shot capability for reading another app's
 /// Keychain item. Every path to Claude Code's item must claim this budget
-/// before calling SecItemCopyMatching.
+/// before touching it.
 nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
+    /// Whether a read may put up the macOS authorization dialog. Only an
+    /// explicit refresh gets this; background reads never prompt.
     let allowsInteraction: Bool
     private let lock = NSLock()
     private var isAvailable = true
 
     init(allowsInteraction: Bool = false) {
         self.allowsInteraction = allowsInteraction
-    }
-
-    var authenticationContext: LAContext {
-        let context = LAContext()
-        context.interactionNotAllowed = !allowsInteraction
-        return context
     }
 
     func claimRead() -> Bool {
@@ -11557,6 +11553,596 @@ nonisolated final class ClaudeCodeKeychainReadBudget: @unchecked Sendable {
         isAvailable = false
         return true
     }
+}
+
+/// Security.framework's legacy login-keychain API, resolved at runtime.
+///
+/// `SecKeychainItemCopyAccess` and friends are deprecated in the headers, but
+/// they are still the only way to read a login-keychain item's access list,
+/// and `kSecUseAuthenticationUIFail` is still the only flag that makes a
+/// legacy read fail instead of prompting. Resolving them with `dlsym` keeps
+/// the build free of deprecation warnings and keeps every such use in one
+/// place. CodexBar takes the same route for the same calls.
+nonisolated enum SecurityFrameworkSymbols {
+    private nonisolated(unsafe) static let handle: UnsafeMutableRawPointer? = dlopen(
+        "/System/Library/Frameworks/Security.framework/Security",
+        RTLD_NOW
+    )
+
+    static func function<T>(_ name: String, as _: T.Type) -> T? {
+        guard let handle, let symbol = dlsym(handle, name) else { return nil }
+        return unsafeBitCast(symbol, to: T.self)
+    }
+
+    /// The value of a `CFStringRef` constant such as `kSecUseAuthenticationUIFail`.
+    static func constant(_ name: String) -> String? {
+        guard let handle, let symbol = dlsym(handle, name) else { return nil }
+        let pointer = symbol.assumingMemoryBound(to: CFString?.self)
+        guard let value = pointer.pointee else { return nil }
+        return value as String
+    }
+}
+
+/// Marks a Security.framework query as one that must never put up the login
+/// keychain's "wants to access key" dialog.
+///
+/// `LAContext.interactionNotAllowed` is the documented switch, but on the
+/// file-based login keychain it does not stop the legacy ACL prompt by
+/// itself. The explicit `kSecUseAuthenticationUIFail` policy does: the read
+/// then fails with `errSecInteractionNotAllowed` instead of asking. CodexBar
+/// sets both for this very item, after shipping prompt storms with only the
+/// first, and so does this. The constant's value has been `u_AuthUIF` since
+/// it was introduced, so that spelling is the fallback should the symbol
+/// ever go missing.
+nonisolated enum ClaudeCodeKeychainNoUIQuery {
+    static let authenticationUIFailPolicy: String =
+        SecurityFrameworkSymbols.constant("kSecUseAuthenticationUIFail") ?? "u_AuthUIF"
+
+    static func apply(to query: inout [String: Any]) {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = context
+        query[kSecUseAuthenticationUI as String] = authenticationUIFailPolicy as CFString
+    }
+}
+
+/// What Claude Code's keychain item says about who may read it without a
+/// prompt.
+///
+/// macOS consults two lists before it hands a login-keychain item's secret to
+/// a process: the item's decrypt ACL (which executables are trusted) and its
+/// partition list (which code-signing partitions — `apple-tool:`, `apple:`,
+/// `teamid:…` — may use that trust without a password). Claude Code writes
+/// the item with `security add-generic-password -U`, so `/usr/bin/security`
+/// is trusted and the partition list is `apple-tool:`. The same rewrite, which
+/// happens at every token renewal, drops the `teamid:` entry that "Always
+/// Allow" added for Limit Counter — which is why that grant stopped counting a
+/// few hours later and macOS asked again.
+nonisolated struct ClaudeCodeKeychainItemAccess: Equatable, Sendable {
+    enum Verdict: Equatable, Sendable {
+        case trusted
+        case untrusted
+        case unknown
+    }
+
+    /// Whether `/usr/bin/security` may read the item without a prompt.
+    var securityTool: Verdict
+    /// Whether this app may read the item in-process without a prompt.
+    var thisApp: Verdict
+
+    static let unknown = ClaudeCodeKeychainItemAccess(securityTool: .unknown, thisApp: .unknown)
+}
+
+nonisolated enum ClaudeCodeKeychainItemInspection: Equatable, Sendable {
+    case notFound
+    case found(ClaudeCodeKeychainItemAccess)
+    case failed(OSStatus)
+}
+
+/// Reads a keychain item's access list without touching its secret, so the
+/// decision to read it can be taken without risking a prompt.
+///
+/// Attribute and reference queries, and the access-list calls, never need
+/// the decrypt authorization, so none of this can put up a dialog — which is
+/// the whole point. The pure evaluator is `access(decryptEntries:…)`, kept
+/// free of Security types so it can be tested anywhere.
+nonisolated enum ClaudeCodeKeychainAccessInspector {
+    static let securityToolPath = "/usr/bin/security"
+    static let securityToolPartition = "apple-tool:"
+
+    /// One entry of an item's decrypt ACL, as the evaluator sees it.
+    struct DecryptEntry: Equatable, Sendable {
+        /// Trusted application paths; `nil` means the entry trusts every
+        /// application (`security add-generic-password -A`).
+        let applicationPaths: [String]?
+        /// The entry's `SecKeychainPromptSelector`. Anything but 0 can demand
+        /// the keychain password regardless of who asks.
+        let promptSelector: UInt16
+
+        init(applicationPaths: [String]?, promptSelector: UInt16 = 0) {
+            self.applicationPaths = applicationPaths
+            self.promptSelector = promptSelector
+        }
+    }
+
+    static func access(
+        decryptEntries: [DecryptEntry],
+        partitionList: String?,
+        inspectionIncomplete: Bool,
+        thisAppPaths: [String],
+        thisAppTeamIdentifier: String?
+    ) -> ClaudeCodeKeychainItemAccess {
+        guard !decryptEntries.isEmpty else { return .unknown }
+
+        var securityTool = ClaudeCodeKeychainItemAccess.Verdict.untrusted
+        var thisApp = ClaudeCodeKeychainItemAccess.Verdict.untrusted
+        for entry in decryptEntries where entry.promptSelector == 0 {
+            guard let paths = entry.applicationPaths else {
+                securityTool = .trusted
+                thisApp = .trusted
+                break
+            }
+            if paths.contains(securityToolPath) {
+                securityTool = .trusted
+            }
+            if paths.contains(where: { thisAppPaths.contains($0) }) {
+                thisApp = .trusted
+            }
+        }
+
+        // Being trusted is not enough: the partition list must name the
+        // caller's partition too, or macOS asks for the password anyway.
+        if securityTool == .trusted,
+           partitionListAllows(partitionList, securityToolPartition) == false {
+            securityTool = .untrusted
+        }
+        if thisApp == .trusted,
+           let thisAppTeamIdentifier,
+           partitionListAllows(partitionList, "teamid:\(thisAppTeamIdentifier)") == false {
+            thisApp = .untrusted
+        }
+
+        // A rejection drawn from an incomplete reading is not a rejection.
+        if inspectionIncomplete {
+            if securityTool == .untrusted { securityTool = .unknown }
+            if thisApp == .untrusted { thisApp = .unknown }
+        }
+        return ClaudeCodeKeychainItemAccess(securityTool: securityTool, thisApp: thisApp)
+    }
+
+    /// Whether a partition list names a partition. `nil` when the text is not
+    /// recognisably a partition list (older items have none at all), in which
+    /// case it must not be allowed to veto anything.
+    static func partitionListAllows(_ partitionList: String?, _ partition: String) -> Bool? {
+        guard let partitionList = partitionList.map(decodedPartitionList),
+              looksLikePartitionList(partitionList) else { return nil }
+        return partitionList.contains(partition)
+    }
+
+    /// The partition ACL's description as macOS hands it over: the hex
+    /// encoding of a property list such as
+    /// `<dict><key>Partitions</key><array><string>apple-tool:</string>…`,
+    /// which is also what `security dump-keychain -a` prints. Verified on
+    /// macOS 26 against Claude Code's item. Anything that is not wholly hex is
+    /// returned as it came, so a future plain-text rendering still works.
+    static func decodedPartitionList(_ text: String) -> String {
+        guard text.count >= 2, text.allSatisfy(\.isHexDigit),
+              let data = ClaudeCodeSecurityToolReader.hexDecoded(text),
+              let decoded = String(data: data, encoding: .utf8) else {
+            return text
+        }
+        return decoded
+    }
+
+    static func looksLikePartitionList(_ text: String) -> Bool {
+        ["apple:", "apple-tool:", "teamid:", "cdhash:", "Partitions"].contains { text.contains($0) }
+    }
+
+    #if os(macOS)
+    static func inspect(service: String, account: String) -> ClaudeCodeKeychainItemInspection {
+        var query: [String: Any] = [
+            kSecClass as String:            kSecClassGenericPassword,
+            kSecAttrService as String:      service,
+            kSecAttrAccount as String:      account,
+            kSecMatchLimit as String:       kSecMatchLimitOne,
+            kSecReturnAttributes as String: true,
+            kSecReturnRef as String:        true
+        ]
+        ClaudeCodeKeychainNoUIQuery.apply(to: &query)
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecItemNotFound:
+            return .notFound
+        default:
+            return .failed(status)
+        }
+        guard let attributes = result as? [String: Any],
+              let reference = attributes[kSecValueRef as String] else {
+            return .found(.unknown)
+        }
+        let item = unsafeDowncast(reference as AnyObject, to: SecKeychainItem.self)
+        return .found(accessList(of: item))
+    }
+
+    private typealias CopyAccessFunction = @convention(c) (
+        SecKeychainItem,
+        UnsafeMutablePointer<Unmanaged<SecAccess>?>
+    ) -> OSStatus
+    private typealias CopyMatchingACLListFunction = @convention(c) (
+        SecAccess,
+        CFTypeRef
+    ) -> Unmanaged<CFArray>?
+    private typealias ACLCopyContentsFunction = @convention(c) (
+        SecACL,
+        UnsafeMutablePointer<Unmanaged<CFArray>?>,
+        UnsafeMutablePointer<Unmanaged<CFString>?>,
+        UnsafeMutablePointer<SecKeychainPromptSelector>
+    ) -> OSStatus
+    private typealias TrustedApplicationCopyDataFunction = @convention(c) (
+        SecTrustedApplication,
+        UnsafeMutablePointer<Unmanaged<CFData>?>
+    ) -> OSStatus
+
+    private static func accessList(of item: SecKeychainItem) -> ClaudeCodeKeychainItemAccess {
+        guard let copyAccess = SecurityFrameworkSymbols.function(
+                  "SecKeychainItemCopyAccess", as: CopyAccessFunction.self),
+              let copyMatchingACLs = SecurityFrameworkSymbols.function(
+                  "SecAccessCopyMatchingACLList", as: CopyMatchingACLListFunction.self),
+              let copyContents = SecurityFrameworkSymbols.function(
+                  "SecACLCopyContents", as: ACLCopyContentsFunction.self),
+              let copyApplicationData = SecurityFrameworkSymbols.function(
+                  "SecTrustedApplicationCopyData", as: TrustedApplicationCopyDataFunction.self) else {
+            return .unknown
+        }
+
+        var accessReference: Unmanaged<SecAccess>?
+        guard copyAccess(item, &accessReference) == errSecSuccess,
+              let accessObject = accessReference?.takeRetainedValue() else {
+            return .unknown
+        }
+
+        var incomplete = false
+        var entries: [DecryptEntry] = []
+        if let decryptACLs = copyMatchingACLs(accessObject, kSecACLAuthorizationDecrypt)?.takeRetainedValue() as? [SecACL] {
+            for acl in decryptACLs {
+                var applications: Unmanaged<CFArray>?
+                var description: Unmanaged<CFString>?
+                var selector = SecKeychainPromptSelector()
+                guard copyContents(acl, &applications, &description, &selector) == errSecSuccess else {
+                    incomplete = true
+                    continue
+                }
+                _ = description?.takeRetainedValue()
+                guard let applicationList = applications?.takeRetainedValue() else {
+                    entries.append(DecryptEntry(applicationPaths: nil, promptSelector: selector.rawValue))
+                    continue
+                }
+                guard let trustedApplications = applicationList as? [SecTrustedApplication] else {
+                    incomplete = true
+                    continue
+                }
+                var paths: [String] = []
+                for application in trustedApplications {
+                    var dataReference: Unmanaged<CFData>?
+                    guard copyApplicationData(application, &dataReference) == errSecSuccess,
+                          let data = dataReference?.takeRetainedValue() as Data?,
+                          let path = String(data: data, encoding: .utf8) else {
+                        incomplete = true
+                        continue
+                    }
+                    paths.append(path.trimmingCharacters(in: CharacterSet(charactersIn: "\0")))
+                }
+                entries.append(DecryptEntry(applicationPaths: paths, promptSelector: selector.rawValue))
+            }
+        } else {
+            incomplete = true
+        }
+
+        var partitionList: String?
+        if let partitionAuthorization = SecurityFrameworkSymbols.constant("kSecACLAuthorizationPartitionID"),
+           let partitionACLs = copyMatchingACLs(accessObject, partitionAuthorization as CFString)?.takeRetainedValue() as? [SecACL],
+           let partitionACL = partitionACLs.first {
+            var applications: Unmanaged<CFArray>?
+            var description: Unmanaged<CFString>?
+            var selector = SecKeychainPromptSelector()
+            if copyContents(partitionACL, &applications, &description, &selector) == errSecSuccess {
+                _ = applications?.takeRetainedValue()
+                if let text = description?.takeRetainedValue() {
+                    partitionList = text as String
+                }
+            }
+        }
+
+        return Self.access(
+            decryptEntries: entries,
+            partitionList: partitionList,
+            inspectionIncomplete: incomplete,
+            thisAppPaths: thisAppPaths,
+            thisAppTeamIdentifier: thisAppTeamIdentifier
+        )
+    }
+
+    /// The spellings macOS may have stored for this app in an access list:
+    /// the bundle for an app, the executable for anything else.
+    private static let thisAppPaths: [String] = {
+        var paths: [String] = []
+        for url in [Bundle.main.bundleURL, Bundle.main.executableURL].compactMap({ $0 }) {
+            for spelling in [url.standardizedFileURL.resolvingSymlinksInPath().path, url.path] where !paths.contains(spelling) {
+                paths.append(spelling)
+            }
+        }
+        return paths
+    }()
+
+    /// The Team ID this build is signed with — the partition macOS files an
+    /// "Always Allow" for this app under.
+    private static let thisAppTeamIdentifier: String? = {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+                  staticCode,
+                  SecCSFlags(rawValue: UInt32(kSecCSSigningInformation)),
+                  &information
+              ) == errSecSuccess,
+              let dictionary = information as? [String: Any] else {
+            return nil
+        }
+        return dictionary[kSecCodeInfoTeamIdentifier as String] as? String
+    }()
+    #else
+    static func inspect(service: String, account: String) -> ClaudeCodeKeychainItemInspection {
+        .found(.unknown)
+    }
+    #endif
+}
+
+/// How Claude Code's credential was, or could be, read.
+nonisolated enum ClaudeCodeKeychainReadRoute: Equatable, Sendable {
+    /// `/usr/bin/security find-generic-password`, the way Claude Code itself
+    /// reads the item. Never prompts, because the tool is the item's creator
+    /// and every rewrite keeps trusting it.
+    case securityTool
+    /// `SecItemCopyMatching` flagged non-interactive: it fails instead of
+    /// prompting.
+    case inProcessSilent
+    /// `SecItemCopyMatching` allowed to prompt. Only on an explicit refresh,
+    /// and only when nothing silent could work.
+    case inProcessInteractive
+    /// `<config dir>/.credentials.json`, which the CLI writes only when its
+    /// keychain write failed.
+    case plaintextFile
+
+    var logName: String {
+        switch self {
+        case .securityTool:         return "/usr/bin/security"
+        case .inProcessSilent:      return "a silent in-process read"
+        case .inProcessInteractive: return "an in-process read that may ask for authorization"
+        case .plaintextFile:        return "the CLI's plaintext fallback file"
+        }
+    }
+}
+
+/// Which reads to attempt, in order, given what the item's access list says.
+///
+/// The `security` tool comes first whenever the item trusts it, which is the
+/// normal state of a Claude Code item: that read works across every renewal
+/// and never asks. A silent in-process read follows while macOS still trusts
+/// this app. A prompting read is the last resort and only exists on an
+/// explicit refresh, so background refreshes can never put up the dialog —
+/// a background cycle that finds nothing silent simply leaves the meters on
+/// the cached reading and says what to do.
+nonisolated enum ClaudeCodeKeychainReadPlanner {
+    static func routes(
+        for access: ClaudeCodeKeychainItemAccess,
+        allowsInteraction: Bool
+    ) -> [ClaudeCodeKeychainReadRoute] {
+        var routes: [ClaudeCodeKeychainReadRoute] = []
+        if access.securityTool == .trusted {
+            routes.append(.securityTool)
+        }
+        if access.thisApp == .trusted {
+            routes.append(.inProcessSilent)
+        }
+        if allowsInteraction {
+            routes.append(.inProcessInteractive)
+        }
+        return routes
+    }
+}
+
+/// Reads Claude Code's keychain item the way Claude Code reads it: by asking
+/// macOS's `security` tool.
+///
+/// Verified against the CLI (2.1.295): it writes the item with
+/// `security add-generic-password -U -a <user> -s <service> -X <hex>` and
+/// reads it with `security find-generic-password -a <user> -w -s <service>`.
+/// Neither passes `-T`, so the item's access list trusts exactly one
+/// executable, `/usr/bin/security`, and its partition list is `apple-tool:`.
+/// Running the same tool therefore reads the item without a prompt, from any
+/// process, however often the CLI rewrites it. The tool is only ever run
+/// after `ClaudeCodeKeychainAccessInspector` has confirmed that trust, and it
+/// is stopped if it does not answer in time, so it cannot hang a refresh.
+nonisolated enum ClaudeCodeSecurityToolReader {
+    static let executablePath = ClaudeCodeKeychainAccessInspector.securityToolPath
+    static let timeout: TimeInterval = 5
+
+    enum Outcome: Equatable, Sendable {
+        case payload(Data)
+        case itemNotFound
+        case failed(String)
+    }
+
+    struct CommandResult: Sendable {
+        let launchError: String?
+        let timedOut: Bool
+        let status: Int32
+        let stdout: Data
+        let stderr: Data
+        let durationMilliseconds: Int
+    }
+
+    /// Claude Code's own argument order, so the two reads are the same request.
+    static func arguments(service: String, account: String) -> [String] {
+        ["find-generic-password", "-a", account, "-w", "-s", service]
+    }
+
+    /// The tool finds the login keychain from `HOME`. Inside the App Sandbox
+    /// that is the container, so the real home is handed over — the one
+    /// Claude Code runs with.
+    static func environment(inheriting base: [String: String], homeDirectory: String) -> [String: String] {
+        var environment = base
+        environment["HOME"] = homeDirectory
+        return environment
+    }
+
+    /// `-w` prints the secret followed by a newline — as text when every byte
+    /// is printable, otherwise as `0x<hex>` with a quoted rendering after it.
+    /// Claude Code's JSON is text; the hex form is handled for completeness.
+    static func payload(fromOutput output: Data) -> Data? {
+        var trimmed = output
+        while let last = trimmed.last, last == 0x0A || last == 0x0D {
+            trimmed.removeLast()
+        }
+        guard !trimmed.isEmpty else { return nil }
+        if Array(trimmed.prefix(2)) == [0x30, 0x78] {
+            let text = String(decoding: trimmed, as: UTF8.self)
+            let hex = text.dropFirst(2).prefix { $0.isHexDigit }
+            if let decoded = hexDecoded(hex) {
+                return decoded
+            }
+        }
+        return trimmed
+    }
+
+    static func hexDecoded<S: StringProtocol>(_ hex: S) -> Data? {
+        let characters = Array(hex)
+        guard !characters.isEmpty, characters.count % 2 == 0 else { return nil }
+        var data = Data(capacity: characters.count / 2)
+        var index = 0
+        while index < characters.count {
+            guard let byte = UInt8(String(characters[index...index + 1]), radix: 16) else { return nil }
+            data.append(byte)
+            index += 2
+        }
+        return data
+    }
+
+    /// `security` exits with the low byte of the `OSStatus` it hit.
+    static func outcome(from result: CommandResult) -> Outcome {
+        if let launchError = result.launchError {
+            return .failed("could not launch \(executablePath): \(launchError)")
+        }
+        if result.timedOut {
+            return .failed("\(executablePath) did not answer within \(Int(timeout)) s and was stopped")
+        }
+        switch result.status {
+        case 0:
+            guard let payload = payload(fromOutput: result.stdout) else {
+                return .failed("\(executablePath) returned an empty item")
+            }
+            return .payload(payload)
+        case 44:
+            return .itemNotFound
+        default:
+            let detail = String(decoding: result.stderr.prefix(240), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let suffix = detail.isEmpty ? "" : ": \(detail)"
+            return .failed("\(executablePath) exited \(result.status)\(exitStatusMeaning(result.status))\(suffix)")
+        }
+    }
+
+    static func exitStatusMeaning(_ status: Int32) -> String {
+        switch status {
+        case 36:  return " (user interaction is not allowed)"
+        case 51:  return " (authorization failed)"
+        case 128: return " (the request was cancelled)"
+        default:  return ""
+        }
+    }
+
+    #if os(macOS)
+    static func read(service: String, account: String) async -> Outcome {
+        let arguments = arguments(service: service, account: account)
+        let environment = environment(
+            inheriting: ProcessInfo.processInfo.environment,
+            homeDirectory: ClaudeConfigDirKeychain.realHomeDirectory()
+        )
+        let result = await run(arguments: arguments, environment: environment)
+        let verdict = outcome(from: result)
+        if case .payload = verdict {
+            ClaudeOAuthLog.info("Read Claude Code's credential through \(executablePath) in \(result.durationMilliseconds) ms")
+        }
+        return verdict
+    }
+
+    private static func run(arguments: [String], environment: [String: String]) async -> CommandResult {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: runBlocking(arguments: arguments, environment: environment))
+            }
+        }
+    }
+
+    private static func runBlocking(arguments: [String], environment: [String: String]) -> CommandResult {
+        let started = DispatchTime.now()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.environment = environment
+        let standardOutput = Pipe()
+        let standardError = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+        } catch {
+            return CommandResult(
+                launchError: error.localizedDescription,
+                timedOut: false,
+                status: -1,
+                stdout: Data(),
+                stderr: Data(),
+                durationMilliseconds: 0
+            )
+        }
+
+        var timedOut = false
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if finished.wait(timeout: .now() + 0.5) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = finished.wait(timeout: .now() + 0.5)
+            }
+        }
+        let output = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = standardError.fileHandleForReading.readDataToEndOfFile()
+        let elapsed = Int((DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000)
+        return CommandResult(
+            launchError: nil,
+            timedOut: timedOut,
+            status: process.isRunning ? -1 : process.terminationStatus,
+            stdout: output,
+            stderr: errorOutput,
+            durationMilliseconds: elapsed
+        )
+    }
+    #else
+    static func read(service: String, account: String) async -> Outcome {
+        .failed("\(executablePath) is only available on macOS")
+    }
+    #endif
 }
 
 /// Reads the two keychain entries we treat as token stores:
@@ -11623,16 +12209,20 @@ nonisolated enum ClaudeConfigDirKeychain {
         return claudeCodeModifiedAt > copyModifiedAt
     }
 
+    /// The user's real home folder. Inside the App Sandbox `NSHomeDirectory()`
+    /// is the container, and Claude Code's folders and keychain live outside.
+    static func realHomeDirectory() -> String {
+        let homePath = NSHomeDirectory()
+        if let range = homePath.range(of: "/Library/Containers/") {
+            return String(homePath[..<range.lowerBound])
+        }
+        return homePath
+    }
+
     private static func pathSpellings(_ path: String) -> [String] {
         var seen: [String] = []
         let withoutSlash = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
-        let homePath = NSHomeDirectory()
-        let realHome: String
-        if let range = homePath.range(of: "/Library/Containers/") {
-            realHome = String(homePath[..<range.lowerBound])
-        } else {
-            realHome = homePath
-        }
+        let realHome = realHomeDirectory()
         for candidate in [withoutSlash, withoutSlash + "/"] {
             for spelled in [candidate, candidate.replacingOccurrences(of: realHome, with: "~")] where !seen.contains(spelled) {
                 seen.append(spelled)
@@ -11666,6 +12256,17 @@ nonisolated enum ClaudeConfigDirKeychain {
     }
 }
 
+/// What one attempt to read Claude Code's credential produced.
+nonisolated enum ClaudeCodeKeychainReadOutcome: Equatable, Sendable {
+    /// The item's JSON payload and the route that produced it.
+    case payload(Data, via: ClaudeCodeKeychainReadRoute, service: String)
+    /// The item exists, but macOS will not hand it over without asking, and
+    /// this cycle was not allowed to ask.
+    case needsUserApproval(service: String)
+    /// No item under any candidate name, and no plaintext fallback.
+    case unavailable
+}
+
 /// Reads the two keychain entries one Claude account treats as token stores:
 ///   1. Claude Code CLI's own entry for that account's config folder
 ///   2. Our backup entry for that account (service "...ClaudeOAuthMirror",
@@ -11677,6 +12278,13 @@ nonisolated enum ClaudeConfigDirKeychain {
 /// `security find-generic-password` several times a minute — so every one of
 /// those reads then puts up a "security wants to access key" password prompt
 /// until the user runs /login and the CLI recreates the item.
+///
+/// Entry 1 is read the way Claude Code reads it, through `/usr/bin/security`,
+/// whenever the item's access list proves that is prompt-free — which it is
+/// for anything Claude Code wrote. Every other read is flagged so that macOS
+/// fails it rather than asking, except the last-resort in-process read of an
+/// explicit refresh, which is the one place a prompt is welcome. See
+/// `ClaudeCodeKeychainReadPlanner`.
 private nonisolated struct ClaudeKeychainStore {
     static let claudeCodeService = ClaudeConfigDirKeychain.baseService
     static let backupService = "com.chrisizatt.LLMUsageCounter.ClaudeOAuthMirror"
@@ -11718,19 +12326,19 @@ private nonisolated struct ClaudeKeychainStore {
     }
 
     static func defaultConfigDir() -> String {
-        let homePath = NSHomeDirectory()
-        let realHome: String
-        if let range = homePath.range(of: "/Library/Containers/") {
-            realHome = String(homePath[..<range.lowerBound])
-        } else {
-            realHome = homePath
-        }
-        return realHome + "/.claude"
+        ClaudeConfigDirKeychain.realHomeDirectory() + "/.claude"
     }
 
     private static var account: String { NSUserName() }
 
-    func readBackup() -> ClaudeOAuthCredentials? { Self.read(service: backupService) }
+    /// Our own item, read silently. It was written by this app, so a silent
+    /// read works — unless a differently signed build (a development build
+    /// beside the installed one) wrote it, in which case it reads as absent
+    /// and `writeBackup` replaces it rather than letting macOS ask.
+    func readBackup() -> ClaudeOAuthCredentials? {
+        guard let data = Self.readData(service: backupService, interactive: false) else { return nil }
+        return Self.credentials(fromKeychainPayloadData: data)
+    }
 
     /// Whether Claude Code has rewritten its item since `writeBackup` last
     /// copied it — the only place our item is written.
@@ -11746,14 +12354,14 @@ private nonisolated struct ClaudeKeychainStore {
     }
 
     private static func modificationDate(service: String) -> Date? {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+        var query: [String: Any] = [
+            kSecClass as String:            kSecClassGenericPassword,
+            kSecAttrService as String:      service,
+            kSecAttrAccount as String:      account,
             kSecReturnAttributes as String: true,
-            kSecUseAuthenticationContext as String: ClaudeCodeKeychainReadBudget().authenticationContext,
-            kSecMatchLimit as String:  kSecMatchLimitOne
+            kSecMatchLimit as String:       kSecMatchLimitOne
         ]
+        ClaudeCodeKeychainNoUIQuery.apply(to: &query)
         var item: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let attributes = item as? [String: Any] else {
@@ -11762,39 +12370,85 @@ private nonisolated struct ClaudeKeychainStore {
         return attributes[kSecAttrModificationDate as String] as? Date
     }
 
-    /// Returns Claude Code's current credential and refreshes our cache of it.
+    /// Reads Claude Code's current credential payload.
     ///
     /// The mirror is nothing more than a cache of what the CLI last held; it
     /// spares us a cross-app read on every dashboard tick. Claude Code mints
     /// and renews the credential and stays its only writer, so once the cache
     /// nears expiry the only way forward is to read the CLI's item again.
     ///
-    /// Background reads cannot prompt — the budget sets
-    /// `interactionNotAllowed` unless the user asked for this directly.
-    /// Item names that do not exist return without prompting, so trying the
-    /// candidates in turn costs nothing the user can see.
-    func readClaudeCode(using readBudget: ClaudeCodeKeychainReadBudget) -> ClaudeOAuthCredentials? {
-        guard readBudget.claimRead() else { return nil }
-        var found: ClaudeOAuthCredentials?
+    /// Each candidate item name is inspected before it is read, so a name
+    /// that does not exist costs nothing the user can see, and a name that
+    /// does is read by the first route that cannot prompt. A background cycle
+    /// that finds the item but no silent route reports that instead of
+    /// asking; an explicit refresh may ask, as the last resort.
+    func readClaudeCode(using readBudget: ClaudeCodeKeychainReadBudget) async -> ClaudeCodeKeychainReadOutcome {
+        guard readBudget.claimRead() else { return .unavailable }
+
+        var foundButUnread: String?
         for service in cliServices {
-            if let cc = Self.read(service: service, authenticationContext: readBudget.authenticationContext) {
-                found = cc
-                break
+            let access: ClaudeCodeKeychainItemAccess
+            switch ClaudeCodeKeychainAccessInspector.inspect(service: service, account: Self.account) {
+            case .notFound:
+                continue
+            case .failed(let status):
+                let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown Keychain error"
+                ClaudeOAuthLog.info("Could not look up Claude Code's keychain item \(service): OSStatus \(status) (\(detail))")
+                continue
+            case .found(let inspected):
+                access = inspected
             }
+
+            let routes = ClaudeCodeKeychainReadPlanner.routes(
+                for: access,
+                allowsInteraction: readBudget.allowsInteraction
+            )
+            let plan = routes.isEmpty
+                ? "no route that cannot prompt; leaving it until the next Refresh"
+                : "trying " + routes.map { $0.logName }.joined(separator: ", then ")
+            ClaudeOAuthLog.info("Claude Code's keychain item \(service): security tool \(access.securityTool), this app \(access.thisApp); \(plan)")
+            for route in routes {
+                if let data = await Self.read(service: service, route: route) {
+                    return .payload(data, via: route, service: service)
+                }
+            }
+            foundButUnread = service
         }
-        if found == nil {
-            found = readPlaintextFallback()
+
+        if let data = readPlaintextFallbackData() {
+            return .payload(data, via: .plaintextFile, service: plaintextFallbackURL?.path ?? "")
         }
-        guard let cc = found else { return nil }
-        if !writeBackup(cc) {
-            ClaudeOAuthLog.error("Read Claude Code's credential but could not cache it; the next cycle will read the CLI's item again")
+        if let service = foundButUnread {
+            return .needsUserApproval(service: service)
         }
-        return cc
+        return .unavailable
+    }
+
+    private static func read(service: String, route: ClaudeCodeKeychainReadRoute) async -> Data? {
+        switch route {
+        case .securityTool:
+            switch await ClaudeCodeSecurityToolReader.read(service: service, account: account) {
+            case .payload(let data):
+                return data
+            case .itemNotFound:
+                ClaudeOAuthLog.info("\(ClaudeCodeSecurityToolReader.executablePath) found no item named \(service) for this user")
+                return nil
+            case .failed(let reason):
+                ClaudeOAuthLog.error("Reading \(service) through the security tool failed: \(reason)")
+                return nil
+            }
+        case .inProcessSilent:
+            return readData(service: service, interactive: false)
+        case .inProcessInteractive:
+            return readData(service: service, interactive: true)
+        case .plaintextFile:
+            return nil
+        }
     }
 
     /// `<config dir>/.credentials.json`, the CLI's own plaintext fallback. Only
     /// reachable inside the folder grant the user gave this account.
-    private func readPlaintextFallback() -> ClaudeOAuthCredentials? {
+    private func readPlaintextFallbackData() -> Data? {
         guard let fileURL = plaintextFallbackURL else { return nil }
         var scopedURL: URL?
         if let bookmarkData {
@@ -11816,10 +12470,17 @@ private nonisolated struct ClaudeKeychainStore {
         let resolvedURL = scopedURL.map { $0.appendingPathComponent(".credentials.json") } ?? fileURL
         guard let data = try? Data(contentsOf: resolvedURL),
               data.count <= 64 * 1024,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] != nil else {
             return nil
         }
-        return Self.credentials(fromKeychainPayload: json)
+        return data
+    }
+
+    static func credentials(fromKeychainPayloadData data: Data) -> ClaudeOAuthCredentials? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return credentials(fromKeychainPayload: json)
     }
 
     private static func credentials(fromKeychainPayload json: [String: Any]) -> ClaudeOAuthCredentials? {
@@ -11837,26 +12498,29 @@ private nonisolated struct ClaudeKeychainStore {
         )
     }
 
-    private static func read(
-        service: String,
-        authenticationContext: LAContext = ClaudeCodeKeychainReadBudget().authenticationContext
-    ) -> ClaudeOAuthCredentials? {
-        let query: [String: Any] = [
+    /// One `SecItemCopyMatching` for the item's data. A non-interactive read
+    /// fails with `errSecInteractionNotAllowed` where macOS would have asked.
+    private static func readData(service: String, interactive: Bool) -> Data? {
+        var query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String:  true,
-            kSecUseAuthenticationContext as String: authenticationContext,
             kSecMatchLimit as String:  kSecMatchLimitOne
         ]
+        if !interactive {
+            ClaudeCodeKeychainNoUIQuery.apply(to: &query)
+        }
         var item: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess else {
+            if status != errSecItemNotFound {
+                let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown Keychain error"
+                ClaudeOAuthLog.info("\(interactive ? "Interactive" : "Silent") read of \(service) failed: OSStatus \(status) (\(detail))")
+            }
             return nil
         }
-
-        return credentials(fromKeychainPayload: json)
+        return item as? Data
     }
 
     /// Writes the credential to **our own** mirror item, dropping the refresh
@@ -11873,6 +12537,10 @@ private nonisolated struct ClaudeKeychainStore {
     ///   copy of the long-lived secret buys nothing and would give a future
     ///   code path something to renew with, which is how the two copies of
     ///   the lineage started fighting in the first place.
+    ///
+    /// The write never prompts either: if macOS would ask before letting this
+    /// build update an item another build of the app wrote, the item is
+    /// replaced instead.
     @discardableResult
     func writeBackup(_ creds: ClaudeOAuthCredentials) -> Bool {
         let payload: [String: Any] = ["claudeAiOauth": creds.mirrorPayload]
@@ -11881,33 +12549,50 @@ private nonisolated struct ClaudeKeychainStore {
             return false
         }
 
-        let query: [String: Any] = [
+        let itemQuery: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: backupService,
-            kSecAttrAccount as String: Self.account,
-            kSecUseAuthenticationContext as String: ClaudeCodeKeychainReadBudget().authenticationContext
+            kSecAttrAccount as String: Self.account
         ]
+        var silentQuery = itemQuery
+        ClaudeCodeKeychainNoUIQuery.apply(to: &silentQuery)
 
         // Try update first; if the item doesn't exist, add it.
-        let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
+        let updateStatus = SecItemUpdate(silentQuery as CFDictionary, [kSecValueData: data] as CFDictionary)
         if updateStatus == errSecSuccess {
             return true
         }
-        if updateStatus == errSecItemNotFound {
-            var addQuery = query
-            addQuery[kSecValueData as String] = data
-            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                let detail = SecCopyErrorMessageString(addStatus, nil) as String? ?? "Unknown Keychain error"
-                print("[ClaudeKeychainStore] SecItemAdd for the mirror failed: OSStatus \(addStatus) (\(detail))")
+        if updateStatus == errSecInteractionNotAllowed || updateStatus == errSecAuthFailed {
+            // Another build of this app owns the item. Replace it; deleting
+            // needs no decrypt grant and therefore never asks.
+            print("[ClaudeKeychainStore] The mirror belongs to a differently signed build; replacing it")
+            let deleteStatus = SecItemDelete(silentQuery as CFDictionary)
+            if deleteStatus != errSecSuccess && deleteStatus != errSecItemNotFound {
+                let detail = SecCopyErrorMessageString(deleteStatus, nil) as String? ?? "Unknown Keychain error"
+                print("[ClaudeKeychainStore] SecItemDelete for the mirror failed: OSStatus \(deleteStatus) (\(detail))")
                 return false
             }
-            return true
+            return Self.addBackup(attributes: itemQuery, data: data)
+        }
+        if updateStatus == errSecItemNotFound {
+            return Self.addBackup(attributes: itemQuery, data: data)
         }
         let detail = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "Unknown Keychain error"
         print("[ClaudeKeychainStore] SecItemUpdate for the mirror failed: OSStatus \(updateStatus) (\(detail))")
         return false
+    }
+
+    private static func addBackup(attributes: [String: Any], data: Data) -> Bool {
+        var addQuery = attributes
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            let detail = SecCopyErrorMessageString(addStatus, nil) as String? ?? "Unknown Keychain error"
+            print("[ClaudeKeychainStore] SecItemAdd for the mirror failed: OSStatus \(addStatus) (\(detail))")
+            return false
+        }
+        return true
     }
 }
 
@@ -12066,6 +12751,17 @@ private enum ClaudeOAuthTokenResolution {
     case token(String)
     case unavailable
     case requiresUserInitiatedRecovery
+    /// Claude Code's item is there and current, but macOS will not hand it
+    /// to Limit Counter without the user approving the access again.
+    case requiresKeychainReapproval
+}
+
+/// What a read of Claude Code's item means for the token manager, once the
+/// payload has been parsed inside the actor.
+private nonisolated enum ClaudeCodeKeychainReadResult {
+    case credentials(ClaudeOAuthCredentials)
+    case needsUserApproval
+    case unavailable
 }
 
 private actor ClaudeOAuthTokenManager {
@@ -12109,6 +12805,31 @@ private actor ClaudeOAuthTokenManager {
         return budget
     }
 
+    /// Reads Claude Code's item, parses it and refreshes our cache of it.
+    private func readFromClaudeCode(
+        using budget: ClaudeCodeKeychainReadBudget,
+        store: ClaudeKeychainStore
+    ) async -> ClaudeCodeKeychainReadResult {
+        switch await store.readClaudeCode(using: budget) {
+        case .payload(let data, let route, let service):
+            guard let credentials = ClaudeKeychainStore.credentials(fromKeychainPayloadData: data) else {
+                // Claude Code 2.1.x keeps MCP server sign-ins in the same item;
+                // one that holds only those means the CLI itself is signed out.
+                ClaudeOAuthLog.info("\(service) (read via \(route.logName)) holds no claude.ai sign-in; start Claude Code and use /login")
+                return .unavailable
+            }
+            if !store.writeBackup(credentials) {
+                ClaudeOAuthLog.error("Read Claude Code's credential but could not cache it; the next cycle will read the CLI's item again")
+            }
+            return .credentials(credentials)
+        case .needsUserApproval(let service):
+            ClaudeOAuthLog.info("macOS would ask before letting Limit Counter read \(service), and a background refresh never asks; click Refresh and choose Always Allow")
+            return .needsUserApproval
+        case .unavailable:
+            return .unavailable
+        }
+    }
+
     /// Returns a usable access token, re-reading Claude Code's item whenever
     /// our cached copy is within `cacheBuffer` of expiry or the CLI has
     /// rewritten its item since we copied it.
@@ -12130,15 +12851,27 @@ private actor ClaudeOAuthTokenManager {
 
         let recoveryEnabled = readBudget != nil
 
-        if let budget = permittedBudget(readBudget),
-           let fromCLI = store.readClaudeCode(using: budget) {
-            if !fromCLI.needsRefresh(buffer: unusableBuffer) {
-                return .token(fromCLI.accessToken)
+        if let budget = permittedBudget(readBudget) {
+            switch await readFromClaudeCode(using: budget, store: store) {
+            case .credentials(let fromCLI):
+                if !fromCLI.needsRefresh(buffer: unusableBuffer) {
+                    return .token(fromCLI.accessToken)
+                }
+                // Claude Code's own token has lapsed, so the CLI has not run in
+                // over eight hours. Only running it can mint another one.
+                ClaudeOAuthLog.info("Claude Code's stored token has expired; only the CLI can renew it — run Claude Code to bring the meters back")
+                return .requiresUserInitiatedRecovery
+            case .needsUserApproval:
+                // The CLI's item is current; ours may still be. Keep sending
+                // the cached token while it has life left, and otherwise say
+                // what unblocks the read.
+                if let cached, !cached.needsRefresh(buffer: unusableBuffer) {
+                    return .token(cached.accessToken)
+                }
+                return .requiresKeychainReapproval
+            case .unavailable:
+                break
             }
-            // Claude Code's own token has lapsed, so the CLI has not run in
-            // over eight hours. Only running it can mint another one.
-            ClaudeOAuthLog.info("Claude Code's stored token has expired; only the CLI can renew it — run Claude Code to bring the meters back")
-            return .requiresUserInitiatedRecovery
         }
 
         // No fresh read was available — no grant, or the throttle held us
@@ -12160,7 +12893,7 @@ private actor ClaudeOAuthTokenManager {
         store: ClaudeKeychainStore
     ) async -> String? {
         guard let budget = permittedBudget(readBudget),
-              let fromCLI = store.readClaudeCode(using: budget),
+              case .credentials(let fromCLI) = await readFromClaudeCode(using: budget, store: store),
               fromCLI.accessToken != rejectedToken else {
             return nil
         }
@@ -12274,6 +13007,7 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
         var tokenAllowsKeychainRecovery = false
         var tokenAllowsKeychainPlanLookup = false
         var requiresUserInitiatedKeychainRecovery = false
+        var requiresKeychainReapproval = false
 
         if oauthToken == nil {
             // An explicit refresh is the user asking us to try properly, so
@@ -12290,6 +13024,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
                 oauthToken = token
             case .requiresUserInitiatedRecovery:
                 requiresUserInitiatedKeychainRecovery = true
+            case .requiresKeychainReapproval:
+                requiresKeychainReapproval = true
             case .unavailable:
                 break
             }
@@ -12307,6 +13043,14 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
                 ? "No usable Claude Code sign-in for this account. Run `\(renew)`, then refresh again. If it says you are signed out, start `\(context.cliCommand)` and use /login."
                 : "Claude Code's sign-in for this account has expired, and only its CLI can renew it. Run `\(renew)` (it uses no quota), then refresh."
             throw ProviderFetchError.credentialExpired(message)
+        }
+        if oauthToken == nil, requiresKeychainReapproval {
+            // Background refreshes never put up the macOS dialog, so when a
+            // renewal has dropped this app from the item's grant the user has
+            // to ask for it once more, from a refresh that is allowed to ask.
+            throw ProviderFetchError.credentialExpired(
+                "Claude Code renewed its sign-in, and macOS wants you to approve Limit Counter's access to the new Keychain item. Click Refresh and choose Always Allow."
+            )
         }
         if let token = oauthToken, !token.isEmpty {
             // 1) Serve fresh cached snapshot if we hit the endpoint very recently.

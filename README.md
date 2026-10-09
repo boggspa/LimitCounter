@@ -56,6 +56,45 @@ side by side; it never switches, rotates or pools them.
 Set an account up from a provider's page in Setup: *Add account*, give it a
 label, then grant its folder or import its session.
 
+## Claude Code's Keychain item
+
+Live Claude meters come from the OAuth token Claude Code keeps in the login
+keychain (`Claude Code-credentials`, or `Claude Code-credentials-<hash>` for a
+custom config folder). Reading it is opt-in: *Setup → Claude → Advanced → Read
+Claude Code's sign-in from the Keychain*. How it is read matters, because it
+used to put up "Limit Counter wants to access key …" every few hours, and
+"Always Allow" never stuck.
+
+- **Why the prompt kept coming back.** Claude Code rewrites its item with
+  `security add-generic-password -U` every time it renews the token (verified
+  against 2.1.295). macOS keeps two lists on a login-keychain item: the decrypt
+  ACL (which executables are trusted) and the partition list (which code-signing
+  partitions may use that trust without a password). The rewrite leaves the ACL
+  entry "Always Allow" added for Limit Counter in place but resets the partition
+  list to `apple-tool:` — so the next read needed the password again. CodexBar's
+  issue tracker traced the same thing (steipete/CodexBar#3798, #367).
+- **How it is read now.** The item is read the way Claude Code reads it: by
+  running macOS's own `/usr/bin/security find-generic-password`. The tool is the
+  item's creator, so every rewrite keeps trusting it, and nothing it does needs
+  a prompt. Before the tool runs, Limit Counter inspects the item's access list
+  (attributes only, never the secret) to confirm that trust; it never runs the
+  tool blind.
+- **Nothing in the background can prompt.** When the tool cannot be used, a
+  background refresh reads in-process with Security.framework flagged
+  non-interactive (`kSecUseAuthenticationUIFail`), which fails instead of
+  asking — `LAContext.interactionNotAllowed` alone does not stop the legacy
+  dialog. The card then keeps its last meters and says that a manual Refresh
+  (the only read allowed to show the macOS dialog) will re-grant access.
+- **Limit Counter never writes Claude Code's item.** A cross-app write would
+  reset the CLI's own grant and make *it* ask for the password on every read.
+  The one copy Limit Counter keeps is its own mirror item, without the refresh
+  token, and it is replaced rather than prompted for if another build of the
+  app wrote it.
+- **What the tool is not.** It is not a way around the opt-in: the toggle above
+  is the consent, and the log line `Read Claude Code's credential through
+  /usr/bin/security` (subsystem `com.chrisizatt.LLMUsageCounter`, category
+  `claude-oauth`) shows every such read.
+
 ## Safety Boundary
 
 This project is intentionally designed around credentials the user explicitly provides.
@@ -63,7 +102,7 @@ This project is intentionally designed around credentials the user explicitly pr
 - Store user-entered credentials in Keychain.
 - Store only normalized quota snapshots in the shared cache.
 - Do not scrape browser cookies.
-- Do not read hidden auth state from Safari, Chrome, Keychain items owned by other apps, or CLI caches without an explicit user-driven import flow and a clear provider policy basis.
+- Do not read hidden auth state from Safari, Chrome, Keychain items owned by other apps, or CLI caches without an explicit user-driven import flow and a clear provider policy basis. Claude Code's keychain item is read only behind its opt-in, only ever read, and read the way the CLI itself reads it (see above).
 
 ## Codex Telemetry Setup
 
