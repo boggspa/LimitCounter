@@ -11714,8 +11714,24 @@ nonisolated enum ClaudeCodeKeychainAccessInspector {
     /// recognisably a partition list (older items have none at all), in which
     /// case it must not be allowed to veto anything.
     static func partitionListAllows(_ partitionList: String?, _ partition: String) -> Bool? {
-        guard let partitionList, looksLikePartitionList(partitionList) else { return nil }
+        guard let partitionList = partitionList.map(decodedPartitionList),
+              looksLikePartitionList(partitionList) else { return nil }
         return partitionList.contains(partition)
+    }
+
+    /// The partition ACL's description as macOS hands it over: the hex
+    /// encoding of a property list such as
+    /// `<dict><key>Partitions</key><array><string>apple-tool:</string>…`,
+    /// which is also what `security dump-keychain -a` prints. Verified on
+    /// macOS 26 against Claude Code's item. Anything that is not wholly hex is
+    /// returned as it came, so a future plain-text rendering still works.
+    static func decodedPartitionList(_ text: String) -> String {
+        guard text.count >= 2, text.allSatisfy(\.isHexDigit),
+              let data = ClaudeCodeSecurityToolReader.hexDecoded(text),
+              let decoded = String(data: data, encoding: .utf8) else {
+            return text
+        }
+        return decoded
     }
 
     static func looksLikePartitionList(_ text: String) -> Bool {

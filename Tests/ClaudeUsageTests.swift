@@ -409,7 +409,7 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
         ) else {
         throw TestError.failure("background recovery needs a silent read budget")
     }
-    try expect(backgroundBudget.authenticationContext.interactionNotAllowed, "background recovery cannot prompt")
+    try expect(!backgroundBudget.allowsInteraction, "background recovery cannot prompt")
     try expect(backgroundBudget.claimRead(), "silent recovery gets one read")
     try expect(!backgroundBudget.claimRead(), "silent recovery cannot loop")
     try expect(
@@ -422,7 +422,7 @@ private func testClaudeCodeKeychainFallbackIsOptIn() throws {
     ) else {
         throw TestError.failure("opted-in manual refresh should receive a Claude Code keychain read budget")
     }
-    try expect(!manualRefreshBudget.authenticationContext.interactionNotAllowed, "manual recovery may authorize access")
+    try expect(manualRefreshBudget.allowsInteraction, "manual recovery may authorize access")
     try expect(
         manualRefreshBudget.claimRead(),
         "the first Claude Code keychain read in a manual refresh should be allowed"
@@ -1210,6 +1210,32 @@ private func testClaudeKeychainAccessListDecidesWhoReadsSilently() throws {
     try expectEqual(access([], partitions: "apple-tool:"), .unknown, "no readable entries means no verdict")
     try expectEqual(ClaudeCodeKeychainAccessInspector.partitionListAllows(nil, "apple-tool:"), nil, "no list, no answer")
     try expectEqual(ClaudeCodeKeychainAccessInspector.partitionListAllows("teamid:ABC", "apple-tool:"), false, "a list without the partition says no")
+
+    // macOS hands the partition list over hex-encoded, as the plist
+    // `security dump-keychain -a` prints. This is a Claude Code item after
+    // "Always Allow" for Limit Counter, read on macOS 26.
+    func hexPlist(_ partitions: [String]) -> String {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>Partitions</key>\n\t<array>\n"
+            + partitions.map { "\t\t<string>\($0)</string>\n" }.joined()
+            + "\t</array>\n</dict>\n</plist>\n"
+        return xml.utf8.map { String(format: "%02x", $0) }.joined()
+    }
+    let granted = hexPlist(["apple-tool:", "teamid:\(team)"])
+    try expect(
+        ClaudeCodeKeychainAccessInspector.decodedPartitionList(granted).contains("<key>Partitions</key>"),
+        "a hex-encoded partition plist is decoded before it is read"
+    )
+    try expectEqual(ClaudeCodeKeychainAccessInspector.decodedPartitionList("apple-tool:"), "apple-tool:", "plain text passes through")
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", app[0]])], partitions: granted),
+        Access(securityTool: .trusted, thisApp: .trusted),
+        "a hex-encoded list that names both partitions lets both read"
+    )
+    try expectEqual(
+        access([Entry(applicationPaths: ["/usr/bin/security", app[0]])], partitions: hexPlist(["apple-tool:"])),
+        Access(securityTool: .trusted, thisApp: .untrusted),
+        "a hex-encoded list without this app's team vetoes the in-process read"
+    )
 }
 
 private func testClaudeKeychainReadRoutesNeverPromptInTheBackground() throws {
