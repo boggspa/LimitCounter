@@ -1175,20 +1175,24 @@ public struct QuotaAPIUsageReport: Codable, Equatable, Hashable {
     public let id: UUID
     /// "Console API" for Anthropic, "OpenAI API" for OpenAI.
     public let label: String
-    /// Month-to-date spend, or nil when the report could not be read. A
+    /// Spend since periodStart, or nil when the report could not be read. A
     /// failed read is never shown as a zero.
     public let amount: Double?
     public let currency: String
     /// Where the figure came from and what it covers, for the row subtitle.
     public let detail: String
     public let periodStart: Date
-    /// The next UTC month boundary, when the figure returns to zero.
+    /// Next UTC month boundary for month-to-date reporting. A prepaid
+    /// allocation continues across this boundary instead of resetting.
     public let periodEnd: Date
     public let fetchedAt: Date
     /// True when this is the last successful read, served because a newer
     /// read failed.
     public let isStale: Bool
     public let failureMessage: String?
+    /// User-entered allocation covering this report's start date onward.
+    /// This estimates remaining prepaid funds; it is not a provider balance.
+    public let prepaidAmountUSD: Double?
 
     public init(
         id: UUID = UUID(),
@@ -1200,7 +1204,8 @@ public struct QuotaAPIUsageReport: Codable, Equatable, Hashable {
         periodEnd: Date,
         fetchedAt: Date,
         isStale: Bool = false,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        prepaidAmountUSD: Double? = nil
     ) {
         self.id = id
         self.label = label
@@ -1212,11 +1217,21 @@ public struct QuotaAPIUsageReport: Codable, Equatable, Hashable {
         self.fetchedAt = fetchedAt
         self.isStale = isStale
         self.failureMessage = failureMessage
+        self.prepaidAmountUSD = prepaidAmountUSD
     }
 
-    /// The spend as a balance row: "API usage  $12.34".
+    /// API spend, or the estimated remaining user-entered prepaid funds.
     public var balance: QuotaBalance? {
         guard let amount, amount.isFinite else { return nil }
+        if let prepaidAmountUSD, prepaidAmountUSD.isFinite, prepaidAmountUSD >= 0, currency == "USD" {
+            let spent = QuotaBalance(label: "Spend", amount: amount, unit: currency).valueText
+            let prepaid = QuotaBalance(label: "Prepaid", amount: prepaidAmountUSD, unit: currency).valueText
+            return QuotaBalance(
+                id: id, label: "Estimated prepaid remaining",
+                amount: max(prepaidAmountUSD - amount, 0), unit: currency,
+                subtitle: "\(spent) spent of \(prepaid) prepaid · \(detail)\(isStale ? " · last successful read" : "")"
+            )
+        }
         return QuotaBalance(
             id: id,
             label: "API usage",
@@ -1231,7 +1246,15 @@ public struct QuotaAPIUsageReport: Codable, Equatable, Hashable {
         QuotaAPIUsageReport(
             id: id, label: label, amount: amount, currency: currency, detail: detail,
             periodStart: periodStart, periodEnd: periodEnd, fetchedAt: fetchedAt,
-            isStale: true, failureMessage: failureMessage
+            isStale: true, failureMessage: failureMessage, prepaidAmountUSD: prepaidAmountUSD
+        )
+    }
+
+    public func withPrepaidAmountUSD(_ amount: Double?) -> QuotaAPIUsageReport {
+        QuotaAPIUsageReport(
+            id: id, label: label, amount: self.amount, currency: currency, detail: detail,
+            periodStart: periodStart, periodEnd: periodEnd, fetchedAt: fetchedAt,
+            isStale: isStale, failureMessage: failureMessage, prepaidAmountUSD: amount
         )
     }
 }
@@ -1527,6 +1550,9 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
     /// Finer reset classification; nil for signals that are not about resets
     /// or that came from a build predating the classification.
     public let resetKind: QuotaResetKind?
+    /// False for a standing notice refreshed for display. Older snapshots
+    /// omit this field and keep their existing alert behavior.
+    public let announcementEligible: Bool?
 
     public var confidenceText: String? {
         guard let confidence else { return nil }
@@ -1542,7 +1568,8 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
         confidence: Double? = nil,
         windowLabel: String? = nil,
         detectedAt: Date = Date(),
-        resetKind: QuotaResetKind? = nil
+        resetKind: QuotaResetKind? = nil,
+        announcementEligible: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -1553,6 +1580,7 @@ public struct QuotaSignal: Codable, Identifiable, Equatable, Hashable {
         self.windowLabel = windowLabel
         self.detectedAt = detectedAt
         self.resetKind = resetKind
+        self.announcementEligible = announcementEligible
     }
 }
 

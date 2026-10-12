@@ -166,7 +166,7 @@ public struct QuotaResetDetector {
         /// Windows resetting together in one sweep for a provider-wide reset.
         public var providerWideMinimumWindows: Int = 2
         public var maxObservations: Int = 12
-        /// A banked credit due to expire within this long earns a reminder.
+        /// A banked credit due to expire within this long shows a warning.
         public var expiringSoonLead: TimeInterval = 3 * 60 * 60
         /// Providers whose meter can read as empty while the account is locked
         /// out; a solo weekly drop there must also show usage resuming, or a
@@ -521,7 +521,7 @@ public struct QuotaResetDetector {
             )
             if summary.availableCount > 0 {
                 fresh.announcedAvailableAt = now
-                fresh.announcedExpiringAt = isExpiringSoon(summary, now: now) ? now : nil
+                fresh.announcedExpiringAt = snapshot.providerID != .openai && isExpiringSoon(summary, now: now) ? now : nil
                 signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: now, now: now))
             }
             state.credits = fresh
@@ -578,19 +578,21 @@ public struct QuotaResetDetector {
                 || track.announcedAvailableAt == nil
             if newlyAvailable {
                 track.announcedAvailableAt = now
-                // A grant first seen inside the reminder window has already
-                // announced its expiry. Do not announce it again next sweep.
-                track.announcedExpiringAt = isExpiringSoon(summary, now: now) ? now : nil
+                // Codex announces grants only. Other providers retain their
+                // existing once-per-credit expiry reminder.
+                track.announcedExpiringAt = snapshot.providerID != .openai && isExpiringSoon(summary, now: now) ? now : nil
                 signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: now, now: now))
-            } else if let expiry = summary.nearestExpiry,
+            } else if snapshot.providerID != .openai,
+                      let expiry = summary.nearestExpiry,
                       expiry.timeIntervalSince(now) <= configuration.expiringSoonLead,
                       expiry > now,
                       track.announcedExpiringAt == nil {
                 track.announcedExpiringAt = now
                 signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: now, now: now))
-            } else if let announcedAt = track.announcedExpiringAt ?? track.announcedAvailableAt {
+            } else if let announcedAt = snapshot.providerID == .openai
+                        ? track.announcedAvailableAt : (track.announcedExpiringAt ?? track.announcedAvailableAt) {
                 // Keep the standing notice visible without re-alerting.
-                signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: announcedAt, now: now))
+                signals.append(availableSignal(snapshot: snapshot, summary: summary, detectedAt: announcedAt, now: now, announcementEligible: false))
             }
         } else {
             track.announcedAvailableAt = nil
@@ -615,7 +617,8 @@ public struct QuotaResetDetector {
         snapshot: QuotaSnapshot,
         summary: QuotaResetCreditSummary,
         detectedAt: Date,
-        now: Date
+        now: Date,
+        announcementEligible: Bool = true
     ) -> QuotaSignal {
         var message = summary.availableCount == 1
             ? "1 usage-limit reset is banked"
@@ -641,7 +644,8 @@ public struct QuotaResetDetector {
             confidence: nil,
             windowLabel: Self.bankedResetWindowLabel,
             detectedAt: detectedAt,
-            resetKind: .bankedAvailable
+            resetKind: .bankedAvailable,
+            announcementEligible: announcementEligible
         )
     }
 

@@ -427,7 +427,7 @@ final class SyncCoordinator {
         switch providerID {
         case .codexTelemetry:
             shouldPreserve = true
-        case .claude:
+        case .claude, .grok:
             shouldPreserve = true
         case .openai:
             // A transient Codex usage decode/network miss should keep the last

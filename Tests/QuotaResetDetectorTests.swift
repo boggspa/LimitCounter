@@ -315,7 +315,7 @@ private func testBankedAvailabilityStopsAfterRedemptionAndUnknownReadings() thro
     try expect(upgraded.isEmpty, "legacy persisted availability is retired on the next healthy observation")
 }
 
-private func testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart() throws {
+private func testBankedExpiryUpdatesStandingNoticeWithoutReannouncing() throws {
     let harness = Harness()
     func sweep(_ minutes: Double) -> QuotaSignal {
         harness.sweep(snapshot(.openai, "Codex", at: at(minutes), windows: [], credits:
@@ -330,7 +330,9 @@ private func testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart() thr
     try expectEqual(granted.detectedAt, at(0), "initial grant is announced")
     try expectEqual(sweep(5).detectedAt, at(0), "ordinary polling does not announce it again")
     let reminder = sweep(180)
-    try expectEqual(reminder.detectedAt, at(180), "crossing into the expiry window earns one reminder")
+    try expectEqual(reminder.detectedAt, granted.detectedAt, "expiry does not create a new arrival")
+    try expectEqual(granted.announcementEligible, true, "first availability announces")
+    try expectEqual(reminder.announcementEligible, false, "expiry only updates the card")
     try expectEqual(reminder.severity, .warning, "expiry reminder remains visible as a warning")
     try expectEqual(sweep(185).detectedAt, reminder.detectedAt, "countdown changes do not create another reminder")
 
@@ -340,6 +342,46 @@ private func testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart() thr
     decoder.dateDecodingStrategy = .iso8601
     harness.state = try decoder.decode(QuotaResetDetector.ProviderState.self, from: encoder.encode(harness.state!))
     try expectEqual(sweep(190).detectedAt, reminder.detectedAt, "relaunch preserves the reminder identity")
+}
+
+private func testOtherProvidersKeepTheirExpiryReminder() throws {
+    let harness = Harness()
+    func sweep(_ minutes: Double) -> QuotaSignal {
+        harness.sweep(snapshot(.minimax, "MiniMax", at: at(minutes), windows: [], credits:
+            .init(availableCount: 1, credits: [.init(id: "expiry", status: "available", expiresAt: at(360))], observedAt: at(minutes))
+        )).signals.first!
+    }
+    _ = sweep(0)
+    let reminder = sweep(180)
+    try expectEqual(reminder.detectedAt, at(180), "another provider retains its expiry reminder")
+    try expectEqual(reminder.announcementEligible, true, "the existing reminder still earns a notification")
+    let polled = sweep(185)
+    try expectEqual(polled.detectedAt, reminder.detectedAt, "expiry reminders still deduplicate")
+    try expectEqual(polled.announcementEligible, false, "refreshing the reminder does not repeat it")
+}
+
+private func testBankedPollingAndRestartOnlyNotifyOnNewGrants() throws {
+    let suite = "limit-counter-reset-announcement-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let detector = QuotaResetDetector()
+    var store = QuotaResetDetectorStateStore(defaults: defaults)
+    func sweep(_ minutes: Double, count: Int) -> CloudAlertPayload? {
+        let reading = snapshot(.openai, "Codex", at: at(minutes), windows: [], credits:
+            .init(availableCount: count, observedAt: at(minutes)))
+        let outcome = detector.observe(reading, state: store.state(for: .openai))
+        store.save(outcome.state, for: .openai)
+        return UsageResetAlertBuilder.resetAlert(for: reading.withSignals(outcome.signals), noticedAt: at(minutes))
+    }
+    try expect(sweep(0, count: 1) != nil, "arrival earns a toast and notification")
+    for minutes in [1.0, 2, 3, 4] {
+        try expect(sweep(minutes, count: 1) == nil, "refreshing an existing reset remains quiet")
+    }
+    store = QuotaResetDetectorStateStore(defaults: defaults)
+    try expect(sweep(5, count: 1) == nil, "relaunch retains the announced arrival")
+    try expect(sweep(6, count: 2) != nil, "a newly banked reset announces")
+    try expect(sweep(7, count: 2) == nil, "the added reset only announces once")
+    try expect(sweep(8, count: 1)?.isAnnounceable != true, "redeeming one of two credits does not reannounce the other")
 }
 
 private func testBankedFirstSightingNearExpiryDoesNotRemindTwice() throws {
@@ -506,7 +548,9 @@ private enum QuotaResetDetectorTestRunner {
         try testSoloFiveHourDropIsIgnored()
         try testBankedCreditLifecycle()
         try testBankedAvailabilityStopsAfterRedemptionAndUnknownReadings()
-        try testBankedExpiryReminderHasOneIdentityAcrossPollingAndRestart()
+        try testBankedExpiryUpdatesStandingNoticeWithoutReannouncing()
+        try testOtherProvidersKeepTheirExpiryReminder()
+        try testBankedPollingAndRestartOnlyNotifyOnNewGrants()
         try testBankedFirstSightingNearExpiryDoesNotRemindTwice()
         try testDelayedGrantHistoryDoesNotReannounceExistingCredit()
         try testUseThenNewGrantBetweenPollsStillAnnouncesOnce()
@@ -544,8 +588,9 @@ private func testUseThenNewGrantBetweenPollsStillAnnouncesOnce() throws {
     let poll = snapshot(.openai, "Codex", at: at(35), windows: [], credits: replacement.resetCredits)
     let repeated = detector.observe(poll, state: next.state)
     let polled = poll.withSignals(QuotaResetSignalRetention.merging(repeated.signals, with: retained))
-    let repeatedAlert = try UsageResetAlertBuilder.resetAlert(for: polled, noticedAt: at(35)).orThrow("standing replacement credit")
-    try expectEqual(repeatedAlert.signature, alert.signature, "polling must not turn the replacement grant into another notification")
+    try expect(UsageResetAlertBuilder.resetAlert(for: polled, noticedAt: at(35)) == nil,
+               "polling a replacement grant emits no additional alert")
+    try expect(alert.isRelevant(to: [polled]), "an already-delivered replacement alert remains valid until redemption")
 }
 
 private extension Optional {
