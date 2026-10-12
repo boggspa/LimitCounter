@@ -157,7 +157,7 @@ private func testBillingLogReaderUsesLatestWeeklyConfig() throws {
     try expectEqual(window.resetDate, makeDate("2026-07-02T17:04:15.560820Z"), "billing log reset date")
 }
 
-private func testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset() throws {
+private func testBillingLogReaderDoesNotInventUsageInNewPeriod() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("limit-counter-grok-reset-test-\(UUID().uuidString)", isDirectory: true)
     let logs = root.appendingPathComponent("logs", isDirectory: true)
@@ -172,12 +172,36 @@ private func testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset() throws {
 
     let now = makeDate("2026-08-20T18:00:00Z")
     let snapshot = try expectSnapshot(GrokLocalBillingLogReader.latestSnapshot(rootURL: root, now: now))
-    let window = try expectWindow(GrokUsageWindowMapper.quotaWindow(from: snapshot, now: now))
+    try expect(GrokUsageWindowMapper.quotaWindow(from: snapshot, now: now) == nil,
+               "a new period without a measurement cannot fabricate a current zero")
 
-    try expectEqual(snapshot.planLabel, "X Premium", "new billing period plan")
-    try expectEqual(snapshot.periodStartAt, "2026-08-20T17:04:15.560Z", "new billing period start")
-    try expectEqual(window.used, 0, "omitted usage in a fresh active period should mean zero")
-    try expectEqual(window.resetDate, makeDate("2026-08-27T17:04:15.560820Z"), "new billing period reset")
+    let handle = try FileHandle(forWritingTo: log)
+    try handle.seekToEnd()
+    try handle.write(contentsOf: Data("\n".utf8))
+    try handle.write(contentsOf: Data(#"{"ts":"2026-08-20T18:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-20T17:04:15.560820Z","end":"2026-08-27T17:04:15.560820Z"}}}}"#.utf8))
+    try handle.close()
+    let observed = try expectSnapshot(GrokLocalBillingLogReader.latestSnapshot(rootURL: root, now: now))
+    try expectEqual(GrokUsageWindowMapper.quotaWindow(from: observed, now: now)?.used, 0,
+                    "an explicitly reported zero still resets the meter")
+}
+
+private func testActivityOnlyRefreshPreservesLastGrokReading() throws {
+    let readAt = makeDate("2026-10-01T12:00:00Z")
+    let window = QuotaWindow(label: "Weekly", windowKind: .weekly, used: 42, total: 100, unit: "%")
+    let previous = QuotaSnapshot(providerID: .grok, displayName: "Grok", windows: [window],
+                                 balances: [QuotaBalance(label: "Usage Credits", amount: 10, unit: "USD")], fetchedAt: readAt)
+    let event = UsageEvent(timestamp: readAt.addingTimeInterval(60), type: .activity)
+    let incoming = QuotaSnapshot(providerID: .grok, displayName: "Grok", events: [event], fetchedAt: readAt.addingTimeInterval(60))
+    let retained = GrokSnapshotRetention.preservingReading(in: incoming, previous: previous)
+    try expectEqual(retained.windows, previous.windows, "activity-only refresh keeps the measured percentage")
+    try expectEqual(retained.balances, previous.balances, "an absent balance is not zero")
+    try expectEqual(retained.fetchedAt, readAt, "cached usage keeps its observation timestamp")
+    try expectEqual(retained.events, [event], "new activity is still accepted")
+    try expect(GrokSnapshotRetention.preservingReading(in: incoming, previous: nil).windows.isEmpty,
+               "a cold activity-only read stays unknown")
+    let zero = QuotaSnapshot(providerID: .grok, displayName: "Grok", windows: [QuotaWindow(label: "Weekly", windowKind: .weekly, used: 0, total: 100, unit: "%")])
+    try expectEqual(GrokSnapshotRetention.preservingReading(in: zero, previous: previous).windows.first?.used, 0,
+                    "a genuine measured reset replaces the cache")
 }
 
 private func testBillingLogReaderPreservesUsageAcrossSamePeriodOmission() throws {
@@ -423,7 +447,8 @@ private enum GrokUsageTestRunner {
         try testPurchasedCreditsAreSeparateFromWeeklyPercentage()
         try testBillingCreditsPreserveZeroSignedCentsAndMissing()
         try testBillingLogReaderUsesLatestWeeklyConfig()
-        try testBillingLogReaderTreatsOmittedUsageInNewPeriodAsReset()
+        try testBillingLogReaderDoesNotInventUsageInNewPeriod()
+        try testActivityOnlyRefreshPreservesLastGrokReading()
         try testBillingLogReaderPreservesUsageAcrossSamePeriodOmission()
         try testPercentStringsDecodeWithoutRejectingSnapshot()
         try testLegacyCreditSnapshotStillMapsWhenCurrent()

@@ -167,10 +167,24 @@ private enum UsageAlertBuilderTestRunner {
         try testClassifiedSignalsDriveTheAlert()
         try testLegacySignalsStillReadAsEarlyResets()
         try testBankedAvailabilityRequiresCurrentCredits()
+        try testStandingBankedNoticeDoesNotAlert()
         try testAvailabilityReplayIsRetiredAfterRedemption()
         try testResetPublicationSurvivesUnrelatedAlerts()
         print("Usage alert builder tests passed")
     }
+}
+
+private func testStandingBankedNoticeDoesNotAlert() throws {
+    let date = Date(timeIntervalSince1970: 20_000)
+    let standing = QuotaSignal(kind: .unexpectedRecovery, title: "Usage-limit reset available", message: "1 reset banked",
+                               severity: .info, windowLabel: "Banked reset", detectedAt: date,
+                               resetKind: .bankedAvailable, announcementEligible: false)
+    let reading = snapshot(signals: [standing]).withResetCredits(.init(availableCount: 1, observedAt: date))
+    try alertExpect(UsageResetAlertBuilder.resetAlert(for: reading, noticedAt: date) == nil,
+                    "even a fresh display notice does not reannounce a standing reset")
+    let decoded = try JSONDecoder().decode(QuotaSnapshot.self, from: JSONEncoder().encode(reading))
+    try alertExpect(UsageResetAlertBuilder.resetAlert(for: decoded, noticedAt: date) == nil,
+                    "cloud and disk round trips preserve display-only notices")
 }
 
 private func classifiedSignal(_ resetKind: QuotaResetKind, label: String, message: String, detectedAt: Date) -> QuotaSignal {

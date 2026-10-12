@@ -1536,8 +1536,6 @@ nonisolated enum GrokLocalBillingLogReader {
         let periodEndDate = periodEnd.flatMap(parseISODate)
         let isWeekly = periodType.contains("WEEKLY")
             || periodDurationSeconds(start: periodStartDate, end: periodEndDate).map { $0 <= 8 * 24 * 60 * 60 } == true
-        let isCurrentPeriod = periodStartDate.map { $0 <= now.addingTimeInterval(5 * 60) } == true
-            && periodEndDate.map { $0 > now.addingTimeInterval(-5 * 60) } == true
         let used: Double
         if let reportedUsage = config.creditUsagePercent {
             used = reportedUsage
@@ -1545,12 +1543,9 @@ nonisolated enum GrokLocalBillingLogReader {
             // A missing value later in the same period is a transient omission,
             // not evidence that usage reset again.
             used = priorUsageInSamePeriod
-        } else if isWeekly && isCurrentPeriod {
-            // xAI omits creditUsagePercent at the beginning of a fresh weekly
-            // period. The dated active period is authoritative evidence of a
-            // zero reset, so do not walk backwards into the exhausted period.
-            used = 0
         } else {
+            // A dated billing period alone says nothing about consumption.
+            // Let the CLI or the last observed reading supply the percentage.
             return nil
         }
         let refreshedAtDate = entry.ts.flatMap(parseISODate) ?? now
@@ -1780,21 +1775,7 @@ public struct GrokProviderClient: ProviderClient {
             throw ProviderFetchError.notConfigured
         }
 
-        if windows.isEmpty {
-            windows.append(
-                QuotaWindow(
-                    label: "Weekly",
-                    windowKind: .weekly,
-                    used: 0,
-                    total: 100,
-                    resetDate: nil,
-                    unit: "%",
-                    subtitle: "Import ~/.grok to read Grok weekly usage directly"
-                )
-            )
-        }
-
-        return QuotaSnapshot(
+        let snapshot = QuotaSnapshot(
             providerID: .grok,
             displayName: "Grok",
             planName: planName,
@@ -1806,6 +1787,8 @@ public struct GrokProviderClient: ProviderClient {
             fetchState: .success,
             fetchedAt: Date()
         )
+        let previous = QuotaSnapshotStore.shared.loadSnapshots().first { $0.accountKey == snapshot.accountKey }
+        return GrokSnapshotRetention.preservingReading(in: snapshot, previous: previous)
     }
 
     private func readTaskWraithGrokData() -> (events: [UsageEvent], snapshot: GrokUsageSnapshot?) {
@@ -1832,6 +1815,24 @@ public struct GrokProviderClient: ProviderClient {
             return nil
         }
         return try? JSONDecoder().decode(GrokUsageSnapshot.self, from: data)
+    }
+}
+
+/// Activity-only refreshes do not constitute a quota measurement. Retain
+/// the original reading timestamp while still accepting newly captured events.
+nonisolated enum GrokSnapshotRetention {
+    static func preservingReading(in snapshot: QuotaSnapshot, previous: QuotaSnapshot?) -> QuotaSnapshot {
+        guard snapshot.providerID == .grok, snapshot.windows.isEmpty,
+              let previous, previous.accountKey == snapshot.accountKey,
+              previous.fetchState.isHealthy, !previous.windows.isEmpty else { return snapshot }
+        return QuotaSnapshot(
+            id: previous.id, providerID: snapshot.providerID, displayName: snapshot.displayName,
+            planName: previous.planName, windows: previous.windows, stats: previous.stats,
+            balances: previous.balances, signals: [], events: snapshot.events,
+            fetchState: previous.fetchState, fetchedAt: previous.fetchedAt,
+            accountSlot: snapshot.accountSlot, accountLabel: snapshot.accountLabel,
+            accountFingerprint: previous.accountFingerprint
+        )
     }
 }
 
@@ -10423,6 +10424,8 @@ private final class ClaudePrepaidRedirectPolicy: NSObject, URLSessionTaskDelegat
 enum APIUsageCredentialField {
     /// Anthropic Admin API key (`sk-ant-admin01-…`), stored on the Claude card.
     static let anthropicAdminKey = "anthropicAdminAPIKey"
+    static let anthropicPrepaidAmountUSD = "anthropicPrepaidAmountUSD"
+    static let anthropicPrepaidStartDate = "anthropicPrepaidStartDate"
     /// OpenAI organisation admin key, stored on the Codex card.
     static let openAIAdminKey = "openaiAdminAPIKey"
     /// Optional `proj_…` id that narrows the OpenAI bill to one project.
@@ -10430,7 +10433,12 @@ enum APIUsageCredentialField {
 
     static func adminKey(for provider: APIUsageReportProvider, in credentials: ProviderCredential?) -> String? {
         let field = provider == .anthropic ? anthropicAdminKey : openAIAdminKey
-        let value = credentials?.extraFields?[field]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stored = credentials?.extraFields?[field]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Honor an Admin key saved in the older, single-token form too, but
+        // never turn the subscription's OAuth token into an API credential.
+        let legacy = provider == .anthropic && credentials?.normalizedAccessToken?.hasPrefix("sk-ant-admin") == true
+            ? credentials?.normalizedAccessToken : nil
+        let value = stored.isEmpty ? (legacy ?? "") : stored
         guard !value.isEmpty, value.utf8.count <= 4096 else { return nil }
         return value
     }
@@ -10444,6 +10452,33 @@ enum APIUsageCredentialField {
             return nil
         }
         return value
+    }
+}
+
+enum ClaudePrepaidTracking {
+    static func dateString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    static func startDate(_ value: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.isLenient = false
+        guard let date = formatter.date(from: value), dateString(date) == value else { return nil }
+        return date
+    }
+
+    static func amount(in credentials: ProviderCredential?) -> Double? {
+        guard let text = credentials?.extraFields?[APIUsageCredentialField.anthropicPrepaidAmountUSD],
+              let amount = APIUsageCostReportParser.decimal(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              amount >= 0 else { return nil }
+        return amount
     }
 }
 
@@ -10467,7 +10502,7 @@ enum APIUsageReportFailure: Error, Equatable {
     func message(for provider: APIUsageReportProvider) -> String {
         switch self {
         case .unauthorized(let status):
-            return "\(provider.vendorName) rejected the key (HTTP \(status)). API usage needs an organisation admin key, not a project or seat key."
+            return "\(provider.vendorName) rejected the key (HTTP \(status)). API usage needs an organisation admin key or equivalent Admin API credential; a workspace key cannot read costs."
         case .rateLimited:
             return "\(provider.vendorName) rate-limited the usage report. Limit Counter will retry later."
         case .http(let status):
@@ -10624,7 +10659,9 @@ struct APIUsageReportClient {
         var components = URLComponents(url: anthropicCostReportURL, resolvingAgainstBaseURL: false)!
         var items = [
             URLQueryItem(name: "starting_at", value: rfc3339.string(from: period.start)),
-            URLQueryItem(name: "ending_at", value: rfc3339.string(from: period.end))
+            URLQueryItem(name: "ending_at", value: rfc3339.string(from: period.end)),
+            URLQueryItem(name: "bucket_width", value: "1d"),
+            URLQueryItem(name: "limit", value: "31")
         ]
         if let page { items.append(URLQueryItem(name: "page", value: page)) }
         components.queryItems = items
@@ -10774,11 +10811,31 @@ final class APIUsageReportLane: @unchecked Sendable {
         return snapshot.withAPIUsage(report)
     }
 
-    func report(for provider: APIUsageReportProvider, credentials: ProviderCredential?) async -> QuotaAPIUsageReport? {
+    func report(for provider: APIUsageReportProvider, credentials: ProviderCredential?, userInitiated: Bool = false) async -> QuotaAPIUsageReport? {
         guard let adminKey = APIUsageCredentialField.adminKey(for: provider, in: credentials) else { return nil }
         let projectID = provider == .openai ? APIUsageCredentialField.openAIProjectID(in: credentials) : nil
-        let key = Self.cacheKey(provider: provider, adminKey: adminKey, projectID: projectID)
         let at = now()
+        let monthlyPeriod = APIUsagePeriod.utcMonthToDate(now: at)
+        let prepaidAmount = provider == .anthropic ? ClaudePrepaidTracking.amount(in: credentials) : nil
+        let prepaidText = provider == .anthropic
+            ? credentials?.extraFields?[APIUsageCredentialField.anthropicPrepaidAmountUSD]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            : ""
+        if !prepaidText.isEmpty && prepaidAmount == nil {
+            return Self.failureReport(provider: provider, message: "Enter a non-negative prepaid amount in USD.", period: monthlyPeriod, at: at)
+        }
+        let prepaidStart = credentials?.extraFields?[APIUsageCredentialField.anthropicPrepaidStartDate]
+            .flatMap(ClaudePrepaidTracking.startDate)
+        let period: APIUsagePeriod
+        if prepaidAmount != nil {
+            guard let prepaidStart, prepaidStart <= at else {
+                return Self.failureReport(provider: provider, message: "Choose a valid prepaid tracking start date (UTC), no later than today.", period: monthlyPeriod, at: at)
+            }
+            period = APIUsagePeriod(start: prepaidStart, end: monthlyPeriod.end, nextReset: monthlyPeriod.nextReset)
+        } else {
+            period = monthlyPeriod
+        }
+        let scope = "\(projectID ?? "")|\(period.start.timeIntervalSince1970)|\(prepaidAmount == nil ? "monthly" : "prepaid")"
+        let key = Self.cacheKey(provider: provider, adminKey: adminKey, projectID: scope)
 
         lock.lock()
         entries = entries.filter { at.timeIntervalSince($0.value.touchedAt) < Self.entryRetention }
@@ -10787,12 +10844,13 @@ final class APIUsageReportLane: @unchecked Sendable {
         entries[key] = entry
         lock.unlock()
 
-        if let report = entry.report, let fetchedAt = entry.fetchedAt, at.timeIntervalSince(fetchedAt) < freshTTL {
-            return report
+        if let report = entry.report, let fetchedAt = entry.fetchedAt,
+           at.timeIntervalSince(fetchedAt) < freshTTL,
+           !userInitiated || at.timeIntervalSince(fetchedAt) < 60 {
+            return report.withPrepaidAmountUSD(prepaidAmount)
         }
-        let period = APIUsagePeriod.utcMonthToDate(now: at)
         if let lastFailureAt = entry.lastFailureAt, at.timeIntervalSince(lastFailureAt) < failureBackoff {
-            return entry.report?.markedStale()
+            return entry.report?.markedStale().withPrepaidAmountUSD(prepaidAmount)
                 ?? Self.failureReport(provider: provider, message: entry.lastFailure ?? APIUsageReportFailure.network.message(for: provider),
                                       period: period, at: at)
         }
@@ -10809,10 +10867,13 @@ final class APIUsageReportLane: @unchecked Sendable {
                 label: provider.reportLabel,
                 amount: reading.total,
                 currency: reading.currency,
-                detail: Self.detail(provider: provider, projectID: projectID),
+                detail: prepaidAmount != nil
+                    ? "Spend since \(ClaudePrepaidTracking.dateString(period.start)) (UTC) · Anthropic Console, whole organisation"
+                    : Self.detail(provider: provider, projectID: projectID),
                 periodStart: period.start,
                 periodEnd: period.nextReset,
-                fetchedAt: readAt
+                fetchedAt: readAt,
+                prepaidAmountUSD: prepaidAmount
             )
             updated.report = report
             updated.fetchedAt = readAt
@@ -10825,7 +10886,7 @@ final class APIUsageReportLane: @unchecked Sendable {
             updated.lastFailureAt = readAt
             updated.lastFailure = message
             entries[key] = updated
-            return updated.report?.markedStale()
+            return updated.report?.markedStale().withPrepaidAmountUSD(prepaidAmount)
                 ?? Self.failureReport(provider: provider, message: message, period: period, at: readAt)
         }
     }
@@ -12953,14 +13014,23 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
 
     private let fileManager: FileManager
     private let apiUsageLane: APIUsageReportLane
+    private let subscriptionWaitSeconds: TimeInterval
+    private let subscriptionFetcher: ((ProviderCredential?, ProviderAccountKey, Bool) async throws -> QuotaSnapshot)?
 
     public init(fileManager: FileManager = .default) {
         self.init(fileManager: fileManager, apiUsageLane: .shared)
     }
 
-    init(fileManager: FileManager = .default, apiUsageLane: APIUsageReportLane) {
+    init(
+        fileManager: FileManager = .default,
+        apiUsageLane: APIUsageReportLane,
+        subscriptionWaitSeconds: TimeInterval = 12,
+        subscriptionFetcher: ((ProviderCredential?, ProviderAccountKey, Bool) async throws -> QuotaSnapshot)? = nil
+    ) {
         self.fileManager = fileManager
         self.apiUsageLane = apiUsageLane
+        self.subscriptionWaitSeconds = subscriptionWaitSeconds
+        self.subscriptionFetcher = subscriptionFetcher
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
@@ -12979,10 +13049,60 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
         account: ProviderAccountKey,
         userInitiated: Bool
     ) async throws -> QuotaSnapshot {
-        let snapshot = try await fetchAccountSnapshot(credentials: credentials, account: account, userInitiated: userInitiated)
-        // The Console organisation's API bill rides beside the subscription
-        // meters as its own Usage Credits row; it never replaces them.
-        return await apiUsageLane.attaching(.anthropic, to: snapshot, credentials: credentials)
+        // Console reporting must run even when Claude Code is signed out or
+        // its subscription read fails. Both sources start independently.
+        async let apiReport = apiUsageLane.report(for: .anthropic, credentials: credentials, userInitiated: userInitiated)
+        do {
+            let snapshot: QuotaSnapshot
+            if APIUsageCredentialField.adminKey(for: .anthropic, in: credentials) != nil {
+                snapshot = try await subscriptionSnapshotWithinBudget(credentials: credentials, account: account, userInitiated: userInitiated).get()
+            } else {
+                snapshot = try await fetchAccountSnapshot(credentials: credentials, account: account, userInitiated: userInitiated)
+            }
+            return await snapshot.withAPIUsage(apiReport)
+        } catch {
+            guard let report = await apiReport else { throw error }
+            let cached = ClaudeOAuthResponseCache.forAccount(account).staleFallback()
+            return QuotaSnapshot(
+                providerID: .claude, displayName: "Claude Code", planName: cached?.planName ?? "Console API",
+                windows: cached?.windows ?? [], stats: cached?.stats ?? [], balances: cached?.balances ?? [],
+                signals: [QuotaSignal(kind: .unexpectedRecovery, title: "Claude Code usage unavailable",
+                                      message: error.localizedDescription, severity: .warning,
+                                      announcementEligible: false)],
+                events: cached?.events ?? [],
+                fetchState: report.amount != nil ? .success : .error,
+                fetchedAt: cached?.fetchedAt ?? report.fetchedAt,
+                accountSlot: account.slot,
+                accountFingerprint: cached?.accountFingerprint
+            ).withAPIUsage(report)
+        }
+    }
+
+    private func subscriptionSnapshotWithinBudget(
+        credentials: ProviderCredential?, account: ProviderAccountKey, userInitiated: Bool
+    ) async -> Result<QuotaSnapshot, Error> {
+        await withCheckedContinuation { continuation in
+            let state = ClaudeTimeoutRaceState<Result<QuotaSnapshot, Error>>(continuation)
+            let fetchTask = Task {
+                do {
+                    let snapshot: QuotaSnapshot
+                    if let subscriptionFetcher {
+                        snapshot = try await subscriptionFetcher(credentials, account, userInitiated)
+                    } else {
+                        snapshot = try await fetchAccountSnapshot(credentials: credentials, account: account, userInitiated: userInitiated)
+                    }
+                    _ = state.resume(with: .success(snapshot))
+                } catch {
+                    _ = state.resume(with: .failure(error))
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, subscriptionWaitSeconds) * 1_000_000_000))
+                if state.resume(with: .failure(ProviderFetchError.networkError(underlying: URLError(.timedOut)))) {
+                    fetchTask.cancel()
+                }
+            }
+        }
     }
 
     private func fetchAccountSnapshot(
@@ -12997,7 +13117,8 @@ public struct ClaudeProviderClient: UserInitiatedProviderClient, AccountScopedPr
         //      and the CLI has not rewritten its item since we copied it
         //   3. A re-read of Claude Code's keychain item (silent in background)
         //   4. ~/.claude/.oauth_token file (headless / CI installs)
-        let manualToken = credentials?.normalizedAccessToken
+        let storedToken = credentials?.normalizedAccessToken
+        let manualToken = storedToken?.hasPrefix("sk-ant-admin") == true ? nil : storedToken
         let claudeCodeKeychainFallbackEnabled = ClaudeOAuthCredentialPolicy.isClaudeCodeKeychainFallbackEnabled(in: credentials)
         let claudeCodeReadBudget = ClaudeOAuthCredentialPolicy.makeClaudeCodeKeychainReadBudget(
             enabled: claudeCodeKeychainFallbackEnabled,

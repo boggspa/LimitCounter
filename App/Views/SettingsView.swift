@@ -1722,7 +1722,26 @@ struct ProviderCredentialView: View {
             #if os(iOS)
                 .textInputAutocapitalization(.never)
             #endif
-            Text("Reads the Console organisation's month-to-date cost report so API spend shows under Usage Credits as \"Claude · Console API\". Use an Admin API key (`sk-ant-admin01-…`) from Console → Settings → Organization, not the OAuth token above. It is stored in Keychain and sent only to api.anthropic.com. Individual accounts and workspace-scoped keys cannot read the report.")
+            Text("Shows the Console organisation's API spend in USD under Usage Credits as \"Claude · Console API\", even when Claude Code is signed out. Use an Admin API key (`sk-ant-admin01-…`) from Console → Settings → Organization, or an equivalent Admin API credential. Individual accounts and workspace keys cannot read this report. The credential stays in Keychain and is sent only to api.anthropic.com.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("Prepaid amount (USD, optional)", text: extraFieldBinding(APIUsageCredentialField.anthropicPrepaidAmountUSD))
+                .onChange(of: storedExtraFields[APIUsageCredentialField.anthropicPrepaidAmountUSD]) { value in
+                    if value?.isEmpty == false, storedExtraFields[APIUsageCredentialField.anthropicPrepaidStartDate] == nil {
+                        storedExtraFields[APIUsageCredentialField.anthropicPrepaidStartDate] = ClaudePrepaidTracking.dateString(APIUsagePeriod.utcMonthToDate(now: Date()).start)
+                    }
+                }
+            if storedExtraFields[APIUsageCredentialField.anthropicPrepaidAmountUSD]?.isEmpty == false {
+                DatePicker("Track spend from (UTC)", selection: claudePrepaidStartBinding, in: ...Date(), displayedComponents: .date)
+                    .environment(\.timeZone, TimeZone(secondsFromGMT: 0) ?? .current)
+                if ClaudePrepaidTracking.amount(in: ProviderCredential(extraFields: storedExtraFields)) == nil {
+                    Text("Enter a non-negative USD amount, for example 25.00.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Text("Optional: enter the prepaid funds available at the start of the selected UTC day, including later top-ups. The row estimates what remains after organisation-wide spend since that date and shows the spend underneath. Clear the amount to show month-to-date spend. Anthropic reports USD; refunds and credit adjustments are not included in this estimate.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1748,6 +1767,16 @@ struct ProviderCredentialView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private var claudePrepaidStartBinding: Binding<Date> {
+        Binding(
+            get: {
+                storedExtraFields[APIUsageCredentialField.anthropicPrepaidStartDate]
+                    .flatMap(ClaudePrepaidTracking.startDate) ?? APIUsagePeriod.utcMonthToDate(now: Date()).start
+            },
+            set: { storedExtraFields[APIUsageCredentialField.anthropicPrepaidStartDate] = ClaudePrepaidTracking.dateString($0) }
+        )
     }
 
     private func extraFieldBinding(_ key: String, defaultValue: String = "") -> Binding<String> {

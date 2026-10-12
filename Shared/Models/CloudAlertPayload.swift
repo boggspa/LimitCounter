@@ -304,6 +304,7 @@ public enum UsageResetAlertBuilder {
         }
 
         let freshSignals = snapshot.signals.filter { signal in
+            guard signal.announcementEligible != false else { return false }
             guard let freshnessWindow else { return true }
             return abs(noticedAt.timeIntervalSince(signal.detectedAt)) <= freshnessWindow
         }

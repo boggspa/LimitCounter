@@ -1050,6 +1050,122 @@ private func testAPIUsageLaneServesFreshThenBacksOffAndFilesUnderUsageCredits() 
     try expect(try JSONDecoder().decode(QuotaSnapshot.self, from: legacy).apiUsage == nil, "snapshots written before the field decode unchanged")
 }
 
+private func testClaudeConsoleReportingWorksWithoutSubscription() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"250","currency":"USD"}]}],"has_more":false}"#.utf8)
+    let account = ProviderAccountKey(providerID: .claude, slot: "apitest")
+    let lane = APIUsageReportLane(client: APIUsageReportClient(session: session))
+    let client = ClaudeProviderClient(apiUsageLane: lane)
+    let credentials = ProviderCredential(
+        accessToken: "sk-ant-admin01-fixture",
+        customEndpoint: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    )
+    let before = ClaudeCreditURLProtocol.requests.count
+    let result = try await client.fetchSnapshot(credentials: credentials, account: account, userInitiated: false)
+    try expectEqual(result.apiUsage?.amount, 2.5, "an admin-only account reads Console spend")
+    try expectEqual(result.accountKey, account, "the report belongs to the requested account")
+    try expect(result.windows.isEmpty && result.fetchState.isHealthy, "a Console-only account has no fabricated subscription usage")
+    try expect(result.signals.contains { $0.title == "Claude Code usage unavailable" }, "the missing subscription is explained")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "the legacy Admin key reaches only the cost endpoint")
+    try expectEqual(ClaudeCreditURLProtocol.requests.last?.url?.path, "/v1/organizations/cost_report", "only billing is requested")
+    ClaudeCreditURLProtocol.status = 403
+    let rejected = ClaudeProviderClient(apiUsageLane: APIUsageReportLane(client: APIUsageReportClient(session: session)))
+    let failed = try await rejected.fetchSnapshot(credentials: credentials, account: account, userInitiated: false)
+    try expect(failed.apiUsageCredits?.balance == nil && failed.apiUsageCredits?.unavailableReason?.contains("Admin API") == true,
+               "an invalid API key is explained even without a subscription")
+    ClaudeCreditURLProtocol.status = 200
+}
+
+private func testPrepaidTrackingPeriodAndManualRefresh() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    nonisolated(unsafe) var clock = makeDate("2026-10-12T12:00:00Z")
+    let lane = APIUsageReportLane(client: APIUsageReportClient(session: session), now: { clock })
+    var fields = [APIUsageCredentialField.anthropicAdminKey: "sk-ant-admin01-fixture",
+                  APIUsageCredentialField.anthropicPrepaidAmountUSD: "25.00",
+                  APIUsageCredentialField.anthropicPrepaidStartDate: "2026-09-20"]
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"1234","currency":"USD"}]}],"has_more":false}"#.utf8)
+    let first = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields))
+    try expectEqual(first?.amount, 12.34, "spend stays available alongside the prepaid estimate")
+    try expectEqual(first?.balance?.amount, 12.66, "remaining funds subtract spend since the chosen date")
+    try expect(first?.balance?.resetDate == nil, "prepaid funds do not reset every month")
+    try expect(first?.balance?.subtitle?.contains("spent of") == true, "the credit row includes spend and allocation")
+    let query = URLComponents(url: ClaudeCreditURLProtocol.requests.last!.url!, resolvingAgainstBaseURL: false)!.queryItems!
+    try expectEqual(query.first { $0.name == "starting_at" }?.value, "2026-09-20T00:00:00Z", "prepaid start date controls billing scope")
+    let before = ClaudeCreditURLProtocol.requests.count
+    clock = clock.addingTimeInterval(61)
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"1300","currency":"USD"}]}],"has_more":false}"#.utf8)
+    let manual = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields), userInitiated: true)
+    try expectEqual(manual?.amount, 13, "manual refresh updates spend after the one-minute polling allowance")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "manual refresh bypasses the long fresh window")
+    _ = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields), userInitiated: true)
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "refresh bursts remain throttled")
+    fields[APIUsageCredentialField.anthropicPrepaidAmountUSD] = "10"
+    let exhausted = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields))
+    try expectEqual(exhausted?.balance?.amount, 0, "exhausted prepaid allocation is clamped at zero")
+    try expectEqual(exhausted?.amount, 13, "overspend remains visible")
+    try expectEqual(ClaudeCreditURLProtocol.requests.count, before + 1, "editing the allocation reuses the same spend reading")
+    fields[APIUsageCredentialField.anthropicPrepaidAmountUSD] = "invalid"
+    let invalidAmount = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields))
+    try expect(invalidAmount?.amount == nil, "an invalid prepaid amount does not silently switch to monthly spend")
+    fields[APIUsageCredentialField.anthropicPrepaidAmountUSD] = "10"
+    fields[APIUsageCredentialField.anthropicPrepaidStartDate] = "2026-11-01"
+    let invalid = await lane.report(for: .anthropic, credentials: ProviderCredential(extraFields: fields))
+    try expect(invalid?.amount == nil && invalid?.failureMessage?.contains("start date") == true, "future tracking dates withhold the estimate")
+    try expect(ClaudePrepaidTracking.startDate("2026-02-30") == nil, "invalid calendar dates are rejected")
+    let decoded = try JSONDecoder().decode(QuotaAPIUsageReport.self, from: JSONEncoder().encode(first!))
+    try expectEqual(decoded.prepaidAmountUSD, 25, "prepaid configuration follows snapshots to iOS")
+}
+
+private func testSlowSubscriptionDoesNotBlockConsoleSpend() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"100","currency":"USD"}]}],"has_more":false}"#.utf8)
+    let client = ClaudeProviderClient(
+        apiUsageLane: APIUsageReportLane(client: APIUsageReportClient(session: session)),
+        subscriptionWaitSeconds: 0.01,
+        subscriptionFetcher: { _, _, _ in
+            try await Task.sleep(nanoseconds: 10_000_000_000)
+            return QuotaSnapshot(providerID: .claude, displayName: "Claude Code")
+        }
+    )
+    let start = Date()
+    let reading = try await client.fetchSnapshot(
+        credentials: ProviderCredential(extraFields: [APIUsageCredentialField.anthropicAdminKey: "sk-ant-admin01-fixture"]),
+        account: ProviderAccountKey(providerID: .claude, slot: "slowapi"), userInitiated: false
+    )
+    try expectEqual(reading.apiUsage?.amount, 1, "the completed cost report survives a stalled subscription fetch")
+    try expect(Date().timeIntervalSince(start) < 2, "the provider returns within its subscription wait budget")
+}
+
+private func testAPIReportingCacheChangesMonth() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ClaudeCreditURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    nonisolated(unsafe) var clock = makeDate("2026-10-31T23:59:00Z")
+    let lane = APIUsageReportLane(client: APIUsageReportClient(session: session), now: { clock })
+    let credentials = ProviderCredential(extraFields: [APIUsageCredentialField.anthropicAdminKey: "sk-ant-admin01-fixture"])
+    ClaudeCreditURLProtocol.status = 200
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[{"results":[{"amount":"1000","currency":"USD"}]}]}"#.utf8)
+    _ = await lane.report(for: .anthropic, credentials: credentials)
+    clock = makeDate("2026-11-01T00:01:00Z")
+    ClaudeCreditURLProtocol.body = Data(#"{"data":[],"has_more":false}"#.utf8)
+    let next = await lane.report(for: .anthropic, credentials: credentials)
+    try expectEqual(next?.amount, 0, "a new month cannot reuse last month's bill inside the cache TTL")
+    try expectEqual(next?.periodStart, makeDate("2026-11-01T00:00:00Z"), "billing period advances")
+}
+
 private func testClaudeSecurityToolReadMirrorsClaudeCode() throws {
     // Verified against Claude Code 2.1.295: it reads its own item with
     // `security find-generic-password -a <user> -w -s <service>`. Sending the
@@ -1281,6 +1397,10 @@ private enum ClaudeUsageTestRunner {
         try testAnthropicCostReportParsesCentsAndFailsClosed()
         try testAPIUsagePeriodAndAnthropicRequestShape()
         try await testAPIUsageLaneServesFreshThenBacksOffAndFilesUnderUsageCredits()
+        try await testClaudeConsoleReportingWorksWithoutSubscription()
+        try await testPrepaidTrackingPeriodAndManualRefresh()
+        try await testSlowSubscriptionDoesNotBlockConsoleSpend()
+        try await testAPIReportingCacheChangesMonth()
         try testClaudeHeatmapBucketingRetainsFullWindow()
         try testClaudeFableWindowWithoutResetStillDisplays()
         try testClaudeMissingFableWindowDoesNotDisplay()
