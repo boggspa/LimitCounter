@@ -296,7 +296,9 @@ public struct AntigravityProviderClient: UserInitiatedProviderClient {
         #else
         let arch = "unknown"
         #endif
-        return "antigravity/cli/1.1.9 (aidev_client; os_type=darwin; arch=\(arch); auth_method=consumer)"
+        // Google selects the quota schema by client version. The 1.1.9
+        // identity omits Argon (and can omit the shared Gemini buckets).
+        return "antigravity/cli/1.3.6 (aidev_client; os_type=darwin; arch=\(arch); auth_method=consumer)"
     }()
     private static let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
     private static let loadCodeAssistURL = URL(
