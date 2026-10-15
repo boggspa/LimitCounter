@@ -72,6 +72,7 @@ private func testRealWorldWindowsLandInTheRightPeriod() throws {
         (.kimi, window("Monthly", .monthly), .monthlyAndAPI),
         (.antigravity, window("Gemini 5H", .session), .fiveHour),
         (.antigravity, window("Gemini Weekly", .weekly), .weekly),
+        (.antigravity, window("Gemini 4 Argon Weekly", .weekly), .weekly),
         (.antigravity, window("Claude/GPT 5H", .session), .fiveHour),
         (.antigravity, window("Claude/GPT Weekly", .weekly), .weekly),
         (.mistral, window("API usage", .monthly), .monthlyAndAPI),
@@ -516,6 +517,19 @@ private func testResetOnlyAccountsDoNotAlsoGetIdleQuotaRows() throws {
 
 // MARK: - Layout mode
 
+private func testCompactAntigravityIncludesIndependentModelQuotas() throws {
+    let windows = [
+        window("Gemini 5H", .session), window("Gemini Weekly", .weekly),
+        window("Claude/GPT 5H", .session), window("Claude/GPT Weekly", .weekly),
+        window("Gemini 4 Argon Weekly", .weekly)
+    ]
+    let antigravity = QuotaSnapshot(providerID: .antigravity, displayName: "Antigravity", windows: windows)
+    try expectEqual(antigravity.compactSummaryWindows.map(\.label), windows.map(\.label),
+                    "Compact Antigravity includes Argon without dropping shared allowances")
+    let other = QuotaSnapshot(providerID: .openai, displayName: "Codex", windows: windows)
+    try expectEqual(other.compactSummaryWindows.count, 4, "Other compact providers keep their existing limit")
+}
+
 private func testLayoutModeCompactFlags() throws {
     try expect(!DashboardLayoutMode.standard.isCompact, "standard is not compact")
     try expect(DashboardLayoutMode.compact.isCompact, "compact is compact")
@@ -531,6 +545,7 @@ private func testLayoutModeCompactFlags() throws {
 private enum QuotaPeriodGroupingTestRunner {
     static func main() throws {
         try testRealWorldWindowsLandInTheRightPeriod()
+        try testCompactAntigravityIncludesIndependentModelQuotas()
         try testGeminiCustomWindowsAreDailyAndOtherCustomWindowsAreAPI()
         try testRowLabelsPrefixTheProviderAndCollapseOverlap()
         try testSectionsGroupByPeriodAndPreserveProviderOrder()

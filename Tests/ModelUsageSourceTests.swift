@@ -545,6 +545,14 @@ struct ModelUsageSourceTests {
         expect(ModelRateCatalog.resolve(source: "taskwraith", model: "cursor/grok-4.6")?.provider == "cursor", "Cursor routes price with Cursor rows")
         expect(ModelRateCatalog.resolve(source: "taskwraith", model: "devin/swe-1-6-slow") == nil, "Uncatalogued providers stay unpriced")
         expect(ModelRateCatalog.resolve(source: "taskwraith", model: "antigravity/gemini-3.1-pro-high") == nil, "Near-miss ids are not guessed")
+        for model in ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"] {
+            let argon = ModelRateCatalog.resolve(source: "antigravity", model: model)
+            expect(argon?.model == "gemini-4-argon", "Argon effort variants share one catalogue identity")
+            expect(argon?.status == .subscription, "CLI Argon is subscription usage")
+            expect(ModelRateCatalog.resolve(source: "taskwraith", model: "antigravity/\(model)")?.model == "gemini-4-argon", "Namespaced Argon resolves too")
+            expect(ModelRateCatalog.costRange(source: "antigravity", model: model, tokens: below, calls: 1) == nil, "Argon never inherits an unverified API price")
+        }
+        expect(ModelRateCatalog.resolve(source: "antigravity", model: "gemini-api:gemini-4-argon") == nil, "CLI availability does not imply a verified API route")
         expect(ModelUsageDisplayIdentity.provider(model: "pi/deepseek/deepseek-v4-flash", source: "taskwraith") == "deepseek", "Pi route colours by vendor")
 
         expect(ModelRateCatalog.fingerprint == ModelRateCatalog.fingerprint(of: ModelRateCatalog.rates), "Fingerprint is deterministic")

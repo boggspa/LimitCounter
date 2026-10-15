@@ -1168,7 +1168,7 @@ public struct QuotaCardSmallView: View {
     }
 
     private var accent: Color { Color(hex: snapshot.providerID.accentColorHex) }
-    private var windows: [QuotaWindow] { Array(snapshot.summaryWindows.prefix(4)) }
+    private var windows: [QuotaWindow] { snapshot.compactSummaryWindows }
 
     public var body: some View {
         GlassCardContainer(style: style, accent: accent, cornerRadius: 16) {

@@ -353,7 +353,7 @@ struct ModelUsageDashboardView: View {
             if snapshot.summaryWindows.isEmpty {
                 Text("No quota windows reported").font(.system(size: 9)).foregroundStyle(.secondary)
             }
-            ForEach(snapshot.summaryWindows.prefix(4)) { quota in
+            ForEach(snapshot.compactSummaryWindows) { quota in
                 VStack(alignment: .leading, spacing: 3) {
                     StackRow(label: quota.label, detail: quota.resetDate.map { "Resets \($0.absoluteResetString)" }, value: quota.leadingValueText)
                     if quota.total != nil { StackBar(fraction: quota.fractionUsed, color: color) }

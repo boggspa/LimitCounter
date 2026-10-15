@@ -192,6 +192,43 @@ private func testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets() throws {
     )
 }
 
+private func testAntigravityParsesIndependentArgonWeeklyBucket() throws {
+    let payload = """
+    {"groups":[
+      {"buckets":[
+        {"bucketId":"gemini-weekly","remainingFraction":0.001},
+        {"bucketId":"gemini-5h","remainingFraction":1}
+      ]},
+      {"buckets":[
+        {"bucketId":"3p-weekly","remainingFraction":0},
+        {"bucketId":"3p-5h","remainingFraction":1}
+      ]},
+      {"displayName":"Gemini 4 Argon","buckets":[
+        {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","remainingFraction":0.75,"resetTime":"2026-10-22T23:23:04.123Z"},
+        {"bucketId":"gemini-argon-wtu-5h","remainingFraction":1},
+        {"bucketId":"gemini-argon-weekly","remainingFraction":1}
+      ]}
+    ]}
+    """
+    let parsed = try AntigravityQuotaSummaryParser.parse(Data(payload.utf8), planName: "Google AI Pro")
+        ?? { throw AdditionalProviderTestError.failure("Argon quota summary did not parse") }()
+    try expectEqual(parsed.windows.map(\.label), [
+        "Gemini 5H", "Gemini Weekly", "Claude/GPT 5H", "Claude/GPT Weekly", "Gemini 4 Argon Weekly"
+    ], "Argon is a separate weekly-only family after existing quotas")
+    let argon = try parsed.windows.last
+        ?? { throw AdditionalProviderTestError.failure("Missing Argon window") }()
+    try expectClose(argon.used, 25, "Argon remaining inverts independently of exhausted Gemini quota")
+    try expectEqual(argon.windowKind, .weekly, "Argon uses the weekly group")
+    try expectEqual(argon.resetDate, fractionalDate("2026-10-22T23:23:04.123Z"), "Argon reset preserves fractional seconds")
+
+    let argonOnly = """
+    {"groups":[{"buckets":[{"bucketId":"gemini-argon-wtu-weekly","remainingFraction":1}]}]}
+    """
+    let argonOnlyObservation = try AntigravityQuotaSummaryParser.parse(Data(argonOnly.utf8), planName: nil)
+    try expect(argonOnlyObservation == nil,
+               "Argon cannot substitute for the required shared Gemini buckets")
+}
+
 private func testAntigravityParsesSeparatedClaudeAndGPTBuckets() throws {
     let payload = """
     {
@@ -4032,6 +4069,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testCodexSessionCredentialReaderFollowsDirectoryRotation()
         try testCodexDirectoryImportStoresPersistentSource()
         try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
+        try testAntigravityParsesIndependentArgonWeeklyBucket()
         try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
         try testAntigravityParsesFractionalSecondResetTimes()
