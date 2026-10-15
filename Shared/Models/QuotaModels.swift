@@ -2518,6 +2518,12 @@ public struct QuotaSnapshot: Codable, Identifiable, Equatable, Hashable {
         return selected.isEmpty ? Array(windows.prefix(3)) : selected
     }
 
+    /// Antigravity's independent model allowances must remain visible even
+    /// when its shared Gemini and third-party windows already fill four rows.
+    public var compactSummaryWindows: [QuotaWindow] {
+        providerID == .antigravity ? summaryWindows : Array(summaryWindows.prefix(4))
+    }
+
     public var primaryWindow: QuotaWindow? {
         windows.first
     }

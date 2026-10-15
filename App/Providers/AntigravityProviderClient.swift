@@ -113,6 +113,7 @@ nonisolated enum AntigravityQuotaSummaryParser {
     private struct AntigravityBucketCandidate {
         enum Family {
             case gemini
+            case argon
             case claude
             case gpt
             case combined3P
@@ -127,7 +128,7 @@ nonisolated enum AntigravityQuotaSummaryParser {
 
         init?(bucket: Bucket) {
             let normalized = bucket.bucketId.lowercased()
-            guard let delimiter = normalized.firstIndex(of: "-") else { return nil }
+            guard let delimiter = normalized.lastIndex(of: "-") else { return nil }
             let family = String(normalized[..<delimiter])
             let window = String(normalized[normalized.index(after: delimiter)...])
             let isFiveHour = window == "5h"
@@ -141,6 +142,8 @@ nonisolated enum AntigravityQuotaSummaryParser {
             switch family {
             case "gemini":
                 (familyType, familyOrder, familyLabel) = (.gemini, 0, "Gemini")
+            case "gemini-argon-wtu" where isWeekly:
+                (familyType, familyOrder, familyLabel) = (.argon, 4, "Gemini 4 Argon")
             case "claude":
                 (familyType, familyOrder, familyLabel) = (.claude, 1, "Claude")
             case "gpt":

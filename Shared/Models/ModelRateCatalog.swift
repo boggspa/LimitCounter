@@ -77,8 +77,8 @@ nonisolated struct ModelCostRange: Equatable, Sendable {
 }
 
 nonisolated enum ModelRateCatalog {
-    static let version = "2026-09-24"
-    static let provenance = "TaskWraith ProviderRateService · 2026-09-24"
+    static let version = "2026-10-16"
+    static let provenance = "TaskWraith ProviderRateService · 2026-09-24; Antigravity Argon CLI · 2026-10-16"
     /// Content fingerprint of every row and mapping, so a rate edit without a date
     /// bump still invalidates cached rollups and republishes the archive.
     static let fingerprint = fingerprint(of: rates)
@@ -117,7 +117,10 @@ nonisolated enum ModelRateCatalog {
         "kimi/kimi-code/kimi-for-coding": "kimi-k2.8-preview",
         "kimi/kimi-code/kimi-for-coding-highspeed": "kimi-k2.7-code-highspeed",
         "kimi/kimi-code/k3": "kimi-k3",
-        "kimi/kimi-code/k3-256k": "kimi-k3-256k"
+        "kimi/kimi-code/k3-256k": "kimi-k3-256k",
+        "antigravity/gemini-4-argon-low": "gemini-4-argon",
+        "antigravity/gemini-4-argon-medium": "gemini-4-argon",
+        "antigravity/gemini-4-argon-high": "gemini-4-argon"
     ]
     private static let routedProviders = [
         "codex": "codex", "openai": "codex", "claude": "claude", "anthropic": "claude",
@@ -329,6 +332,7 @@ nonisolated enum ModelRateCatalog {
         ModelRate(provider: "pi", model: "openrouter/unbiased/pareto", input: 2.5, output: 7.5, cached: 0.25, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://openrouter.ai/unbiased/pareto", status: .estimated, notes: "Paid OpenRouter route, Unbiased-hosted with no routing fan-out (verified 2026-09-18); mirrors the cost block in PiOpenRouterModelRegistration.", context: 262144),
         ModelRate(provider: "pi", model: "openrouter/typesafe/jev-1.13", input: 0, output: 0, cached: nil, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://openrouter.ai/typesafe/jev-1.13", status: .pending, notes: "Route listed 2026-09-17 but \"coming soon\" — OpenRouter publishes no pricing yet. Zero is a neutral placeholder, NOT a free-route claim: re-verify against the Models API at launch before it prices a run.", context: 32000),
         ModelRate(provider: "pi", model: "openrouter/stealth/space-bunny-alpha", input: 0, output: 0, cached: nil, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://openrouter.ai/stealth/space-bunny-alpha", status: .free, notes: "Free stealth preview (verified 2026-09-23); mirrors cost 0/0 in PiOpenRouterModelRegistration. Free for the duration of the preview only — if the route is ever relisted at a price this row must be re-verified before it prices another run.", context: 1000000),
+        ModelRate(provider: "antigravity", model: "gemini-4-argon", input: 0, output: 0, cached: nil, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://antigravity.google/", status: .subscription, notes: "Gemini 4 Argon through the Antigravity CLI. Low, medium and high share the model identity; its weekly quota is separate from the shared Gemini allowance. API pricing and context size are unverified; zero placeholders do not mean free usage.", context: nil),
         ModelRate(provider: "antigravity", model: "gemini-api:gemini-2.5-flash", input: 0.3, output: 2.5, cached: 0.03, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://ai.google.dev/gemini-api/docs/pricing", status: .estimated, notes: "Gemini API paid tier via the AntiGravity BYO-key lane. First row = fallback rate for unknown/agy ids.", context: 1048576),
         ModelRate(provider: "antigravity", model: "gemini-api:gemini-2.5-flash-lite", input: 0.1, output: 0.4, cached: 0.01, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://ai.google.dev/gemini-api/docs/pricing", status: .estimated, notes: "Gemini API paid tier via the AntiGravity BYO-key lane.", context: 1048576),
         ModelRate(provider: "antigravity", model: "gemini-api:gemini-2.5-pro", input: 1.25, output: 10, cached: 0.125, threshold: nil, longInput: nil, longOutput: nil, longCached: nil, url: "https://ai.google.dev/gemini-api/docs/pricing", status: .estimated, notes: "Gemini API paid tier, ≤200K-prompt rate; >200K prompts bill higher (not modelled — long-prompt estimates undercount).", context: 1048576),
