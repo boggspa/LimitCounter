@@ -229,6 +229,52 @@ private func testAntigravityParsesIndependentArgonWeeklyBucket() throws {
                "Argon cannot substitute for the required shared Gemini buckets")
 }
 
+private func testAntigravityRequestsArgonCapableQuotaSchema() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-antigravity-request-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let token: [String: Any] = ["token": [
+        "access_token": "fixture-access-token", "expiry": isoString(Date().addingTimeInterval(3600))
+    ]]
+    try JSONSerialization.data(withJSONObject: token).write(to: root.appendingPathComponent("antigravity-oauth-token"))
+    let bookmark = try root.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+    var paths: [String] = []
+    OpenRouterMockURLProtocol.handler = { request in
+        try expectEqual(request.url?.host, "daily-cloudcode-pa.googleapis.com", "Quota stays on Google's endpoint")
+        try expectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-access-token", "Uses the CLI session")
+        let identity = request.value(forHTTPHeaderField: "User-Agent") ?? ""
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        let path = request.url!.path
+        paths.append(path)
+        if path == "/v1internal:loadCodeAssist" {
+            return (response, Data(#"{"cloudaicompanionProject":"fixture-project","paidTier":{"name":"Google AI Pro"}}"#.utf8))
+        }
+        try expectEqual(path, "/v1internal:retrieveUserQuotaSummary", "Requests the official quota summary")
+        // The live endpoint omits the Argon bucket for the old 1.1.9 identity.
+        let argon = identity.hasPrefix("antigravity/cli/1.3.6 ")
+            ? #",{"bucketId":"gemini-argon-wtu-weekly","remainingFraction":0.75}"# : ""
+        let body = """
+        {"groups":[{"buckets":[
+          {"bucketId":"gemini-weekly","remainingFraction":0},
+          {"bucketId":"gemini-5h","remainingFraction":1},
+          {"bucketId":"3p-weekly","remainingFraction":0},
+          {"bucketId":"3p-5h","remainingFraction":1}\(argon)
+        ]}]}
+        """
+        return (response, Data(body.utf8))
+    }
+    defer { OpenRouterMockURLProtocol.handler = nil }
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OpenRouterMockURLProtocol.self]
+    let snapshot = try await AntigravityProviderClient(session: URLSession(configuration: configuration))
+        .fetchSnapshot(credentials: ProviderCredential(bookmarkData: bookmark), userInitiated: true)
+    try expectEqual(paths, ["/v1internal:loadCodeAssist", "/v1internal:retrieveUserQuotaSummary"], "Fetches metadata and quota")
+    try expectEqual(snapshot.windows.count, 5, "A real client request includes the independent Argon meter")
+    try expectClose(snapshot.windows.first { $0.label == "Gemini 4 Argon Weekly" }?.used ?? -1, 25,
+                    "Argon quota reaches the client snapshot")
+}
+
 private func testAntigravityParsesSeparatedClaudeAndGPTBuckets() throws {
     let payload = """
     {
@@ -4070,6 +4116,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testCodexDirectoryImportStoresPersistentSource()
         try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
         try testAntigravityParsesIndependentArgonWeeklyBucket()
+        try await testAntigravityRequestsArgonCapableQuotaSchema()
         try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
         try testAntigravityParsesFractionalSecondResetTimes()
