@@ -38,7 +38,7 @@ struct ModelUsageAnalyticsTests {
         let tier = ModelTokenCounts(input: 272000, output: 1000)
         close(ModelRateCatalog.estimate(source: "codex", model: "gpt-6-sol", tokens: tier)!, 1.103, "Long prompt switches every token")
         close(ModelRateCatalog.estimate(source: "codex", model: "gpt-6-sol", tokens: .init(input: 271999, output: 1000))!, 0.553998, "Below threshold uses base rate")
-        expect(ModelRateCatalog.rates.count == 191, "Whole verified catalog imported")
+        expect(ModelRateCatalog.rates.count == 192, "Whole verified catalog including the Antigravity Argon subscription imported")
         for rate in ModelRateCatalog.rates where rate.status == .subscription || rate.status == .pending {
             expect(rate.estimate(tokens) == nil, "Subscription and pending are not free")
         }
