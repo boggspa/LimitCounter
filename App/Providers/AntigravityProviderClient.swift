@@ -240,36 +240,45 @@ enum AntigravityRefreshCadence {
 private actor AntigravityUsageCache {
     static let shared = AntigravityUsageCache()
 
-    private var observation: AntigravityUsageObservation?
-    private var fetchedAt: Date?
-    private var lastAttemptAt: Date?
-    private var cadenceIndex = 0
+    private struct Entry {
+        var observation: AntigravityUsageObservation?
+        var fetchedAt: Date?
+        var lastAttemptAt: Date?
+        var cadenceIndex = 0
+    }
 
-    func cachedObservation() -> AntigravityUsageObservation? {
-        observation
+    // Each granted CLI session keeps its own quota and refresh cadence.
+    private var entries: [URL: Entry] = [:]
+
+    func cachedObservation(for tokenFileURL: URL) -> AntigravityUsageObservation? {
+        entries[tokenFileURL]?.observation
     }
 
     /// Manual refreshes always proceed. Autonomous refreshes follow the
     /// 4→7→16→3→21 minute cadence loop.
-    func beginFetch(userInitiated: Bool, now: Date = Date()) -> Bool {
+    func beginFetch(for tokenFileURL: URL, userInitiated: Bool, now: Date = Date()) -> Bool {
+        var entry = entries[tokenFileURL] ?? Entry()
         if !userInitiated {
             guard AntigravityRefreshCadence.isDue(
                 now: now,
-                cadenceIndex: cadenceIndex,
-                fetchedAt: fetchedAt,
-                lastAttemptAt: lastAttemptAt
+                cadenceIndex: entry.cadenceIndex,
+                fetchedAt: entry.fetchedAt,
+                lastAttemptAt: entry.lastAttemptAt
             ) else {
                 return false
             }
         }
-        lastAttemptAt = now
+        entry.lastAttemptAt = now
+        entries[tokenFileURL] = entry
         return true
     }
 
-    func store(_ value: AntigravityUsageObservation, at date: Date = Date()) {
-        observation = value
-        fetchedAt = date
-        cadenceIndex = AntigravityRefreshCadence.nextIndex(after: cadenceIndex)
+    func store(_ value: AntigravityUsageObservation, for tokenFileURL: URL, at date: Date = Date()) {
+        var entry = entries[tokenFileURL] ?? Entry()
+        entry.observation = value
+        entry.fetchedAt = date
+        entry.cadenceIndex = AntigravityRefreshCadence.nextIndex(after: entry.cadenceIndex)
+        entries[tokenFileURL] = entry
     }
 }
 
@@ -322,19 +331,19 @@ public struct AntigravityProviderClient: UserInitiatedProviderClient {
         credentials: ProviderCredential?,
         userInitiated: Bool
     ) async throws -> QuotaSnapshot {
+        guard let access = AntigravitySessionAccess.resolve(credentials: credentials) else {
+            throw ProviderFetchError.notConfigured
+        }
+        defer { access.stop() }
+        let tokenFileURL = access.tokenFileURL.standardizedFileURL
         let taskWraithEvents = AGBenchUsageReader.loadEvents(forProviderKey: "antigravity")
-        var observation = await AntigravityUsageCache.shared.cachedObservation()
+        var observation = await AntigravityUsageCache.shared.cachedObservation(for: tokenFileURL)
         var fetchError: Error?
 
-        if await AntigravityUsageCache.shared.beginFetch(userInitiated: userInitiated) {
-            guard let access = AntigravitySessionAccess.resolve(credentials: credentials) else {
-                throw ProviderFetchError.notConfigured
-            }
-            defer { access.stop() }
-
+        if await AntigravityUsageCache.shared.beginFetch(for: tokenFileURL, userInitiated: userInitiated) {
             do {
-                let fetched = try await fetchObservation(tokenFileURL: access.tokenFileURL)
-                await AntigravityUsageCache.shared.store(fetched)
+                let fetched = try await fetchObservation(tokenFileURL: tokenFileURL)
+                await AntigravityUsageCache.shared.store(fetched, for: tokenFileURL)
                 observation = fetched
             } catch {
                 fetchError = error

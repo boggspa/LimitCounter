@@ -275,6 +275,90 @@ private func testAntigravityRequestsArgonCapableQuotaSchema() async throws {
                     "Argon quota reaches the client snapshot")
 }
 
+private func testAntigravityAccountsKeepSeparateQuotaCachesAndRefreshCadence() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("limit-counter-antigravity-accounts-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func credential(for name: String) throws -> ProviderCredential {
+        let directory = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let token: [String: Any] = ["token": [
+            "access_token": "fixture-\(name)", "expiry": isoString(Date().addingTimeInterval(3600))
+        ]]
+        try JSONSerialization.data(withJSONObject: token)
+            .write(to: directory.appendingPathComponent("antigravity-oauth-token"))
+        return ProviderCredential(bookmarkData: try directory.bookmarkData(
+            options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil
+        ))
+    }
+
+    let primary = try credential(for: "primary")
+    let secondary = try credential(for: "secondary")
+    let rejected = try credential(for: "rejected")
+    var remainingBySession = ["Bearer fixture-primary": 0.8, "Bearer fixture-secondary": 0.3]
+    var requestsBySession: [String: Int] = [:]
+    OpenRouterMockURLProtocol.handler = { request in
+        try expectEqual(request.url?.host, "daily-cloudcode-pa.googleapis.com", "Uses the quota service")
+        let session = request.value(forHTTPHeaderField: "Authorization") ?? ""
+        requestsBySession[session, default: 0] += 1
+        if session == "Bearer fixture-rejected" {
+            return (HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        let remaining = try remainingBySession[session]
+            ?? { throw AdditionalProviderTestError.failure("Unknown fixture session") }()
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        if request.url?.path == "/v1internal:loadCodeAssist" {
+            return (response, Data(#"{"cloudaicompanionProject":"fixture-project","paidTier":{"name":"Google AI Pro"}}"#.utf8))
+        }
+        try expectEqual(request.url?.path, "/v1internal:retrieveUserQuotaSummary", "Requests quota for this session")
+        let body = """
+        {"groups":[{"buckets":[
+          {"bucketId":"gemini-weekly","remainingFraction":\(remaining)},
+          {"bucketId":"gemini-5h","remainingFraction":\(remaining)}
+        ]}]}
+        """
+        return (response, Data(body.utf8))
+    }
+    defer { OpenRouterMockURLProtocol.handler = nil }
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OpenRouterMockURLProtocol.self]
+    let client = AntigravityProviderClient(session: URLSession(configuration: configuration))
+
+    func weeklyUsed(_ snapshot: QuotaSnapshot) -> Double {
+        snapshot.windows.first { $0.label == "Gemini Weekly" }?.used ?? -1
+    }
+
+    let primaryInitial = try await client.fetchSnapshot(credentials: primary, userInitiated: true)
+    try expectClose(weeklyUsed(primaryInitial), 20, "Primary starts with its own quota")
+    let secondaryInitial = try await client.fetchSnapshot(credentials: secondary)
+    try expectClose(weeklyUsed(secondaryInitial), 70, "Primary cooldown cannot suppress the secondary's first fetch")
+
+    remainingBySession["Bearer fixture-primary"] = 0.6
+    let primaryRefreshed = try await client.fetchSnapshot(credentials: primary, userInitiated: true)
+    try expectClose(weeklyUsed(primaryRefreshed), 40, "Primary manual refresh fetches immediately")
+    let secondaryCached = try await client.fetchSnapshot(credentials: secondary)
+    try expectClose(weeklyUsed(secondaryCached), 70, "Secondary keeps its own cached quota after a primary refresh")
+
+    remainingBySession["Bearer fixture-secondary"] = 0.1
+    let secondaryRefreshed = try await client.fetchSnapshot(credentials: secondary, userInitiated: true)
+    try expectClose(weeklyUsed(secondaryRefreshed), 90, "Secondary manual refresh fetches immediately")
+    let primaryCached = try await client.fetchSnapshot(credentials: primary)
+    try expectClose(weeklyUsed(primaryCached), 40, "Primary keeps its own cached quota after a secondary refresh")
+    try expectEqual(requestsBySession["Bearer fixture-primary"], 4, "Primary cached reads respect its cooldown")
+    try expectEqual(requestsBySession["Bearer fixture-secondary"], 4, "Secondary cached reads respect its cooldown")
+
+    do {
+        _ = try await client.fetchSnapshot(credentials: nil)
+        throw AdditionalProviderTestError.failure("An unconfigured account borrowed another account's cached quota")
+    } catch ProviderFetchError.notConfigured {}
+
+    do {
+        _ = try await client.fetchSnapshot(credentials: rejected, userInitiated: true)
+        throw AdditionalProviderTestError.failure("A failed account borrowed another account's cached quota")
+    } catch ProviderFetchError.invalidCredential {}
+}
+
 private func testAntigravityParsesSeparatedClaudeAndGPTBuckets() throws {
     let payload = """
     {
@@ -4117,6 +4201,7 @@ private enum AdditionalProviderUsageTestRunner {
         try testAntigravityParsesOfficialGeminiAndClaudeGPTBuckets()
         try testAntigravityParsesIndependentArgonWeeklyBucket()
         try await testAntigravityRequestsArgonCapableQuotaSchema()
+        try await testAntigravityAccountsKeepSeparateQuotaCachesAndRefreshCadence()
         try testAntigravityParsesSeparatedClaudeAndGPTBuckets()
         try testAntigravityFailsClosedWithoutBothGeminiBuckets()
         try testAntigravityParsesFractionalSecondResetTimes()
