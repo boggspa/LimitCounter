@@ -493,7 +493,7 @@ nonisolated enum TaskWraithBranding {
     /// TaskWraith's legacy classes, plus Limit Counter provider ids it spells differently.
     static let aliases: [String: String] = [
         "openai": "codex", "google": "antigravity", "qwen": "alibaba", "ornith": "deep-reinforce",
-        "codextelemetry": "codex", "openaiapi": "codex", "chatgpt": "codex", "mimo": "xiaomi"
+        "codextelemetry": "codex", "openaiapi": "codex", "chatgpt": "codex", "mimo": "xiaomi", "x": "grok"
     ]
     /// TaskWraith's runtime providers: a route namespace naming one is that seat.
     static let runtimeProviders: Set<String> = [

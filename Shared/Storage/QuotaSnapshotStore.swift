@@ -840,6 +840,7 @@ public final class ProviderCardOrderStore: ObservableObject {
         .chatgpt,
         .devin,
         .cursor,
+        .x,
         .gemini,
         .kimi,
         .antigravity,

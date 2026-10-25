@@ -90,7 +90,7 @@ enum ProviderSetupPolicy {
 
     /// Providers whose `customEndpoint` is bookmarked as a folder grant on save.
     static let localFolderProviders: Set<ProviderID> = [
-        .openai, .codexTelemetry, .claude, .chatgpt, .cursor, .gemini, .kimi,
+        .openai, .codexTelemetry, .claude, .chatgpt, .cursor, .x, .gemini, .kimi,
         .grok, .antigravity, .mistral, .cerebras, .meta, .devin
     ]
 
@@ -350,7 +350,7 @@ enum ProviderSetupPolicy {
     static func sessionFlags(_ draft: Draft, providerID: ProviderID) -> SessionFlags {
         let fields = draft.extraFields
         var flags = SessionFlags()
-        flags.cursor = providerID == .cursor && (
+        flags.cursor = (providerID == .cursor || providerID == .x) && (
             fields["cursorAuthMode"] == "cookie"
             || (fields["cursorCookieHeader"]?.isEmpty == false)
         )
@@ -500,7 +500,7 @@ enum ProviderSetupPolicy {
             return "Each account is a separate Claude Code config folder — the one you launch that account with via CLAUDE_CONFIG_DIR, such as ~/.claude-work. Limit Counter reads that account's own Claude Code sign-in and transcripts. It never switches accounts for you."
         case .openai:
             return "Each account is a separate CODEX_HOME folder, such as ~/.codex-work, with its own auth.json. Grant the folder and Limit Counter follows that account's session."
-        case .cursor, .kimi, .ollama, .mistral, .meta, .cerebras, .qwen, .mimo:
+        case .cursor, .x, .kimi, .ollama, .mistral, .meta, .cerebras, .qwen, .mimo:
             return "Each account is its own signed-in web session or key, imported here exactly as the primary account was."
         case .gemini, .grok, .antigravity:
             return "Each account is the separate CLI data folder that account signs in from. Grant that folder."
@@ -511,6 +511,8 @@ enum ProviderSetupPolicy {
 
     private static func importSectionTitle(_ providerID: ProviderID) -> String {
         switch providerID {
+        case .x:
+            return "Connect Your X Subscription"
         case .openai:
             return "Grant Codex Session Access"
         case .kimi:
@@ -530,6 +532,8 @@ enum ProviderSetupPolicy {
 
     private static func importButtonTitle(_ providerID: ProviderID) -> String {
         switch providerID {
+        case .x:
+            return "Select Cursor account data..."
         case .openai:
             return "Select ~/.codex folder..."
         case .grok:
@@ -551,6 +555,8 @@ enum ProviderSetupPolicy {
 
     private static func importHelpText(_ providerID: ProviderID) -> String {
         switch providerID {
+        case .x:
+            return "Connect the Cursor account included in your X Subscription, using its web session or its globalStorage folder. The weekly allowance is shared with Grok and Grok Bot."
         case .openai:
             return "Grant access to the full `~/.codex` folder. Limit Counter can then follow `auth.json` token rotation inside that grant without another prompt after a Codex CLI update."
         case .grok:

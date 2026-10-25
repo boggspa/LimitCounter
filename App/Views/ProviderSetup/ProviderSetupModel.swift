@@ -438,11 +438,11 @@ final class ProviderSetupModel: ObservableObject {
         _ imported: CredentialImportService.ImportedCredential,
         for providerID: ProviderID
     ) -> Bool {
-        let merged = providerID == .cursor
+        let merged = (providerID == .cursor || providerID == .x)
             ? ProviderSetupPolicy.mergingCursor(
                 draft(for: providerID),
                 imported: imported,
-                existing: store.credential(for: .cursor)
+                existing: store.credential(for: providerID)
             )
             : ProviderSetupPolicy.merging(
                 draft(for: providerID),

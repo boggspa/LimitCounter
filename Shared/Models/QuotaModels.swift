@@ -17,6 +17,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
     case codexTelemetry
     case devin
     case cursor
+    case x
     case gemini
     case kimi
     case grok
@@ -64,6 +65,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "Codex Telemetry"
         case .devin: return "Devin"
         case .cursor:   return "Cursor"
+        case .x:        return "X"
         case .gemini:   return "Gemini"
         case .kimi:     return "Kimi Code"
         case .grok:     return "Grok"
@@ -92,7 +94,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ChatGPT"
         case .codexTelemetry:
             return "Codex Telemetry"
-        case .claude, .devin, .cursor, .gemini, .kimi, .grok,
+        case .claude, .devin, .cursor, .x, .gemini, .kimi, .grok,
                 .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return displayName
         }
@@ -109,6 +111,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "cpu.fill"
         case .devin: return "wave.3.right"
         case .cursor:   return "cursorarrow.rays"
+        case .x:        return "xmark"
         case .gemini:   return "sparkles"
         case .kimi:     return "moon.stars.fill"
         case .grok:     return "bolt.fill"
@@ -138,6 +141,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "#705AFF" // codex: TaskWraith gives OpenAI models the Codex seat's accent
         case .devin:    return "#4878AE"
         case .cursor:   return "#8C7508"
+        case .x:        return "#757575"
         case .gemini:   return "#346EEC"
         case .kimi:     return "#0073E6"
         case .grok:     return "#757575"
@@ -172,6 +176,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
             return "ProviderDevinLogo"
         case .cursor:
             return "ProviderCursorLogo"
+        case .x:
+            return "ProviderXLogo"
         case .gemini:
             return "ProviderGeminiLogo"
         case .kimi:
@@ -207,7 +213,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .chatgpt, .codexTelemetry:
             return .prototype
-        case .claude, .openai, .openaiAPI, .devin, .cursor, .gemini, .kimi,
+        case .claude, .openai, .openaiAPI, .devin, .cursor, .x, .gemini, .kimi,
                 .grok, .antigravity, .mistral, .deepseek, .cerebras, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax:
             return .session
         case .heatmap:
@@ -217,6 +223,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
 
     public var configurationTitle: String {
         switch self {
+        case .x:
+            return "The X Subscription"
         case .claude:
             return "Claude Code local session"
         case .openai:
@@ -264,6 +272,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
 
     public var configurationDescription: String {
         switch self {
+        case .x:
+            return "Reads the shared weekly allowance for Cursor, Grok and Grok Bot on The X Subscription using the connected Cursor account. Legacy Cursor and Grok plans keep their own provider entries."
         case .claude:
             return "Reads local Claude Code transcripts under `~/.claude` for token stats. Uses a pasted OAuth token or Limit Counter's mirrored OAuth token for live 5-hour and 7-day quota meters. An optional Anthropic Admin API key adds the Console organisation's month-to-date API spend under Usage Credits."
         case .openai:
@@ -283,7 +293,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         case .kimi:
             return "Uses a Kimi Code Console API key or imported CLI OAuth folder for 5-hour and weekly quota. An optional kimi.ai web session adds the shared monthly membership-credit meter and supplies the 5-hour meter when it answers."
         case .grok:
-            return "Runs the local Grok CLI `/usage` screen from a user-granted `~/.grok` folder and parses the weekly quota meter. TaskWraith data remains optional for activity history."
+            return "Reads the Grok CLI quota and activity from a user-granted `~/.grok` folder. Keep legacy Grok plans here; use X for the unified allowance shared with Cursor and Grok Bot."
         case .antigravity:
             return "Reads an explicitly granted Antigravity CLI session and requests the official 5-hour and 7-day quota summary on a looping cadence (4m → 7m → 16m → 3m → 21m), or immediately on manual refresh."
         case .mistral:
@@ -311,6 +321,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
 
     public var primaryCredentialLabel: String {
         switch self {
+        case .x:
+            return "Cursor dashboard session for The X Subscription"
         case .claude:
             return "Claude Code data root"
         case .openai:
@@ -360,7 +372,7 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
         switch self {
         case .claude:
             return "OAuth token (optional)"
-        case .chatgpt, .gemini, .kimi, .grok, .antigravity, .deepseek,
+        case .chatgpt, .x, .gemini, .kimi, .grok, .antigravity, .deepseek,
               .codexTelemetry, .meta, .ollama, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return nil
         case .mistral:
@@ -380,6 +392,8 @@ public enum ProviderID: String, Codable, CaseIterable, Identifiable, Hashable {
 
     public var securityNote: String {
         switch self {
+        case .x:
+            return "Uses only the Cursor session or local data folder you intentionally connect to read your unified subscription usage. Credentials stay in Keychain. It does not change or combine subscriptions."
         case .openai:
             return "Use only a Codex session or `~/.codex` folder you intentionally grant from an account you control. Folder access is limited to following `auth.json` session rotation. An optional admin API key is stored in Keychain and sent only to `https://api.openai.com/v1/organization/costs`."
         case .openaiAPI:
@@ -509,7 +523,7 @@ public extension ProviderID {
                 AppIconCandidate(bundleIdentifier: "com.electron.ollama", applicationNames: ["Ollama.app"]),
                 AppIconCandidate(bundleIdentifier: "ai.ollama.ollama", applicationNames: ["Ollama.app"])
             ]
-        case .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .qwen, .mimo, .minimax, .heatmap:
+        case .x, .gemini, .mistral, .deepseek, .cerebras, .meta, .codexTelemetry, .openrouter, .qwen, .mimo, .minimax, .heatmap:
             return []
         }
     }

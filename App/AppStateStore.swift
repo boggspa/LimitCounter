@@ -137,6 +137,7 @@ final class AppStateStore: ObservableObject {
         coordinator.register(ClaudeProviderClient())
         coordinator.register(DevinProviderClient())
         coordinator.register(CursorProviderClient())
+        coordinator.register(XSubscriptionProviderClient())
         coordinator.register(GeminiProviderClient())
         coordinator.register(KimiProviderClient())
         coordinator.register(GrokProviderClient())

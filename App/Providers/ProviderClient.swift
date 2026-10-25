@@ -3180,7 +3180,7 @@ public enum CredentialImportService {
             )
         }
 
-        if providerID == .cursor, url.hasDirectoryPath {
+        if (providerID == .cursor || providerID == .x), url.hasDirectoryPath {
             let stateDBURL = url.appendingPathComponent("state.vscdb")
             let backupDBURL = url.appendingPathComponent("state.vscdb.backup")
             guard FileManager.default.fileExists(atPath: stateDBURL.path)
@@ -3207,7 +3207,7 @@ public enum CredentialImportService {
             // For Cursor: capture the selected DB path with a security-scoped
             // bookmark. The local editor token is useful for cached metadata,
             // but it is not enough for cursor.com live usage on its own.
-            if providerID == .cursor {
+            if providerID == .cursor || providerID == .x {
                 let bookmarkData = makeSecurityScopedBookmarkData(for: url)
                 return ImportedCredential(
                     accessToken: nil,
@@ -3568,7 +3568,7 @@ public enum CredentialImportService {
             )
         case .claude:
             return try parseClaudeJSON(json, sourceURL: sourceURL)
-        case .cursor:
+        case .cursor, .x:
             return try parseCursorJSON(json)
         case .devin:
             return try parseDevinJSON(json, sourceURL: sourceURL)
@@ -3886,7 +3886,7 @@ public extension CredentialImportService {
                     return "Select your ~/.codex folder so Limit Counter can follow Codex session rotation without repeated file prompts."
                 case .codexTelemetry:
                     return "Select the ~/.codex folder for complete Codex activity, or one log file for limited access."
-                case .cursor:
+                case .cursor, .x:
                     return "Select Cursor's globalStorage folder or state.vscdb for local metadata. Use the web session import for live usage."
                 case .grok:
                     return "Select your ~/.grok folder so Limit Counter can run /usage locally."
@@ -3909,7 +3909,7 @@ public extension CredentialImportService {
             } else if providerID == .cerebras {
                 panel.allowedContentTypes = [.folder, .commaSeparatedText, .plainText, .data]
             } else if providerID == .openai || providerID == .codexTelemetry || providerID == .claude
-                        || providerID == .chatgpt || providerID == .cursor
+                        || providerID == .chatgpt || providerID == .cursor || providerID == .x
                         || providerID == .gemini || providerID == .grok {
                 panel.allowedContentTypes = [.folder, .json, .plainText, .data]
             } else {
@@ -3917,7 +3917,7 @@ public extension CredentialImportService {
             }
             panel.allowsMultipleSelection = false
             panel.canChooseDirectories = providerID == .openai || providerID == .codexTelemetry || providerID == .claude
-                || providerID == .chatgpt || providerID == .cursor || providerID == .gemini
+                || providerID == .chatgpt || providerID == .cursor || providerID == .x || providerID == .gemini
                 || providerID == .kimi || providerID == .grok || providerID == .antigravity
                 || providerID == .mistral || providerID == .cerebras || providerID == .meta
             panel.canChooseFiles = providerID != .kimi
@@ -3939,7 +3939,7 @@ public extension CredentialImportService {
                 panel.directoryURL = home.appendingPathComponent(".codex")
             case .claude:
                 panel.directoryURL = home.appendingPathComponent(".claude")
-            case .cursor:
+            case .cursor, .x:
                 // Point to the directory containing state.vscdb
                 panel.directoryURL = home.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage")
             case .devin:
@@ -8721,8 +8721,24 @@ private struct CursorRecentCommitMetadata {
 // MARK: - Cursor Provider Client
 
 /// Reads a Cursor web session cookie or local state token and fetches usage.
+/// The unified subscription has its own card; legacy Cursor and Grok keep
+/// their identities and credentials. All reads use the connected Cursor seat.
+public struct XSubscriptionProviderClient: ProviderClient {
+    public let providerID: ProviderID = .x
+    private let client: CursorProviderClient
+
+    public init(session: URLSession = .shared) {
+        client = CursorProviderClient(session: session, providerID: .x)
+    }
+
+    public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
+        guard credentials != nil else { throw ProviderFetchError.notConfigured }
+        return try await client.fetchSnapshot(credentials: credentials)
+    }
+}
+
 public struct CursorProviderClient: ProviderClient {
-    public let providerID: ProviderID = .cursor
+    public let providerID: ProviderID
 
     private let session: URLSession
     private let decoder = JSONDecoder()
@@ -8730,33 +8746,45 @@ public struct CursorProviderClient: ProviderClient {
 
     public init(session: URLSession = .shared) {
         self.session = session
+        self.providerID = .cursor
+    }
+
+    fileprivate init(session: URLSession, providerID: ProviderID) {
+        self.session = session
+        self.providerID = providerID
     }
 
     public func fetchSnapshot(credentials: ProviderCredential?) async throws -> QuotaSnapshot {
         print("[CursorProvider] Starting fetch...")
-        let localState = try? await loadLocalStateSnapshot(credentials: credentials)
+        // An explicitly imported session owns this account. Do not replace it
+        // with the ambient editor token or attach another account's metadata.
+        let hasExplicitSession = credentials?.extraFields?["cursorCookieHeader"]?.isEmpty == false
+            || credentials?.extraFields?["cursorAuthMode"] == "cookie"
+            || credentials?.extraFields?["cursorAuthMode"] == "bearer"
+            || (credentials?.normalizedAccessToken?.isEmpty == false
+                && credentials?.extraFields?["cursorAuthMode"] != "localState")
+        let localState = hasExplicitSession && credentials?.normalizedCustomEndpoint == nil
+            ? nil : try? await loadLocalStateSnapshot(credentials: credentials)
+        let auth = try await getAuthMaterial(credentials: credentials, localState: localState)
 
-        // PRIMARY: modern dashboard usage endpoint (percentage model).
-        // Cursor migrated from the legacy per-model request counts to a
-        // spend/percentage model (Included-in-Pro / Auto+Composer / API).
-        // The legacy `GET /api/usage` now returns zeros, which is why the
-        // card only showed the placeholder. The modern data lives behind
-        // a Connect-RPC endpoint authenticated with the access token that
-        // the Cursor editor stores in `state.vscdb`.
-        if let accessToken = localState?.accessToken, !accessToken.isEmpty {
+        let dashboardAuth: AuthMaterial?
+        if case .localMetadataOnly = auth {
+            dashboardAuth = localState?.accessToken.flatMap { $0.isEmpty ? nil : .bearer($0) }
+        } else {
+            dashboardAuth = auth
+        }
+        if let dashboardAuth {
             do {
-                let modern = try await fetchModernCursorUsage(accessToken: accessToken, localState: localState)
+                let modern = try await fetchModernCursorUsage(auth: dashboardAuth, localState: localState)
                 print("[CursorProvider] Modern usage endpoint succeeded")
                 return modern
             } catch {
+                if providerID == .x { throw error }
                 print("[CursorProvider] Modern usage endpoint failed (\(error.localizedDescription)) — falling back to legacy path")
             }
         }
 
-        // Try to get a real web credential first. The local editor DB remains a
-        // metadata source unless the user explicitly imports a web session or
-        // dashboard token.
-        let auth = try await getAuthMaterial(credentials: credentials, localState: localState)
+        if providerID == .x { throw ProviderFetchError.notConfigured }
 
         if case .localMetadataOnly = auth {
             return cursorLocalMetadataSnapshot(
@@ -8812,24 +8840,64 @@ public struct CursorProviderClient: ProviderClient {
         return try parseUsageResponse(data: data, localState: localState)
     }
 
-    /// Modern Cursor usage via the dashboard Connect-RPC endpoint.
-    /// Returns the same percentage model the cursor.com/dashboard UI
-    /// shows: Included-in-Pro total %, Auto+Composer %, API %, billing
-    /// cycle reset date, and on-demand spend limits.
-    ///
-    /// This is a reverse-engineered, undocumented endpoint (the same
-    /// one the dashboard itself calls). It can change without notice —
-    /// callers fall back to the legacy `/api/usage` path on any error.
+    /// Read the same three dashboard surfaces used by Cursor's Plan & Usage
+    /// view. Billing dates and included-usage reset dates are distinct.
+    /// These private Connect-RPC schemas come from the shipped Cursor client.
     private func fetchModernCursorUsage(
-        accessToken: String,
+        auth: AuthMaterial,
         localState: CursorLocalStateSnapshot?
     ) async throws -> QuotaSnapshot {
-        guard let url = URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage") else {
+        async let usageData = fetchCursorDashboardData(method: "GetCurrentPeriodUsage", auth: auth)
+        async let planData = try? fetchCursorDashboardData(method: "GetPlanInfo", auth: auth)
+        async let botData = try? fetchCursorDashboardData(method: "GetSandUsageStatus", auth: auth)
+
+        var usageError: Error?
+        let usage: [String: Any]
+        do {
+            usage = try JSONSerialization.jsonObject(with: try await usageData) as? [String: Any] ?? [:]
+        } catch {
+            usage = [:]
+            usageError = error
+        }
+        let plan = await planData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let bot = await botData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        do {
+            return try parseModernCursorUsage(json: usage, plan: plan, bot: bot, localState: localState)
+        } catch {
+            if let usageError, usage.isEmpty, plan == nil, bot == nil { throw usageError }
+            throw error
+        }
+    }
+
+    private func fetchCursorDashboardData(method: String, auth: AuthMaterial) async throws -> Data {
+        guard let url = URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/\(method)") else {
             throw ProviderFetchError.networkError(underlying: URLError(.badURL))
         }
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        switch auth {
+        case .bearer(let accessToken):
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        case .cookie(let header):
+            // The web cookie wraps the same bearer used by the editor's
+            // Connect client: user-id::access-token (often URL encoded).
+            let sessionCookie = header.split(separator: ";").compactMap { part -> String? in
+                let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+                guard pair.count == 2,
+                      pair[0].trimmingCharacters(in: .whitespaces) == "WorkosCursorSessionToken" else { return nil }
+                return pair[1].removingPercentEncoding ?? pair[1]
+            }.first
+            if let sessionCookie, let separator = sessionCookie.range(of: "::"),
+               !sessionCookie[separator.upperBound...].isEmpty {
+                request.setValue("Bearer \(sessionCookie[separator.upperBound...])", forHTTPHeaderField: "Authorization")
+            } else {
+                request.setValue(header, forHTTPHeaderField: "Cookie")
+            }
+            request.setValue("https://cursor.com", forHTTPHeaderField: "Origin")
+            request.setValue("https://cursor.com/", forHTTPHeaderField: "Referer")
+        case .localMetadataOnly:
+            throw ProviderFetchError.notConfigured
+        }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
         request.httpBody = Data("{}".utf8)
@@ -8839,51 +8907,95 @@ public struct CursorProviderClient: ProviderClient {
             throw ProviderFetchError.networkError(underlying: URLError(.badServerResponse))
         }
         guard http.statusCode == 200 else {
+            if http.statusCode == 401 || http.statusCode == 403 { throw ProviderFetchError.invalidCredential }
+            if http.statusCode == 429 { throw ProviderFetchError.rateLimited }
             throw ProviderFetchError.parsingError("Cursor dashboard usage HTTP \(http.statusCode)")
         }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ProviderFetchError.parsingError("Cursor dashboard usage: invalid JSON")
-        }
-
-        return try parseModernCursorUsage(json: json, localState: localState)
+        return data
     }
 
     private func parseModernCursorUsage(
         json: [String: Any],
+        plan: [String: Any]?,
+        bot: [String: Any]?,
         localState: CursorLocalStateSnapshot?
     ) throws -> QuotaSnapshot {
         func number(_ value: Any?) -> Double? {
-            if let v = value as? Double { return v }
-            if let v = value as? Int { return Double(v) }
-            if let v = value as? NSNumber { return v.doubleValue }
-            if let v = value as? String { return Double(v) }
-            return nil
+            let result = (value as? NSNumber)?.doubleValue ?? (value as? String).flatMap(Double.init)
+            return result.flatMap { $0.isFinite ? $0 : nil }
+        }
+        func date(_ value: Any?) -> Date? {
+            if let string = value as? String, let date = ISO8601Timestamp.date(from: string) { return date }
+            if let timestamp = value as? [String: Any], let seconds = number(timestamp["seconds"]) {
+                return Date(timeIntervalSince1970: seconds + (number(timestamp["nanos"]) ?? 0) / 1_000_000_000)
+            }
+            return number(value).map { Date(timeIntervalSince1970: $0 / 1000) }
         }
 
         let planUsage = json["planUsage"] as? [String: Any] ?? [:]
+        let planInfo = plan?["planInfo"] as? [String: Any] ?? [:]
+        let includedPeriod = (planInfo["includedUsagePeriod"] as? String)?.uppercased()
+        let hasWeeklyIncludedPeriod = number(planInfo["includedUsagePeriod"]) == 2
+            || includedPeriod == "WEEKLY" || includedPeriod == "INCLUDED_USAGE_PERIOD_WEEKLY"
+        // Newly created weekly subscriptions need not have merged old accounts.
+        // An explicit weekly plan period also identifies the shared allowance.
+        let isUnified = plan?["isMerged"] as? Bool == true || bot?["isUnified"] as? Bool == true
+            || hasWeeklyIncludedPeriod
+        let planName = cursorPlanName(
+            from: planInfo["planName"] as? String ?? bot?["cursorPlanName"] as? String,
+            localMembershipType: localState?.membershipType
+        )
+        let supplemental = cursorSupplementalContent(localState: localState, now: Date())
 
-        // billingCycleEnd is a unix-millisecond timestamp (string or num).
-        let resetDate: Date? = number(json["billingCycleEnd"]).map {
-            Date(timeIntervalSince1970: $0 / 1000.0)
+        if providerID == .x && !isUnified {
+            throw ProviderFetchError.parsingError("This session does not report a unified X Subscription. Connect the Cursor account in your X Subscription; legacy plans remain under Cursor and Grok.")
+        }
+        if providerID == .x, bot?["includedLimitZero"] as? Bool == true,
+           (number(planUsage["limit"]) ?? 0) <= 0 {
+            throw ProviderFetchError.parsingError("This X Subscription seat reports no included weekly allowance.")
+        }
+        if providerID == .cursor && isUnified {
+            return QuotaSnapshot(
+                providerID: .cursor, displayName: "Cursor", planName: planName,
+                windows: [], stats: supplemental.stats,
+                signals: supplemental.signals + [QuotaSignal(
+                    kind: .unexpectedRecovery, title: "Shared allowance is under X",
+                    message: "This account uses The X Subscription. Connect X in Providers to track the weekly pool shared by Cursor, Grok and Grok Bot.",
+                    severity: .info, announcementEligible: false
+                )],
+                events: cursorActivityEvents(from: localState), fetchState: .success, fetchedAt: Date()
+            )
+        }
+
+        let billingResetDate = date(json["billingCycleEnd"] ?? planInfo["billingCycleEnd"])
+        let resetDate = isUnified
+            ? date(planInfo["includedUsageResetsAt"]) ?? date(bot?["nextResetTimestampUtc"])
+            : billingResetDate
+        let totalPercent: Double?
+        if let limit = number(planUsage["limit"]), limit > 0,
+           let used = number(planUsage["includedSpend"]), used >= 0 {
+            totalPercent = min(100, max(0, used / limit * 100))
+        } else {
+            totalPercent = number(planUsage["totalPercentUsed"])
+                ?? (isUnified && bot?["isUnified"] as? Bool == true ? number(bot?["usagePercent"]) : nil)
         }
 
         var windows: [QuotaWindow] = []
 
-        if let total = number(planUsage["totalPercentUsed"]) {
+        if let total = totalPercent, total >= 0 {
             windows.append(
                 QuotaWindow(
-                    label: "Included in Pro",
-                    windowKind: .monthly,
+                    label: isUnified ? "Shared Weekly" : "Included in \(planName)",
+                    windowKind: isUnified ? .weekly : .monthly,
                     used: total,
                     total: 100,
                     resetDate: resetDate,
                     unit: "%",
-                    subtitle: "Total plan usage this cycle"
+                    subtitle: isUnified ? "Shared by Cursor, Grok and Grok Bot" : "Total plan usage this cycle"
                 )
             )
         }
-        if let auto = number(planUsage["autoPercentUsed"]) {
+        if !isUnified, let auto = number(planUsage["autoPercentUsed"]) {
             windows.append(
                 QuotaWindow(
                     label: "Auto + Composer",
@@ -8896,7 +9008,7 @@ public struct CursorProviderClient: ProviderClient {
                 )
             )
         }
-        if let api = number(planUsage["apiPercentUsed"]) {
+        if !isUnified, let api = number(planUsage["apiPercentUsed"]) {
             windows.append(
                 QuotaWindow(
                     label: "API",
@@ -8910,7 +9022,19 @@ public struct CursorProviderClient: ProviderClient {
             )
         }
 
-        // On-demand spend (cents → dollars) as a balance, if present.
+        // A legacy Bot grant is a separate weekly meter on the Cursor account.
+        // Unified Bot usage is already in the X pool and must not be duplicated.
+        if !isUnified, let used = number(bot?["usagePercent"]), used >= 0,
+           bot?["includedLimitZero"] as? Bool != true {
+            windows.append(QuotaWindow(
+                label: "Grok Bot Weekly", windowKind: .weekly,
+                used: used, total: 100, resetDate: date(bot?["nextResetTimestampUtc"]), unit: "%",
+                subtitle: "Legacy Grok Bot allowance billed through Cursor"
+            ))
+        }
+
+        // Paid additional usage keeps its monthly billing reset even when the
+        // included pool resets weekly. Amounts from this surface are cents.
         var balances: [QuotaBalance] = []
         if let spend = json["spendLimitUsage"] as? [String: Any] {
             let individualLimit = number(spend["individualLimit"]) ?? 0
@@ -8919,46 +9043,31 @@ public struct CursorProviderClient: ProviderClient {
                 let usedCents = max(0, individualLimit - individualRemaining)
                 balances.append(
                     QuotaBalance(
-                        label: "On-Demand Spend",
+                        label: isUnified ? "Additional Usage Budget" : "On-Demand Spend",
                         amount: individualRemaining / 100.0,
                         unit: "USD",
                         subtitle: "\((usedCents / 100).compactString) of \((individualLimit / 100).compactString) USD on-demand used",
-                        resetDate: resetDate
+                        resetDate: billingResetDate
                     )
                 )
             }
         }
 
-        // If the endpoint returned a healthy 200 but no usable windows
-        // (e.g. brand-new account), fall back to a zero placeholder so
-        // the card still reads "connected".
-        if windows.isEmpty {
-            windows.append(
-                QuotaWindow(
-                    label: "Included in Pro",
-                    windowKind: .monthly,
-                    used: 0,
-                    total: 100,
-                    resetDate: resetDate,
-                    unit: "%",
-                    subtitle: "No usage yet this cycle"
-                )
-            )
+        guard !windows.isEmpty else {
+            throw ProviderFetchError.parsingError("The dashboard did not report a measured usage percentage. Refresh the connected session and try again.")
         }
 
-        let planName = cursorPlanName(from: nil, localMembershipType: localState?.membershipType)
-        let supplemental = cursorSupplementalContent(localState: localState, now: Date())
         let events = cursorActivityEvents(from: localState)
 
         return QuotaSnapshot(
-            providerID: .cursor,
-            displayName: "Cursor",
+            providerID: providerID,
+            displayName: providerID.displayName,
             planName: planName,
             windows: windows,
-            stats: supplemental.stats,
+            stats: providerID == .x ? [] : supplemental.stats,
             balances: balances,
             signals: supplemental.signals,
-            events: events.sorted { $0.timestamp > $1.timestamp },
+            events: providerID == .x ? [] : events.sorted { $0.timestamp > $1.timestamp },
             fetchState: .success,
             fetchedAt: Date()
         )
