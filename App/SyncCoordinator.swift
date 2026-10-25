@@ -511,7 +511,7 @@ final class SyncCoordinator {
             return 30
         case .claude, .chatgpt, .gemini, .ollama:
             return 15
-        case .openai, .openaiAPI, .devin, .cursor, .kimi, .grok,
+        case .openai, .openaiAPI, .devin, .cursor, .x, .kimi, .grok,
                .mistral, .deepseek, .cerebras, .meta, .openrouter, .minimax:
             return 20
         case .qwen, .mimo:

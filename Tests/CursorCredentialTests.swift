@@ -31,7 +31,165 @@ enum CursorCredentialTestRunner {
         try testImportsCursorStateFile()
         try await testCursorProviderReadsDirectoryState()
         try await testCursorProviderNormalizesProPlusPlan()
+        try await testUnifiedXSubscriptionHasOneWeeklyPool()
+        try await testCursorKeepsLegacyMonthlyAndBotWeeklyMeters()
+        try await testUnifiedCursorDirectsSharedAllowanceToX()
+        try await testXRejectsLegacyAndMissingMeasurements()
+        try testXImportsTheSelectedCursorAccount()
         print("Cursor credential tests passed")
+    }
+
+    private static func dashboardClient(
+        provider: ProviderID,
+        usage: [String: Any],
+        plan: [String: Any]?,
+        bot: [String: Any]?,
+        cookie: Bool = false
+    ) async throws -> QuotaSnapshot {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // If the client accidentally follows ambient/local auth instead of the
+        // explicit session, this fixture sends the wrong token to the mock.
+        let dbURL = directory.appendingPathComponent("state.vscdb")
+        try createCursorStateDatabase(at: dbURL, membershipType: "wrong-local-account")
+        var db: OpaquePointer?
+        try cursorExpectEqual(sqlite3_open(dbURL.path, &db), SQLITE_OK, "fixture database opens")
+        if let db {
+            try insert(key: "cursorAuth/accessToken", value: "wrong-local-token", db: db)
+            sqlite3_close(db)
+        }
+        CursorDashboardMockURLProtocol.handler = { request in
+            try cursorExpectEqual(request.url?.host, "api2.cursor.sh", "Dashboard calls stay on Cursor's service")
+            try cursorExpectEqual(request.httpMethod, "POST", "Dashboard reads use Connect RPC")
+            try cursorExpectEqual(request.value(forHTTPHeaderField: "Connect-Protocol-Version"), "1", "Connect protocol")
+            if cookie {
+                try cursorExpectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-dashboard-token", "Unwraps this account's web session for Connect RPC")
+                try cursorExpect(request.value(forHTTPHeaderField: "Cookie") == nil, "Unrelated browser cookies are not forwarded")
+            } else {
+                try cursorExpectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-dashboard-token", "Explicit account wins over local token")
+            }
+            let body: [String: Any]?
+            switch request.url?.lastPathComponent {
+            case "GetCurrentPeriodUsage": body = usage
+            case "GetPlanInfo": body = plan
+            case "GetSandUsageStatus": body = bot
+            default: throw CursorTestFailure.failed("Unexpected dashboard method")
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: body == nil ? 404 : 200, httpVersion: nil, headerFields: nil)!
+            return (response, try JSONSerialization.data(withJSONObject: body ?? [:]))
+        }
+        defer { CursorDashboardMockURLProtocol.handler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CursorDashboardMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let credential = ProviderCredential(
+            accessToken: cookie ? nil : "fixture-dashboard-token",
+            customEndpoint: directory.path,
+            extraFields: cookie
+                ? ["cursorAuthMode": "cookie", "cursorCookieHeader": "theme=dark; WorkosCursorSessionToken=fixture-user%3A%3Afixture-dashboard-token"]
+                : ["cursorAuthMode": "bearer"]
+        )
+        if provider == .x {
+            return try await XSubscriptionProviderClient(session: session).fetchSnapshot(credentials: credential)
+        }
+        return try await CursorProviderClient(session: session).fetchSnapshot(credentials: credential)
+    }
+
+    private static func testUnifiedXSubscriptionHasOneWeeklyPool() async throws {
+        let weeklyReset = Date().addingTimeInterval(7 * 24 * 60 * 60)
+        let monthlyReset = Date().addingTimeInterval(30 * 24 * 60 * 60)
+        let snapshot = try await dashboardClient(
+            provider: .x,
+            usage: ["billingCycleEnd": monthlyReset.timeIntervalSince1970 * 1000,
+                    "planUsage": ["includedSpend": 250, "limit": 1000,
+                                  "totalPercentUsed": 0, "autoPercentUsed": 0, "apiPercentUsed": 0],
+                    "spendLimitUsage": ["individualLimit": 2000, "individualRemaining": 1500]],
+            plan: ["isMerged": true, "planInfo": ["planName": "Premium",
+                   "includedUsagePeriod": "INCLUDED_USAGE_PERIOD_WEEKLY",
+                   "includedUsageResetsAt": String(weeklyReset.timeIntervalSince1970 * 1000)]],
+            bot: ["isUnified": true, "usagePercent": 25,
+                  "nextResetTimestampUtc": ISO8601DateFormatter().string(from: weeklyReset)],
+            cookie: true
+        )
+        try cursorExpectEqual(snapshot.providerID, .x, "The shared subscription has its own provider")
+        try cursorExpect(snapshot.events.isEmpty, "The shared allowance does not duplicate Cursor's activity history")
+        try cursorExpect(snapshot.stats.isEmpty, "Cursor activity stats stay on the Cursor card")
+        try cursorExpectEqual(snapshot.planName, "Premium", "Plan info overrides stale local membership")
+        try cursorExpectEqual(snapshot.windows.map(\.label), ["Shared Weekly"], "Shared pool is never split or duplicated")
+        try cursorExpectEqual(snapshot.windows.first?.windowKind, .weekly, "Included usage is weekly")
+        try cursorExpectEqual(snapshot.windows.first?.used, 25, "Uses measured included spend rather than stale CLI zeros")
+        try cursorExpect(abs((snapshot.windows.first?.resetDate ?? .distantPast).timeIntervalSince(weeklyReset)) < 0.01,
+                         "Uses the included-usage reset rather than monthly billing")
+        try cursorExpectEqual(snapshot.balances.first?.amount, 15, "Spend-limit cents convert to dollars")
+        try cursorExpect(abs((snapshot.balances.first?.resetDate ?? .distantPast).timeIntervalSince(monthlyReset)) < 0.01,
+                         "Additional usage cap keeps the monthly reset after timestamp conversion")
+
+        let newAccount = try await dashboardClient(
+            provider: .x, usage: ["planUsage": ["totalPercentUsed": 27]],
+            plan: ["isMerged": false, "planInfo": ["planName": "Premium", "includedUsagePeriod": 2]], bot: nil
+        )
+        try cursorExpectEqual(newAccount.windows.first?.windowKind, .weekly, "New weekly accounts do not need a historical account merge")
+        try cursorExpectEqual(newAccount.windows.first?.used, 27, "New weekly accounts retain their measured usage")
+    }
+
+    private static func testCursorKeepsLegacyMonthlyAndBotWeeklyMeters() async throws {
+        let snapshot = try await dashboardClient(
+            provider: .cursor,
+            usage: ["planUsage": ["totalPercentUsed": 35, "autoPercentUsed": 20, "apiPercentUsed": 15]],
+            plan: ["isMerged": false, "planInfo": ["planName": "pro_plus", "includedUsagePeriod": 1]],
+            bot: ["isUnified": false, "usagePercent": 62,
+                  "nextResetTimestampUtc": ["seconds": String(Int(Date().addingTimeInterval(3600).timeIntervalSince1970))]]
+        )
+        try cursorExpectEqual(snapshot.planName, "Pro +", "Legacy plan name survives")
+        try cursorExpectEqual(snapshot.windows.map(\.windowKind), [.monthly, .monthly, .monthly, .weekly], "Legacy monthly and Bot weekly stay independent")
+        try cursorExpectEqual(snapshot.windows.last?.label, "Grok Bot Weekly", "The Bot meter is clearly identified")
+        try cursorExpectEqual(snapshot.windows.last?.used, 62, "Bot consumption is not the Cursor monthly percentage")
+        try cursorExpect(snapshot.windows.last?.resetDate != nil, "Accepts protobuf timestamp objects")
+
+        let withoutBot = try await dashboardClient(
+            provider: .cursor, usage: ["planUsage": ["totalPercentUsed": 12]], plan: nil, bot: nil
+        )
+        try cursorExpectEqual(withoutBot.windows.count, 1, "Old endpoint support survives unavailable auxiliary methods")
+        try cursorExpectEqual(withoutBot.windows.first?.used, 12, "Legacy data is preserved")
+    }
+
+    private static func testUnifiedCursorDirectsSharedAllowanceToX() async throws {
+        let snapshot = try await dashboardClient(
+            provider: .cursor, usage: ["planUsage": ["totalPercentUsed": 42]],
+            plan: ["isMerged": true, "planInfo": ["planName": "Premium", "includedUsagePeriod": 2]],
+            bot: ["isUnified": true, "usagePercent": 42]
+        )
+        try cursorExpect(snapshot.windows.isEmpty, "The Cursor card does not duplicate the unified pool")
+        try cursorExpect(snapshot.signals.contains { $0.title == "Shared allowance is under X" }, "Explains where to connect the shared meter")
+    }
+
+    private static func testXRejectsLegacyAndMissingMeasurements() async throws {
+        for (plan, bot) in [
+            (["isMerged": false, "planInfo": ["planName": "Premium"]] as [String: Any], ["usagePercent": 5] as [String: Any]),
+            (["isMerged": true] as [String: Any], ["isUnified": true] as [String: Any]),
+            (["isMerged": true] as [String: Any], ["isUnified": true, "usagePercent": -1] as [String: Any]),
+            (["isMerged": true] as [String: Any], ["isUnified": true, "usagePercent": 0, "includedLimitZero": true] as [String: Any])
+        ] {
+            do {
+                _ = try await dashboardClient(provider: .x, usage: [:], plan: plan, bot: bot)
+                throw CursorTestFailure.failed("X fabricated a shared quota without a unified measured reading")
+            } catch ProviderFetchError.parsingError {}
+        }
+        let measuredZero = try await dashboardClient(
+            provider: .x, usage: [:], plan: nil,
+            bot: ["isUnified": true, "usagePercent": 0, "nextResetTimestampUtc": "2027-01-01T00:00:00Z"]
+        )
+        try cursorExpectEqual(measuredZero.windows.first?.used, 0, "An explicitly observed zero remains valid")
+    }
+
+    private static func testXImportsTheSelectedCursorAccount() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        FileManager.default.createFile(atPath: directory.appendingPathComponent("state.vscdb").path, contents: Data())
+        let imported = try CredentialImportService.importFromURL(directory, for: .x)
+        try cursorExpectEqual(imported.customEndpoint, directory.appendingPathComponent("state.vscdb").path, "X follows the selected Cursor account")
+        try cursorExpectEqual(imported.extraFields?["cursorAuthMode"], "localState", "X supports the existing folder import")
+        try cursorExpectEqual(ProviderID.x.bundledLogoAssetName, "ProviderXLogo", "X uses its own PNG asset")
     }
 
     private static func testImportsCursorStateDirectory() throws {
@@ -164,4 +322,25 @@ enum CursorCredentialTestRunner {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
+}
+
+private final class CursorDashboardMockURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            guard let handler = Self.handler else { throw URLError(.unsupportedURL) }
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

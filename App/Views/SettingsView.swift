@@ -1101,9 +1101,11 @@ struct ProviderCredentialView: View {
             #endif
 
             Section("Credentials You Control") {
-                if providerID == .cursor {
+                if providerID == .cursor || providerID == .x {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Sign in to Cursor in the embedded browser to capture your current cursor.com session. The app stores only a normalized cookie header in Keychain.")
+                        Text(providerID == .x
+                             ? "Connect the Cursor account in your X Subscription. Its session reads the weekly allowance shared by Cursor, Grok and Grok Bot. The app stores the session in Keychain."
+                             : "Sign in to Cursor in the embedded browser to capture your current cursor.com session. The app stores only a normalized cookie header in Keychain.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1454,8 +1456,10 @@ struct ProviderCredentialView: View {
                     #if os(iOS)
                         .textInputAutocapitalization(.never)
                     #endif
-                } else if providerID == .cursor {
-                    Text("Use the in-app Cursor session import flow above for live usage meters. You can also import Cursor's `globalStorage` folder or `state.vscdb` for cached account metadata and local AI activity stats.")
+                } else if providerID == .cursor || providerID == .x {
+                    Text(providerID == .x
+                         ? "Connect your unified Cursor account using the session import above or select its Cursor data folder. The shared allowance appears here; legacy plans stay under Cursor and Grok."
+                         : "Use the in-app Cursor session import flow above for live usage meters. You can also import Cursor's `globalStorage` folder or `state.vscdb` for cached account metadata and local AI activity stats.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2198,7 +2202,7 @@ struct ProviderCredentialView: View {
     private func applyImportedCredential(
         _ credential: CredentialImportService.ImportedCredential
     ) -> Bool {
-        var merged = providerID == .cursor
+        var merged = (providerID == .cursor || providerID == .x)
             ? ProviderSetupPolicy.mergingCursor(
                 currentDraft,
                 imported: credential,

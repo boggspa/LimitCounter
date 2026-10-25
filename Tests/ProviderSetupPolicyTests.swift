@@ -420,6 +420,12 @@ private func testSessionFlagsMatchLegacyDerivation() throws {
         ProviderSetupPolicy.sessionFlags(cursorHeader, providerID: .cursor).cursor,
         "a cookie header alone also marks Cursor as imported"
     )
+    try setupExpect(
+        ProviderSetupPolicy.sessionFlags(cursorHeader, providerID: .x).cursor,
+        "X recognises the imported Cursor session for the shared subscription"
+    )
+    try setupExpect(ProviderSetupPolicy.localFolderProviders.contains(.x),
+                    "X preserves the selected Cursor folder's security-scoped access")
 
     var ollama = ProviderSetupPolicy.Draft()
     ollama.accessToken = "key"
